@@ -1,0 +1,162 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: inventory
+  namespace: argo-workflows
+
+spec:
+  templates:
+
+  - name: subject-data-inventory-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: inventory
+        cloudpipe.io/step: subject-data-inventory
+    retryStrategy:
+      limit: "3"
+      retryPolicy: OnFailure
+      backoff:
+        duration: "30s"
+        factor: "2"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+          ephemeral-storage: 500M
+        limits:
+          ephemeral-storage: 500M
+
+      env:
+        - name: SUBJECT_ID
+          value: "{{workflow.parameters.subjID}}"
+        - name: BUCKET_NAME
+          value: "{{workflow.parameters.bucket}}"
+
+      command: ["sh", "-c"]
+
+      source: |
+
+        #!/bin/sh
+        set -e
+
+        python - <<EOF
+        import boto3
+        import json
+        import os
+        import sys
+
+        s3_client = boto3.client('s3')
+
+        def get_anat_sessions(bucket_name:str, prefix_key: str):
+          sessions = []
+          if prefix_key and not prefix_key.endswith('/'):
+              prefix_key += '/'
+
+          paginator = s3_client.get_paginator('list_objects_v2')
+          pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix_key, Delimiter='/')
+
+          for page in pages:
+            if 'CommonPrefixes' in page:
+              for cp in page['CommonPrefixes']:
+                full_path = cp['Prefix']
+                relative_path = full_path[len(prefix_key):]
+                clean_name = relative_path.strip('/')
+                sessions.append(clean_name)
+
+          return sessions
+
+        def main():
+          subject_id = os.environ.get('SUBJECT_ID')
+          bucket_name = os.environ.get('BUCKET_NAME')
+          prefix_key = f"mmps_mproc/{subject_id}/"
+          try:
+            sessions = get_anat_sessions(bucket_name, prefix_key)
+            print(json.dumps(sessions))
+          except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if __name__ == "__main__":
+          main()
+
+        EOF
+
+  - name: derivatives-inventory-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: inventory
+        cloudpipe.io/step: derivatives-inventory
+    retryStrategy:
+      limit: "3"
+      retryPolicy: OnFailure
+      backoff:
+        duration: "30s"
+        factor: "2"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          ephemeral-storage: 200M
+          memory: "256Mi"
+          cpu: "100m"
+      command: ["sh", "-c"]
+
+      env:
+        - name: SUBJECT_ID
+          value: "{{workflow.parameters.subjID}}"
+        - name: BUCKET_NAME
+          value: "{{workflow.parameters.bucket}}"
+
+      source: |
+
+        #!/bin/sh
+        set -e
+
+        python - <<EOF
+        import sys
+        import os
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def check_prefix_exists(bucket_name, prefix):
+          s3_client = boto3.client('s3')
+          if not prefix.endswith('/'):
+            prefix += '/'
+          try:
+            response = s3_client.list_objects_v2(
+                Bucket=bucket_name,
+                Prefix=prefix,
+                MaxKeys=1
+            )
+            return 'Contents' in response and len(response['Contents']) > 0
+          except ClientError as e:
+            raise e
+
+        if __name__ == "__main__":
+          bucket = os.environ.get('BUCKET_NAME')
+          subject_id = os.environ.get('SUBJECT_ID')
+
+          if not bucket or not subject_id:
+            print("Error: BUCKET_NAME and SUBJECT_ID environment variables are required.", file=sys.stderr)
+            sys.exit(1)
+
+          target_prefix = f"derivatives/fastsurfer/{subject_id}/"
+
+          try:
+            exists = check_prefix_exists(bucket, target_prefix)
+            print("True" if exists else "False")
+          except Exception as e:
+            print(f"Critical Error: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        EOF

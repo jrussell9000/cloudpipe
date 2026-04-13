@@ -1,0 +1,269 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  namespace: argo-workflows
+  name: cloudpipe
+  # annotations:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::575108944090:role/argo-workflows-runner
+
+spec:
+  # Pre-specify metadata for all workflows run from this workflow
+  workflowMetadata:
+    annotations:
+      workflows.argoproj.io/title: "{{workflow.parameters.subjID}}"
+      workflows.argoproj.io/description: "{{workflow.parameters.subjID}}"
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  retryStrategy:
+    limit: "3"
+    retryPolicy: "OnFailure"
+    # Optional: Only retry if the failure looks like a Spot termination
+    expression: "lastRetry.message matches 'pod deleted' || lastRetry.exitCode in [137, 143]"
+    backoff:
+      duration: "1m"
+      factor: "2"
+
+  podMetadata:
+    labels:
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  # Create the following persistent volume claim for this workflow
+  volumeClaimTemplates:
+    # Naming the volume claim after the subject ID (for tracking)
+    - metadata:
+        # "Name" should be used to reference this PVC further down the workflow
+        name: "{{=lower(workflow.parameters.subjID)}}"
+        # Specify a string that will be appended to the string created by generateName in the workflow metadata
+        # By introducing the random character sequence from the metadata, we create a unique PVC for each workflow
+        # run, even if it's for the same subject ID. Neat!
+        generateName: "{{=lower(workflow.parameters.subjID)}}"
+      spec:
+        accessModes: [ "ReadWriteMany" ]
+        storageClassName: efs-sc
+        resources:
+          requests:
+            storage: 50Gi
+
+  # Workflow pods should be deleted on workflow completion
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  # Maximum workflow runtime (https://argo-workflows.readthedocs.io/en/latest/walk-through/timeouts/)
+  activeDeadlineSeconds: 43200
+
+  # Clean up persistent volume claims when the workflow completes (success or failure)
+  volumeClaimGC:
+    strategy: OnWorkflowSuccess
+
+  # IRSA for running the workflow
+  serviceAccountName: argo-workflows-runner
+
+  # Time to live after workflow is completed, replaces ttlSecondsAfterFinished
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  podDisruptionBudget:
+    minAvailable: "100%"
+
+  # MUST include a global security context to ensure artifacts are passed with the same (accessible)
+  # permissions or else some tasks may not be able to access passed artifacts (this took too long to figure out)
+  # see: https://github.com/argoproj/argo-workflows/issues/9651 (can also set 'mode: 755' e.g., to define permissions)
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  arguments:
+    parameters:
+      - name: subjID
+
+      # Globus transfer parameters
+      - name: globus-source-collection-id
+      - name: globus-source-base-path
+        # Collection root — subject ID is appended automatically, e.g. /abcd/raw
+      - name: globus-dest-collection-id
+      - name: globus-dest-base-path
+        # Collection root — subject ID is appended automatically, e.g. /mmps_mproc
+      # JSON array of BIDS scan types to transfer across all sessions, e.g.:
+      # '["T1w", "T2w", "rest", "dwi"]'
+      # Valid values: T1w, T2w, rest, nback, sst, mid, dwi
+      - name: globus-scan-types
+
+  # Which template (below) should we start with?
+  entrypoint: master-pipeline-dag
+
+  templates:
+  # This is the master DAG for the entire pipeline
+  - name: master-pipeline-dag
+
+    # Maximum number of pods (job steps) that can run at any one time
+    parallelism: 3
+    dag:
+      # Do NOT stop the workflow if one part of the DAG fails
+      # Necessary for subject_sessions that may have only anatomicals, but no functionals
+      failFast: false
+      # Providing each task in the DAG, its dependencies, and any output artifacts to be passed
+      tasks:
+        # Start the Globus Connect Server EC2 instance and wait for it to be ready.
+        # Skips the start call if the instance is already running (safe to re-run).
+        - name: start-globus-instance-dagtask
+          templateRef:
+            name: globus-transfer
+            template: start-globus-instance-template
+
+        # Pull all subject files from the remote Globus collection into S3 before
+        # the inventory runs.  Uses sync_level=checksum so re-runs are safe.
+        - name: globus-transfer-dagtask
+          depends: start-globus-instance-dagtask.Succeeded
+          templateRef:
+            name: globus-transfer
+            template: globus-transfer-template
+          arguments:
+            parameters:
+              - name: source-collection-id
+                value: '{{workflow.parameters.globus-source-collection-id}}'
+              - name: source-base-path
+                value: '{{workflow.parameters.globus-source-base-path}}'
+              - name: dest-collection-id
+                value: '{{workflow.parameters.globus-dest-collection-id}}'
+              - name: dest-base-path
+                value: '{{workflow.parameters.globus-dest-base-path}}'
+              - name: scan-types
+                value: '{{workflow.parameters.globus-scan-types}}'
+
+        - name: subject-data-inventory-dagtask
+          templateRef:
+            name: inventory
+            template: subject-data-inventory-template
+          # Raw data must be in S3 before the inventory checks for it
+          depends: globus-transfer-dagtask.Succeeded
+
+        # Check if FastSurfer derivatives for this subject already exist.
+        # Independent of the Globus transfer — derivatives are written by prior
+        # workflow runs, not pulled from the remote collection.
+        - name: derivatives-inventory-dagtask
+          templateRef:
+            name: inventory
+            template: derivatives-inventory-template
+
+        # # Anatomical processing pipeline
+        # - name: anatomical-processing-pipeline-dagtask
+        #   # Reference to an in-line DAG template (provided below)
+        #   template: anatomical-processing-pipeline-dag-template
+        #   depends: "subject-data-inventory-dagtask.Succeeded && derivatives-inventory-dagtask.Succeeded"
+        #   arguments:
+        #     parameters:
+        #       # Receiving the output from the subject-data-inventory-dagtask as a parameter named T1w_sessions
+        #       - name: T1w_sessions
+        #         value: '{{tasks.subject-data-inventory-dagtask.outputs.result}}'
+        #   # Skip anatomical processing if the FastSurfer derivatives were already created
+        #   when: '"{{tasks.derivatives-inventory-dagtask.outputs.result}}" == False'
+
+        - name: functional-processing-pipeline-dagtask
+          template: functional-processing-pipeline-dag-template
+          #depends: "anatomical-processing-pipeline-dagtask.Succeeded || anatomical-processing-pipeline-dagtask.Skipped"
+          depends: subject-data-inventory-dagtask.Succeeded && derivatives-inventory-dagtask.Succeeded
+          arguments:
+            parameters:
+              - name: session
+                value: '{{item}}'
+          withParam: '{{tasks.subject-data-inventory-dagtask.outputs.result}}'
+
+#######################################
+#----- Anatomical Processing DAG -----#
+#######################################
+
+  - name: anatomical-processing-pipeline-dag-template
+    # Maximum number of steps in this workflow that can run concurrently (DAG width)
+    # Set to 2 per long_fastsurfer_run.sh
+    parallelism: 1
+    inputs:
+      parameters:
+        # Pull in in the T1w_sessions parameter when calling the DAG template above
+        - name: T1w_sessions
+    dag:
+      tasks:
+        # Create a within-subject template and register all the scans to it
+        - name: fastsurfer-template-creation-dagtask
+          templateRef:
+            name: fast-tmpl
+            template: fastsurfer-template-creation-dag-template
+          arguments:
+            parameters:
+              # Pull in the T1w_sessions parameter passed in to the in-line DAG template (above)
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+        # Segment the within-subject template
+        - name: fastsurfer-template-segmentation-dagtask
+          templateRef:
+            name: fast-tmpl
+            template: fastsurfer-template-segmentation-template
+          # Depends on creation of the within-subject template
+          dependencies:
+            - fastsurfer-template-creation-dagtask
+          arguments:
+            parameters:
+              - name: argstring
+                value: >-
+                  {{= "--sid " + workflow.parameters.subjID +
+                     "_template --sd /opt/freesurfer/subjects --base --edits --seg_only --threads 8" }}
+
+        # Parcellate the within-subject template
+        - name: fastsurfer-template-parcellation-steps
+          templateRef:
+            name: fast-tmpl
+            template: fastsurfer-template-parcellation-steps-template
+          # Template segmentation is a pre-requisite for parcellation
+          dependencies:
+            - fastsurfer-template-segmentation-dagtask
+
+        # Segment each of the newly-registered session scans
+        # Can be run concurrent to within-subject seg/parc
+        - name: fastsurfer-long-segmentation-steps
+          templateRef:
+            name: fast-long
+            template: fastsurfer-long-segmentation-steps-template
+          dependencies:
+            - fastsurfer-template-parcellation-steps
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+        # Parcellate each of the registered session scans
+        - name: fastsurfer-long-parcellation-steps
+          templateRef:
+            name: fast-long
+            template: fastsurfer-long-parcellation-steps-template
+          # Requires all previous steps
+          dependencies:
+            - fastsurfer-long-segmentation-steps
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+
+#######################################
+#----- Functional Processing DAG -----#
+#######################################
+
+  - name: functional-processing-pipeline-dag-template
+    inputs:
+      parameters:
+        - name: session
+
+    dag:
+      tasks:
+        - name: functional-preprocessing-dagtask
+          templateRef:
+            name: func-preproc
+            template: func-preproc-steps
+          arguments:
+            parameters:
+              - name: session
+                value: '{{inputs.parameters.session}}'
+

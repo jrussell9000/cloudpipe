@@ -1,0 +1,244 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: functional-preprocessing
+  namespace: argo-workflows
+
+spec:
+  retryStrategy:
+    limit: "3"
+    retryPolicy: OnFailure
+    expression: 'lastRetry.message matches "pod deleted" || lastRetry.exitCode in [137, 143]'
+    backoff:
+      duration: "1m"
+      factor: "2"
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  # Standalone submissions use these defaults; production submissions inherit
+  # them from the cloudpipe master workflow (where configmap defaults are set).
+  arguments:
+    parameters:
+      - name: subjID
+      - name: session
+      - name: task
+      - name: run
+      - name: nss-frames
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  # preproc-script is declared here for standalone submissions; the cloudpipe
+  # and registration workflow templates also declare it for production runs.
+  volumes:
+    - name: preproc-script
+      configMap:
+        name: preproc-script
+
+  entrypoint: functional-preprocessing-entrypoint
+
+  templates:
+
+  ###########################################################################
+  # Standalone entrypoint — maps workflow-level parameters (subjID, session,
+  # task, run) to the template's input parameters so the template can be
+  # submitted directly without the registration steps wrapper.
+  # Not used when called via templateRef from the registration workflow.
+  ###########################################################################
+
+  - name: functional-preprocessing-entrypoint
+    steps:
+    - - name: functional-preprocessing
+        template: functional-preprocessing-template
+        arguments:
+          parameters:
+            - name: session
+              value: '{{workflow.parameters.session}}'
+            - name: task
+              value: '{{workflow.parameters.task}}'
+            - name: run
+              value: '{{workflow.parameters.run}}'
+            - name: nss-frames
+              value: '{{workflow.parameters.nss-frames}}'
+
+  ###########################################################################
+  # Core template — called once per (session, task, run) from the registration
+  # steps template, after bold-to-t1w and t1w-to-mni have completed.
+  #
+  # Downloads from S3 → /tmp/bold_to_t1w/{task}_{run}:
+  #   …_desc-bold2t1w_brainmask.nii.gz
+  #   …_desc-bold2t1w_itk.txt
+  # Downloads from S3 → /tmp/t1w_to_mni:
+  #   …_desc-t1w2mni_affine.mat
+  #   …_desc-t1w2mni_warp.nii.gz
+  # Downloads from S3 → /tmp/fastsurfer/{subjID}_{session}:
+  #   mri/aseg.mgz  (for WM/CSF masks used in aCompCor)
+  #
+  # Downloads from S3:
+  #   BOLD (4D NIfTI) from mmps_mproc/
+  #   MNI152NLin2009cAsym reference template from config/
+  #
+  # Uploads to S3:
+  #   derivatives/func/{subjID}/{session}/
+  #     {subjID}_{session}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
+  ###########################################################################
+
+  - name: functional-preprocessing-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: functional
+        cloudpipe.io/step: bold-preprocessing
+    inputs:
+      parameters:
+        - name: session
+        - name: task
+        - name: run
+        - name: nss-frames
+
+      artifacts:
+        - name: bold
+          path: /data/bold.nii.gz
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.nii.gz'
+
+        - name: bids-sidecar
+          path: /data/bold.json
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.json'
+
+        - name: mni-template
+          path: /data/MNI152NLin2009cAsym_T1w_brain.nii.gz
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: config/MNI152NLin2009cAsym_T1w_brain.nii.gz
+
+        - name: motion-params
+          path: /data/motion.tsv
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_motion.tsv'
+
+        # bold-to-t1w outputs (brainmask + ITK affine) — uploaded to S3 by the
+        # bold-to-t1w step so func-preproc can run standalone without a PVC
+        # dependency and bold-to-t1w can be skipped on reruns.
+        - name: bold-to-t1w
+          path: '/tmp/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/bold_to_t1w_{{inputs.parameters.task}}_{{inputs.parameters.run}}.tar.gz'
+
+        # t1w-to-mni transforms — always downloaded from S3 so this template
+        # works standalone regardless of whether the registration step ran.
+        - name: t1w-to-mni-transforms
+          path: /tmp/t1w_to_mni
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni.tar.gz'
+
+        # FastSurfer outputs (for aseg.mgz → WM/CSF masks in aCompCor).
+        - name: fastsurfer-output
+          path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}'
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
+
+    outputs:
+      artifacts:
+        - name: mni-bold
+          path: '/tmp/func/{{inputs.parameters.session}}/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'derivatives/func/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_space-MNI152NLin2009cAsym_bold.tar.gz'
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-ce5e35a7ee6b6f45403cb7ec82a0cb619215c24d"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+        - name: preproc-script
+          mountPath: /app/preproc.py
+          subPath: preproc.py
+
+      resources:
+        requests:
+          memory: 32G
+          cpu: '8'
+          ephemeral-storage: 10G
+
+      env:
+        - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+          value: '8'
+
+      command: [/entrypoint.sh, python, /app/preproc.py]
+      args:
+        - --bold
+        - /data/bold.nii.gz
+        - --bids-sidecar
+        - /data/bold.json
+        - --brainmask
+        - '/tmp/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_desc-bold2t1w_brainmask.nii.gz'
+        - --bold2t1w-affine
+        - '/tmp/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_desc-bold2t1w_itk.txt'
+        - --t1w2mni-affine
+        - '/tmp/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_affine.mat'
+        - --t1w2mni-warp
+        - '/tmp/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_warp.nii.gz'
+        - --mni-template
+        - /data/MNI152NLin2009cAsym_T1w_brain.nii.gz
+        - --outdir
+        - '/tmp/func/{{inputs.parameters.session}}/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
+        - --subj
+        - '{{workflow.parameters.subjID}}'
+        - --session
+        - '{{inputs.parameters.session}}'
+        - --task
+        - '{{inputs.parameters.task}}'
+        - --run
+        - '{{inputs.parameters.run}}'
+        - --threads
+        - '8'
+        - --aseg
+        - '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/aseg.mgz'
+        - --motion-file
+        - /data/motion.tsv
+        - --nss-frames
+        - '{{inputs.parameters.nss-frames}}'

@@ -1,0 +1,268 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: fast-tmpl
+  namespace: argo-workflows
+spec:
+
+  retryStrategy:
+    limit: "3"
+    retryPolicy: OnFailure
+    expression: 'lastRetry.message matches "pod deleted" || lastRetry.exitCode in [64, 137, 143]'
+    backoff:
+      duration: "1m"
+      factor: "2"
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  securityContext:
+    runAsNonRoot: true
+
+  templates:
+
+  ##############################################
+  # 1. Template Creation (long_prepare_template)
+  ##############################################
+
+  - name: fastsurfer-template-creation-dag-template
+    inputs:
+      parameters:
+        - name: T1w_sessions
+
+    dag:
+      tasks:
+      - name: fastsurfer-template-creation-dagtask
+        template: fastsurfer-template-creation-template
+        arguments:
+          parameters:
+            - name: fastsurfer-command-string
+              value: >-
+                {{= "--tid " + workflow.parameters.subjID + "_template" +
+                   " --t1s " +
+                   join(map(jsonpath(inputs.parameters.T1w_sessions, "$[*]"),
+                     {"/home/nonroot/" + workflow.parameters.subjID + "/" + # +
+                      "/anat/" + workflow.parameters.subjID + "_" + # + "_run-01_T1w.nii.gz"}), " ") +
+                   " --tpids " +
+                   join(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), " ") +
+                   " --threads 8" }}
+            - name: T1w_sessions
+              value: "{{inputs.parameters.T1w_sessions}}"
+
+  # NOTE: The code in long_prepare_template.sh will automagically handle timepoints with only baseline data
+  - name: fastsurfer-template-creation-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: anatomical
+        cloudpipe.io/step: template-creation
+    inputs:
+      parameters:
+        - name: fastsurfer-command-string
+        - name: T1w_sessions
+
+      artifacts:
+      - name: fslicense
+        path: '/opt/freesurfer/.license'
+        s3:
+          endpoint: s3-accelerate.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: us-east-2
+          key: 'config/fslicense'
+
+      - name: fsaverage
+        path: '/opt/freesurfer/subjects/fsaverage'
+        s3:
+          endpoint: s3-accelerate.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: us-east-2
+          key: 'config/fsaverage/'
+
+    nodeSelector:
+      karpenter.sh/nodepool: gpu-nodepool
+
+    volumes:
+      - name: t1w-inputs
+        emptyDir: {}
+
+    initContainers:
+      - name: download-t1w-inputs
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            memory: 512M
+            cpu: '1'
+        env:
+          - name: SUBJECT_ID
+            value: "{{workflow.parameters.subjID}}"
+          - name: T1W_SESSIONS
+            value: "{{inputs.parameters.T1w_sessions}}"
+          - name: BUCKET
+            value: "{{workflow.parameters.bucket}}"
+        volumeMounts:
+          - name: t1w-inputs
+            mountPath: /home/nonroot
+        command: [python]
+        args:
+          - -c
+          - |
+            import boto3, json, os
+            from pathlib import Path
+
+            s3 = boto3.client('s3')
+            subj = os.environ['SUBJECT_ID']
+            sessions = json.loads(os.environ['T1W_SESSIONS'])
+
+            for ses in sessions:
+                key = f"mmps_mproc/{subj}/{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz"
+                dest = Path(f"/home/nonroot/{subj}/{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                bucket = os.environ['BUCKET']
+                print(f"Downloading s3://{bucket}/{key} -> {dest}", flush=True)
+                s3.download_file(bucket, key, str(dest))
+
+            print(f"Downloaded T1w files for {len(sessions)} session(s).", flush=True)
+
+      - name: clear-is-running
+        image: public.ecr.aws/docker/library/alpine:3.21
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            ephemeral-storage: 300M
+        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+        mirrorVolumeMounts: true
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      imagePullPolicy: IfNotPresent
+      volumeMounts:
+      - name: "{{=lower(workflow.parameters.subjID)}}"
+        mountPath: /opt/freesurfer/subjects
+        subPath: opt/freesurfer/subjects
+      - name: t1w-inputs
+        mountPath: /home/nonroot
+
+      env:
+        - name: FS_LICENSE
+          value: /opt/freesurfer/.license
+
+      resources:
+        requests:
+          memory: 8G
+          cpu: '4'
+        limits:
+          nvidia.com/gpu: '1'
+
+      command: [bash, -c]
+      args: ["/fastsurfer/recon_surf/long_prepare_template.sh {{inputs.parameters.fastsurfer-command-string}}"]
+
+  ##############################################
+  # 2. Template Segmentation (seg_only --base)
+  ##############################################
+
+  - name: fastsurfer-template-segmentation-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: anatomical
+        cloudpipe.io/step: template-segmentation
+    inputs:
+      parameters:
+        - name: argstring
+
+    nodeSelector:
+      karpenter.sh/nodepool: gpu-nodepool
+
+    initContainers:
+      - name: clear-is-running
+        image: public.ecr.aws/docker/library/alpine:3.21
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            ephemeral-storage: 300M
+        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+        mirrorVolumeMounts: true
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      imagePullPolicy: IfNotPresent
+      volumeMounts:
+      - name: "{{=lower(workflow.parameters.subjID)}}"
+        mountPath: /opt/freesurfer/subjects
+        subPath: opt/freesurfer/subjects
+
+      resources:
+        requests:
+          memory: 8G
+          cpu: '4'
+        limits:
+          nvidia.com/gpu: '1'
+
+      command: [bash, -c]
+      args: ["/fastsurfer/run_fastsurfer.sh {{inputs.parameters.argstring}}"]
+
+  ##############################################
+  # 3. Template Parcellation (surf_only --base)
+  ##############################################
+
+  - name: fastsurfer-template-parcellation-steps-template
+    steps:
+    - - name: fastsurfer-template-parcellation-step
+        template: fastsurfer-template-parcellation-template
+        arguments:
+          parameters:
+            - name: argstring
+              value: >-
+                {{= "--sid " + workflow.parameters.subjID +
+                   "_template --sd /opt/freesurfer/subjects --surf_only --base --edits --3T --fsaparc --threads 8" }}
+
+  - name: fastsurfer-template-parcellation-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: anatomical
+        cloudpipe.io/step: template-parcellation
+    inputs:
+      parameters:
+        - name: argstring
+
+      artifacts:
+      - name: fslicense
+        path: '/opt/freesurfer/.license'
+        s3:
+          endpoint: s3-accelerate.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: us-east-2
+          key: 'config/fslicense'
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+
+    initContainers:
+      - name: clear-is-running
+        image: public.ecr.aws/docker/library/alpine:3.21
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            ephemeral-storage: 300M
+        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+        mirrorVolumeMounts: true
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+      - name: "{{=lower(workflow.parameters.subjID)}}"
+        mountPath: /opt/freesurfer/subjects
+        subPath: opt/freesurfer/subjects
+
+      env:
+      - name: FS_LICENSE
+        value: /opt/freesurfer/.license
+
+      resources:
+        requests:
+          memory: 16G
+          cpu: '8'
+
+      command: [bash, -c]
+      args: ["/fastsurfer/run_fastsurfer.sh {{inputs.parameters.argstring}}"]

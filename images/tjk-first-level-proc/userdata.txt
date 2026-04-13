@@ -1,0 +1,18 @@
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+
+--==BOUNDARY==
+Content-Type: text/x-shellscript; charset="us-ascii"
+
+#!/bin/bash
+# Install the CloudWatch agent
+yum install -y amazon-cloudwatch-agent
+
+# Load config from SSM Parameter Store and start the agent
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config \
+  -m ec2 \
+  -s \
+  -c ssm:/cloudwatch-agent/batch-config
+
+--==BOUNDARY==--

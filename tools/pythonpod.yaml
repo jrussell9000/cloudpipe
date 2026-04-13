@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: python-alpine-pod
+  labels:
+    app: python-alpine
+spec:
+  containers:
+    - name: python-container
+      # Uses the latest 3.13 version on Alpine
+      image: python:3.13-alpine
+
+      # Keeps the pod running so you can exec into it.
+      # Without this, the pod will start, do nothing, and exit immediately.
+      command: ["/bin/sh", "-c", "sleep infinity"]
+
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "100m"
+        limits:
+          memory: "128Mi"
+          cpu: "250m"
+
+  # faster restart if you are testing
+  restartPolicy: Always

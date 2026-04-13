@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: pvc-inspector
+  namespace: argo-workflows
+spec:
+  containers:
+  - image: ubuntu
+    name: ubuntu
+    command: ["tail"]
+    args: ["-f", "/dev/null"]
+    volumeMounts:
+    - name: workdir
+      mountPath: /opt/freesurfer/subjects
+    resources:
+      requests:
+        memory: 16Gi
+        cpu: 4000m
+
+  volumes:
+    - name: workdir
+      persistentVolumeClaim:
+        claimName: cloudpipe-long-master-workflow-template-gdf42-workdir
+  restartPolicy: Always
+

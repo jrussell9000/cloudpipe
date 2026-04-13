@@ -1,0 +1,497 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  namespace: argo-workflows
+  name: registration
+
+spec:
+  retryStrategy:
+    limit: "3"
+    retryPolicy: OnFailure
+    expression: 'lastRetry.message matches "pod deleted" || lastRetry.exitCode in [64, 137, 143]'
+    backoff:
+      duration: "1m"
+      factor: "2"
+
+  volumes:
+    # Mounts preproc.py from a ConfigMap so it can be updated without
+    # rebuilding the afni image.  Needs to be declared here for direct
+    # `submit --from workflowtemplate/registration` runs; the master
+    # workflow declares it too for production submissions.
+    - name: preproc-script
+      configMap:
+        name: preproc-script
+
+  templates:
+
+  ###########################################################################
+  # Entry point — called once per session from the master DAG.
+  #
+  # Step group 1: discover-bold-runs-step, lookup-nss-step, and
+  #   check-t1w-to-mni-step all run concurrently — all are cheap S3/CSV ops.
+  # Step group 2: t1w-to-mni-step — skipped if output already exists in S3.
+  # Step group 3: bold-to-t1w steps fanned out via withParam over the
+  #   discovered runs only — no wasted GPU pods for missing runs.
+  ###########################################################################
+
+  - name: registration-steps-template
+    inputs:
+      parameters:
+        - name: session
+
+    steps:
+    - - name: discover-bold-runs-step
+        template: discover-bold-runs-template
+        arguments:
+          parameters:
+            - name: session
+              value: '{{inputs.parameters.session}}'
+
+      - name: lookup-nss-step
+        template: lookup-nss-template
+        arguments:
+          parameters:
+            - name: session
+              value: '{{inputs.parameters.session}}'
+
+      - name: check-t1w-to-mni-step
+        template: check-t1w-to-mni-template
+        arguments:
+          parameters:
+            - name: session
+              value: '{{inputs.parameters.session}}'
+
+    - - name: t1w-to-mni-step
+        template: t1w-to-mni-template
+        arguments:
+          parameters:
+            - name: session
+              value: '{{inputs.parameters.session}}'
+        when: '{{steps.check-t1w-to-mni-step.outputs.result}} == "False"'
+
+    - - name: bold-to-t1w-step
+        template: bold-to-t1w-template
+        arguments:
+          parameters:
+            - name: session
+              value: '{{inputs.parameters.session}}'
+            - name: task
+              value: '{{item.task}}'
+            - name: run
+              value: '{{item.run}}'
+            - name: nss-frames
+              value: '{{steps.lookup-nss-step.outputs.parameters.nss-frames}}'
+        withParam: '{{steps.discover-bold-runs-step.outputs.result}}'
+        when: "'{{item.b2t_exists}}' != 'true'"
+
+    - - name: functional-preprocessing-step
+        templateRef:
+          name: functional-preprocessing
+          template: functional-preprocessing-template
+        arguments:
+          parameters:
+            - name: session
+              value: '{{inputs.parameters.session}}'
+            - name: task
+              value: '{{item.task}}'
+            - name: run
+              value: '{{item.run}}'
+            - name: nss-frames
+              value: '{{steps.lookup-nss-step.outputs.parameters.nss-frames}}'
+        withParam: '{{steps.discover-bold-runs-step.outputs.result}}'
+
+  ###########################################################################
+  # BOLD run discovery
+  # Lists S3 under mmps_mproc/{subjID}/{session}/func/ and returns a JSON
+  # array of {"task": "task-rest", "run": "run-01"} objects for every BOLD
+  # NIfTI that exists.  Only task-rest and task-nback runs are returned.
+  # Output feeds withParam in the parent steps template so only real runs
+  # get a bold-to-t1w pod — no wasted GPU launches for missing runs.
+  ###########################################################################
+
+  - name: discover-bold-runs-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: registration
+        cloudpipe.io/step: discover-bold-runs
+    inputs:
+      parameters:
+        - name: session
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 256M
+          cpu: '100m'
+      command: ["sh", "-c"]
+      env:
+        - name: SUBJECT_ID
+          value: "{{workflow.parameters.subjID}}"
+        - name: SESSION
+          value: "{{inputs.parameters.session}}"
+        - name: BUCKET
+          value: "{{workflow.parameters.bucket}}"
+      source: |
+        #!/bin/sh
+        set -e
+        python - <<EOF
+        import boto3, json, os, re, sys
+        from botocore.exceptions import ClientError
+
+        s3 = boto3.client('s3')
+        subj = os.environ['SUBJECT_ID']
+        ses  = os.environ['SESSION']
+        bucket = os.environ['BUCKET']
+        prefix = f"mmps_mproc/{subj}/{ses}/func/"
+        target_tasks = {"rest", "nback"}
+        runs = []
+
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                if not key.endswith(('.nii', '.nii.gz')):
+                    continue
+                fname = key.split('/')[-1]
+                task_m = re.search(r'task-([a-zA-Z0-9]+)', fname)
+                run_m  = re.search(r'run-(\d+)',            fname)
+                if not task_m or not run_m:
+                    continue
+                task = task_m.group(1)
+                if task not in target_tasks:
+                    continue
+                task_label = f"task-{task}"
+                run_label  = f"run-{run_m.group(1)}"
+
+                # Check whether bold-to-t1w outputs already exist in S3 so
+                # the bold-to-t1w GPU step can be skipped on reruns.
+                b2t_key = (f"derivatives/registration/{subj}/{ses}/"
+                           f"bold_to_t1w_{task_label}_{run_label}.tar.gz")
+                try:
+                    s3.head_object(Bucket=bucket, Key=b2t_key)
+                    b2t_exists = True
+                except ClientError as e:
+                    if e.response['Error']['Code'] == '404':
+                        b2t_exists = False
+                    else:
+                        raise
+
+                entry = {"task": task_label, "run": run_label,
+                         "b2t_exists": b2t_exists}
+                if entry not in runs:
+                    runs.append(entry)
+
+        if not runs:
+            print(f"WARNING: no BOLD runs found for {subj}/{ses}", file=sys.stderr)
+
+        print(json.dumps(runs))
+        EOF
+
+  ###########################################################################
+  # T1w→MNI existence check
+  # Returns "True" if t1w_to_mni.tar.gz already exists in S3 for this
+  # subject/session, "False" otherwise.  Checked before every run so that
+  # workflow retries skip the expensive GPU registration step.
+  ###########################################################################
+
+  - name: check-t1w-to-mni-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: registration
+        cloudpipe.io/step: check-t1w-to-mni
+    inputs:
+      parameters:
+        - name: session
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 256M
+          cpu: '100m'
+      command: ["sh", "-c"]
+      env:
+        - name: SUBJECT_ID
+          value: "{{workflow.parameters.subjID}}"
+        - name: SESSION
+          value: "{{inputs.parameters.session}}"
+        - name: BUCKET
+          value: "{{workflow.parameters.bucket}}"
+      source: |
+        #!/bin/sh
+        set -e
+        python - <<EOF
+        import boto3, os
+        from botocore.exceptions import ClientError
+
+        s3 = boto3.client('s3')
+        subj = os.environ['SUBJECT_ID']
+        ses  = os.environ['SESSION']
+        bucket = os.environ['BUCKET']
+        key  = f"derivatives/registration/{subj}/{ses}/t1w_to_mni.tar.gz"
+
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            print("True")
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                print("False")
+            else:
+                raise
+        EOF
+
+  ###########################################################################
+  # NSS frame count lookup
+  # Downloads the shared config CSV from S3 and emits the nss-frames count
+  # for this subject/session as an output parameter.  Runs once per session.
+  # Fails (exit 1) if the subject/session is not present in the table.
+  # The CSV must have columns: subject_id, session, nss_frames.
+  ###########################################################################
+
+  - name: lookup-nss-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: registration
+        cloudpipe.io/step: lookup-nss
+    inputs:
+      parameters:
+        - name: session
+      artifacts:
+        - name: nss-table
+          path: /data/nss_volumes.csv
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: config/nss_volumes.csv
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    outputs:
+      parameters:
+        - name: nss-frames
+          valueFrom:
+            path: /tmp/nss_frames.txt
+    script:
+      image: public.ecr.aws/docker/library/python:3.12.0-slim-bookworm
+      command: [python]
+      resources:
+        requests:
+          memory: 256M
+          cpu: '0.1'
+      source: |
+        import csv, sys
+        subj = "{{workflow.parameters.subjID}}"
+        ses  = "{{inputs.parameters.session}}"
+        with open("/data/nss_volumes.csv") as f:
+            for row in csv.DictReader(f):
+                if row["subject_id"] == subj and row["session"] == ses:
+                    open("/tmp/nss_frames.txt", "w").write(row["nss_frames"])
+                    sys.exit(0)
+        print(f"ERROR: no nss_frames entry for {subj} / {ses} in nss_volumes.csv",
+              file=sys.stderr)
+        sys.exit(1)
+
+  ###########################################################################
+  # T1w → MNI152NLin2009cAsym
+  # Runs once per session.  Affine + SyN via FireANTs (GPU).
+  #
+  # Coordinate space consistency: bbregister (bold_to_t1w.py) produces a
+  # BOLD→T1w transform referenced to FreeSurfer conformed space (orig.mgz,
+  # 256³ 1mm isotropic).  To ensure the T1w→MNI transform shares the same
+  # source space, fst1w_to_mni.py receives orig.mgz converted to NIfTI
+  # rather than the BIDS T1w.nii.gz.  brainmask.mgz is already in the same
+  # conformed space as orig.mgz, so both are converted directly (no --like).
+  #
+  # Outputs (uploaded to S3 for cross-session reuse):
+  #   <prefix>_T1w_brain.nii.gz        skull-stripped orig-space T1w (QC)
+  #   <prefix>_affine.mat
+  #   <prefix>_warp.nii.gz
+  #   <prefix>_invwarp.nii.gz
+  #   <prefix>_warped.nii.gz           (QC)
+  ###########################################################################
+
+  - name: t1w-to-mni-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: registration
+        cloudpipe.io/step: t1w-to-mni
+    inputs:
+      parameters:
+        - name: session
+
+      artifacts:
+        - name: fastsurfer-output
+          path: /fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
+
+        - name: mni-template
+          path: /data/MNI152NLin2009cAsym_T1w_brain.nii.gz
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: config/MNI152NLin2009cAsym_T1w_brain.nii.gz
+
+    outputs:
+      artifacts:
+        # Upload to S3 so downstream sessions / re-runs can skip this step
+        - name: t1w-to-mni-transforms
+          path: '/work/registration/{{inputs.parameters.session}}/t1w_to_mni'
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni.tar.gz'
+
+    nodeSelector:
+      karpenter.sh/nodepool: gpu-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-b1f96fc738b80b85f68ae94ea13ce60a821898ab"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+        - name: '{{=lower(workflow.parameters.subjID)}}'
+          mountPath: /work/registration
+          subPath: registration
+        - name: '{{=lower(workflow.parameters.subjID)}}'
+          mountPath: /fastsurfer
+          subPath: opt/freesurfer/subjects
+
+      resources:
+        requests:
+          memory: 16G
+          cpu: '4'
+        limits:
+          nvidia.com/gpu: '1'
+
+      command: [python, /app/fst1w_to_mni.py]
+      args:
+        # Pass MGZ files directly — fst1w_to_mni.py reads them via nibabel,
+        # eliminating the fastsurfer initContainer and its image pull.
+        - --t1w
+        - '/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/orig.mgz'
+        - --brainmask
+        - '/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/brainmask.mgz'
+        - --template
+        - /data/MNI152NLin2009cAsym_T1w_brain.nii.gz
+        - --out-dir
+        - '/work/registration/{{inputs.parameters.session}}/t1w_to_mni'
+        - --prefix
+        - '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni'
+
+  ###########################################################################
+  # BOLD reference → T1w
+  # Runs once per run (parallelised over runs by the parent steps template).
+  # Uses SynthMorph (contrast-agnostic deep learning affine registration).
+  # GPU-accelerated — single forward pass ~5s vs bbregister ~5-10min.
+  #
+  # The LTA output is converted to an ANTs/ITK .mat in Python (RAS→LPS flip)
+  # for use in antsApplyTransforms.
+  #
+  # Outputs written to PVC and uploaded to S3:
+  #   <prefix>_desc-bold2t1w_ref.nii.gz      reference volume (QC)
+  #   <prefix>_desc-bold2t1w.lta             SynthMorph LTA transform
+  #   <prefix>_desc-bold2t1w_warped.nii.gz   BOLD ref in T1w space (QC)
+  #   <prefix>_desc-bold2t1w_itk.txt         ANTs/ITK affine transform
+  #   <prefix>_desc-bold2t1w_brainmask.nii.gz brain mask in BOLD space
+  ###########################################################################
+
+  - name: bold-to-t1w-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: registration
+        cloudpipe.io/step: bold-to-t1w
+    inputs:
+      parameters:
+        - name: session
+        - name: task
+        - name: run
+        - name: nss-frames
+
+      artifacts:
+        - name: bold
+          path: /data/bold.nii.gz
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.nii.gz'
+
+        - name: fastsurfer-output
+          path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}'
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
+
+        - name: fslicense
+          path: '/opt/freesurfer/.license'
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'config/fslicense'
+
+    outputs:
+      artifacts:
+        # Upload to S3 so func-preproc can download them directly and
+        # so bold-to-t1w can be skipped on reruns (see b2t_exists check
+        # in discover-bold-runs-template).
+        - name: bold-to-t1w
+          path: '/work/registration/{{inputs.parameters.session}}/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: us-east-2
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/bold_to_t1w_{{inputs.parameters.task}}_{{inputs.parameters.run}}.tar.gz'
+
+    nodeSelector:
+      karpenter.sh/nodepool: gpu-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/synthmorph:sha-eb02fedc62ac08dbd97688d56f7b6c438d80ea3d"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+        - name: '{{=lower(workflow.parameters.subjID)}}'
+          mountPath: /work/registration
+          subPath: registration
+
+      resources:
+        requests:
+          memory: 4G
+          cpu: '2'
+          ephemeral-storage: 4G
+        limits:
+          nvidia.com/gpu: '1'
+
+      command: [python, /app/bold_to_t1w.py]
+      args:
+        - --bold
+        - /data/bold.nii.gz
+        - --nss-frames
+        - '{{inputs.parameters.nss-frames}}'
+        - --subjects-dir
+        - /tmp/fastsurfer
+        - --subject
+        - '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}'
+        - --out-dir
+        - '/work/registration/{{inputs.parameters.session}}/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
+        - --prefix
+        - '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}'

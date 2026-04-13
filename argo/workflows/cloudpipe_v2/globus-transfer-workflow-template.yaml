@@ -1,0 +1,247 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: globus-transfer
+  namespace: argo-workflows
+
+spec:
+  templates:
+
+  ###########################################################################
+  # Starts the Globus Connect Server EC2 instance and waits until it passes
+  # its status checks before the transfer step runs.  The instance ID is
+  # read from SSM Parameter Store so the template stays infrastructure-agnostic.
+  ###########################################################################
+
+  - name: start-globus-instance-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: transfer
+        cloudpipe.io/step: start-globus-instance
+    retryStrategy:
+      limit: "3"
+      retryPolicy: OnFailure
+      backoff:
+        duration: "30s"
+        factor: "2"
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:latest"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 128M
+          cpu: '100m'
+          ephemeral-storage: 200M
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+      command: ["sh", "-c"]
+      source: |
+        python - <<EOF
+        import boto3
+        import sys
+
+        ssm = boto3.client('ssm')
+        ec2 = boto3.client('ec2')
+
+        instance_id = ssm.get_parameter(
+            Name='/cloudpipe/globus/instance-id'
+        )['Parameter']['Value']
+
+        state = ec2.describe_instance_status(
+            InstanceIds=[instance_id],
+            IncludeAllInstances=True
+        )['InstanceStatuses'][0]['InstanceState']['Name']
+
+        if state == 'running':
+            print(f"Instance {instance_id} is already running.")
+        else:
+            print(f"Starting instance {instance_id} (current state: {state})...")
+            ec2.start_instances(InstanceIds=[instance_id])
+            waiter = ec2.get_waiter('instance_status_ok')
+            waiter.wait(
+                InstanceIds=[instance_id],
+                WaiterConfig={'Delay': 15, 'MaxAttempts': 40}
+            )
+            print(f"Instance {instance_id} is ready.")
+        EOF
+
+  ###########################################################################
+  # Submits a Globus transfer from the remote collection to the GCS instance's
+  # local staging directory and polls until completion.
+  #
+  # Mountpoint-s3 does not support out-of-order (parallel) writes from GridFTP,
+  # so files land in /data/globus-staging on the instance.  A separate sync
+  # step (globus-s3-sync-template) copies them to S3 afterwards.
+  #
+  # Inputs:
+  #   source-collection-id  UUID of the remote Globus collection
+  #   source-base-path      Collection root on the source (subject ID appended automatically)
+  #   dest-collection-id    UUID of the GCS POSIX collection (backed by local staging dir)
+  #   dest-base-path        Path within the staging collection (subject ID appended automatically)
+  #   scan-types            JSON array of BIDS scan types, e.g. '["T1w","T2w","rest"]'
+  ###########################################################################
+
+  - name: globus-transfer-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: transfer
+        cloudpipe.io/step: globus-transfer
+    retryStrategy:
+      limit: "3"
+      retryPolicy: OnFailure
+      backoff:
+        duration: "60s"
+        factor: "2"
+    activeDeadlineSeconds: "7200"
+
+    inputs:
+      parameters:
+        - name: source-collection-id
+        - name: source-base-path
+        - name: dest-collection-id
+        - name: dest-base-path
+        - name: scan-types
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus:sha-648c308b0408b44507718709161ccdd6408be556"
+      imagePullPolicy: IfNotPresent
+
+      resources:
+        requests:
+          memory: 256M
+          cpu: '100m'
+          ephemeral-storage: 200M
+
+      env:
+        - name: GLOBUS_NATIVE_APP_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: globus-credentials
+              key: native-app-client-id
+        - name: GLOBUS_REFRESH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: globus-credentials
+              key: refresh-token
+
+      command: [python, /app/transfer.py]
+      args:
+        - --subject-id
+        - '{{workflow.parameters.subjID}}'
+        - --source-collection-id
+        - '{{inputs.parameters.source-collection-id}}'
+        - --source-base-path
+        - '{{inputs.parameters.source-base-path}}'
+        - --dest-collection-id
+        - '{{inputs.parameters.dest-collection-id}}'
+        - --dest-base-path
+        - '{{inputs.parameters.dest-base-path}}'
+        - --scan-types
+        - '{{inputs.parameters.scan-types}}'
+
+  ###########################################################################
+  # Syncs files from the GCS instance's local staging directory to S3 via
+  # SSM send-command, then removes the local staging data.
+  #
+  # Inputs:
+  #   subject-id    Subject ID (used to scope the sync and cleanup)
+  #   s3-bucket     Destination S3 bucket name
+  #   dest-base-path  Path within the staging dir (same value as in globus-transfer-template)
+  ###########################################################################
+
+  - name: globus-s3-sync-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: transfer
+        cloudpipe.io/step: globus-s3-sync
+    retryStrategy:
+      limit: "2"
+      retryPolicy: OnFailure
+      backoff:
+        duration: "30s"
+        factor: "2"
+    activeDeadlineSeconds: "7200"
+
+    inputs:
+      parameters:
+        - name: subject-id
+        - name: s3-bucket
+        - name: dest-base-path
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:latest"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 128M
+          cpu: '100m'
+          ephemeral-storage: 200M
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+      command: ["sh", "-c"]
+      source: |
+        python - <<EOF
+        import boto3, time, sys
+
+        ssm = boto3.client('ssm')
+
+        instance_id = ssm.get_parameter(
+            Name='/cloudpipe/globus/instance-id'
+        )['Parameter']['Value']
+
+        subject_id  = '{{inputs.parameters.subject-id}}'
+        s3_bucket   = '{{inputs.parameters.s3-bucket}}'
+        dest_base   = '{{inputs.parameters.dest-base-path}}'.rstrip('/')
+        local_path  = f'/data/globus-staging{dest_base}/{subject_id}'
+        s3_prefix   = f's3://{s3_bucket}{dest_base}/{subject_id}'
+
+        commands = [
+            f'aws s3 sync {local_path}/ {s3_prefix}/ --region $AWS_DEFAULT_REGION',
+            f'rm -rf {local_path}',
+            f'echo "Sync and cleanup complete for {subject_id}"',
+        ]
+
+        resp = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'commands': commands},
+            TimeoutSeconds=7200,
+        )
+        command_id = resp['Command']['CommandId']
+        print(f"SSM command {command_id} submitted")
+
+        for _ in range(480):  # poll up to 2 hours
+            time.sleep(15)
+            inv = ssm.get_command_invocation(
+                CommandId=command_id, InstanceId=instance_id
+            )
+            status = inv['Status']
+            print(f"SSM status: {status}", flush=True)
+            if status == 'Success':
+                print(inv['StandardOutputContent'], flush=True)
+                sys.exit(0)
+            elif status in ('Failed', 'Cancelled', 'TimedOut'):
+                print(inv['StandardErrorContent'], file=sys.stderr)
+                sys.exit(1)
+
+        print("Timed out waiting for SSM command", file=sys.stderr)
+        sys.exit(1)
+        EOF

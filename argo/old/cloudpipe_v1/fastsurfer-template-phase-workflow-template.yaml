@@ -1,0 +1,231 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: fast-tmpl
+  namespace: argo-workflows
+spec:
+
+  retryStrategy:
+    retryPolicy: "Always"
+    limit: "2"
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  securityContext:
+    runAsNonRoot: true
+
+  templates:
+
+  ##############################################
+  # 1. Template Creation (long_prepare_template)
+  ##############################################
+
+  - name: fastsurfer-template-creation-dag-template
+    inputs:
+      parameters:
+        - name: T1w_sessions
+
+    dag:
+      tasks:
+      - name: fastsurfer-template-creation-dagtask
+        template: fastsurfer-template-creation-template
+        arguments:
+          parameters:
+            - name: fastsurfer-command-string
+              value: >-
+                {{= "--tid " + workflow.parameters.subjID + "_template" +
+                   " --t1s " +
+                   join(map(jsonpath(inputs.parameters.T1w_sessions, "$[*]"),
+                     {"/home/nonroot/" + workflow.parameters.subjID + "/" + # +
+                      "/anat/" + workflow.parameters.subjID + "_" + # + "_run-01_T1w.nii.gz"}), " ") +
+                   " --tpids " +
+                   join(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), " ") +
+                   " --threads 8" }}
+
+  # NOTE: The code in long_prepare_template.sh will automagically handle timepoints with only baseline data
+  - name: fastsurfer-template-creation-template
+    inputs:
+      parameters:
+        - name: fastsurfer-command-string
+
+      artifacts:
+      - name: fslicense
+        path: '/opt/freesurfer/.license'
+        s3:
+          key: 'config/fslicense'
+
+      - name: fsaverage
+        path: '/opt/freesurfer/subjects/fsaverage'
+        s3:
+          key: 'config/fsaverage/'
+
+      - name: T1w_Y0
+        path: /home/nonroot/{{workflow.parameters.subjID}}/ses-00A/anat/{{workflow.parameters.subjID}}_ses-00A_run-01_T1w.nii.gz
+        s3:
+          key: 'mmps_mproc/{{workflow.parameters.subjID}}/ses-00A/anat/{{workflow.parameters.subjID}}_ses-00A_run-01_T1w.nii.gz'
+
+      - name: T1w_Y2
+        path: /home/nonroot/{{workflow.parameters.subjID}}/ses-02A/anat/{{workflow.parameters.subjID}}_ses-02A_run-01_T1w.nii.gz
+        optional: true
+        s3:
+          key: 'mmps_mproc/{{workflow.parameters.subjID}}/ses-02A/anat/{{workflow.parameters.subjID}}_ses-02A_run-01_T1w.nii.gz'
+
+      - name: T1w_Y4
+        path: /home/nonroot/{{workflow.parameters.subjID}}/ses-04A/anat/{{workflow.parameters.subjID}}_ses-04A_run-01_T1w.nii.gz
+        optional: true
+        s3:
+          key: 'mmps_mproc/{{workflow.parameters.subjID}}/ses-04A/anat/{{workflow.parameters.subjID}}_ses-04A_run-01_T1w.nii.gz'
+
+      - name: T1w_Y6
+        path: /home/nonroot/{{workflow.parameters.subjID}}/ses-06A/anat/{{workflow.parameters.subjID}}_ses-06A_run-01_T1w.nii.gz
+        optional: true
+        s3:
+          key: 'mmps_mproc/{{workflow.parameters.subjID}}/ses-06A/anat/{{workflow.parameters.subjID}}_ses-06A_run-01_T1w.nii.gz'
+
+      - name: T1w_Y8
+        path: /home/nonroot/{{workflow.parameters.subjID}}/ses-08A/anat/{{workflow.parameters.subjID}}_ses-08A_run-01_T1w.nii.gz
+        optional: true
+        s3:
+          key: 'mmps_mproc/{{workflow.parameters.subjID}}/ses-08A/anat/{{workflow.parameters.subjID}}_ses-08A_run-01_T1w.nii.gz'
+
+      - name: T1w_Y10
+        path: /home/nonroot/{{workflow.parameters.subjID}}/ses-10A/anat/{{workflow.parameters.subjID}}_ses-10A_run-01_T1w.nii.gz
+        optional: true
+        s3:
+          key: 'mmps_mproc/{{workflow.parameters.subjID}}/ses-10A/anat/{{workflow.parameters.subjID}}_ses-10A_run-01_T1w.nii.gz'
+
+    nodeSelector:
+      karpenter.sh/nodepool: gpu-nodepool
+
+    initContainers:
+      - name: clear-is-running
+        image: public.ecr.aws/docker/library/alpine:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            ephemeral-storage: 300M
+        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+        mirrorVolumeMounts: true
+
+    container:
+      image: public.ecr.aws/l9e7l1h1/cloudpipe/fastsurfer:latest
+      imagePullPolicy: IfNotPresent
+      volumeMounts:
+      - name: "{{=lower(workflow.parameters.subjID)}}"
+        mountPath: /opt/freesurfer/subjects
+        subPath: opt/freesurfer/subjects
+
+      env:
+        - name: FS_LICENSE
+          value: /opt/freesurfer/.license
+
+      resources:
+        requests:
+          memory: 8G
+          cpu: '4'
+        limits:
+          nvidia.com/gpu: '1'
+
+      command: [bash, -c]
+      args: ["/fastsurfer/recon_surf/long_prepare_template.sh {{inputs.parameters.fastsurfer-command-string}}"]
+
+  ##############################################
+  # 2. Template Segmentation (seg_only --base)
+  ##############################################
+
+  - name: fastsurfer-template-segmentation-template
+    inputs:
+      parameters:
+        - name: argstring
+
+    nodeSelector:
+      karpenter.sh/nodepool: gpu-nodepool
+
+    initContainers:
+      - name: clear-is-running
+        image: public.ecr.aws/docker/library/alpine:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            ephemeral-storage: 300M
+        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+        mirrorVolumeMounts: true
+
+    container:
+      image: public.ecr.aws/l9e7l1h1/cloudpipe/fastsurfer:latest
+      imagePullPolicy: IfNotPresent
+      volumeMounts:
+      - name: "{{=lower(workflow.parameters.subjID)}}"
+        mountPath: /opt/freesurfer/subjects
+        subPath: opt/freesurfer/subjects
+
+      resources:
+        requests:
+          memory: 8G
+          cpu: '4'
+        limits:
+          nvidia.com/gpu: '1'
+
+      command: [bash, -c]
+      args: ["/fastsurfer/run_fastsurfer.sh {{inputs.parameters.argstring}}"]
+
+  ##############################################
+  # 3. Template Parcellation (surf_only --base)
+  ##############################################
+
+  - name: fastsurfer-template-parcellation-steps-template
+    steps:
+    - - name: fastsurfer-template-parcellation-step
+        template: fastsurfer-template-parcellation-template
+        arguments:
+          parameters:
+            - name: argstring
+              value: >-
+                {{= "--sid " + workflow.parameters.subjID +
+                   "_template --sd /opt/freesurfer/subjects --surf_only --base --edits --3T --fsaparc --threads 8" }}
+
+  - name: fastsurfer-template-parcellation-template
+    inputs:
+      parameters:
+        - name: argstring
+
+      artifacts:
+      - name: fslicense
+        path: '/opt/freesurfer/.license'
+        s3:
+          key: 'config/fslicense'
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+
+    initContainers:
+      - name: clear-is-running
+        image: public.ecr.aws/docker/library/alpine:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            ephemeral-storage: 300M
+        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+        mirrorVolumeMounts: true
+
+    container:
+      image: public.ecr.aws/l9e7l1h1/cloudpipe/fastsurfer:latest
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+      - name: "{{=lower(workflow.parameters.subjID)}}"
+        mountPath: /opt/freesurfer/subjects
+        subPath: opt/freesurfer/subjects
+
+      env:
+      - name: FS_LICENSE
+        value: /opt/freesurfer/.license
+
+      resources:
+        requests:
+          memory: 16G
+          cpu: '8'
+
+      command: [bash, -c]
+      args: ["/fastsurfer/run_fastsurfer.sh {{inputs.parameters.argstring}}"]
