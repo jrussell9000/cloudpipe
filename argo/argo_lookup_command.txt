@@ -1,2 +1,2 @@
 # See /userinfo on the Argo Server website
-argo list -n argo-workflows -s argo.braveresearchcollaborative.org:443 --argo-http1
+argo list -n argo-workflows -s argo.<YOUR_DOMAIN>:443 --argo-http1

@@ -1,0 +1,47 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: first-level-nodepool
+spec:
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 10m
+    budgets:
+    - nodes: "10"
+  limits:
+    cpu: 512
+    memory: 2500Gi
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: nodeclass
+      # Avoid possible race between the scheduler and the CSINode
+      # see https://karpenter.sh/docs/troubleshooting/#pods-were-scheduled-due-to-a-race-condition-in-kubernetes
+      startupTaints:
+      - key: efs.csi.aws.com/agent-not-ready
+        effect: NoExecute
+      requirements:
+      - key: "kubernetes.io/arch"
+        operator: In
+        values: ["arm64"]
+      - key: "kubernetes.io/os"
+        operator: In
+        values: ["linux"]
+      # Spot only — mirrors the Batch compute environment
+      - key: "karpenter.sh/capacity-type"
+        operator: In
+        values: ["spot"]
+      - key: "karpenter.k8s.aws/instance-hypervisor"
+        operator: In
+        values: ["nitro"]
+      # Graviton families with NVMe instance store; the nodeclass
+      # instanceStorePolicy: RAID0 puts the NVMe on the data partition,
+      # so emptyDir volumes land on fast local NVMe automatically.
+      - key: "karpenter.k8s.aws/instance-family"
+        operator: In
+        values: ["m6gd", "m7gd", "r6gd", "r7gd", "c6gd", "c7gd"]
+      - key: "karpenter.k8s.aws/instance-size"
+        operator: In
+        values: ["xlarge", "2xlarge", "4xlarge"]

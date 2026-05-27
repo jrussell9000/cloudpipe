@@ -1,0 +1,44 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-nodeclass
+spec:
+  # AL2023 — required for pre-baked AMIs built with Packer.
+  # Bottlerocket's immutable OS makes standard AMI customisation impractical.
+  amiFamily: AL2023
+
+  # Select the most recently created AMI that has the matching fastsurfer tag and
+  # EKS version. When a new pre-baked AMI is built (new fastsurfer release or base
+  # AMI refresh), Karpenter automatically picks the newest matching AMI.
+  amiSelectorTerms:
+    - tags:
+        fastsurfer-image-tag: "${ fastsurfer_ami_tag }"
+        eks-version: "${ eks_version }"
+
+  # Use any available NVMe instance store as scratch for containers.
+  # Single root volume for AL2023 (unlike Bottlerocket's OS + data split).
+  # 150 GiB accommodates the pre-baked fastsurfer image (~4 GB) plus runtime
+  # pulls of afni, fireants, and synthmorph with comfortable headroom.
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 150Gi
+        volumeType: gp3
+        encrypted: true
+
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 3
+    httpTokens: required
+  detailedMonitoring: true
+  role: ${ karpenter_node_iam_role_name }
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${ eks_cluster_name }
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${ eks_cluster_name }
+
+  kubelet:
+    maxPods: 110

@@ -1,0 +1,112 @@
+################################################################################
+# Prefect Server
+################################################################################
+
+prefect-server:
+  # Disable the embedded PostgreSQL subchart — we use an external RDS instance.
+  postgresql:
+    enabled: false
+
+  # Disable built-in secret creation — credentials come from the ExternalSecret
+  # (prefect-db-credentials) managed by Terraform/ESO.
+  secret:
+    create: false
+    name: prefect-db-credentials
+
+  server:
+    uiConfig:
+      # Public URL the browser uses to reach the API — must match the ALB hostname.
+      prefectUiApiUrl: "https://prefect.<YOUR_DOMAIN>/api"
+
+    env:
+      # Disable telemetry — ABCD data, keep metadata on-premises.
+      - name: PREFECT_SERVER_ANALYTICS_ENABLED
+        value: "false"
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+
+    tolerations:
+      - key: "CriticalAddonsOnly"
+        value: "true"
+        effect: "NoSchedule"
+
+  serviceAccount:
+    create: true
+    name: prefect-server
+
+################################################################################
+# Prefect Worker
+################################################################################
+
+prefect-worker:
+  worker:
+    # Self-hosted Prefect server (not Prefect Cloud)
+    apiConfig: selfHostedServer
+    selfHostedServerApiConfig:
+      # In-cluster URL — worker talks to server directly without going through the ALB.
+      apiUrl: "http://prefect-server.prefect.svc.cluster.local:4200/api"
+
+    config:
+      workPool: cloudpipe-k8s-pool
+      type: kubernetes
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+
+    tolerations:
+      - key: "CriticalAddonsOnly"
+        value: "true"
+        effect: "NoSchedule"
+
+  serviceAccount:
+    create: true
+    name: prefect-worker
+
+################################################################################
+# oauth2-proxy — SSO reverse proxy in front of Prefect server
+################################################################################
+
+oauth2-proxy:
+  fullnameOverride: "prefect-oauth2-proxy"
+
+  config:
+    existingSecret: prefect-oauth2-proxy
+    emailDomains:
+      - "<YOUR_INSTITUTION_DOMAIN>"
+    upstreams:
+      - "http://prefect-server:4200"
+
+  extraArgs:
+    provider: oidc
+    oidc-issuer-url: "https://argocd.<YOUR_DOMAIN>/api/dex"
+    redirect-url: "https://prefect.<YOUR_DOMAIN>/oauth2/callback"
+    scope: "openid profile email"
+    cookie-secure: "true"
+    skip-provider-button: "true"
+    pass-access-token: "true"
+    pass-user-headers: "true"
+    # API calls from the Prefect CLI and programmatic clients bypass SSO.
+    # The endpoint is VPN-gated at the ALB security group level.
+    skip-auth-regex: "^/api/"
+
+  service:
+    portNumber: 4180
+
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"

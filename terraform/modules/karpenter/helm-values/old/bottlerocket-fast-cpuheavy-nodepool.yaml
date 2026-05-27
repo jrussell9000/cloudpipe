@@ -1,0 +1,41 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: bottlerocket-fast-cpuheavy-nodepool
+spec:
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: bottlerocket-fast-nodeclass
+      requirements:
+      # see: https://karpenter.sh/docs/concepts/scheduling/#well-known-labels
+      # AMD64
+      - key: "kubernetes.io/arch"
+        operator: In
+        values: ["amd64"]
+      # Runs linux
+      - key: "kubernetes.io/os"
+        operator: In
+        values: ["linux"]
+      # Spot instances
+      - key: "karpenter.sh/capacity-type"
+        operator: In
+        values: ["spot"]
+      # Instance generation
+      # Karpenter recommends this setting: https://karpenter.sh/docs/concepts/nodepools/#min-values
+      - key: "karpenter.k8s.aws/instance-generation"
+        operator: Gt
+        values: ["2"]
+      # Instance category (first letter)
+      - key: "node.kubernetes.io/instance-category"
+        operator: In
+        values: ["c", "m", "r"]
+      # Instance memory (in mebibytes)
+      - key: "karpenter.k8s.aws/instance-memory"
+        operator: Gt
+        values: ["16383"]

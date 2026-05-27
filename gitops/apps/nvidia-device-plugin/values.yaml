@@ -1,0 +1,8 @@
+nvidia-device-plugin:
+  # Run only on Karpenter-provisioned GPU nodes.
+  # The chart's default affinity requires feature.node.kubernetes.io/pci-10de.present
+  # (set by Node Feature Discovery, not installed here); override both to use the
+  # Karpenter nodepool label instead.
+  nodeSelector:
+    karpenter.sh/nodepool: gpu-nodepool
+  affinity: {}

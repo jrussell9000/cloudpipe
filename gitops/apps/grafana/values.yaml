@@ -1,0 +1,103 @@
+grafana:
+  # ---------------------------------------------------------------------------
+  # Service account — must match the Pod Identity association created in
+  # terraform/modules/metrics/iam.tf (grafana_sa_name = "grafana").
+  # ---------------------------------------------------------------------------
+  serviceAccount:
+    create: true
+    name: grafana
+
+  # ---------------------------------------------------------------------------
+  # Plugins — Athena datasource plugin (installed from Grafana plugin registry)
+  # ---------------------------------------------------------------------------
+  plugins:
+    - grafana-athena-datasource
+
+  # ---------------------------------------------------------------------------
+  # Datasource: Athena — cloudpipe_metrics database
+  # Credentials come from the Pod Identity role (no explicit key/secret).
+  # ---------------------------------------------------------------------------
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Athena - CloudPipe Metrics
+          type: grafana-athena-datasource
+          uid: cloudpipe-athena
+          access: proxy
+          isDefault: true
+          jsonData:
+            authType: default
+            defaultRegion: <YOUR_AWS_REGION>
+            catalog: AwsDataCatalog
+            database: cloudpipe_metrics
+            workgroup: cloudpipe_metrics_workgroup
+            outputLocation: s3://cloudpipe-finops/grafana-query-results/
+
+  # ---------------------------------------------------------------------------
+  # Dashboard provisioning — sidecar watches ConfigMaps labelled
+  # grafana_dashboard=1 in the grafana namespace and auto-loads them.
+  # ---------------------------------------------------------------------------
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: grafana
+
+  # ---------------------------------------------------------------------------
+  # ALB Ingress — routes grafana.<YOUR_DOMAIN> → Grafana svc
+  # The certificate ARN is managed by cert-manager / ACM via external-dns.
+  # ---------------------------------------------------------------------------
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      external-dns.alpha.kubernetes.io/hostname: grafana.<YOUR_DOMAIN>
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+      alb.ingress.kubernetes.io/ssl-redirect: "443"
+      alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      alb.ingress.kubernetes.io/backend-protocol: HTTP
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/healthcheck-path: /api/health
+      alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    hosts:
+      - grafana.<YOUR_DOMAIN>
+    path: /
+    pathType: Prefix
+
+  # ---------------------------------------------------------------------------
+  # Scheduling — use the backend nodegroup (same as Prefect, Argo server, etc.)
+  # ---------------------------------------------------------------------------
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+
+  tolerations:
+    - key: CriticalAddonsOnly
+      value: "true"
+      effect: NoSchedule
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+  # ---------------------------------------------------------------------------
+  # Persistence — keep dashboard state across pod restarts
+  # ---------------------------------------------------------------------------
+  persistence:
+    enabled: true
+    size: 5Gi
+
+  # ---------------------------------------------------------------------------
+  # Grafana configuration
+  # ---------------------------------------------------------------------------
+  grafana.ini:
+    server:
+      root_url: https://grafana.<YOUR_DOMAIN>
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+    auth.anonymous:
+      enabled: false

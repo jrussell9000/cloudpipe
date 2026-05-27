@@ -6,6 +6,9 @@ import time
 
 import globus_sdk
 
+SUBMIT_RETRY_LIMIT = 10
+SUBMIT_RETRY_INITIAL_WAIT = 60  # seconds
+
 
 POLL_INTERVAL_SECS = 60
 
@@ -37,6 +40,27 @@ def build_transfer_client(native_app_client_id: str, refresh_token: str) -> glob
         print(f"Warning: could not retrieve userinfo: {e}", flush=True)
 
     return globus_sdk.TransferClient(authorizer=authorizer)
+
+
+def verify_dest_collection(
+    transfer_client: globus_sdk.TransferClient,
+    dest_collection_id: str,
+    dest_base_path: str,
+) -> None:
+    """Fail fast if the destination collection is unreachable or its S3 credential is unprovisioned."""
+    try:
+        transfer_client.operation_ls(dest_collection_id, path=dest_base_path)
+        print("Destination collection pre-flight check passed.", flush=True)
+    except globus_sdk.TransferAPIError as e:
+        if e.http_status == 404 or (e.code or "").startswith("ClientError.NotFound"):
+            # Path doesn't exist yet — collection is reachable and credentials are fine.
+            print("Destination collection pre-flight check passed (path not yet created).", flush=True)
+            return
+        raise RuntimeError(
+            f"Destination collection pre-flight failed — {e.code}: {e.message}. "
+            "If the S3 credential is unprovisioned, run: "
+            "globus-connect-server user-credentials s3-create"
+        ) from e
 
 
 def ls(transfer_client: globus_sdk.TransferClient, collection_id: str, path: str) -> list:
@@ -119,13 +143,22 @@ def submit_transfer(
 ) -> str:
     label = f"cloudpipe-{subject_id}"
 
-    # If a task with this label is already active (e.g. from a prior retry),
-    # reuse it rather than submitting a duplicate that will conflict.
+    # Reuse a genuinely ACTIVE task (still transferring).
+    # Cancel INACTIVE tasks — they are suspended/errored and will not self-recover;
+    # reusing one would perpetuate whatever failure caused it to stall.
     for task in transfer_client.task_list(filter="status:ACTIVE,INACTIVE"):
-        if task["label"] == label:
-            task_id = task["task_id"]
-            print(f"Reusing existing transfer task {task_id} ({task['status']})", flush=True)
+        if task["label"] != label:
+            continue
+        task_id = task["task_id"]
+        if task["status"] == "ACTIVE":
+            print(f"Reusing existing ACTIVE transfer task {task_id}", flush=True)
             return task_id
+        print(f"Cancelling stale INACTIVE task {task_id}; will resubmit fresh.", flush=True)
+        try:
+            transfer_client.cancel_task(task_id)
+        except globus_sdk.TransferAPIError as e:
+            print(f"Warning: could not cancel task {task_id}: {e}", flush=True)
+        break
 
     tdata = globus_sdk.TransferData(
         source_collection_id,
@@ -142,10 +175,27 @@ def submit_transfer(
     for rel in rel_paths:
         tdata.add_item(f"{base_src}/{rel}", f"{base_dst}/{rel}")
 
-    result = transfer_client.submit_transfer(tdata)
-    task_id = result["task_id"]
-    print(f"Submitted transfer task {task_id} ({len(rel_paths)} files)", flush=True)
-    return task_id
+    wait = SUBMIT_RETRY_INITIAL_WAIT
+    last_exc: globus_sdk.TransferAPIError | None = None
+    for attempt in range(1, SUBMIT_RETRY_LIMIT + 1):
+        try:
+            result = transfer_client.submit_transfer(tdata)
+            task_id = result["task_id"]
+            print(f"Submitted transfer task {task_id} ({len(rel_paths)} files)", flush=True)
+            return task_id
+        except globus_sdk.TransferAPIError as e:
+            if e.code == "ClientError.Conflict.TooManyPendingJobs":
+                last_exc = e
+                print(
+                    f"TooManyPendingJobs (attempt {attempt}/{SUBMIT_RETRY_LIMIT}); "
+                    f"retrying in {wait}s ...",
+                    flush=True,
+                )
+                time.sleep(wait)
+                wait = min(wait * 2, 600)
+            else:
+                raise
+    raise RuntimeError(f"Gave up submitting transfer after {SUBMIT_RETRY_LIMIT} attempts") from last_exc
 
 
 def wait_for_transfer(transfer_client: globus_sdk.TransferClient, task_id: str) -> None:
@@ -161,6 +211,8 @@ def wait_for_transfer(transfer_client: globus_sdk.TransferClient, task_id: str) 
         elif status == "FAILED":
             details = task.get("nice_status_details") or task.get("nice_status") or "unknown error"
             raise RuntimeError(f"Globus transfer {task_id} failed: {details}")
+        elif status == "CANCELLED":
+            raise RuntimeError(f"Globus transfer {task_id} was cancelled externally")
 
         time.sleep(POLL_INTERVAL_SECS)
 
@@ -207,6 +259,7 @@ def main() -> None:
         sys.exit(1)
 
     transfer_client = build_transfer_client(native_app_client_id, refresh_token)
+    verify_dest_collection(transfer_client, args.dest_collection_id, args.dest_base_path)
 
     source_subject_root = f"{args.source_base_path.rstrip('/')}/{args.subject_id}"
     dest_subject_root   = f"{args.dest_base_path.rstrip('/')}/{args.subject_id}"
@@ -220,8 +273,8 @@ def main() -> None:
     )
 
     if not rel_paths:
-        print("No matching files found — nothing to transfer.", flush=True)
-        sys.exit(0)
+        print("No matching files found for any requested scan type — check source-base-path and that subject data exists on the source collection.", file=sys.stderr, flush=True)
+        sys.exit(1)
 
     print(f"Discovered {len(rel_paths)} file(s) across all sessions.", flush=True)
 

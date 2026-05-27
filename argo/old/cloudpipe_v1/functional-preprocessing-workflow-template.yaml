@@ -4,7 +4,7 @@ metadata:
   name: func-preproc
   namespace: argo-workflows
   # annotations:
-  #   eks.amazonaws.com/role-arn: arn:aws:iam::575108944090:role/argo-workflows-runner
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::<YOUR_AWS_ACCOUNT_ID>:role/argo-workflows-runner
 
 spec:
 
@@ -95,7 +95,7 @@ spec:
         - name: SESSION
           value: '{{inputs.parameters.session}}'
         - name: BUCKET_NAME
-          value: "abcd-v6"
+          value: "<YOUR_INPUT_S3_BUCKET>"
 
       source: |
 
@@ -531,6 +531,6 @@ spec:
         path: /fmriprep_output/{{workflow.parameters.subjID}}/
         s3:
           endpoint: s3-accelerate.amazonaws.com
-          bucket: 'abcd-v6'
+          bucket: '<YOUR_INPUT_S3_BUCKET>'
           key: 'derivatives/fmriprep/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_fmriprep-output.tar.gz'
-          region: us-east-2
+          region: <YOUR_AWS_REGION>

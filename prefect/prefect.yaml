@@ -1,0 +1,56 @@
+name: cloudpipe-queue-manager
+prefect-version: "3.x"
+
+pull:
+  - prefect.deployments.steps.set_working_directory:
+      directory: /opt/prefect
+
+deployments:
+  - name: cloudpipe-queue-manager
+    entrypoint: ./flows/cloudpipe_queue_manager.py:cloudpipe_queue_manager
+    work_pool:
+      name: cloudpipe-k8s-pool
+      job_variables:
+        namespace: prefect
+        service_account_name: prefect-worker
+        image: public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
+        image_pull_policy: Always
+        finished_job_ttl: 60
+    schedules: []
+    parameters:
+      subjects_file: s3://abcd-v7/subjects.csv
+      start_index: 0
+
+  - name: first-level-queue-manager
+    entrypoint: ./flows/first_level_queue_manager.py:first_level_queue_manager
+    work_pool:
+      name: cloudpipe-k8s-pool
+      job_variables:
+        namespace: prefect
+        service_account_name: prefect-worker
+        image: public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
+        image_pull_policy: Always
+        finished_job_ttl: 60
+    schedules: []
+    parameters:
+      subjects_file: s3://abcd-v7/first-level-subjects.csv
+      start_index: 0
+
+  - name: kubecost-cost-scraper
+    entrypoint: ./flows/cost_scraper.py:kubecost_cost_scraper
+    work_pool:
+      name: cloudpipe-k8s-pool
+      job_variables:
+        namespace: prefect
+        service_account_name: prefect-worker
+        image: public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
+        image_pull_policy: Always
+        finished_job_ttl: 60
+    schedules:
+      - cron: "0 2 * * *"
+        timezone: UTC
+        active: false
+    parameters:
+      bucket: abcd-v7
+      region: <YOUR_AWS_REGION>
+      pipeline: cloudpipe_minproc

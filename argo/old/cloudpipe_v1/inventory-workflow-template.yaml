@@ -24,7 +24,7 @@ spec:
         - name: SUBJECT_ID
           value: "{{workflow.parameters.subjID}}"
         - name: BUCKET_NAME
-          value: "abcd-v6"
+          value: "<YOUR_INPUT_S3_BUCKET>"
 
       command: ["sh", "-c"]
 
@@ -93,7 +93,7 @@ spec:
         - name: SUBJECT_ID
           value: "{{workflow.parameters.subjID}}"
         - name: BUCKET_NAME
-          value: "abcd-v6"
+          value: "<YOUR_INPUT_S3_BUCKET>"
 
       source: |
 

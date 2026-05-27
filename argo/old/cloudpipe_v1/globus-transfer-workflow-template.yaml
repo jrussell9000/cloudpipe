@@ -57,7 +57,7 @@ spec:
         import boto3
         import sys
 
-        region = 'us-east-2'
+        region = '<YOUR_AWS_REGION>'
         ssm = boto3.client('ssm', region_name=region)
         ec2 = boto3.client('ec2', region_name=region)
 

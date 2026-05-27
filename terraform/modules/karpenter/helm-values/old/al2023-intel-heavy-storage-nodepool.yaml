@@ -1,0 +1,50 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: al2023-intel-heavy-storage-nodepool
+spec:
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+    # A budget of zero nodes will prevent any of those nodes from being considered for voluntary disruption.
+    # see https://karpenter.sh/docs/concepts/disruption/#example-disable-disruption-on-a-nodepool
+    # budgets:
+    # - nodes: "0"
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: al2023-storage-nodeclass
+      # Avoid possible race between the scheduler and the CSINode
+      # see https://karpenter.sh/docs/troubleshooting/#pods-were-scheduled-due-to-a-race-condition-in-kubernetes
+      startupTaints:
+      - key: efs.csi.aws.com/agent-not-ready
+        effect: NoExecute
+      requirements:
+      # see: https://karpenter.sh/docs/concepts/scheduling/#well-known-labels
+      # AMD64
+      - key: "kubernetes.io/arch"
+        operator: In
+        values: ["amd64"]
+      # Runs linux
+      - key: "kubernetes.io/os"
+        operator: In
+        values: ["linux"]
+      # Spot instances
+      # - key: "karpenter.sh/capacity-type"
+      #   operator: In
+      #   values: ["spot"]
+      # Instance generation
+      # Karpenter recommends this setting: https://karpenter.sh/docs/concepts/nodepools/#min-values
+      - key: "karpenter.k8s.aws/instance-generation"
+        operator: Gt
+        values: ["2"]
+      # Instance category (first letter)
+      - key: "karpenter.k8s.aws/instance-category"
+        operator: In
+        values: ["c", "m", "r"]
+      # Instance memory (in mebibytes)
+      - key: "karpenter.k8s.aws/instance-memory"
+        operator: Gt
+        values: ["16383"]

@@ -1,0 +1,21 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: al2023-storage-nodeclass
+spec:
+  amiSelectorTerms:
+  - alias: al2023@latest
+  blockDeviceMappings:
+  - deviceName: /dev/xvda
+    ebs:
+      volumeSize: 75Gi
+      volumeType: gp3
+      deleteOnTermination: true
+      
+  role: ${ karpenter_node_iam_role_name }
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }

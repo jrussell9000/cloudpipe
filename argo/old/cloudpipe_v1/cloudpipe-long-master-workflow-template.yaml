@@ -4,7 +4,7 @@ metadata:
   namespace: argo-workflows
   name: cloudpipe
   # annotations:
-  #   eks.amazonaws.com/role-arn: arn:aws:iam::575108944090:role/argo-workflows-runner
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::<YOUR_AWS_ACCOUNT_ID>:role/argo-workflows-runner
 
 spec:
   # Pre-specify metadata for all workflows run from this workflow

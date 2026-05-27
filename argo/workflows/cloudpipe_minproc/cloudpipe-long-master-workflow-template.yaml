@@ -1,0 +1,473 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  namespace: argo-workflows
+  name: cloudpipe
+
+spec:
+  # Pre-specify metadata for all workflows run from this workflow
+  workflowMetadata:
+    annotations:
+      workflows.argoproj.io/title: "{{workflow.parameters.subjID}}"
+      workflows.argoproj.io/description: "{{workflow.parameters.subjID}}"
+    labels:
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  retryStrategy:
+    limit: "3"
+    retryPolicy: Always
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    backoff:
+      duration: "1m"
+      factor: "2"
+
+  podMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  # Create the following persistent volume claim for this workflow
+  volumeClaimTemplates:
+    # Naming the volume claim after the subject ID (for tracking)
+    - metadata:
+        # "Name" should be used to reference this PVC further down the workflow
+        name: "{{=lower(workflow.parameters.subjID)}}"
+        # Specify a string that will be appended to the string created by generateName in the workflow metadata
+        # By introducing the random character sequence from the metadata, we create a unique PVC for each workflow
+        # run, even if it's for the same subject ID. Neat!
+        generateName: "{{=lower(workflow.parameters.subjID)}}"
+      spec:
+        accessModes: [ "ReadWriteMany" ]
+        storageClassName: efs-sc
+        resources:
+          requests:
+            storage: 50Gi
+
+  # Workflow pods should be deleted on workflow completion
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  # Maximum workflow runtime (https://argo-workflows.readthedocs.io/en/latest/walk-through/timeouts/)
+  activeDeadlineSeconds: 43200
+
+  # Clean up persistent volume claims when the workflow completes (success or failure)
+  volumeClaimGC:
+    strategy: OnWorkflowCompletion
+
+  # IRSA for running the workflow
+  serviceAccountName: argo-workflows-runner
+
+  # Time to live after workflow is completed, replaces ttlSecondsAfterFinished
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  podDisruptionBudget:
+    minAvailable: "100%"
+
+  # MUST include a global security context to ensure artifacts are passed with the same (accessible)
+  # permissions or else some tasks may not be able to access passed artifacts (this took too long to figure out)
+  # see: https://github.com/argoproj/argo-workflows/issues/9651 (can also set 'mode: 755' e.g., to define permissions)
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  arguments:
+    parameters:
+      - name: subjID
+
+      # S3 bucket — defaults to the value set by Terraform in cloudpipe-config.
+      # Override at submission time to target a different bucket without redeploying.
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+
+      # ECR Public registry prefix — set by Terraform in cloudpipe-config.
+      # Override at submission time to pull images from a different registry.
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+      # Globus transfer parameters
+      - name: globus-source-collection-id
+      - name: globus-source-base-path
+        # Collection root — subject ID is appended automatically, e.g. /abcd/raw
+      - name: globus-dest-collection-id
+      - name: globus-dest-base-path
+        # Collection root — subject ID is appended automatically, e.g. /mmps_mproc
+      # JSON array of BIDS scan types to transfer across all sessions, e.g.:
+      # '["T1w", "T2w", "rest", "dwi"]'
+      # Valid values: T1w, T2w, rest, nback, sst, mid, dwi
+      - name: globus-scan-types
+      # Set to "true" when the GCS endpoint uses an S3 storage gateway
+      # (globus_use_s3_gateway = true in Terraform). GridFTP writes go directly
+      # to S3 and the post-transfer s3-sync step is skipped.
+      # Set to "false" for the POSIX staging approach.
+      - name: globus-use-s3-gateway
+        value: "true"
+
+  # Which template (below) should we start with?
+  entrypoint: master-pipeline-dag
+
+  # Emit WorkflowRun metrics to S3 on success or failure.
+  onExit: emit-workflow-metrics-template
+
+  templates:
+  # This is the master DAG for the entire pipeline
+  - name: master-pipeline-dag
+
+    # Maximum number of pods (job steps) that can run at any one time
+    parallelism: 3
+    dag:
+      # Do NOT stop the workflow if one part of the DAG fails
+      # Necessary for subject_sessions that may have only anatomicals, but no functionals
+      failFast: false
+      # Providing each task in the DAG, its dependencies, and any output artifacts to be passed
+      tasks:
+        # Start the Globus Connect Server EC2 instance and wait for it to be ready.
+        # Skips the start call if the instance is already running (safe to re-run).
+        - name: start-globus-instance-dagtask
+          templateRef:
+            name: globus-transfer
+            template: start-globus-instance-template
+
+        # Pull all subject files from the remote Globus collection directly into
+        # the cloudpipe S3 bucket via the GCS S3 storage gateway.
+        - name: globus-transfer-dagtask
+          depends: start-globus-instance-dagtask.Succeeded
+          templateRef:
+            name: globus-transfer
+            template: globus-transfer-template
+          arguments:
+            parameters:
+              - name: source-collection-id
+                value: '{{workflow.parameters.globus-source-collection-id}}'
+              - name: source-base-path
+                value: '{{workflow.parameters.globus-source-base-path}}'
+              - name: dest-collection-id
+                value: '{{workflow.parameters.globus-dest-collection-id}}'
+              - name: dest-base-path
+                value: '{{workflow.parameters.globus-dest-base-path}}'
+              - name: scan-types
+                value: '{{workflow.parameters.globus-scan-types}}'
+
+        # Sync files from local EBS staging to S3 via SSM send-command.
+        # Skipped when globus-use-s3-gateway == "true" (files already landed in S3).
+        - name: globus-s3-sync-dagtask
+          depends: globus-transfer-dagtask.Succeeded
+          when: '"{{workflow.parameters.globus-use-s3-gateway}}" != "true"'
+          templateRef:
+            name: globus-transfer
+            template: globus-s3-sync-template
+          arguments:
+            parameters:
+              - name: subject-id
+                value: '{{workflow.parameters.subjID}}'
+              - name: s3-bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: dest-base-path
+                value: '{{workflow.parameters.globus-dest-base-path}}'
+
+        - name: subject-data-inventory-dagtask
+          templateRef:
+            name: inventory
+            template: subject-data-inventory-template
+          # Waits for sync to complete (POSIX approach) or skipped (S3 gateway approach).
+          depends: "globus-s3-sync-dagtask.Succeeded || globus-s3-sync-dagtask.Skipped"
+
+        # Anatomical processing pipeline
+        - name: anatomical-processing-pipeline-dagtask
+          # Reference to an in-line DAG template (provided below)
+          template: anatomical-processing-pipeline-dag-template
+          depends: subject-data-inventory-dagtask.Succeeded
+          arguments:
+            parameters:
+              # Extract session strings from the enriched inventory array for anatomical templates,
+              # which expect a flat ["ses-00A", "ses-02A", ...] list.
+              - name: T1w_sessions
+                value: '{{= toJson(map(jsonpath(tasks["subject-data-inventory-dagtask"].outputs.result, "$[*]"), {#.session})) }}'
+          # Skip anatomical processing if the FastSurfer derivatives were already created
+          when: '{{tasks.subject-data-inventory-dagtask.outputs.parameters.fastsurfer-exists}} == "False"'
+
+        # Run registration and functional preprocessing per session once anatomical
+        # derivatives are available. Depends on anatomical succeeding OR being
+        # skipped (derivatives already exist).
+        - name: session-level-pipeline-dagtask
+          template: session-level-pipeline-dag-template
+          depends: "anatomical-processing-pipeline-dagtask.Succeeded || anatomical-processing-pipeline-dagtask.Skipped"
+          arguments:
+            parameters:
+              - name: session
+                value: '{{item.session}}'
+              - name: runs
+                value: '{{item.runs}}'
+              - name: nss-frames
+                value: '{{item.nss_frames}}'
+              - name: t1w-to-mni-exists
+                value: '{{item.t1w_to_mni_exists}}'
+          withParam: '{{tasks.subject-data-inventory-dagtask.outputs.result}}'
+
+#######################################
+#----- Anatomical Processing DAG -----#
+#######################################
+
+  - name: anatomical-processing-pipeline-dag-template
+    inputs:
+      parameters:
+        - name: T1w_sessions
+    dag:
+      tasks:
+        - name: fastsurfer-template-creation-dagtask
+          templateRef:
+            name: fast-tmpl
+            template: fastsurfer-template-creation-template
+          arguments:
+            parameters:
+              - name: fastsurfer-command-string
+                value: >-
+                  {{= "--tid " + workflow.parameters.subjID + "_template" +
+                     " --t1s " +
+                     join(map(jsonpath(inputs.parameters.T1w_sessions, "$[*]"),
+                       {"/home/nonroot/" + workflow.parameters.subjID + "/" + # +
+                        "/anat/" + workflow.parameters.subjID + "_" + # + "_run-01_T1w.nii.gz"}), " ") +
+                     " --tpids " +
+                     join(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), " ") +
+                     " --threads 8" }}
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+        - name: fastsurfer-template-segmentation-dagtask
+          templateRef:
+            name: fast-tmpl
+            template: fastsurfer-template-segmentation-template
+          depends: fastsurfer-template-creation-dagtask
+          arguments:
+            parameters:
+              - name: argstring
+                value: >-
+                  {{= "--sid " + workflow.parameters.subjID +
+                     "_template --sd /opt/freesurfer/subjects --base --edits --seg_only --threads 4" }}
+
+        - name: fastsurfer-template-parcellation-dagtask
+          templateRef:
+            name: fast-tmpl
+            template: fastsurfer-template-parcellation-template
+          depends: fastsurfer-template-segmentation-dagtask
+          arguments:
+            parameters:
+              - name: argstring
+                value: >-
+                  {{= "--sid " + workflow.parameters.subjID +
+                     "_template --sd /opt/freesurfer/subjects --surf_only --base --edits --3T --fsaparc --threads 4" }}
+
+        - name: fastsurfer-long-segmentation-dagtask
+          templateRef:
+            name: fast-long
+            template: fastsurfer-long-segmentation-template
+          depends: fastsurfer-template-segmentation-dagtask
+          arguments:
+            parameters:
+              - name: argstring
+                value: >-
+                  {{= "--subjects " +
+                     join(map(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), {# + "=from-base"}), " ") +
+                     " --sd /opt/freesurfer/subjects --seg_only --edits --fsaparc --long " +
+                     workflow.parameters.subjID + "_template --threads 4" }}
+
+        - name: fastsurfer-long-parcellation-dagtask
+          templateRef:
+            name: fast-long
+            template: fastsurfer-long-parcellation-template
+          depends: fastsurfer-long-segmentation-dagtask && fastsurfer-template-parcellation-dagtask
+          arguments:
+            parameters:
+              - name: argstring
+                value: >-
+                  {{= "--subjects " +
+                     join(map(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), {# + "=from-base"}), " ") +
+                     " --sd /opt/freesurfer/subjects --surf_only --edits --3T --long " +
+                     workflow.parameters.subjID + "_template" +
+                     " --parallel " + string(len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))) +
+                     " --threads 2" }}
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+
+##################################################
+#----- Per-Session Processing DAG ------#
+# Orchestrates registration then functional     #
+# preprocessing for a single session.           #
+##################################################
+
+  - name: session-level-pipeline-dag-template
+    inputs:
+      parameters:
+        - name: session
+        - name: runs
+        - name: nss-frames
+        - name: t1w-to-mni-exists
+
+    dag:
+      failFast: false
+      tasks:
+        - name: registration-dagtask
+          templateRef:
+            name: registration
+            template: registration-dag-template
+          arguments:
+            parameters:
+              - name: session
+                value: '{{inputs.parameters.session}}'
+              - name: runs
+                value: '{{inputs.parameters.runs}}'
+              - name: nss-frames
+                value: '{{inputs.parameters.nss-frames}}'
+              - name: t1w-to-mni-exists
+                value: '{{inputs.parameters.t1w-to-mni-exists}}'
+
+        # Functional preprocessing runs once per (session, task, run) after all
+        # registration steps (t1w-to-mni + bold-to-t1w) have completed.
+        - name: functional-preprocessing-dagtask
+          depends: registration-dagtask.Succeeded
+          template: functional-preprocessing-session-level-dag-template
+          arguments:
+            parameters:
+              - name: session
+                value: '{{inputs.parameters.session}}'
+              - name: bold-runs
+                value: '{{inputs.parameters.runs}}'
+              - name: nss-frames
+                value: '{{inputs.parameters.nss-frames}}'
+
+########################################################
+#----- Functional Preprocessing Per-Session DAG ------#
+# Fans out func-preproc over all (task, run) pairs     #
+# discovered during the registration phase.            #
+########################################################
+
+  - name: functional-preprocessing-session-level-dag-template
+    parallelism: 2
+    inputs:
+      parameters:
+        - name: session
+        - name: bold-runs
+        - name: nss-frames
+
+    dag:
+      failFast: false
+      tasks:
+        - name: functional-preprocessing-dagtask
+          templateRef:
+            name: functional-preprocessing
+            template: functional-preprocessing-template
+          arguments:
+            parameters:
+              - name: session
+                value: '{{inputs.parameters.session}}'
+              - name: task
+                value: '{{item.task}}'
+              - name: run
+                value: '{{item.run}}'
+              - name: nss-frames
+                value: '{{inputs.parameters.nss-frames}}'
+          withParam: '{{inputs.parameters.bold-runs}}'
+          when: "'{{item.func_exists}}' != 'true'"
+
+##################################################
+#----- Workflow Exit Handler -----#
+# Runs on workflow completion (success or failure)
+# via onExit. Emits WorkflowRun metrics to S3,
+# then deletes the Globus-transferred input files
+# from S3 on success.
+##################################################
+
+  - name: emit-workflow-metrics-template
+    steps:
+    - - name: emit-metrics
+        templateRef:
+          name: metrics-exit-handler
+          template: workflow-exit-handler
+        arguments:
+          parameters:
+            - name: workflow-name
+              value: '{{workflow.name}}'
+            - name: subject
+              value: '{{workflow.parameters.subjID}}'
+            - name: status
+              value: '{{workflow.status}}'
+            - name: started-at
+              value: '{{workflow.creationTimestamp}}'
+            - name: duration-s
+              value: '{{workflow.duration}}'
+            - name: bucket
+              value: '{{workflow.parameters.bucket}}'
+            - name: pipeline
+              value: cloudpipe_minproc
+    - - name: delete-globus-input
+        template: delete-globus-input-template
+        when: '{{workflow.status}} == Succeeded'
+
+##################################################
+#----- Globus Input Cleanup -----#
+# Deletes the Globus-transferred input files from
+# S3 after a successful workflow run.
+##################################################
+
+  - name: delete-globus-input-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: cleanup
+        cloudpipe.io/step: delete-globus-input
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 128M
+          cpu: '100m'
+          ephemeral-storage: 200M
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+      command: ["sh", "-c"]
+      source: |
+        python - <<'EOF'
+        import boto3
+        import sys
+
+        s3 = boto3.client('s3')
+
+        bucket = '{{workflow.parameters.bucket}}'
+        dest_base = '{{workflow.parameters.globus-dest-base-path}}'.strip('/')
+        subject_id = '{{workflow.parameters.subjID}}'
+        prefix = f'{dest_base}/{subject_id}/'
+
+        paginator = s3.get_paginator('list_objects_v2')
+        deleted = 0
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            objects = page.get('Contents', [])
+            if not objects:
+                continue
+            s3.delete_objects(
+                Bucket=bucket,
+                Delete={'Objects': [{'Key': o['Key']} for o in objects]}
+            )
+            deleted += len(objects)
+
+        if deleted == 0:
+            print(f"No objects found under s3://{bucket}/{prefix} — nothing to delete.")
+            sys.exit(0)
+
+        print(f"Deleted {deleted} objects from s3://{bucket}/{prefix}")
+        EOF

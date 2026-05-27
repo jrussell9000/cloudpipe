@@ -1,0 +1,26 @@
+# ============================================================================
+# Conda environment for ABCD_fmri_orchestrator_S3
+# ============================================================================
+#
+# Create:  conda env create -f environment.yaml
+# Activate: conda activate ABCD_fmri_orchestrator_S3
+# Update:  conda env update -f environment.yaml --prune
+#
+# NOTE: AFNI must be installed separately (not available via conda-forge).
+#       See https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html
+# ============================================================================
+
+name: ABCD_fmri_orchestrator_S3
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python>=3.8
+  - numpy
+  - pandas
+  - pyyaml
+  - matplotlib     # QC carpet plots and tSNR visualization
+  - boto3          # AWS S3 data transfer
+  - pip

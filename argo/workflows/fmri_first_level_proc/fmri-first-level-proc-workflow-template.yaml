@@ -1,0 +1,93 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: fmri-first-level-proc
+  namespace: argo-workflows
+
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  workflowMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  podMetadata:
+    labels:
+      app: fmri-first-level-proc
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  podDisruptionBudget:
+    minAvailable: "100%"
+
+  # 2-hour hard cap — matches the Batch job timeout
+  activeDeadlineSeconds: 7200
+
+  retryStrategy:
+    limit: "3"
+    retryPolicy: OnFailure
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    backoff:
+      duration: "1m"
+      factor: "2"
+
+  arguments:
+    parameters:
+      - name: subjID
+
+  volumes:
+    - name: scratch
+      emptyDir:
+        sizeLimit: 300Gi
+
+  entrypoint: first-level-proc-template
+
+  templates:
+
+  - name: first-level-proc-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: first-level
+        cloudpipe.io/step: orchestrate
+
+    nodeSelector:
+      karpenter.sh/nodepool: first-level-nodepool
+
+    container:
+      image: "public.ecr.aws/l9e7l1h1/cloudpipe/fmri-first-level-proc:sha-61de8f3d65ad4547b3021e0e6d8f04a5bd5aa1b9"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+
+      resources:
+        requests:
+          cpu: "1200m"
+          memory: 10Gi
+          ephemeral-storage: 20Gi
+        limits:
+          cpu: "2"
+          memory: 10Gi
+
+      # Override the image ENTRYPOINT to strip the "sub-" prefix before
+      # passing the NDAR ID to orchestrate_first_level.py, which expects
+      # a bare ID (e.g. "NDARABC123") and prepends "sub-" itself.
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          cd /app/ABCD_fmri_orchestrator_S3 && \
+          python3 orchestrate_first_level.py \
+            --orchestrate_config orch_config_final.yaml \
+            --proc_config proc_config_final.yaml \
+            --subj_id "${SUBJ_ID#sub-}"
+      env:
+        - name: SUBJ_ID
+          value: "{{workflow.parameters.subjID}}"

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: prometheus-operator-crds
+description: Prometheus Operator CRDs (ServiceMonitor, PodMonitor, PrometheusRule, etc.)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+dependencies:
+  - name: prometheus-operator-crds
+    version: 23.0.0
+    repository: https://prometheus-community.github.io/helm-charts

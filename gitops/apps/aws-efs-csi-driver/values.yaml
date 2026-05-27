@@ -1,0 +1,14 @@
+aws-efs-csi-driver:
+  controller:
+    # Delete the path on EFS when deleting an access point
+    deleteAccessPointRootDir: true
+    # see: https://github.com/kubernetes-sigs/aws-efs-csi-driver?tab=readme-ov-file#timeouts
+    timeout: 60s
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+    tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  node:
+    volMetricsOptIn: true

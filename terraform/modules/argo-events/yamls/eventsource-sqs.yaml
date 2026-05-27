@@ -1,0 +1,26 @@
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: aws-sqs
+  namespace: argo-events
+spec:
+  template:
+    serviceAccountName: argo-events-handler-sa
+    tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  sqs:
+    sqs_argo_workflow:
+      # Confusingly, this must be FALSE or else we get errors about marshaling the JSON body
+      jsonBody: false
+      # aws region
+      region: "${region}"
+      # Name of the queue
+      queue: ${queue_name}
+      # This value needs to be added, but isn't in the documentation (automatic resolution of the queue URL doesn't work as of v1.9.5)
+      endpoint: ${endpoint}
+      # The duration (in seconds) for which the call waits for a message to arrive in the queue before returning.
+      # MUST BE > 0 AND <= 20
+      waitTimeSeconds: 20
+

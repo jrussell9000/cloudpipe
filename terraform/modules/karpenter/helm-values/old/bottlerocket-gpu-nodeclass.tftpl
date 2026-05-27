@@ -1,0 +1,29 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: bottlerocket-gpu-nodeclass
+spec:
+  amiSelectorTerms:
+  - alias: bottlerocket@latest
+
+  instanceStorePolicy: RAID0
+  blockDeviceMappings:
+  - deviceName: /dev/xvda
+    ebs:
+      volumeType: gp3
+      volumeSize: 4Gi
+  # Bottlerocket data volume
+  - deviceName: /dev/xvdb
+    ebs:
+      volumeType: gp3
+      volumeSize: 30Gi # replace with your required disk size
+      
+  role: ${ karpenter_node_iam_role_name }
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  tags:
+    karpenter.sh/discovery: ${ eks_cluster_name }

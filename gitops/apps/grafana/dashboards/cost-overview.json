@@ -1,0 +1,98 @@
+{
+  "uid": "cloudpipe-costs",
+  "title": "CloudPipe — Cost Overview",
+  "description": "Daily pipeline costs per subject from Kubecost allocation data. Populated after the nightly kubecost_scraper Prefect flow runs.",
+  "tags": ["cloudpipe", "cost", "finops"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1h",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Cost (selected range)",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(SUM(total_cost_usd), 2) AS total_cost FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Mean Cost per Subject",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(total_cost_usd), 2) AS mean_cost FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Subjects Processed",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT COUNT(DISTINCT subject) AS subjects FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Daily Spend",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT date, ROUND(SUM(total_cost_usd), 2) AS daily_cost, ROUND(SUM(cpu_cost_usd), 2) AS cpu_cost, ROUND(SUM(memory_cost_usd), 2) AS memory_cost FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY date ORDER BY date ASC"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Cost by Subject (top 50)",
+      "description": "Placeholder — populated once the Kubecost labeling work (Phase 7) is complete.",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT subject, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(cpu_cost_usd), 2) AS cpu_cost, ROUND(SUM(memory_cost_usd), 2) AS memory_cost, COUNT(*) AS days FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY subject ORDER BY total_cost DESC LIMIT 50"
+        }
+      ]
+    }
+  ]
+}

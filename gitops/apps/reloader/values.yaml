@@ -1,0 +1,7 @@
+reloader:
+  reloadStrategy: annotations
+  logFormat: json
+  logLevel: info
+  deployment:
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend

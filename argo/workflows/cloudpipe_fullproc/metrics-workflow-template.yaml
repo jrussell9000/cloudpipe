@@ -1,0 +1,60 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: metrics-exit-handler
+  namespace: argo-workflows
+
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  templates:
+
+  ###########################################################################
+  # Workflow exit handler — runs after every cloudpipe workflow (success or
+  # failure) via onExit.  Writes a WorkflowRun JSON to
+  # s3://{bucket}/metrics/workflow-runs/{workflow-name}_run_summary.json.
+  ###########################################################################
+
+  - name: workflow-exit-handler
+    metadata:
+      labels:
+        cloudpipe.io/phase: observability
+        cloudpipe.io/step: workflow-run-metrics
+    inputs:
+      parameters:
+        - name: workflow-name
+        - name: subject
+        - name: status
+        - name: started-at
+        - name: duration-s
+        - name: bucket
+        - name: pipeline
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+      imagePullPolicy: IfNotPresent
+
+      resources:
+        requests:
+          memory: 128M
+          cpu: 100m
+
+      command: [python, /app/exit_handler.py]
+      args:
+        - --workflow-name
+        - '{{inputs.parameters.workflow-name}}'
+        - --subject
+        - '{{inputs.parameters.subject}}'
+        - --status
+        - '{{inputs.parameters.status}}'
+        - --started-at
+        - '{{inputs.parameters.started-at}}'
+        - --duration-s
+        - '{{inputs.parameters.duration-s}}'
+        - --bucket
+        - '{{inputs.parameters.bucket}}'
+        - --pipeline
+        - '{{inputs.parameters.pipeline}}'

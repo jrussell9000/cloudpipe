@@ -1,0 +1,25 @@
+external-dns:
+  provider:
+    name: aws
+  env:
+    - name: AWS_DEFAULT_REGION
+      value: <YOUR_AWS_REGION>
+    - name: AWS_REGION
+      value: <YOUR_AWS_REGION>
+  domainFilters:
+    - "<YOUR_DOMAIN>"
+  txtOwnerId: "cloudpipe"
+  policy: upsert-only
+  sources:
+    - ingress
+    - service
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+  tolerations:
+  - key: "CriticalAddonsOnly"
+    value: "true"
+    effect: "NoSchedule"
+  # Pod Identity — no role-arn annotation needed; SA created by Helm
+  serviceAccount:
+    create: true
+    name: external-dns

@@ -1,0 +1,29 @@
+aws-ebs-csi-driver:
+  controller:
+    tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: eks.amazonaws.com/nodegroup
+              operator: In
+              values:
+              - backend
+            - key: eks.amazonaws.com/compute-type
+              operator: NotIn
+              values:
+              - fargate
+              - auto
+              - hybrid
+            - key: node.kubernetes.io/instance-type
+              operator: NotIn
+              values:
+                - a1.medium
+                - a1.large
+                - a1.xlarge
+                - a1.2xlarge
+                - a1.4xlarge

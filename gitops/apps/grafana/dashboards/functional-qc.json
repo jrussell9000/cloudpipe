@@ -1,0 +1,146 @@
+{
+  "uid": "cloudpipe-funcqc",
+  "title": "CloudPipe — Functional QC",
+  "description": "BOLD run quality metrics: framewise displacement, DVARS, tSNR, and confound regressor counts.",
+  "tags": ["cloudpipe", "qc", "functional"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Mean FD (all runs)",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(mean_fd), 3) AS mean_fd FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mm",
+          "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.2 }, { "color": "red", "value": 0.5 }] }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "% Runs with >10% FD > 0.5 mm",
+      "gridPos": { "x": 4, "y": 0, "w": 5, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(100.0 * SUM(CASE WHEN pct_fd_above_0p5 > 10 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_high_motion FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 20 }, { "color": "red", "value": 40 }] }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Median tSNR",
+      "gridPos": { "x": 9, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(tsnr_median), 1) AS avg_tsnr FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 30 }, { "color": "green", "value": 50 }] }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Mean Runtime (min)",
+      "gridPos": { "x": 13, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(total_runtime_s) / 60.0, 1) AS mean_min FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "m" } }
+    },
+    {
+      "id": 5,
+      "type": "histogram",
+      "title": "Mean FD Distribution",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT mean_fd FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND mean_fd IS NOT NULL"
+        }
+      ],
+      "options": { "bucketSize": "auto", "fillOpacity": 80 }
+    },
+    {
+      "id": 6,
+      "type": "histogram",
+      "title": "tSNR Distribution",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT tsnr_median FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND tsnr_median IS NOT NULL"
+        }
+      ],
+      "options": { "bucketSize": "auto", "fillOpacity": 80 }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "High-Motion Runs (mean FD > 0.5 mm)",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT subject, session, task, run, ROUND(mean_fd, 3) AS mean_fd, ROUND(pct_fd_above_0p5, 1) AS pct_fd_above_0p5, ROUND(tsnr_median, 1) AS tsnr_median, n_frames, completed_at FROM cloudpipe_metrics.func_preproc WHERE mean_fd > 0.5 AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() ORDER BY mean_fd DESC LIMIT 100"
+        }
+      ]
+    }
+  ]
+}

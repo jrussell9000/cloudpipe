@@ -18,7 +18,7 @@ spec:
     limit: "3"
     retryPolicy: "OnFailure"
     # Optional: Only retry if the failure looks like a Spot termination
-    expression: "lastRetry.message matches 'pod deleted' || lastRetry.exitCode in [64, 137, 143]"
+    expression: "lastRetry.message matches 'pod deleted|imminent node shutdown' || lastRetry.exitCode in [64, 137, 143]"
     backoff:
       duration: "1m"
       factor: "2"
@@ -101,23 +101,25 @@ spec:
 
       # Globus transfer parameters
       - name: globus-source-collection-id
+        default: "<YOUR_GLOBUS_SOURCE_COLLECTION_ID>"
       - name: globus-source-base-path
-        # Root path on the source collection containing raw DICOM files.
-        # Subject ID is appended automatically, e.g. /dairc/sourcedata/{subjID}
-        default: /dairc/sourcedata
       - name: globus-dest-collection-id
+        default: "c2edcb2d-c51a-4eb0-961c-c81748f43c84"
       - name: globus-dest-base-path
         # Root path on the destination (GCS staging) collection.
         # Subject ID is appended automatically, e.g. /sourcedata/{subjID}
         # Files are synced from here to S3 under the same prefix.
         default: /sourcedata
-      # JSON array of BIDS scan types to transfer across all sessions, e.g.:
-      # '["T1w", "T2w", "rest", "dwi"]'
+      # JSON array of BIDS scan types to transfer across all sessions.
       # Valid values: T1w, T2w, rest, nback, sst, mid, dwi
       - name: globus-scan-types
+        default: '["T1w", "rest", "nback"]'
 
   # Which template (below) should we start with?
   entrypoint: master-pipeline-dag
+
+  # Emit WorkflowRun metrics to S3 on success or failure.
+  onExit: emit-workflow-metrics-template
 
   templates:
   # This is the master DAG for the entire pipeline
@@ -284,6 +286,35 @@ spec:
               - name: T1w_sessions
                 value: "{{inputs.parameters.T1w_sessions}}"
 
+
+##################################################
+#----- Workflow Exit Handler -----#
+# Runs on workflow completion (success or failure)
+# via onExit. Emits WorkflowRun metrics to S3.
+##################################################
+
+  - name: emit-workflow-metrics-template
+    steps:
+    - - name: emit-metrics
+        templateRef:
+          name: metrics-exit-handler
+          template: workflow-exit-handler
+        arguments:
+          parameters:
+            - name: workflow-name
+              value: '{{workflow.name}}'
+            - name: subject
+              value: '{{workflow.parameters.subjID}}'
+            - name: status
+              value: '{{workflow.status}}'
+            - name: started-at
+              value: '{{workflow.creationTimestamp}}'
+            - name: duration-s
+              value: '{{workflow.duration}}'
+            - name: bucket
+              value: '{{workflow.parameters.bucket}}'
+            - name: pipeline
+              value: cloudpipe_fullproc
 
 ##########################################
 #----- Registration Processing DAG ------#

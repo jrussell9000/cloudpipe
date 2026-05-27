@@ -1,0 +1,12 @@
+dependencies:
+- name: prefect-server
+  repository: https://prefecthq.github.io/prefect-helm
+  version: 2026.4.10163454
+- name: prefect-worker
+  repository: https://prefecthq.github.io/prefect-helm
+  version: 2026.4.10163454
+- name: oauth2-proxy
+  repository: https://oauth2-proxy.github.io/manifests
+  version: 10.4.3
+digest: sha256:9a5d9f604b4113afa52d836b00edc5e61dafdd0a8f71a16522a0593c3a33ea0e
+generated: "2026-05-07T12:10:18.637682279-05:00"

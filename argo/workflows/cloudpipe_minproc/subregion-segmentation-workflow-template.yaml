@@ -1,0 +1,576 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: subregion-seg
+  namespace: argo-workflows
+spec:
+
+  entrypoint: subregion-seg-dag-template
+  serviceAccountName: argo-workflows-runner
+
+  arguments:
+    parameters:
+      - name: subjID
+      - name: bucket
+      - name: ecr-registry
+      - name: T1w_sessions
+
+  volumeClaimTemplates:
+    - metadata:
+        name: "{{=lower(workflow.parameters.subjID)}}"
+        generateName: "{{=lower(workflow.parameters.subjID)}}"
+      spec:
+        accessModes: ["ReadWriteMany"]
+        storageClassName: efs-sc
+        resources:
+          requests:
+            storage: 50Gi
+
+  retryStrategy:
+    limit: "3"
+    retryPolicy: Always
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    backoff:
+      duration: "1m"
+      factor: "2"
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+
+  templates:
+
+  ##############################################
+  # Entry-point DAG
+  # All three steps run in parallel — thalamus
+  # and brainstem are the long poles (~30-45 min
+  # each); hypothalamic + sclimbic are ~5 min.
+  ##############################################
+
+  - name: subregion-seg-dag-template
+    inputs:
+      parameters:
+        - name: T1w_sessions
+
+    dag:
+      failFast: false
+      tasks:
+        - name: thalamus-dagtask
+          template: segment-thalamus-template
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+        - name: brainstem-dagtask
+          template: segment-brainstem-template
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+        - name: deeplearning-dagtask
+          template: segment-deeplearning-template
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+  ##############################################
+  # Thalamic Nuclei
+  # segment_subregions thalamus --long-base
+  # GEMS/Bayesian atlas deformation, CPU-only.
+  # ~30-45 min per subject with 4 threads.
+  #
+  # Outputs (per-session + template, in mri/):
+  #   ThalamicNuclei.v13.T1.mgz
+  #   ThalamicNuclei.v13.T1.volumes.txt
+  ##############################################
+
+  - name: segment-thalamus-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: subregion-segmentation
+        cloudpipe.io/step: thalamus
+    inputs:
+      parameters:
+        - name: T1w_sessions
+
+      artifacts:
+        - name: fslicense
+          path: /opt/freesurfer/.license
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: config/fslicense
+
+        - name: long-template
+          path: /opt/freesurfer/subjects/{{workflow.parameters.subjID}}_template
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz
+
+        - name: ses-00A-templated
+          path: /opt/freesurfer/subjects/ses-00A
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz
+
+        - name: ses-02A-templated
+          path: /opt/freesurfer/subjects/ses-02A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-02A_templated.tar.gz
+
+        - name: ses-04A-templated
+          path: /opt/freesurfer/subjects/ses-04A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-04A_templated.tar.gz
+
+        - name: ses-06A-templated
+          path: /opt/freesurfer/subjects/ses-06A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-06A_templated.tar.gz
+
+        - name: ses-08A-templated
+          path: /opt/freesurfer/subjects/ses-08A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-08A_templated.tar.gz
+
+        - name: ses-10A-templated
+          path: /opt/freesurfer/subjects/ses-10A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-10A_templated.tar.gz
+
+    outputs:
+      artifacts:
+        - name: thalamus-segmentation
+          path: /out/thalamus
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_thalamus.tar.gz
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-d014d4417575d8c1f8c3d942a959cd9df485695b"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+        - name: "{{=lower(workflow.parameters.subjID)}}"
+          mountPath: /opt/freesurfer/subjects
+          subPath: opt/freesurfer/subjects
+
+      resources:
+        requests:
+          memory: 12G
+          cpu: '4'
+          ephemeral-storage: 5G
+
+      env:
+        - name: SUBJECTS_DIR
+          value: /opt/freesurfer/subjects
+        - name: FS_LICENSE
+          value: /opt/freesurfer/.license
+
+      command: [bash, -c]
+      args:
+        - |
+          set -euo pipefail
+          SD=/opt/freesurfer/subjects
+          BASE={{workflow.parameters.subjID}}_template
+
+          source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" 2>/dev/null
+
+          # segment_subregions --long-base expects timepoints named {tp}.long.{base}.
+          # FastSurfer writes bare session IDs (ses-00A, ses-02A, ...). Symlinks bridge
+          # the naming gap; writes from segment_subregions land in the real directories.
+          while IFS= read -r tp; do
+            [[ -n "$tp" ]] && ln -sfn "${SD}/${tp}" "${SD}/${tp}.long.${BASE}"
+          done < "${SD}/${BASE}/base-tps"
+
+          segment_subregions thalamus \
+            --long-base "$BASE" \
+            --sd "$SD" \
+            --threads 4
+
+          # Collect outputs into a flat structure: {session}/mri/ThalamicNuclei* and
+          # {template}/mri/ThalamicNuclei* — preserving directory layout for downstream use.
+          mkdir -p /out/thalamus
+          while IFS= read -r tp; do
+            [[ -n "$tp" ]] || continue
+            mkdir -p "/out/thalamus/${tp}/mri"
+            cp "${SD}/${tp}/mri/"ThalamicNuclei* "/out/thalamus/${tp}/mri/" 2>/dev/null || true
+          done < "${SD}/${BASE}/base-tps"
+          mkdir -p "/out/thalamus/${BASE}/mri"
+          cp "${SD}/${BASE}/mri/"ThalamicNuclei* "/out/thalamus/${BASE}/mri/" 2>/dev/null || true
+
+  ##############################################
+  # Brainstem Substructures
+  # segment_subregions brainstem --long-base
+  # GEMS/Bayesian, CPU-only. ~15-25 min.
+  #
+  # Outputs (per-session + template, in mri/):
+  #   brainstemSsLabels.v13.T1.mgz
+  #   brainstemSsVolumes.v13.txt
+  ##############################################
+
+  - name: segment-brainstem-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: subregion-segmentation
+        cloudpipe.io/step: brainstem
+    inputs:
+      parameters:
+        - name: T1w_sessions
+
+      artifacts:
+        - name: fslicense
+          path: /opt/freesurfer/.license
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: config/fslicense
+
+        - name: long-template
+          path: /opt/freesurfer/subjects/{{workflow.parameters.subjID}}_template
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz
+
+        - name: ses-00A-templated
+          path: /opt/freesurfer/subjects/ses-00A
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz
+
+        - name: ses-02A-templated
+          path: /opt/freesurfer/subjects/ses-02A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-02A_templated.tar.gz
+
+        - name: ses-04A-templated
+          path: /opt/freesurfer/subjects/ses-04A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-04A_templated.tar.gz
+
+        - name: ses-06A-templated
+          path: /opt/freesurfer/subjects/ses-06A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-06A_templated.tar.gz
+
+        - name: ses-08A-templated
+          path: /opt/freesurfer/subjects/ses-08A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-08A_templated.tar.gz
+
+        - name: ses-10A-templated
+          path: /opt/freesurfer/subjects/ses-10A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-10A_templated.tar.gz
+
+    outputs:
+      artifacts:
+        - name: brainstem-segmentation
+          path: /out/brainstem
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_brainstem.tar.gz
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-d014d4417575d8c1f8c3d942a959cd9df485695b"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+        - name: "{{=lower(workflow.parameters.subjID)}}"
+          mountPath: /opt/freesurfer/subjects
+          subPath: opt/freesurfer/subjects
+
+      resources:
+        requests:
+          memory: 12G
+          cpu: '4'
+          ephemeral-storage: 5G
+
+      env:
+        - name: SUBJECTS_DIR
+          value: /opt/freesurfer/subjects
+        - name: FS_LICENSE
+          value: /opt/freesurfer/.license
+
+      command: [bash, -c]
+      args:
+        - |
+          set -euo pipefail
+          SD=/opt/freesurfer/subjects
+          BASE={{workflow.parameters.subjID}}_template
+
+          source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" 2>/dev/null
+
+          while IFS= read -r tp; do
+            [[ -n "$tp" ]] && ln -sfn "${SD}/${tp}" "${SD}/${tp}.long.${BASE}"
+          done < "${SD}/${BASE}/base-tps"
+
+          segment_subregions brainstem \
+            --long-base "$BASE" \
+            --sd "$SD" \
+            --threads 4
+
+          mkdir -p /out/brainstem
+          while IFS= read -r tp; do
+            [[ -n "$tp" ]] || continue
+            mkdir -p "/out/brainstem/${tp}/mri"
+            cp "${SD}/${tp}/mri/"brainstemSs* "/out/brainstem/${tp}/mri/" 2>/dev/null || true
+          done < "${SD}/${BASE}/base-tps"
+          mkdir -p "/out/brainstem/${BASE}/mri"
+          cp "${SD}/${BASE}/mri/"brainstemSs* "/out/brainstem/${BASE}/mri/" 2>/dev/null || true
+
+  ##############################################
+  # Deep-Learning Segmentation
+  # Runs two fast CNN/U-Net tools sequentially:
+  #
+  # 1. mri_segment_hypothalamic_subunits
+  #    TensorFlow CNN. ~10 sec/session CPU.
+  #    5 bilateral hypothalamic subregions.
+  #    Output: hypothalamic_subunits_seg.v1.mgz
+  #            hypothalamic_subunits_volumes.v1.csv
+  #
+  # 2. mri_sclimbic_seg
+  #    U-Net. <1 min/session CPU.
+  #    Hypothalamus (coarse), mammillary bodies,
+  #    basal forebrain, septal nuclei, NAcc, fornix.
+  #    Output: sclimbic.mgz, sclimbic.stats
+  #
+  # NOTE: Both tools require model files from
+  # $FREESURFER_HOME/models/. The freesurfer image
+  # must be built with models/ included (see
+  # images/freesurfer/Dockerfile).
+  ##############################################
+
+  - name: segment-deeplearning-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: subregion-segmentation
+        cloudpipe.io/step: deeplearning
+    inputs:
+      parameters:
+        - name: T1w_sessions
+
+      artifacts:
+        - name: fslicense
+          path: /opt/freesurfer/.license
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: config/fslicense
+
+        - name: long-template
+          path: /opt/freesurfer/subjects/{{workflow.parameters.subjID}}_template
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz
+
+        - name: ses-00A-templated
+          path: /opt/freesurfer/subjects/ses-00A
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz
+
+        - name: ses-02A-templated
+          path: /opt/freesurfer/subjects/ses-02A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-02A_templated.tar.gz
+
+        - name: ses-04A-templated
+          path: /opt/freesurfer/subjects/ses-04A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-04A_templated.tar.gz
+
+        - name: ses-06A-templated
+          path: /opt/freesurfer/subjects/ses-06A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-06A_templated.tar.gz
+
+        - name: ses-08A-templated
+          path: /opt/freesurfer/subjects/ses-08A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-08A_templated.tar.gz
+
+        - name: ses-10A-templated
+          path: /opt/freesurfer/subjects/ses-10A
+          optional: true
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-10A_templated.tar.gz
+
+    outputs:
+      artifacts:
+        - name: hypothalamic-segmentation
+          path: /out/hypothalamic
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_hypothalamic.tar.gz
+
+        - name: sclimbic-segmentation
+          path: /out/sclimbic
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_sclimbic.tar.gz
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-d014d4417575d8c1f8c3d942a959cd9df485695b"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+        - name: "{{=lower(workflow.parameters.subjID)}}"
+          mountPath: /opt/freesurfer/subjects
+          subPath: opt/freesurfer/subjects
+
+      resources:
+        requests:
+          memory: 8G
+          cpu: '4'
+          ephemeral-storage: 5G
+
+      env:
+        - name: SUBJECTS_DIR
+          value: /opt/freesurfer/subjects
+        - name: FS_LICENSE
+          value: /opt/freesurfer/.license
+
+      command: [bash, -c]
+      args:
+        - |
+          set -euo pipefail
+          SD=/opt/freesurfer/subjects
+          BASE={{workflow.parameters.subjID}}_template
+
+          source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" 2>/dev/null
+
+          # Build space-separated session list from base-tps for tools that
+          # accept multiple --s arguments in one call (faster than per-session invocations).
+          mapfile -t SESSIONS < <(grep -v '^$' "${SD}/${BASE}/base-tps")
+          SESSION_ARGS=()
+          for tp in "${SESSIONS[@]}"; do SESSION_ARGS+=(--s "$tp"); done
+
+          # 1. Hypothalamic subunits — TensorFlow CNN, ~10 sec/session
+          mri_segment_hypothalamic_subunits \
+            "${SESSION_ARGS[@]}" \
+            --sd "$SD" \
+            --threads 4
+
+          # 2. ScLimbic — U-Net, <1 min/session
+          mri_sclimbic_seg \
+            "${SESSION_ARGS[@]}" \
+            --sd "$SD" \
+            --threads 4
+
+          # Collect hypothalamic outputs
+          mkdir -p /out/hypothalamic
+          for tp in "${SESSIONS[@]}"; do
+            mkdir -p "/out/hypothalamic/${tp}/mri" "/out/hypothalamic/${tp}/stats"
+            cp "${SD}/${tp}/mri/"hypothalamic_subunits* \
+               "/out/hypothalamic/${tp}/mri/" 2>/dev/null || true
+            cp "${SD}/${tp}/stats/"hypothalamic_subunits* \
+               "/out/hypothalamic/${tp}/stats/" 2>/dev/null || true
+          done
+
+          # Collect sclimbic outputs
+          mkdir -p /out/sclimbic
+          for tp in "${SESSIONS[@]}"; do
+            mkdir -p "/out/sclimbic/${tp}/mri" "/out/sclimbic/${tp}/stats"
+            cp "${SD}/${tp}/mri/sclimbic"* \
+               "/out/sclimbic/${tp}/mri/" 2>/dev/null || true
+            cp "${SD}/${tp}/stats/sclimbic"* \
+               "/out/sclimbic/${tp}/stats/" 2>/dev/null || true
+          done

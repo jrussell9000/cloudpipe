@@ -8,7 +8,7 @@ spec:
   retryStrategy:
     limit: "3"
     retryPolicy: OnFailure
-    expression: 'lastRetry.message matches "pod deleted" || lastRetry.exitCode in [64, 137, 143]'
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
     backoff:
       duration: "1m"
       factor: "2"
@@ -122,7 +122,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -169,7 +169,7 @@ spec:
                 run_label  = f"run-{run_m.group(1)}"
 
                 # Check whether bold-to-t1w outputs already exist in S3 so
-                # the bold-to-t1w GPU step can be skipped on reruns.
+                # the bold-to-t1w step can be skipped on reruns.
                 b2t_key = (f"derivatives/registration/{subj}/{ses}/"
                            f"bold_to_t1w_{task_label}_{run_label}.tar.gz")
                 try:
@@ -212,7 +212,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -271,7 +271,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: config/nss_volumes.csv
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
@@ -335,7 +335,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
 
         - name: mni-template
@@ -343,7 +343,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: config/MNI152NLin2009cAsym_T1w_brain.nii.gz
 
     outputs:
@@ -354,14 +354,24 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni.tar.gz'
+
+        - name: t1w-to-mni-reg-qc
+          path: '/tmp/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'metrics/registration/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
 
     nodeSelector:
       karpenter.sh/nodepool: gpu-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-b1f96fc738b80b85f68ae94ea13ce60a821898ab"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -393,6 +403,12 @@ spec:
         - '/work/registration/{{inputs.parameters.session}}/t1w_to_mni'
         - --prefix
         - '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni'
+        - --subj
+        - '{{workflow.parameters.subjID}}'
+        - --ses
+        - '{{inputs.parameters.session}}'
+        - --pipeline
+        - cloudpipe_fullproc
 
   ###########################################################################
   # BOLD reference → T1w
@@ -429,7 +445,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.nii.gz'
 
         - name: fastsurfer-output
@@ -437,7 +453,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
 
         - name: fslicense
@@ -445,7 +461,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'config/fslicense'
 
     outputs:
@@ -458,14 +474,24 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/bold_to_t1w_{{inputs.parameters.task}}_{{inputs.parameters.run}}.tar.gz'
 
+        - name: bold-to-t1w-reg-qc
+          path: '/tmp/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold_to_t1w_reg_qc.json'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'metrics/registration/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold_to_t1w_reg_qc.json'
+
     nodeSelector:
-      karpenter.sh/nodepool: gpu-nodepool
+      karpenter.sh/nodepool: cpu-heavy-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/synthmorph:sha-eb02fedc62ac08dbd97688d56f7b6c438d80ea3d"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/synthmorph:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -478,8 +504,6 @@ spec:
           memory: 4G
           cpu: '2'
           ephemeral-storage: 4G
-        limits:
-          nvidia.com/gpu: '1'
 
       command: [python, /app/bold_to_t1w.py]
       args:
@@ -495,3 +519,13 @@ spec:
         - '/work/registration/{{inputs.parameters.session}}/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
         - --prefix
         - '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}'
+        - --subj
+        - '{{workflow.parameters.subjID}}'
+        - --ses
+        - '{{inputs.parameters.session}}'
+        - --task
+        - '{{inputs.parameters.task}}'
+        - --run
+        - '{{inputs.parameters.run}}'
+        - --pipeline
+        - cloudpipe_fullproc

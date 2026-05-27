@@ -1,0 +1,22 @@
+cert-manager:
+  installCRDs: true
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+  tolerations:
+  - key: "CriticalAddonsOnly"
+    value: "true"
+    effect: "NoSchedule"
+  webhook:
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+    tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  cainjector:
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+    tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"

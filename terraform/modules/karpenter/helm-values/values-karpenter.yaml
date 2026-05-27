@@ -1,0 +1,25 @@
+nodeSelector:
+  karpenter.sh/controller: 'true'
+tolerations:
+- key: karpenter.sh/controller
+  operator: Exists
+  effect: NoSchedule
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+          - key: eks.amazonaws.com/nodegroup
+            operator: In
+            values:
+              - karpenter
+          - key: karpenter.sh/nodepool
+            operator: DoesNotExist
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - topologyKey: "kubernetes.io/hostname"
+settings:
+  clusterName: ${clusterName}
+  clusterEndpoint: ${clusterEndpoint}
+  interruptionQueue: ${interruptionQueue}
+  eksControlPlane: true

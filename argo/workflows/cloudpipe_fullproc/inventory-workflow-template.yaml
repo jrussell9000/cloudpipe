@@ -22,7 +22,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -102,7 +102,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/bravepy:sha-0aae28dd7e437306ca44f6081d4954737b03a056"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

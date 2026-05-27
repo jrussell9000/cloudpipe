@@ -1,0 +1,43 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: first-level-sqs
+  namespace: argo-events
+spec:
+  template:
+    serviceAccountName: argo-events-handler-sa
+    tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  dependencies:
+    - name: first-level-sqs-source
+      eventSourceName: first-level-sqs
+      eventName: first_level_workflow
+      # Body arrives base64-encoded; decode it so dataKey: body gives plain text
+      transform:
+        jq: .body|=@base64d
+  triggers:
+    - template:
+        name: first_level_workflow
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: first-level-proc-
+                namespace: ${argoworkflows_ns}
+              spec:
+                arguments:
+                  parameters:
+                  - name: subjID
+                    value: ""
+                workflowTemplateRef:
+                  name: fmri-first-level-proc
+          parameters:
+          - src:
+              dependencyName: first-level-sqs-source
+              dataKey: body
+            dest: spec.arguments.parameters.0.value

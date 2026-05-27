@@ -1,0 +1,18 @@
+apiVersion: v2
+name: prefect
+description: Prefect server and worker for cloudpipe pipeline orchestration
+type: application
+version: 0.1.0
+appVersion: "3.6.26"
+dependencies:
+  # Verify latest versions with: helm search repo prefect/prefect-server
+  - name: prefect-server
+    version: 2026.4.10163454
+    repository: https://prefecthq.github.io/prefect-helm
+  - name: prefect-worker
+    version: 2026.4.10163454
+    repository: https://prefecthq.github.io/prefect-helm
+  # Verify latest version with: helm search repo oauth2-proxy/oauth2-proxy
+  - name: oauth2-proxy
+    version: 10.4.3
+    repository: https://oauth2-proxy.github.io/manifests

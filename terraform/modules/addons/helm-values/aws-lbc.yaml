@@ -1,0 +1,13 @@
+clusterName: ${cluster_name}
+region: ${region}
+vpcId: ${vpc_id}
+nodeSelector:
+  eks.amazonaws.com/nodegroup: backend
+tolerations:
+- key: "CriticalAddonsOnly"
+  value: "true"
+  effect: "NoSchedule"
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: "${role_arn}"

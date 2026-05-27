@@ -1,0 +1,23 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: fs-segmentation-nodepool
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: al2023-nodeclass
+      requirements:
+      - key: "node.kubernetes.io/instance-type"
+        operator: In
+        values: ["g6e.4xlarge", "g6e.12xlarge", "g6e.48xlarge", "g6.2xlarge", "g6.12xlarge", "g6.48xlarge", "g5.xlarge", "g5.12xlarge", "g5.48xlarge", "g4dn.xlarge", "g4dn.12xlarge", "g4dn.metal"]
+      - key: "karpenter.sh/capacity-type"
+        operator: In
+        values: ["spot"]
+  limits:
+    cpu: 1000
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30s

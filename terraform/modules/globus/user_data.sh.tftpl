@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+# Globus Connect Server v5 — first-boot setup
+# Runs as root via EC2 user_data.
+#
+# Storage gateway approach is controlled by the globus_use_s3_gateway Terraform variable:
+#
+#   false (default) — POSIX gateway over a local EBS staging volume. Works with any
+#                     GCS endpoint; no Globus subscription required. GridFTP writes to
+#                     /data/globus-staging (EBS), then globus-s3-sync-template syncs to S3.
+#
+#   true            — Native S3 storage gateway. Globus writes directly to S3 via
+#                     multipart upload using the EC2 IAM role (admin-managed credentials).
+#                     No local staging or Mountpoint required. Requires a Globus
+#                     subscription with High Assurance support.
+#
+# After this script runs, SSH/SSM in and execute:
+#   sudo /usr/local/bin/gcs-finalize-setup
+
+set -euo pipefail
+exec > >(tee /var/log/gcs-user-data.log | logger -t gcs-user-data) 2>&1
+
+###############################################################################
+# 1. Install Globus Connect Server
+###############################################################################
+# Force HTTPS for apt — HTTP egress is blocked by the security group
+sed -i 's|http://|https://|g' /etc/apt/sources.list
+
+curl -LOs https://downloads.globus.org/globus-connect-server/stable/installers/repo/deb/globus-repo_latest_all.deb
+dpkg -i globus-repo_latest_all.deb
+
+apt-get update -y
+apt-get install -y globus-connect-server54 awscli
+
+%{ if globus_use_s3_gateway ~}
+###############################################################################
+# 2. S3 mode: create cloudpipe system user and identity mapping script.
+#    The native S3 storage gateway handles writes via S3 multipart upload
+#    using the EC2 IAM role (admin-managed credentials). No Mountpoint or
+#    local staging volume required.
+###############################################################################
+groupadd --gid 997 cloudpipe 2>/dev/null || true
+useradd --system --uid 997 --gid 997 --no-create-home --shell /bin/false cloudpipe 2>/dev/null || true
+
+cat > /usr/local/bin/gcs-identity-map.py <<'PYEOF'
+#!/usr/bin/env python3
+"""Maps any authenticated Globus identity to the local 'cloudpipe' user."""
+import sys, json
+data = json.load(sys.stdin)
+identities = data["identities"]
+result = [{"id": i["id"], "output": "cloudpipe"} for i in identities]
+print(json.dumps({"DATA_TYPE": "identity_mapping_output#1.0.0", "result": result}))
+PYEOF
+chmod +x /usr/local/bin/gcs-identity-map.py
+
+%{ else ~}
+###############################################################################
+# 2. POSIX approach: create cloudpipe system user and identity mapping script.
+#    GridFTP runs as this user (via the POSIX gateway identity mapping) and
+#    writes directly to /data/globus-staging (EBS).
+###############################################################################
+groupadd --gid 997 cloudpipe 2>/dev/null || true
+useradd --system --uid 997 --gid 997 --no-create-home --shell /bin/false cloudpipe 2>/dev/null || true
+
+# Write identity mapping script here so it exists on replacement instances that
+# use gcs-auto-reregister instead of gcs-finalize-setup.
+cat > /usr/local/bin/gcs-identity-map.py <<'PYEOF'
+#!/usr/bin/env python3
+"""Maps any authenticated Globus identity to the local 'cloudpipe' user."""
+import sys, json
+data = json.load(sys.stdin)
+identities = data["identities"]
+result = [{"id": i["id"], "output": "cloudpipe"} for i in identities]
+print(json.dumps({"DATA_TYPE": "identity_mapping_output#1.0.0", "result": result}))
+PYEOF
+chmod +x /usr/local/bin/gcs-identity-map.py
+
+###############################################################################
+# 3. POSIX approach: format and mount the staging EBS volume.
+#    GridFTP writes land here; globus-s3-sync-template syncs to S3 after.
+#    On replacement instances the volume is already formatted — the label-based
+#    fstab entry remounts it without reformatting.
+###############################################################################
+STAGING_LABEL="globus-staging"
+STAGING_MOUNT="/data/globus-staging"
+
+mkdir -p "$STAGING_MOUNT"
+
+STAGING_DEV=""
+for dev in /dev/nvme1n1 /dev/nvme2n1 /dev/xvdf /dev/sdf; do
+  if [ -b "$dev" ] && ! blkid "$dev" > /dev/null 2>&1; then
+    STAGING_DEV="$dev"
+    break
+  fi
+done
+
+if [ -n "$STAGING_DEV" ]; then
+  echo "Formatting staging volume $STAGING_DEV with label $STAGING_LABEL"
+  mkfs.ext4 -L "$STAGING_LABEL" "$STAGING_DEV"
+else
+  echo "No unformatted staging device found — volume may already be formatted (replacement instance)"
+fi
+
+if ! grep -q "LABEL=$STAGING_LABEL" /etc/fstab; then
+  echo "LABEL=$STAGING_LABEL $STAGING_MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+
+mount "$STAGING_MOUNT" 2>/dev/null || mount -a
+chown 997:997 "$STAGING_MOUNT"
+chmod 755 "$STAGING_MOUNT"
+echo "Staging volume mounted at $STAGING_MOUNT"
+
+%{ endif ~}
+###############################################################################
+# Write the one-time interactive finalization script.
+# Gateway type is baked in at Terraform render time.
+###############################################################################
+cat > /usr/local/bin/gcs-finalize-setup <<SCRIPT
+#!/usr/bin/env bash
+# Run this once after first boot to complete Globus Connect Server setup.
+# Opens two browser auth flows, creates the storage gateway, and stores the
+# collection UUID in SSM.
+set -euo pipefail
+
+REGION="${region}"
+NAME="${name}"
+ORG="${globus_org_name}"
+EMAIL="${globus_contact_email}"
+COLLECTION_NAME="${globus_collection_name}"
+GCS_CLIENT_ID="${globus_client_id}"
+SSM_COLLECTION_PARAM="/${name}/globus/collection-id"
+%{ if !globus_use_s3_gateway ~}
+STAGING_MOUNT="/data/globus-staging"
+%{ endif ~}
+
+echo "=== Step 1: Endpoint setup (requires browser login) ==="
+# --client-id: registers the endpoint under a service account, not a personal identity.
+# --owner:     transfers ownership to UW-Madison Globus admins for subscription management.
+# --public:    makes the endpoint visible in the Globus web UI search.
+globus-connect-server endpoint setup "\$NAME" \
+  --organization "\$ORG" \
+  --contact-email "\$EMAIL" \
+  --owner "globusadmins@<YOUR_INSTITUTION_DOMAIN>" \
+  --client-id "\$GCS_CLIENT_ID" \
+  --public \
+  --agree-to-letsencrypt-tos
+ENDPOINT_ID=\$(globus-connect-server endpoint show --format json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+echo "Endpoint ID: \$ENDPOINT_ID"
+
+aws ssm put-parameter \
+  --region "\$REGION" \
+  --name "/\$NAME/globus/endpoint-id" \
+  --type String \
+  --value "\$ENDPOINT_ID" \
+  --overwrite
+echo "Endpoint ID saved to SSM at /\$NAME/globus/endpoint-id"
+echo ""
+echo "=== ACTION REQUIRED: Request UW-Madison subscription association ==="
+echo "Email globusadmins@<YOUR_INSTITUTION_DOMAIN> with the following information:"
+echo "  Subject: Add endpoint to Globus subscription <YOUR_GLOBUS_SUBSCRIPTION_UUID>"
+echo "  Body:    Please associate endpoint \$ENDPOINT_ID with the UW-Madison High Assurance subscription."
+echo "You can continue setup while waiting for confirmation."
+echo ""
+
+echo "=== Step 1b: Save deployment key to SSM ==="
+mkdir -p /etc/globus-connect-server
+cp deployment-key.json /etc/globus-connect-server/deployment-key.json
+
+DEPLOYMENT_KEY=\$(cat /etc/globus-connect-server/deployment-key.json)
+aws ssm put-parameter \
+  --region "\$REGION" \
+  --name "/\$NAME/globus/deployment-key" \
+  --type SecureString \
+  --value "\$DEPLOYMENT_KEY" \
+  --overwrite
+echo "Deployment key saved to SSM at /\$NAME/globus/deployment-key"
+
+echo "=== Step 2: Node setup and service start ==="
+globus-connect-server node setup \
+  -d /etc/globus-connect-server/deployment-key.json \
+  --ip-address "\$(curl -s https://checkip.amazonaws.com)"
+systemctl start globus-gridftp-server
+systemctl enable globus-gridftp-server
+
+echo "=== Step 3: Login to endpoint (requires browser login) ==="
+globus-connect-server login "\$ENDPOINT_ID"
+
+%{ if globus_use_s3_gateway ~}
+echo "=== Step 4: Create native S3 storage gateway ==="
+# Uses EC2 IAM role via admin-managed credentials — no static credentials required.
+# --high-assurance: required because the ABCD source collection is HA.
+# --no-s3-user-credential-required: server-side IAM role used; users supply no creds.
+GATEWAY_ID=\$(globus-connect-server storage-gateway create s3 "\$COLLECTION_NAME" \
+  --bucket "${globus_s3_bucket}" \
+  --s3-endpoint "https://s3.${region}.amazonaws.com" \
+  --domain <YOUR_INSTITUTION_DOMAIN> \
+  --high-assurance \
+  --authentication-timeout-mins \$((60 * 24 * 7)) \
+  --s3-user-credential \
+  --admin-managed-credentials \
+  --no-allow-multiple-keys \
+  --format json | python3 -c "import sys,json; d=json.load(sys.stdin); r=d[0] if isinstance(d,list) else d; print(r.get('id') or r.get('data',[{}])[0].get('id'))")
+echo "Storage gateway ID: \$GATEWAY_ID"
+
+echo "=== Step 5: Create mapped collection (rooted at /<bucket> — first path component is always bucket name) ==="
+COLLECTION_ID=\$(globus-connect-server collection create \
+  "\$GATEWAY_ID" "/${globus_s3_bucket}" "\$COLLECTION_NAME" \
+  --allow-guest-collections \
+  --enable-https \
+  --format json | python3 -c "import sys,json; d=json.load(sys.stdin); r=d[0] if isinstance(d,list) else d; print(r.get('id') or r.get('data',[{}])[0].get('id'))")
+echo "Collection ID: \$COLLECTION_ID"
+%{ else ~}
+echo "=== Step 4: Create POSIX storage gateway (EBS staging volume) ==="
+useradd --system --uid 997 --gid 997 --no-create-home --shell /bin/false cloudpipe 2>/dev/null || true
+
+cat > /usr/local/bin/gcs-identity-map.py <<'PYEOF'
+#!/usr/bin/env python3
+"""Maps any authenticated Globus identity to the local 'cloudpipe' user."""
+import sys, json
+data = json.load(sys.stdin)
+identities = data["identities"]
+result = [{"id": i["id"], "output": "cloudpipe"} for i in identities]
+print(json.dumps({"DATA_TYPE": "identity_mapping_output#1.0.0", "result": result}))
+PYEOF
+chmod +x /usr/local/bin/gcs-identity-map.py
+
+GATEWAY_ID=\$(globus-connect-server storage-gateway create posix "\$COLLECTION_NAME" \
+  --domain <YOUR_INSTITUTION_DOMAIN> \
+  --identity-mapping "external:/usr/local/bin/gcs-identity-map.py" \
+  --format json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+echo "Storage gateway ID: \$GATEWAY_ID"
+
+echo "=== Step 5: Create mapped collection (EBS staging volume) ==="
+COLLECTION_ID=\$(globus-connect-server collection create \
+  "\$GATEWAY_ID" "\$STAGING_MOUNT" "\$COLLECTION_NAME" \
+  --format json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+echo "Collection ID: \$COLLECTION_ID"
+%{ endif ~}
+
+echo "=== Store collection ID in SSM ==="
+aws ssm put-parameter \
+  --region "\$REGION" \
+  --name "\$SSM_COLLECTION_PARAM" \
+  --type String \
+  --value "\$COLLECTION_ID" \
+  --overwrite
+echo "Stored collection ID in SSM at \$SSM_COLLECTION_PARAM"
+
+echo ""
+echo "=== Setup complete ==="
+echo "Destination collection UUID: \$COLLECTION_ID"
+echo "Use this as globus-dest-collection-id when submitting workflows."
+SCRIPT
+
+chmod +x /usr/local/bin/gcs-finalize-setup
+
+###############################################################################
+# Write the auto-reregister script (runs on every boot via systemd).
+# S3 mode: ensures s3-mount is running before starting gridftp.
+# EBS POSIX mode: verifies the staging volume is mounted before starting gridftp.
+###############################################################################
+cat > /usr/local/bin/gcs-auto-reregister <<SCRIPT
+#!/usr/bin/env bash
+# Runs on every boot. If this is a replacement instance (no local GCS config
+# but SSM has a deployment key), re-registers the node non-interactively so
+# gridftp starts without any manual steps.
+set -euo pipefail
+exec >> /var/log/gcs-auto-reregister.log 2>&1
+
+NAME="${name}"
+REGION="${region}"
+GCS_KEY_PATH="/etc/globus-connect-server/deployment-key.json"
+SSM_KEY_PARAM="/\$NAME/globus/deployment-key"
+
+# If gridftp is already active, nothing to do.
+if systemctl is-active --quiet globus-gridftp-server 2>/dev/null; then
+  echo "\$(date -Iseconds) gridftp already running — skipping"
+  exit 0
+fi
+
+# If local GCS config exists (stop/start of same instance), just restart.
+if [ -f "\$GCS_KEY_PATH" ]; then
+  echo "\$(date -Iseconds) Local deployment key found — restarting gridftp"
+  globus-connect-server node setup \
+    -d "\$GCS_KEY_PATH" \
+    --ip-address "\$(curl -s https://checkip.amazonaws.com)"
+  systemctl start globus-gridftp-server
+  exit 0
+fi
+
+# Fresh replacement instance — pull deployment key from SSM.
+echo "\$(date -Iseconds) No local GCS config — checking SSM for deployment key..."
+DEPLOY_KEY=\$(aws ssm get-parameter \
+  --region "\$REGION" \
+  --name "\$SSM_KEY_PARAM" \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text 2>/dev/null || echo "")
+
+if [ -z "\$DEPLOY_KEY" ] || [ "\$DEPLOY_KEY" = "REPLACE_AFTER_GCS_SETUP" ]; then
+  echo "\$(date -Iseconds) No deployment key in SSM — first boot, run gcs-finalize-setup manually"
+  exit 0
+fi
+
+echo "\$(date -Iseconds) Deployment key retrieved from SSM — running automated node re-registration"
+mkdir -p /etc/globus-connect-server
+echo "\$DEPLOY_KEY" > "\$GCS_KEY_PATH"
+chmod 600 "\$GCS_KEY_PATH"
+
+globus-connect-server node setup \
+  -d "\$GCS_KEY_PATH" \
+  --ip-address "\$(curl -s https://checkip.amazonaws.com)"
+
+%{ if !globus_use_s3_gateway ~}
+if ! mountpoint -q /data/globus-staging; then
+  echo "\$(date -Iseconds) ERROR: /data/globus-staging is not mounted — gridftp will not start"
+  exit 1
+fi
+
+%{ endif ~}
+systemctl enable globus-gridftp-server
+systemctl start globus-gridftp-server
+echo "\$(date -Iseconds) Automated node re-registration complete — gridftp started"
+
+%{ if globus_use_s3_gateway ~}
+# Check S3 IAM credential health using service credentials (if populated in SSM).
+# Logs a warning if the credential is unprovisioned so operators know before a transfer fails.
+GCS_SVC_CLIENT_ID=\$(aws ssm get-parameter \
+  --region "\$REGION" --name "/\$NAME/globus/gcs-client-id" \
+  --with-decryption --query Parameter.Value --output text 2>/dev/null || echo "")
+GCS_SVC_CLIENT_SECRET=\$(aws ssm get-parameter \
+  --region "\$REGION" --name "/\$NAME/globus/gcs-client-secret" \
+  --with-decryption --query Parameter.Value --output text 2>/dev/null || echo "")
+GCS_SVC_ENDPOINT_ID=\$(aws ssm get-parameter \
+  --region "\$REGION" --name "/\$NAME/globus/endpoint-id" \
+  --query Parameter.Value --output text 2>/dev/null || echo "")
+
+if [ -n "\$GCS_SVC_CLIENT_ID" ] && [ "\$GCS_SVC_CLIENT_ID" != "REPLACE_AFTER_GCS_SETUP" ] && \
+   [ -n "\$GCS_SVC_CLIENT_SECRET" ] && [ "\$GCS_SVC_CLIENT_SECRET" != "REPLACE_AFTER_GCS_SETUP" ] && \
+   [ -n "\$GCS_SVC_ENDPOINT_ID" ] && [ "\$GCS_SVC_ENDPOINT_ID" != "REPLACE_AFTER_GCS_SETUP" ]; then
+  echo "\$(date -Iseconds) Checking S3 IAM credential status via service credentials..."
+  CRED_OUTPUT=\$(GCS_CLI_CLIENT_ID="\$GCS_SVC_CLIENT_ID" \
+    GCS_CLI_CLIENT_SECRET="\$GCS_SVC_CLIENT_SECRET" \
+    GCS_CLI_ENDPOINT_ID="\$GCS_SVC_ENDPOINT_ID" \
+    globus-connect-server user-credentials list 2>&1 || echo "user-credentials list failed")
+  echo "\$(date -Iseconds) \$CRED_OUTPUT"
+  if echo "\$CRED_OUTPUT" | grep -qi "unprovisioned"; then
+    echo "\$(date -Iseconds) WARNING: S3 IAM credential is unprovisioned — transfers will fail." \
+         "Run: globus-connect-server user-credentials s3-create <gateway-id> --globus-identity <identity>"
+  fi
+else
+  echo "\$(date -Iseconds) GCS service credentials not yet in SSM — skipping credential health check"
+fi
+%{ endif ~}
+SCRIPT
+
+chmod +x /usr/local/bin/gcs-auto-reregister
+
+cat > /etc/systemd/system/gcs-auto-reregister.service <<EOF
+[Unit]
+Description=Globus Connect Server — automatic node re-registration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gcs-auto-reregister
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now gcs-auto-reregister
+
+###############################################################################
+# Print instructions to console (visible in EC2 console output)
+###############################################################################
+echo ""
+echo "============================================================"
+%{ if globus_use_s3_gateway ~}
+echo " Globus Connect Server installed (native S3 gateway mode)."
+echo " Writes go directly to '${globus_s3_bucket}' via S3 multipart upload."
+echo " Admin-managed credentials use EC2 IAM role — no Mountpoint, no staging."
+echo " Requires Globus subscription with High Assurance support."
+%{ else ~}
+echo " Globus Connect Server installed (POSIX staging mode)."
+echo " GridFTP writes to EBS staging volume at: /data/globus-staging"
+echo " Run globus-s3-sync after transfer to push files to S3."
+%{ endif ~}
+echo " First-time setup: SSH/SSM in and run:"
+echo "   sudo /usr/local/bin/gcs-finalize-setup"
+echo " Future replacements: gcs-auto-reregister runs automatically on boot."
+echo "============================================================"

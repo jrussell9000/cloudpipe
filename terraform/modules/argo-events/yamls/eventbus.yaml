@@ -1,0 +1,31 @@
+apiVersion: argoproj.io/v1alpha1
+kind: EventBus
+metadata:
+  name: default
+  namespace: argo-events
+spec:
+  # Not yet officially supported by Argo Events
+  # see: https://github.com/argoproj/argo-events/issues/3142
+  # jetstream:
+  #   version: 2.11.6
+  nats:
+    native:
+      # Optional, defaults to 3. If it is < 3, set it to 3, that is the minimal requirement.
+      replicas: 3
+      # Optional, authen strategy, "none" or "token", defaults to "none"
+      auth: token
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: eks.amazonaws.com/nodegroup
+                operator: In
+                values: ["argo"]
+      tolerations:
+      - key: "CriticalAddonsOnly"
+        value: "true"
+        effect: "NoSchedule"
+      - key: "argoproj.io/backend"
+        value: "true"
+        effect: "NoSchedule"

@@ -1,0 +1,29 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: al2023-gpu-nodeclass
+spec:
+  amiFamily: AL2023
+  amiSelectorTerms:
+  #- alias: al2023@latest
+  - id: ami-0c73e8c9dda43bf46
+
+  # Optional, use instance-store volumes for node ephemeral-storage
+  instanceStorePolicy: RAID0
+
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 3
+    httpTokens: required
+  detailedMonitoring: true
+  role: ${ karpenter_node_iam_role_name }
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+
+  kubelet:
+    maxPods: 110

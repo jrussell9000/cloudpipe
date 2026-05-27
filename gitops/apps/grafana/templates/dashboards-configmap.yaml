@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudpipe-dashboards
+  namespace: grafana
+  labels:
+    grafana_dashboard: "1"
+data:
+  pipeline-throughput.json: |
+{{ .Files.Get "dashboards/pipeline-throughput.json" | indent 4 }}
+  functional-qc.json: |
+{{ .Files.Get "dashboards/functional-qc.json" | indent 4 }}
+  anatomical-qc.json: |
+{{ .Files.Get "dashboards/anatomical-qc.json" | indent 4 }}
+  cost-overview.json: |
+{{ .Files.Get "dashboards/cost-overview.json" | indent 4 }}

@@ -1,0 +1,164 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argo-workflows-server-sso-rbac
+rules:
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argo-server-node-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-server-node-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-server-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflows-server
+    namespace: argo-workflows
+  - kind: ServiceAccount
+    name: argo-admin
+    namespace: argo-workflows
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-workflows-server-sso-rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-workflows-server-sso-rbac
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflows-server
+    namespace: argo-workflows
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-server-cluster-template
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-workflows-server-cluster-template
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflows-server
+    namespace: argo-workflows
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-server-admin
+  namespace: argo-workflows
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-workflows-admin
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflows-server
+    namespace: argo-workflows
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-admin-workflows
+  namespace: argo-workflows
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-workflows-admin
+subjects:
+  - kind: ServiceAccount
+    name: argo-admin
+    namespace: argo-workflows
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argo-admin-events
+  namespace: argo-workflows
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["sensors", "eventsources", "eventbus"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-admin-events
+  namespace: argo-workflows
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argo-admin-events
+subjects:
+  - kind: ServiceAccount
+    name: argo-admin
+    namespace: argo-workflows
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argo-admin-pod-ops
+  namespace: argo-workflows
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-admin-pod-ops
+  namespace: argo-workflows
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argo-admin-pod-ops
+subjects:
+  - kind: ServiceAccount
+    name: argo-admin
+    namespace: argo-workflows
+---
+# Grant argo-workflows-server and argo-admin read access to Argo Events resources
+# in the argo-events namespace, where sensors/eventsources/eventbus actually live.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argo-server-events-reader
+  namespace: argo-events
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["sensors", "eventsources", "eventbus"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-server-events-reader
+  namespace: argo-events
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argo-server-events-reader
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflows-server
+    namespace: argo-workflows
+  - kind: ServiceAccount
+    name: argo-admin
+    namespace: argo-workflows

@@ -1,0 +1,131 @@
+global:
+  imageRegistry: public.ecr.aws
+  clusterId: ${clusterId}
+  federatedStorage:
+    existingSecret: kubecost-s3-configs
+    fileName: federated-store.yaml  # set this value to change what the file name for the yaml config is
+
+  serviceAccount:
+    create: true
+    name: kubecost-serviceaccount
+
+localStore:
+  persistentVolume:
+    size: 32Gi
+    enabled: true  # Note that setting this to false means cluster storage will be wiped out on pod restart.
+    storageClass: ebs-sc
+    existingClaim: ""  # kubecost-cost-analyzer # use this if upgrading from kubecost 2.x
+    labels: {}
+    annotations:
+      ## The "helm.sh/resource-policy: keep" annotation is used to prevent the persistent volume from being deleted when uninstalling or moving to a different deployment method.
+      # This can be used to allow the agent history to be uploaded to cloud storage when upgrading to Enterprise.
+      helm.sh/resource-policy: keep
+    tolerations:
+      - key: "CriticalAddonsOnly"
+        value: "true"
+        effect: "NoSchedule"
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+
+finopsagent:
+  image:
+    repository: kubecost/agent
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+  serviceAccount:
+    create: false
+    name: kubecost-serviceaccount
+
+
+frontend:
+  image:
+    repository: kubecost/frontend
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+
+aggregator:
+  image:
+    repository: kubecost/cost-model
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+
+forecasting:
+  image:
+    repository: kubecost/modeling
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+
+networkCosts:
+  image:
+    repository: kubecost/network-costs
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+  serviceAccount:
+    create: false
+    name: kubecost-serviceaccount
+
+clusterController:
+  image:
+    repository: kubecost/cluster-controller
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+  serviceAccount:
+    create: false
+    name: kubecost-serviceaccount
+  storageConfigSecret: kubecost-s3-configs
+
+kubecostProductConfigs:
+  spotLabel: "karpenter.sh/capacity-type"
+  spotLabelValue: "spot"
+  labelMappingConfigs:
+    node_pool_label: "karpenter.sh/nodepool"
+    # Promote cloudpipe pod labels to named Kubecost UI dimensions
+    department_label: "cloudpipe.io/phase"
+    product_label: "workflows.argoproj.io/workflow-template"
+    environment_label: "app"
+    owner_label: "subjectid"
+
+cloudCost:
+  enabled: true
+  startDate: "2026-04-01"
+  image:
+    registry: "icr.io"  # Default is "icr.io"
+    repository: kubecost/cost-model
+    tag: ""  # Default is to match the Chart.AppVersion
+  cloudIntegrationSecret: cloud-integration
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      value: "true"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend

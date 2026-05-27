@@ -1,0 +1,10 @@
+apiVersion: v2
+name: aws-efs-csi-driver
+description: A Helm chart for AWS EFS CSI Driver
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+dependencies:
+  - name: aws-efs-csi-driver
+    version: 3.4.1
+    repository: https://kubernetes-sigs.github.io/aws-efs-csi-driver/

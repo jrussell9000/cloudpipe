@@ -1,0 +1,24 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: bottlerocket-fast-nodeclass
+spec:
+  amiFamily: Bottlerocket
+  amiSelectorTerms:
+    - alias: bottlerocket@1.32.0
+  blockDeviceMappings:
+  - deviceName: /dev/xvdb
+    ebs:
+      volumeSize: 50Gi
+      volumeType: gp3
+      snapshotID: snap-04c6797c8066b028d
+      
+  role: ${ karpenter_node_iam_role_name }
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  tags:
+    karpenter.sh/discovery: ${ eks_cluster_name }

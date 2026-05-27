@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudpipe-semaphores
+  namespace: argo-workflows
+data:
+  # Maximum concurrent Globus transfers through the single GCS EC2 instance.
+  # The GCS instance (c5n.xlarge, 4 vCPU / 10.5 GB RAM) runs one GridFTP process
+  # per active transfer. 8 is a safe ceiling for large BOLD file transfers.
+  globus-transfer: "8"

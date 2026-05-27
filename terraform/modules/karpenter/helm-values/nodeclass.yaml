@@ -1,0 +1,39 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: nodeclass
+spec:
+  amiFamily: Bottlerocket
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+
+  # We shouldn't need these, but K can't find instances unless they're specified
+  instanceStorePolicy: RAID0
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 8Gi
+        volumeType: gp3
+        encrypted: true
+    - deviceName: /dev/xvdb  # Bottlerocket data volume (container image cache)
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        encrypted: true
+
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 3
+    httpTokens: required
+  detailedMonitoring: true
+  role: ${ karpenter_node_iam_role_name }
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+
+  kubelet:
+    maxPods: 110

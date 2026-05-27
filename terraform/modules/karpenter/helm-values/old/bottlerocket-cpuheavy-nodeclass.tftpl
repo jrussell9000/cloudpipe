@@ -1,0 +1,30 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: bottlerocket-cpuheavy-nodeclass
+spec:
+  amiSelectorTerms:
+  - alias: bottlerocket@latest # Bottlerocket
+
+  blockDeviceMappings:
+  - deviceName: /dev/xvda
+    ebs:
+      volumeType: gp3
+      volumeSize: 4Gi
+      deleteOnTermination: true
+  # Bottlerocket data volume
+  - deviceName: /dev/xvdb
+    ebs:
+      volumeType: gp3
+      volumeSize: 20Gi # replace with your required disk size
+      deleteOnTermination: true
+
+  role: ${ karpenter_node_iam_role_name }
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: ${ eks_cluster_name }
+  tags:
+    karpenter.sh/discovery: ${ eks_cluster_name }

@@ -58,6 +58,14 @@ def run(cmd: list) -> None:
     subprocess.run([str(c) for c in cmd], check=True)
 
 
+def _dice(a: np.ndarray, b: np.ndarray) -> float:
+    """Dice coefficient between two binary arrays thresholded at > 0."""
+    ma = (a > 0).ravel()
+    mb = (b > 0).ravel()
+    denom = float(ma.sum() + mb.sum())
+    return float(2 * (ma & mb).sum() / denom) if denom > 0 else 0.0
+
+
 def get_first_steady_state_frame(nss_frames: int | None,
                                   json_sidecar: Path | None) -> int:
     if nss_frames is not None:
@@ -265,7 +273,8 @@ def parse_args() -> argparse.Namespace:
         description="BOLD → T1w registration via SynthMorph (GPU-accelerated)"
     )
     p.add_argument("--bold",         required=True,  type=Path)
-    p.add_argument("--nss-frames",   required=False, type=int,  default=None,
+    p.add_argument("--nss-frames",   required=False, type=lambda x: int(x) if x != '' else None,
+                   default=None,
                    help="Number of NSS frames to skip; takes precedence over --json")
     p.add_argument("--json",         required=False, type=Path, default=None,
                    help="BIDS sidecar JSON for NSS volume detection")
@@ -274,6 +283,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--subject",      required=True)
     p.add_argument("--out-dir",      required=True,  type=Path)
     p.add_argument("--prefix",       required=True)
+    p.add_argument("--subj",         default="",
+                   help="Subject ID written into RegistrationQC metrics JSON")
+    p.add_argument("--ses",          default="",
+                   help="Session label written into RegistrationQC metrics JSON")
+    p.add_argument("--task",         default="",
+                   help="Task label written into RegistrationQC metrics JSON")
+    p.add_argument("--run",          default="",
+                   help="Run label written into RegistrationQC metrics JSON")
+    p.add_argument("--pipeline",     default="cloudpipe_minproc",
+                   help="Pipeline name written into RegistrationQC metrics JSON")
     return p.parse_args()
 
 
@@ -296,6 +315,38 @@ def main() -> None:
     register(ref, args.subjects_dir, args.subject, lta, warped)
     convert_to_itk(lta, itk_mat)
     mask_to_bold(args.subjects_dir, args.subject, ref, lta, bold_mask)
+
+    # Dice between warped BOLD brain and T1w brainmask (both in T1w space).
+    from datetime import datetime, timezone
+    warped_data   = nib.load(str(warped)).get_fdata(dtype=np.float32)
+    t1w_mask_path = args.subjects_dir / args.subject / "mri" / "brainmask.mgz"
+    t1w_mask_data = nib.load(str(t1w_mask_path)).get_fdata(dtype=np.float32)
+    dice_val = _dice(warped_data, t1w_mask_data)
+    log.info(f"  Dice (BOLD→T1w mask): {dice_val:.4f}")
+
+    if args.subj and args.ses:
+        qc = {
+            'schema_version':    '1.0',
+            'pipeline':          args.pipeline,
+            'subject':           args.subj,
+            'session':           args.ses,
+            'registration_type': 'bold_to_t1w',
+            'dice':              dice_val,
+            'ncc':               0.0,
+            'jac_det_min':       0.0,
+            'jac_det_max':       0.0,
+            'jac_det_mean':      0.0,
+            'jac_det_std':       0.0,
+            'jac_det_frac_negative': 0.0,
+            'task':              args.task,
+            'run':               args.run,
+            'completed_at':      datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }
+        metrics_path = Path(
+            f'/tmp/{args.subj}_{args.ses}_{args.task}_{args.run}_bold_to_t1w_reg_qc.json'
+        )
+        metrics_path.write_text(json.dumps(qc))
+        log.info(f"  Registration QC metrics: {metrics_path}")
 
     log.info("=== bold_to_t1w complete ===")
     log.info(f"  Reference    : {ref}")

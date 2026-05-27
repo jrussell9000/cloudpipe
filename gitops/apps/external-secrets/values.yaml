@@ -1,0 +1,21 @@
+external-secrets:
+  installCRDs: true
+
+  # Pod Identity — SA created by Helm; Pod Identity Association in Terraform
+  serviceAccount:
+    create: true
+    name: external-secrets
+
+  certController:
+    serviceAccount:
+      create: true
+      name: external-secrets-cert-controller
+
+  global:
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+    tolerations:
+    - key: "CriticalAddonsOnly"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"

@@ -21,6 +21,8 @@ import logging
 import sys
 from pathlib import Path
 
+import json
+
 import nibabel as nib
 import numpy as np
 import SimpleITK as sitk
@@ -47,6 +49,12 @@ def parse_args():
     p.add_argument('--brainmask', default=None,
                    help='Brain mask (NIfTI or MGZ, e.g. FastSurfer brainmask.mgz). '
                         'Applied to T1w before registration; improves alignment by removing skull signal.')
+    p.add_argument('--subj', default='',
+                   help='Subject ID written into RegistrationQC metrics JSON')
+    p.add_argument('--ses', default='',
+                   help='Session label written into RegistrationQC metrics JSON')
+    p.add_argument('--pipeline', default='cloudpipe_minproc',
+                   help='Pipeline name written into RegistrationQC metrics JSON')
 
     # Registration tuning
     p.add_argument('--affine-scales', nargs='+', type=int, default=[8, 4, 2, 1])
@@ -57,6 +65,59 @@ def parse_args():
                    help='optimizer_lr passed to AffineRegistration and SyNRegistration')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     return p.parse_args()
+
+
+def _ncc(a: np.ndarray, b: np.ndarray, mask: np.ndarray | None = None) -> float:
+    """Normalized cross-correlation between two arrays, optionally within a mask."""
+    if mask is not None:
+        a, b = a[mask], b[mask]
+    a = a.ravel().astype(np.float64)
+    b = b.ravel().astype(np.float64)
+    a -= a.mean()
+    b -= b.mean()
+    denom = np.sqrt((a ** 2).sum() * (b ** 2).sum())
+    return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+
+def _dice(a: np.ndarray, b: np.ndarray) -> float:
+    """Dice coefficient between binary brain masks derived by thresholding at > 0."""
+    ma = (a > 0).ravel()
+    mb = (b > 0).ravel()
+    denom = float(ma.sum() + mb.sum())
+    return float(2 * (ma & mb).sum() / denom) if denom > 0 else 0.0
+
+
+def _jacobian_stats(warp_path: str) -> dict:
+    """Jacobian determinant statistics of a displacement field (ANTs NIfTI format)."""
+    img = nib.load(warp_path)
+    d = img.get_fdata(dtype=np.float32)
+    if d.ndim == 5:
+        d = d[:, :, :, 0, :]           # (X, Y, Z, 1, 3) → (X, Y, Z, 3)
+    vox = np.abs(img.header.get_zooms()[:3]).tolist()
+
+    ux, uy, uz = d[..., 0], d[..., 1], d[..., 2]
+
+    j11 = 1 + np.gradient(ux, vox[0], axis=0)
+    j12 =     np.gradient(ux, vox[1], axis=1)
+    j13 =     np.gradient(ux, vox[2], axis=2)
+    j21 =     np.gradient(uy, vox[0], axis=0)
+    j22 = 1 + np.gradient(uy, vox[1], axis=1)
+    j23 =     np.gradient(uy, vox[2], axis=2)
+    j31 =     np.gradient(uz, vox[0], axis=0)
+    j32 =     np.gradient(uz, vox[1], axis=1)
+    j33 = 1 + np.gradient(uz, vox[2], axis=2)
+
+    det = (j11 * (j22 * j33 - j32 * j23)
+           - j12 * (j21 * j33 - j31 * j23)
+           + j13 * (j21 * j32 - j31 * j22))
+
+    return {
+        'jac_det_min':           float(det.min()),
+        'jac_det_max':           float(det.max()),
+        'jac_det_mean':          float(det.mean()),
+        'jac_det_std':           float(det.std()),
+        'jac_det_frac_negative': float((det < 0).mean()),
+    }
 
 
 def to_nifti(src: str, dest: str) -> None:
@@ -153,8 +214,49 @@ def main():
     syn_reg.save_as_ants_transforms([warp_path])
     syn_reg.save_moved_images(moving, [warped_path])
 
+    # ------------------------------------------------------------------
+    # QC metrics
+    # ------------------------------------------------------------------
+    from datetime import datetime, timezone
+
+    log.info('Computing QC metrics')
+    template_sitk = sitk.ReadImage(args.template)
+    warped_sitk   = sitk.ReadImage(warped_path)
+    # FireANTs save_moved_images can output at the moving image voxel count
+    # rather than the fixed (template) grid. Resample to template space so
+    # NCC/Dice comparisons use matching arrays.
+    if warped_sitk.GetSize() != template_sitk.GetSize():
+        log.info(f'QC resampling: warped {warped_sitk.GetSize()} → template {template_sitk.GetSize()}')
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetReferenceImage(template_sitk)
+        resampler.SetInterpolator(sitk.sitkLinear)
+        warped_sitk = resampler.Execute(warped_sitk)
+    # sitk.GetArrayFromImage uses (z, y, x) order; consistent for both arrays
+    template_data = sitk.GetArrayFromImage(template_sitk).astype(np.float32)
+    warped_data   = sitk.GetArrayFromImage(warped_sitk).astype(np.float32)
+    brain_mask    = template_data > 0
+
+    qc = {
+        'schema_version':    '1.0',
+        'pipeline':          args.pipeline,
+        'subject':           args.subj,
+        'session':           args.ses,
+        'registration_type': 't1w_to_mni',
+        'ncc':               _ncc(template_data, warped_data, mask=brain_mask),
+        'dice':              _dice(template_data, warped_data),
+        **_jacobian_stats(warp_path),
+        'task':              '',
+        'run':               '',
+        'completed_at':      datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    }
+    qc_path = str(pfx_staging) + '_qc.json'
+    with open(qc_path, 'w') as fh:
+        json.dump(qc, fh)
+    log.info(f'QC: ncc={qc["ncc"]:.4f}  dice={qc["dice"]:.4f}  '
+             f'jac_frac_neg={qc["jac_det_frac_negative"]:.6f}')
+
     # Verify all required outputs exist before promoting to the real output dir.
-    for p in [affine_path, warp_path]:
+    for p in [affine_path, warp_path, qc_path]:
         if not Path(p).exists():
             log.error(f'Expected output not found: {p}')
             sys.exit(1)
@@ -166,6 +268,12 @@ def main():
         shutil.rmtree(out_dir)
     staging.rename(out_dir)
     pfx = out_dir / args.prefix
+
+    # Write flat metrics JSON to /tmp for Argo to upload as a separate artifact.
+    if args.subj and args.ses:
+        metrics_path = Path(f'/tmp/{args.subj}_{args.ses}_t1w_to_mni_reg_qc.json')
+        metrics_path.write_text(json.dumps(qc))
+        log.info(f'Registration QC metrics: {metrics_path}')
 
     log.info(f'Warp:       {out_dir / (args.prefix + "_warp.nii.gz")}')
     log.info(f'Warped T1w: {out_dir / (args.prefix + "_warped.nii.gz")}  (QC only)')

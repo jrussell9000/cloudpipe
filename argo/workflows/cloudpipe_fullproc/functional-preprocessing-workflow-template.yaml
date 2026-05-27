@@ -8,7 +8,7 @@ spec:
   retryStrategy:
     limit: "3"
     retryPolicy: OnFailure
-    expression: 'lastRetry.message matches "pod deleted" || lastRetry.exitCode in [137, 143]'
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [137, 143]'
     backoff:
       duration: "1m"
       factor: "2"
@@ -119,7 +119,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.nii.gz'
 
         - name: bids-sidecar
@@ -127,23 +127,23 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.json'
 
         - name: mni-template
-          path: /data/MNI152NLin2009cAsym_T1w_brain.nii.gz
+          path: /data/MNI152NLin2009cAsym_res-01_desc-brain_T1w.nii.gz
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
-            key: config/MNI152NLin2009cAsym_T1w_brain.nii.gz
+            region: <YOUR_AWS_REGION>
+            key: config/MNI152NLin2009cAsym_res-01_desc-brain_T1w.nii.gz
 
         - name: motion-params
           path: /data/motion.tsv
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_motion.tsv'
 
         # bold-to-t1w outputs (brainmask + ITK affine) — uploaded to S3 by the
@@ -154,7 +154,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/bold_to_t1w_{{inputs.parameters.task}}_{{inputs.parameters.run}}.tar.gz'
 
         # t1w-to-mni transforms — always downloaded from S3 so this template
@@ -164,7 +164,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni.tar.gz'
 
         # FastSurfer outputs (for aseg.mgz → WM/CSF masks in aCompCor).
@@ -173,7 +173,7 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
 
     outputs:
@@ -183,14 +183,24 @@ spec:
           s3:
             endpoint: s3-accelerate.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
-            region: us-east-2
+            region: <YOUR_AWS_REGION>
             key: 'derivatives/func/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_space-MNI152NLin2009cAsym_bold.tar.gz'
+
+        - name: func-qc
+          path: '/tmp/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_qc.json'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3-accelerate.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'metrics/func-preproc/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_qc.json'
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-ce5e35a7ee6b6f45403cb7ec82a0cb619215c24d"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -242,3 +252,5 @@ spec:
         - /data/motion.tsv
         - --nss-frames
         - '{{inputs.parameters.nss-frames}}'
+        - --pipeline
+        - cloudpipe_fullproc

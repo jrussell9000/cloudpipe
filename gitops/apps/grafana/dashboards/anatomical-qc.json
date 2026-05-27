@@ -1,0 +1,141 @@
+{
+  "uid": "cloudpipe-anatqc",
+  "title": "CloudPipe — Anatomical QC",
+  "description": "FastSurfer volumetric and cortical thickness QC metrics per subject and session.",
+  "tags": ["cloudpipe", "qc", "anatomical"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Mean eTIV (mm³)",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(etiv_mm3)) AS mean_etiv FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Mean Brain Volume (mm³)",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(total_brain_vol_mm3)) AS mean_brain FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Mean LH Thickness (mm)",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(lh_mean_thickness_mm), 3) AS mean_lh_thick FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "lengthmm",
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 2.0 }, { "color": "green", "value": 2.2 }] }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Mean RH Thickness (mm)",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(rh_mean_thickness_mm), 3) AS mean_rh_thick FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "lengthmm",
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 2.0 }, { "color": "green", "value": 2.2 }] }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "histogram",
+      "title": "Brain Volume Distribution",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT total_brain_vol_mm3 FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND total_brain_vol_mm3 > 0"
+        }
+      ],
+      "options": { "bucketSize": "auto", "fillOpacity": 80 }
+    },
+    {
+      "id": 6,
+      "type": "histogram",
+      "title": "Mean Cortical Thickness Distribution",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT (lh_mean_thickness_mm + rh_mean_thickness_mm) / 2.0 AS mean_thickness FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND lh_mean_thickness_mm > 0"
+        }
+      ],
+      "options": { "bucketSize": "auto", "fillOpacity": 80 }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "All Sessions — Volumetric Summary",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT subject, session, ROUND(etiv_mm3) AS etiv, ROUND(total_brain_vol_mm3) AS brain_vol, ROUND(lh_cortex_vol_mm3) AS lh_cortex, ROUND(rh_cortex_vol_mm3) AS rh_cortex, ROUND(lh_mean_thickness_mm, 3) AS lh_thick, ROUND(rh_mean_thickness_mm, 3) AS rh_thick, completed_at FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() ORDER BY completed_at DESC LIMIT 100"
+        }
+      ]
+    }
+  ]
+}

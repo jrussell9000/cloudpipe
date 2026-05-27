@@ -1,0 +1,62 @@
+# Triggering an Argo Workflows workflow from an Argo Events sensor requires that the Argo Events 
+# service account (operate-workflow-sa, below) have permissions in the namespace for Argo Workflows 
+# and the namespace for Argo Events. To do this, we first create a ClusterRole with full access to
+# argoproj.io resources (e.g., workflows, workflowtemplates). Next, we create TWO rolebindings linking 
+# the service account to the clusterrole - one in the argo-events namespace and one in the argo-workflows namespace.
+
+# see e.g. here: https://faun.pub/kubernetes-rbac-use-one-role-in-multiple-namespaces-d1d08bb08286
+# ---
+# # 1. Create a service account we'll grant permissions to:
+# apiVersion: v1
+# kind: ServiceAccount
+# metadata:
+#   name: argo-events-handler-sa
+#   namespace: argo-events
+---
+# 2. Create a cluster role with full permissions for resources in argoproj.io (e.g., workflow templates)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argo-events-handler-cluster-role
+rules:
+  - apiGroups:
+      - "argoproj.io"
+    verbs:
+      - "*"
+    resources:
+      - workflows
+      - workflowtemplates
+      - cronworkflows
+      - clusterworkflowtemplates
+---
+# 3. Create a role binding in the argo-events namespace to bind the service account (in argo-events) to the cluster role 
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-events-handler-role-binding-1
+  namespace: argo-events
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-events-handler-cluster-role
+subjects:
+  - kind: ServiceAccount
+    name: argo-events-handler-sa
+    namespace: argo-events
+---
+# 4. Create a role binding in the argo-workflows namespace to bind the service account (in argo-events) to the cluster role 
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-events-handler-role-binding-2
+  namespace: argo-workflows
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-events-handler-cluster-role
+subjects:
+  - kind: ServiceAccount
+    name: argo-events-handler-sa
+    namespace: argo-events
+# 5. Optionally, test to verify access
+# kubectl auth can-i get workflowtemplates -n argo-workflows --as system:serviceaccount:argo-events:operate-workflow-sa 

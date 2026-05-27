@@ -1,0 +1,105 @@
+{
+  "uid": "cloudpipe-throughput",
+  "title": "CloudPipe — Pipeline Throughput",
+  "description": "Workflow submission counts, success rates, and durations from the workflow_runs metrics table.",
+  "tags": ["cloudpipe", "pipeline"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": { "from": "now-7d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Runs (selected range)",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT COUNT(*) AS total_runs FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "blue", "value": null }] } }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Success Rate",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(100.0 * SUM(CASE WHEN status = 'Succeeded' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_pct FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 80 }, { "color": "green", "value": 95 }] }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Mean Duration (hours)",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT ROUND(AVG(total_duration_s) / 3600.0, 2) AS mean_hours FROM cloudpipe_metrics.workflow_runs WHERE status = 'Succeeded' AND from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo()"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "h" } }
+    },
+    {
+      "id": 4,
+      "type": "bargauge",
+      "title": "Runs by Status",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT status, COUNT(*) AS count FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() GROUP BY status ORDER BY count DESC"
+        }
+      ],
+      "options": { "orientation": "horizontal", "displayMode": "basic" }
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Recent Workflow Runs",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 10 },
+      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
+          "rawSQL": "SELECT subject, pipeline, status, started_at, ROUND(total_duration_s / 3600.0, 2) AS duration_h, message FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() ORDER BY started_at DESC LIMIT 50"
+        }
+      ],
+      "options": { "sortBy": [{ "displayName": "started_at", "desc": true }] }
+    }
+  ]
+}

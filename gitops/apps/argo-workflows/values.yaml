@@ -1,0 +1,101 @@
+argo-workflows:
+  crds:
+    install: true
+
+  createAggregateRoles: true
+
+  workflow:
+    # Pod Identity — SA created by Helm
+    serviceAccount:
+      create: true
+      name: argo-workflows-runner
+    rbac:
+      create: true
+      agentPermissions: true
+      artifactGC: true
+
+  controller:
+    deploymentAnnotations:
+      secret.reloader.stakater.com/reload: "argo-db"
+
+    parallelism: 1000
+    resourceRateLimit:
+      limit: 20
+      burst: 35
+
+    rbac:
+      create: true
+      writeConfigMaps: true
+      accessAllSecrets: false
+
+    # Terraform owns this ConfigMap (contains dynamic DB persistence config)
+    configMap:
+      create: false
+      name: "argo-workflows-controller-configmap"
+
+    metricsConfig:
+      enabled: true
+      path: /metrics
+      interval: 30s
+      port: 9090
+      secure: false
+      portName: metrics
+      servicePort: 8080
+      servicePortName: metrics
+
+    # Pod Identity — SA created by Helm
+    serviceAccount:
+      create: true
+      name: "argo-workflows-controller"
+
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: argo
+    tolerations:
+    - key: "argoproj.io/backend"
+      value: "true"
+      effect: "NoSchedule"
+
+  server:
+    deploymentAnnotations:
+      secret.reloader.stakater.com/reload: "argo-db"
+
+    # Pod Identity — SA created by Helm (server needs no AWS permissions)
+    serviceAccount:
+      create: true
+      name: argo-workflows-server
+
+    extraArgs:
+    - --secure=false
+    - --auth-mode=sso
+    - --auth-mode=client
+
+    sso:
+      issuer: https://argocd.<YOUR_DOMAIN>/api/dex
+      clientId:
+        name: argo-workflows-sso
+        key: clientID
+      clientSecret:
+        name: argo-workflows-sso
+        key: clientSecret
+      redirectUrl: https://argo.<YOUR_DOMAIN>/oauth2/callback
+      scopes:
+      - openid
+      - profile
+      - email
+      rbac:
+        enabled: true
+
+    clusterWorkflowTemplates:
+      enabled: true
+
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: argo
+    tolerations:
+    - key: "argoproj.io/backend"
+      value: "true"
+      effect: "NoSchedule"
+
+  useStaticCredentials: false
+  # artifactRepository is intentionally omitted here — the controller ConfigMap
+  # (managed by Terraform) owns the artifactRepository and artifact-repositories
+  # keys so the bucket name stays in sync with var.globus_s3_destination_bucket.

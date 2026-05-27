@@ -1,0 +1,56 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-nodepool
+spec:
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30m
+    budgets:
+    - nodes: "20%"
+  limits:
+    cpu: 128
+    memory: 512Gi
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-nodeclass
+      # Avoid possible race between the scheduler and the CSINode
+      # see https://karpenter.sh/docs/troubleshooting/#pods-were-scheduled-due-to-a-race-condition-in-kubernetes
+      startupTaints:
+      - key: efs.csi.aws.com/agent-not-ready
+        effect: NoExecute
+      requirements:
+      # see: https://karpenter.sh/docs/concepts/scheduling/#well-known-labels
+      # AMD64 only — g5g is Graviton (ARM) and will fail to run amd64 container images
+      - key: "kubernetes.io/arch"
+        operator: In
+        values: ["amd64"]
+      # Runs linux
+      - key: "kubernetes.io/os"
+        operator: In
+        values: ["linux"]
+      # Spot/On-demand instances
+      - key: "karpenter.sh/capacity-type"
+        operator: In
+        values: ["spot"]
+      # Nitro instances are required for using prefixes to expand ip addresses
+      - key: "karpenter.k8s.aws/instance-hypervisor"
+        operator: In
+        values: ["nitro"]
+      - key: "karpenter.k8s.aws/instance-gpu-manufacturer"
+        operator: In
+        values: ["nvidia"]
+      - key: "karpenter.k8s.aws/instance-size"
+        operator: In
+        values: ["xlarge", "2xlarge"]
+      # g6 excluded: nvidia-fabricmanager fails on single-GPU L4 instances (no NVLink).
+      # g4dn (T4) and g5 (A10G) use DKMS-archived open kernel modules that support both families.
+      - key: "karpenter.k8s.aws/instance-family"
+        operator: In
+        values: ["g4dn", "g5"]
+      - key: "topology.kubernetes.io/zone"
+        operator: In
+        values: ["<YOUR_AWS_REGION>a", "<YOUR_AWS_REGION>b", "<YOUR_AWS_REGION>c"]

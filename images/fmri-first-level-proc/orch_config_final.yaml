@@ -1,0 +1,246 @@
+# ============================================================================
+# ORCHESTRATOR CONFIG — fMRI First-Level Processing (ABCD Study)
+# ============================================================================
+#
+# This YAML file configures the per-participant orchestrator script
+# (orchestrate_first_level.py). It defines study-level settings that apply
+# to all participants, while participant-specific details (subj_id) are
+# passed at the command line.
+#
+# A separate fmri_first_level_proc config file (--proc_config) serves as
+# the analysis template. The orchestrator preserves all analysis-level
+# settings (hrf_model, contrasts, bandpass, etc.) from that template and
+# only overrides subject-specific fields (paths, output dirs, prefixes).
+#
+# ABCD-specific design:
+#   - Sessions are discovered dynamically from S3 (not specified per-subject)
+#   - fMRIPrep data comes from session-level tar.gz archives on S3
+#   - Events files come from mmps_mproc on S3 (not local BIDS)
+#   - FD thresholds are per-analysis (different tasks can use different thresholds)
+#   - Processing is session-centric: one session at a time through the full
+#     pipeline (download -> preprocess -> analyze -> compress -> upload -> cleanup)
+#     to minimize EC2 disk usage
+#
+# Usage:
+#   python orchestrate_first_level.py \
+#     --orchestrate_config this_file.yaml \
+#     --proc_config example_config.yaml \
+#     --subj_id NDARABC123
+#
+# All local paths should be absolute. The orchestrator will construct
+# BIDS-compliant filenames automatically from the entities defined here.
+# ============================================================================
+
+# ============================================================================
+# study — Paths and processing parameters
+# ============================================================================
+study:
+
+  # fMRIPrep derivatives root (local working directory for extracted archives)
+  fmriprep_dir: "/scratch/fmriprep_in/"
+
+  # Orchestrator output root (will create sub-*/ses-*/ dirs inside)
+  output_dir: "/scratch/first-level-proc-out/"
+
+  # fMRIPrep template space (matches the "space-" entity in filenames)
+  space: "MNI152NLin2009cAsym"
+
+  # Repetition time in seconds
+  TR: 0.8
+
+  # Force recomputation of cached outputs. When false (default), preprocessing
+  # steps that find an existing output file will skip recomputation. Set to
+  # true to recompute all outputs regardless of existing files (e.g., after
+  # upstream changes to fMRIPrep derivatives or motion files).
+  force_recompute: false
+
+  # Number of temporal derivative sets to compute for motion regressors.
+  # Total output columns = 6 * (1 + calc_n_motion_derivs)
+  #   0 -> 6 columns  (trans_x/y/z, rot_x/y/z only)
+  #   1 -> 12 columns (base + first derivatives)
+  #   2 -> 18 columns (base + first + second derivatives)
+  # Motion parameters are sourced from raw motion.tsv files (mmps_mproc on
+  # S3), not from fMRIPrep confounds. Rotations are converted from degrees
+  # to radians. Derivatives are always computed numerically via finite
+  # differences. fmri_first_level_proc truncates extra columns as needed.
+  calc_n_motion_derivs: 1
+
+# ============================================================================
+# tasks — Task definitions (BIDS task entities)
+# ============================================================================
+# Each entry defines a task-label. Runs are discovered dynamically from S3
+# (not specified here). The orchestrator discovers fMRIPrep outputs in the
+# extracted archive and events files from mmps_mproc on S3.
+tasks:
+
+  - task_label: "nback"
+
+    # Column in the events.tsv that contains condition names
+    condition_column: "trial_type"
+
+    # Conditions to explicitly drop (applied to events file):
+    #   null = drop nothing
+    #   list = remove these conditions
+    conditions_exclude: ["dummy"]
+
+    # Whether to concatenate runs before first-level analysis
+    # Typically true for task analyses (activation & connectivity)
+    concatenate_runs: true
+
+    # Whether to relabel generic "cue" trial types in n-back events files.
+    # 0-back cues become bare condition names (e.g. "posface"); 2-back cues
+    # become "instruction". See fix_nback_cue_labels() for details.
+    fix_nback_cues: true
+
+  - task_label: "rest"
+
+    # Resting-state runs are NOT concatenated -- each is processed separately
+    concatenate_runs: false
+
+
+# ============================================================================
+# smoothing — Optional spatial smoothing
+# ============================================================================
+# Applied to BOLD data AFTER preprocessing steps and BEFORE first-level.
+# If disabled, no smoothing is performed.
+smoothing:
+
+  enabled: false
+
+  # Smoothing method:
+  #   "3dmerge"      — Gaussian blur with fixed FWHM (faster, simpler)
+  #   "3dBlurToFWHM" — Iterative blur to target FWHM within mask (more precise)
+  method: "3dmerge"
+
+  # Full width at half maximum in mm
+  fwhm: 6.0
+
+
+# ============================================================================
+# qc — Quality control settings
+# ============================================================================
+# QC is consolidated into a single JSON per session:
+#   sub-{ID}_ses-{session}A_orchestrator_qc.json
+# Phase 1 (preproc): DVARS, tSNR, brain mask, registration. Computed by orchestrator.
+# Phase 2 (per-analysis): FD/censor stats from upstream fmri_first_level_proc QC.
+qc:
+
+  preproc:
+    enabled: true
+
+    # Compute temporal signal-to-noise ratio (mean / stdev across time)
+    tsnr: true
+
+    # Generate carpet plots (FD/DVARS traces + voxel x time heatmap)
+    carpet_plots: true
+
+    # Compute Dice coefficient between functional and anatomical brain masks
+    registration_quality: true
+
+  first_level:
+    enabled: true
+
+
+# ============================================================================
+# analyses — First-level analysis specifications
+# ============================================================================
+# Each entry links an orchestrator analysis to a matching analysis block
+# (by name) in the proc template config (--proc_config).
+#
+# The orchestrator only sets subject-specific fields:
+#   - out_dir, out_file_pre  (from post_id_out_pre)
+#   - paths                  (resolved from preprocessed files)
+#   - extraction prefix      (from post_id_extract_pre, if present)
+#   - connectivity prefix    (from post_id_conn_pre, if present)
+#
+# Prefix construction rule (session-aware):
+#   The orchestrator builds "sub-{subj_id}_ses-{session}A_{post_id}" for
+#   each analysis. Session labels are injected automatically.
+#
+# Resulting prefixes (for subj_id "NDARABC123", session "00"):
+#   out_file_pre:         "sub-NDARABC123_ses-00A_nback"
+#   extract_out_file_pre: "sub-NDARABC123_ses-00A_nback_Shen368"
+#   conn_out_file_pre:    "sub-NDARABC123_ses-00A_nback_Shen368"
+#
+# fd_threshold (required, per-analysis):
+#   Different analyses can use different FD thresholds. For example,
+#   resting-state may use a stricter 0.4mm threshold while task analyses
+#   use 0.9mm. Censor files are generated per unique (task, threshold) pair.
+analyses:
+
+  # ------------------------------------------------------------------
+  # nback activation analysis (task_act)
+  # ------------------------------------------------------------------
+  - name: "nback_act"
+    type: "task_act"
+    task_label: "nback"
+    fd_threshold: 0.9
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+    post_id_out_pre: "nback"
+    post_id_extract_pre: "nback_SchaeferTian"
+
+  # ------------------------------------------------------------------
+  # nback connectivity analysis (task_conn)
+  # ------------------------------------------------------------------
+  - name: "nback_conn"
+    type: "task_conn"
+    task_label: "nback"
+    fd_threshold: 0.9
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+    post_id_out_pre: "nback"
+    post_id_extract_pre: "nback_SchaeferTian"
+    post_id_conn_pre: "nback_SchaeferTian"
+
+  # ------------------------------------------------------------------
+  # Resting-state connectivity analysis (rest_conn)
+  # ------------------------------------------------------------------
+  - name: "rest_conn"
+    type: "rest_conn"
+    task_label: "rest"
+    fd_threshold: 0.4
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+    post_id_out_pre: "rest"
+    post_id_extract_pre: "rest_SchaeferTian"
+    post_id_conn_pre: "rest_SchaeferTian"
+
+
+# ============================================================================
+# s3 — AWS S3 data transfer (ABCD-specific)
+# ============================================================================
+# The ABCD data resides in two S3 locations:
+#
+# 1. fMRIPrep archive:
+#    s3://{bucket}/{fmriprep_s3_prefix}/sub-{ID}/ses-{session}A/
+#      sub-{ID}_ses-{session}A_fmriprep-output.tar.gz
+#    Contains preprocessed BOLD, confounds, masks, and anatomical files.
+#
+# 2. mmps_mproc events and motion files:
+#    s3://{bucket}/{mmps_mproc_s3_prefix}/sub-{ID}/ses-{session}A/func/
+#      sub-{ID}_ses-{session}A_task-{task}_run-0{N}_events.tsv
+#      sub-{ID}_ses-{session}A_task-{task}_run-0{N}_motion.tsv
+#    Contains task timing (events) files and raw motion parameter files.
+#    Motion files are downloaded for ALL tasks (including rest).
+#
+# Sessions are discovered dynamically by probing S3 for each code in
+# available_sessions. Not all subjects have all sessions.
+#
+# Credentials: configured via standard AWS credential chain
+#   (environment variables, ~/.aws/credentials, EC2 instance role, etc.)
+#
+# bucket               — bucket name only; no "s3://" prefix and no slashes
+# *_s3_prefix          — S3 key prefix; no leading or trailing slash
+# upload_prefix        — destination prefix for output archives
+# cleanup_after_upload — if true, delete downloaded/extracted files after
+#                        successful upload (saves disk on EC2)
+# available_sessions   — pool of possible session codes to probe on S3
+s3:
+  enabled: true
+  bucket: "<YOUR_INPUT_S3_BUCKET>"
+  fmriprep_s3_prefix: "derivatives/fmriprep"
+  mmps_mproc_s3_prefix: "mmps_mproc_noimages"
+  upload_prefix: "derivatives/first_levels"
+  cleanup_after_upload: true
+  available_sessions: ["00", "02", "04", "06"]
+  # Number of concurrent worker threads for per-file S3 upload.
+  # Default 8; valid range [1, 64]. Boto3 S3 client is thread-safe.
+  upload_max_workers: 1

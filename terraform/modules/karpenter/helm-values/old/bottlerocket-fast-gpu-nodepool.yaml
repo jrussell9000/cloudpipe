@@ -1,0 +1,41 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: bottlerocket-fast-gpu-nodepool
+spec:
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: bottlerocket-fast-nodeclass
+
+      taints:
+        # Only allow Argo Workflow pods to run on these nodes
+        - key: "argo.io/workflow"
+          effect: "NoSchedule"
+      requirements:
+      # see: https://karpenter.sh/docs/concepts/scheduling/#well-known-labels
+      # AMD64
+      - key: "kubernetes.io/arch"
+        operator: In
+        values: ["amd64"]
+      # Runs linux
+      - key: "kubernetes.io/os"
+        operator: In
+        values: ["linux"]
+      # Spot instances
+      - key: "karpenter.sh/capacity-type"
+        operator: In
+        values: ["spot"]
+      # Instance memory (in mebibytes)
+      - key: "karpenter.k8s.aws/instance-memory"
+        operator: Gt
+        values: ["8191"]
+      # Instance family
+      - key: "karpenter.k8s.aws/instance-family"
+        operator: In
+        values: ["g4dn", "g5", "g6", "g6e", "gr"]

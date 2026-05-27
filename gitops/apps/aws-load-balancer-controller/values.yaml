@@ -1,0 +1,14 @@
+aws-load-balancer-controller:
+  clusterName: <YOUR_CLUSTER_NAME>
+  region: <YOUR_AWS_REGION>
+  # vpcId is omitted — LBC auto-discovers from EC2 instance metadata
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: backend
+  tolerations:
+  - key: "CriticalAddonsOnly"
+    value: "true"
+    effect: "NoSchedule"
+  # Pod Identity — no role-arn annotation needed; SA created by Helm
+  serviceAccount:
+    create: true
+    name: aws-load-balancer-controller

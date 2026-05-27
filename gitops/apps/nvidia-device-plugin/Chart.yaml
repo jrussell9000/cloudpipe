@@ -1,0 +1,10 @@
+apiVersion: v2
+name: nvidia-device-plugin
+description: NVIDIA device plugin for Kubernetes — exposes nvidia.com/gpu on GPU nodes
+type: application
+version: 0.1.0
+appVersion: "0.19.1"
+dependencies:
+  - name: nvidia-device-plugin
+    version: 0.19.1
+    repository: https://nvidia.github.io/k8s-device-plugin
