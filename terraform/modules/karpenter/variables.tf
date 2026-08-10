@@ -14,7 +14,6 @@ variable "node_iam_role_additional_policies" {
   default = {
     AmazonSSMManagedInstanceCore   = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
     CloudWatchAgentServerPolicy    = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-    AmazonEFSCSIDriverPolicy       = "arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy"
     AmazonEKSVPCResourceController = "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"
   }
 }
@@ -27,6 +26,11 @@ variable "karpenter_version" {
 
 variable "fastsurfer_ami_tag" {
   description = "Fastsurfer image tag (e.g. sha-abc123) used to select the pre-baked GPU AMI via Karpenter amiSelectorTerms. Update when a new AMI is built."
+  type        = string
+}
+
+variable "fireants_ami_tag" {
+  description = "FireANTs image tag (e.g. sha-abc123) used to select the pre-baked GPU AMI via Karpenter amiSelectorTerms. Update when a new AMI is built."
   type        = string
 }
 

@@ -4,24 +4,36 @@ metadata:
   name: gpu-nodepool
 spec:
   disruption:
+    # WhenEmpty (not WhenEmptyOrUnderutilized) is deliberate: FastSurfer pods carry
+    # karpenter.sh/do-not-disrupt: "true" (master workflow template), so Karpenter can never
+    # evict them anyway — WhenEmptyOrUnderutilized would add no repacking for this workload
+    # while risking eviction of a long segmentation step if that annotation were ever dropped.
     consolidationPolicy: WhenEmpty
-    consolidateAfter: 30m
+    # 30m -> 10m (deep-dive 4.2). An empty GPU node is the most expensive idle resource we have,
+    # and it bleeds cost at every batch tail / phase gap. The old 30m was partly deliberate
+    # warm-keeping: the 2026-07-17 spot-scarcity investigation showed GPU re-provisioning can
+    # stall on thin spot pools, so this is NOT cut aggressively — 10m matches cpu-light-nodepool
+    # and sits at the conservative end of 4.2's 5-10m range.
+    #
+    # Safe now because GPU time-slicing (2 pods/GPU) keeps nodes fuller, so they go empty less
+    # often. This also feeds back into packing: idle nodes lingering 30m gave newly-pending GPU
+    # pods somewhere to spread 1-per-node instead of packing 2 onto fewer nodes. Reclaiming empties
+    # sooner means a burst is more likely to pack. Keep this >= a few minutes: within a subject the
+    # GPU steps (creation -> template-seg -> long-seg) are near-contiguous (long-seg depends on
+    # template-seg, NOT parcellation), so brief gaps should not churn nodes.
+    consolidateAfter: 10m
     budgets:
     - nodes: "20%"
   limits:
-    cpu: 128
-    memory: 512Gi
+    cpu: 512
+    memory: 2048Gi
   template:
     spec:
+      expireAfter: 720h
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: gpu-nodeclass
-      # Avoid possible race between the scheduler and the CSINode
-      # see https://karpenter.sh/docs/troubleshooting/#pods-were-scheduled-due-to-a-race-condition-in-kubernetes
-      startupTaints:
-      - key: efs.csi.aws.com/agent-not-ready
-        effect: NoExecute
       requirements:
       # see: https://karpenter.sh/docs/concepts/scheduling/#well-known-labels
       # AMD64 only — g5g is Graviton (ARM) and will fail to run amd64 container images
@@ -43,14 +55,65 @@ spec:
       - key: "karpenter.k8s.aws/instance-gpu-manufacturer"
         operator: In
         values: ["nvidia"]
+      # Exclude MULTI-GPU variants (e.g. g5.12xlarge = 4 GPUs, g5.48xlarge = 8), which would waste
+      # GPUs on a 1-GPU-per-pod workload no matter which sizes are listed. Expressed as NotIn the
+      # real multi-GPU counts (2/4/8) rather than In ["1"], because g6f fractional-GPU instances
+      # report instance-gpu-count=0 (the EC2 API returns GpuInfo.Count=0 for the partitioned L4 —
+      # the same gap gpu-nodeoverlay.yaml works around). In ["1"] would silently exclude g6f;
+      # NotIn ["2","4","8"] keeps both single-GPU (1) and fractional-GPU (0) while dropping multi-GPU.
+      - key: "karpenter.k8s.aws/instance-gpu-count"
+        operator: NotIn
+        values: ["2", "4", "8"]
+      # xlarge/2xlarge ONLY. Every size in these families carries the SAME single GPU, and the
+      # gpu-timeslice-2x overlay advertises 2 slices per node regardless of size — so a larger
+      # instance buys zero extra GPU capacity for a workload whose pods request 1-2 cpu and
+      # <= 4G. It only raises the hourly rate the whole node is billed at.
+      #
+      # This reverts an earlier broadening to 16xlarge, whose comment assumed
+      # price-capacity-optimized "still picks the cheapest available first (xlarge/2xlarge), so
+      # the larger sizes cost nothing in the common case". Measured on the 10-subject batch of
+      # 2026-07-31 that assumption is false: 12 of 20 GPU pods landed on g4dn.8xlarge and ZERO
+      # landed on g4dn.xlarge. price-capacity-optimized weights pool capacity (interruption
+      # risk), not price alone, so it reaches for the deeper large-instance pools by design.
+      # Observed effective rate: $0.63/GPU-hour on g4dn.8xlarge vs $0.40 on g6.xlarge, against
+      # a g4dn.xlarge spot price of ~$0.20 for the same one GPU.
+      #
+      # Sizing floor: a g4dn.xlarge (4 vCPU / ~3920m allocatable, 16 GiB) must hold TWO
+      # time-sliced GPU pods. ALL THREE GPU steps now request cpu 1 (t1w-to-mni was cut
+      # from cpu 2 / 4G, which packed only 1-per-node at xlarge and stranded the second
+      # slice — see registration-workflow-template.yaml), so every one of them packs 2 per
+      # xlarge. 2xlarge is retained for bursts that xlarge cannot absorb.
+      #
+      # This floor is what any increase to the time-slice replica count runs into first:
+      # at 3 slices a node needs 3 allocatable cores for GPU pods alone, which xlarge can
+      # still just carry, and at 4 it cannot. See tests/argo/test_gpu_step_resources.py.
+      #
+      # Keep BOTH sizes across all four families (8 spot pools). The 2026-07-17 spot-scarcity
+      # investigation landed on exactly this xlarge/2xlarge set; do not narrow it further
+      # without re-reading docs/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md.
       - key: "karpenter.k8s.aws/instance-size"
         operator: In
         values: ["xlarge", "2xlarge"]
-      # g6 excluded: nvidia-fabricmanager fails on single-GPU L4 instances (no NVLink).
-      # g4dn (T4) and g5 (A10G) use DKMS-archived open kernel modules that support both families.
+      # g4dn (T4), g5 (A10G), g6 (L4) — all single-GPU Ada/Ampere/Turing parts driven by
+      # the stock EKS AL2023 NVIDIA AMI's driver (580, supports L4). nvidia-fabricmanager fails
+      # on all of these (no NVLink) but the failure is benign — fabricmanager is only required for
+      # NVSwitch multi-GPU systems and does not block node readiness or GPU allocation. Verified:
+      # the service is `enabled`/`failed` on the running g5 nodes, which serve GPU workloads fine.
+      # g5g/g6g are Graviton (ARM) and excluded by the amd64 arch requirement above. g6e (L40S) is
+      # included as a compatible overflow family (Ada, same driver 580) — price-capacity-optimized
+      # only reaches for it when the cheaper families are scarce. g7 still omitted: GPU generation
+      # not yet validated against this AMI's driver. Capacity is spot-only by design (cost).
+      #
+      # g6f DROPPED (Option A of the GPU time-slicing change): the cluster-wide device-plugin
+      # config advertises 2 nvidia.com/gpu per GPU via time-slicing (gitops/apps/
+      # nvidia-device-plugin/values.yaml). g6f exposes only a ~5.59 GiB 1/4-L4 slice, and
+      # 2 x 3.7 GiB working set = 7.4 GiB > 5.59 → the second FastSurfer pod OOMs. Because the
+      # time-slicing config is uniform, keeping g6f in the pool would let a g6f node advertise 2
+      # slices and OOM. Do NOT re-add g6f without first moving the device plugin to per-node
+      # configs (Option B). g6f was only overflow headroom price-capacity-optimized rarely picked.
       - key: "karpenter.k8s.aws/instance-family"
         operator: In
-        values: ["g4dn", "g5"]
+        values: ["g4dn", "g5", "g6", "g6e"]
       - key: "topology.kubernetes.io/zone"
         operator: In
         values: ["<YOUR_AWS_REGION>a", "<YOUR_AWS_REGION>b", "<YOUR_AWS_REGION>c"]

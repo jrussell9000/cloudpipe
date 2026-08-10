@@ -1,0 +1,895 @@
+{
+  "uid": "cloudpipe-regqc",
+  "title": "CloudPipe — Registration QC",
+  "description": "How well each scan was aligned, in two steps: the anatomical to the MNI template (T1w to MNI), and each BOLD run to that participant's own anatomical (BOLD to T1w). Deduplicated to the most recent attempt per session/run.",
+  "tags": [
+    "cloudpipe",
+    "qc",
+    "registration"
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "CloudPipe dashboards",
+      "tags": [
+        "cloudpipe"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "5m",
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "subject",
+        "type": "query",
+        "label": "Subject",
+        "datasource": {
+          "uid": "cloudpipe-athena",
+          "type": "grafana-athena-datasource"
+        },
+        "query": {
+          "rawSQL": "SELECT DISTINCT subject FROM cloudpipe_metrics.registration ORDER BY subject",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          }
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false
+      },
+      {
+        "name": "session",
+        "type": "query",
+        "label": "Session",
+        "datasource": {
+          "uid": "cloudpipe-athena",
+          "type": "grafana-athena-datasource"
+        },
+        "query": {
+          "rawSQL": "SELECT DISTINCT session FROM cloudpipe_metrics.registration ORDER BY session",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          }
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 900,
+      "type": "text",
+      "title": "About this dashboard",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 9,
+        "h": 6
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### 🎯 How well did the scans line up?\n\nTwo different alignment jobs, measured separately:\n\n- **T1w → MNI** — the participant's anatomy warped onto a standard template. Non-linear, so the checks are about *warp health*: does it fold, stretch, or tear?\n- **BOLD → T1w** — each functional run aligned to that same participant's anatomy. Rigid, so the checks are about *intensity agreement*.\n\n**Two traps worth knowing before you read the numbers:**\n\n1. **NMI near 1.0 is not a failure.** Perfect disagreement scores 1.0 and a *do-nothing* alignment already scores ~1.011 here. A good result is ~1.02. The small absolute differences are the entire signal.\n2. **A large transform is not a bad transform.** BOLD is never resampled out of native scanner space, so a 16–97 mm offset is just how the field of view was prescribed — it says nothing about quality, and nothing here gates on it.\n\n🟢🟡🔴 = a calibrated bound exists · 🔵 = descriptive only"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Anatomicals registered",
+      "gridPos": {
+        "x": 9,
+        "y": 0,
+        "w": 5,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_sessions FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Distinct sessions with a T1w→MNI registration record in range, counted once per session even if it was reprocessed.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "BOLD runs registered",
+      "gridPos": {
+        "x": 14,
+        "y": 0,
+        "w": 5,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_runs FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        }
+      },
+      "description": "Distinct BOLD runs with a BOLD→T1w registration record in range, counted once per run.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Anatomicals not passing",
+      "gridPos": {
+        "x": 19,
+        "y": 0,
+        "w": 5,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_not_pass FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND verdict IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 15
+              }
+            ]
+          }
+        }
+      },
+      "description": "Share of sessions whose composite T1w→MNI verdict is not `pass`. This gate IS calibrated — it fails the step before outputs are promoted, so a non-pass session did not proceed. Bounds live in _T1W_MNI_THRESHOLDS in images/shared/registration_qc.py.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "🧠 Anatomy → template (T1w → MNI)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Brain mask overlap (Dice)",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(mask_dice), 3) AS mean_mask_dice FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.9
+              },
+              {
+                "color": "green",
+                "value": 0.93
+              }
+            ]
+          }
+        }
+      },
+      "description": "Overlap between the warped brain mask and the MNI reference mask. 1.0 is perfect. Recorded but NOT gated — a pass on the composite verdict does not imply this is good."
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Warps that fold",
+      "gridPos": {
+        "x": 6,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN jac_det_frac_negative > 0.005 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_folded FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND jac_det_frac_negative IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 2
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "description": "Share of sessions exceeding the folding budget (fraction of voxels with a negative Jacobian determinant > 0.005). Folding means the warp turned space inside out locally — a real, gated failure family."
+    },
+    {
+      "id": 7,
+      "type": "histogram",
+      "title": "Mask overlap — spread across sessions",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.82
+              },
+              {
+                "color": "green",
+                "value": 0.9
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mask_dice FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND mask_dice IS NOT NULL"
+        }
+      ],
+      "options": {
+        "fillOpacity": 80
+      },
+      "description": "Dice overlap between each warped brain mask and the MNI reference, one observation per session. Healthy registrations bunch tightly near the top of the range, so the interesting feature is any left tail — those sessions are worth opening individually. Recorded but not gated: a passing verdict does not guarantee a good value here."
+    },
+    {
+      "type": "histogram",
+      "title": "Intensity agreement (LNCC) — spread across sessions",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.82
+              },
+              {
+                "color": "green",
+                "value": 0.9
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT lncc FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND lncc IS NOT NULL"
+        }
+      ],
+      "options": {
+        "fillOpacity": 80
+      },
+      "description": "Local normalized cross-correlation in the MNI brain mask. Gate: warn < 0.75, fail < 0.65.",
+      "id": 3
+    },
+    {
+      "id": 9,
+      "type": "histogram",
+      "title": "Warp stretch & squeeze (mean Jacobian)",
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT jac_det_mean FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND jac_det_mean IS NOT NULL"
+        }
+      ],
+      "options": {
+        "fillOpacity": 80
+      },
+      "description": "Mean Jacobian determinant of the warp: 1.0 means volume preserved on average, above 1 expanded, below 1 compressed. Filter on schema_version before pooling — jac_det_* changed meaning at 2.0 → 2.1, when it was restricted to brain voxels.",
+      "fieldConfig": {
+        "defaults": {}
+      }
+    },
+    {
+      "id": 10,
+      "type": "histogram",
+      "title": "Warp folding — spread across sessions",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.005
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT jac_det_frac_negative FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND jac_det_frac_negative IS NOT NULL"
+        }
+      ],
+      "options": {
+        "fillOpacity": 80
+      },
+      "description": "Fraction of voxels where the warp folded, per session. Almost all mass should sit at or very near zero — folding is a genuine failure mode, not a matter of degree, so the shape to look for is a spike at zero with nothing to its right."
+    },
+    {
+      "id": 19,
+      "type": "histogram",
+      "title": "Centre-of-mass shift after warp",
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mm",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5.0
+              },
+              {
+                "color": "red",
+                "value": 15.0
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT centroid_displacement_mm FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND centroid_displacement_mm IS NOT NULL"
+        }
+      ],
+      "options": {
+        "fillOpacity": 80
+      },
+      "description": "How far the brain's centroid moved once the warp was applied, in mm. For T1w→MNI this IS informative, unlike the BOLD→T1w offsets described in the intro."
+    },
+    {
+      "id": 20,
+      "type": "histogram",
+      "title": "Worst local compression (min Jacobian)",
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT jac_det_min FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND jac_det_min IS NOT NULL"
+        }
+      ],
+      "options": {
+        "fillOpacity": 80
+      },
+      "description": "The single most compressed voxel in the warp. A value at or below 0 means the warp folded there.",
+      "fieldConfig": {
+        "defaults": {}
+      }
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "🌊 BOLD → anatomy (BOLD → T1w)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "BOLD↔anatomy agreement (NMI)",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(nmi), 4) AS mean_nmi FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND nmi > 0"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 4,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Studholme normalized mutual information between the warped BOLD reference and the T1w, inside the brain mask. Read the intro before judging this number: ~1.011 is what doing nothing scores, ~1.02 is good. Uncalibrated, so deliberately uncoloured."
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Runs failing the sanity check",
+      "gridPos": {
+        "x": 6,
+        "y": 40,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN nmi_gain <= 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(nmi_gain), 0), 1) AS pct_failed FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        }
+      },
+      "description": "Share of BOLD runs where nmi_gain ≤ 0 — the fitted transform did no better than leaving the run where it started. This is a structural sanity floor, not a calibrated quality gate: passing it means 'the registration did something', not 'the registration is good'."
+    },
+    {
+      "id": 21,
+      "type": "histogram",
+      "title": "What the alignment actually bought (NMI gain)",
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 5,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT nmi_gain FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND nmi_gain IS NOT NULL AND nmi > 0"
+        }
+      ],
+      "options": {
+        "fillOpacity": 80
+      },
+      "description": "nmi_gain = nmi − nmi_identity: the improvement over doing nothing, measured per run. This is the meaningful quantity — far more so than raw NMI, because it cancels the large constant offset that makes absolute NMI so easy to misread."
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "🔍 Needs review",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "table",
+      "title": "Anatomicals to review",
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT subject, session, verdict, ROUND(mask_dice, 3) AS mask_dice, ROUND(lncc, 3) AS lncc, ROUND(jac_det_frac_negative, 6) AS jac_det_frac_neg, ROUND(centroid_displacement_mm, 2) AS centroid_disp_mm, completed_at FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND verdict IS NOT NULL AND verdict <> 'pass' ORDER BY CASE verdict WHEN 'fail' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, mask_dice LIMIT 100"
+        }
+      ],
+      "description": "Sessions whose T1w→MNI verdict is not `pass`. These did not promote outputs; the session needs resubmitting.",
+      "fieldConfig": {
+        "defaults": {}
+      }
+    },
+    {
+      "id": 18,
+      "type": "table",
+      "title": "BOLD runs to review",
+      "gridPos": {
+        "x": 12,
+        "y": 49,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT subject, session, task, run, verdict, ROUND(nmi, 4) AS nmi, ROUND(nmi_identity, 4) AS nmi_identity, ROUND(nmi_gain, 5) AS nmi_gain, ROUND(mhd_mm, 2) AS mhd_mm, completed_at FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND nmi_gain <= 0 ORDER BY completed_at DESC LIMIT 100"
+        }
+      ],
+      "description": "Runs where the alignment gained nothing over identity. Empty is the good outcome.",
+      "fieldConfig": {
+        "defaults": {}
+      }
+    }
+  ]
+}

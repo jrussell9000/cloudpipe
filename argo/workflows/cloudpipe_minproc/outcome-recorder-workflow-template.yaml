@@ -1,0 +1,97 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: outcome-recorder
+  namespace: argo-workflows
+
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  templates:
+
+  ###########################################################################
+  # Reusable outcome-recording template.
+  #
+  # Invoked as a sibling DAG task after each substantive pipeline step with
+  # depends: "X || X.Failed || X.Skipped" so it runs regardless
+  # of the upstream step's terminal status.
+  #
+  # Writes a StepOutcome JSON to:
+  #   s3://{bucket}/metrics/step-outcomes/dt={date}/{workflow-name}__{step}__{subject}__{session}__{task}__{run}_outcome.json
+  #
+  # Failure of this task does NOT propagate to the workflow — it is
+  # non-critical observability infrastructure.
+  ###########################################################################
+
+  - name: record-step-outcome
+    metadata:
+      labels:
+        cloudpipe.io/phase: observability
+        cloudpipe.io/step: record-step-outcome
+    inputs:
+      parameters:
+        - name: step           # canonical step name (e.g. t1w-to-mni)
+        - name: status         # Argo task status: Succeeded | Failed | Skipped | Error
+        - name: message        # Argo task message (may be empty); not available as a DAG task variable
+          default: ""
+        # {{tasks.<name>.exitCode}} — the only failure detail a DAG task does
+        # expose. Without it every DAG-recorded failure classifies as "unknown",
+        # because the taxonomy has no message to match against.
+        - name: exit-code
+          default: ""
+        - name: subject
+        - name: session
+          default: "na"
+        - name: task
+          default: "na"
+        - name: run
+          default: "na"
+        - name: bucket           # data bucket — outputs verified here
+        - name: metrics-bucket   # versioned metrics bucket — record written here
+        - name: pipeline
+          default: cloudpipe_minproc
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
+      imagePullPolicy: IfNotPresent
+
+      resources:
+        requests:
+          memory: 128M
+          cpu: 100m
+
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+
+      command: [python, /app/outcome_recorder.py]
+      args:
+        - --workflow-name
+        - '{{workflow.name}}'
+        - --step
+        - '{{inputs.parameters.step}}'
+        - --subject
+        - '{{inputs.parameters.subject}}'
+        - --session
+        - '{{inputs.parameters.session}}'
+        - --task
+        - '{{inputs.parameters.task}}'
+        - --run
+        - '{{inputs.parameters.run}}'
+        - --status
+        - '{{inputs.parameters.status}}'
+        - --message
+        - '{{inputs.parameters.message}}'
+        - --exit-code
+        - '{{inputs.parameters.exit-code}}'
+        - --bucket
+        - '{{inputs.parameters.bucket}}'
+        - --metrics-bucket
+        - '{{inputs.parameters.metrics-bucket}}'
+        - --pipeline
+        - '{{inputs.parameters.pipeline}}'

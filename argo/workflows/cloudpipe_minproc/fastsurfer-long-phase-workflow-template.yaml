@@ -6,12 +6,24 @@ metadata:
 spec:
 
   retryStrategy:
-    limit: "3"
+    # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
+    # design, so consecutive reclaims on one long step are routine (2 back-to-back
+    # observed on fastsurfer-long-parcellation, 2026-08-03). At limit 3, four in a
+    # row lose the subject outright. See issue #115.
+    limit: "8"
     retryPolicy: Always
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
+    # never emitted by our scripts. 75 = EX_TEMPFAIL, the base-tps guard below.
+    # 137 is deliberately absent: a real OOMKill here is deterministic (#120,
+    # #129, #134 each needed a config change, not a retry), so retrying it only
+    # burns the enlarged budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
     backoff:
       duration: "1m"
       factor: "2"
+      # cap bounds each individual delay (maxDuration would abort the retries
+      # instead): 1+2+4+5+5+5+5+5 = 32m worst case, vs 7m at the old limit of 3.
+      cap: "5m"
 
   artifactRepositoryRef:
     key: cloudpipe-artifacts
@@ -20,10 +32,24 @@ spec:
     runAsNonRoot: true
     runAsUser: 1000
 
+  # ---------------------------------------------------------------------------
+  # No shared EFS volume — see the header on fast-tmpl. SUBJECTS_DIR is
+  # /work/subjects on a private emptyDir; state crosses pods via S3 (ADR 004).
+  #
+  # The per-session artifacts below are declared one-per-possible-session and
+  # marked optional because Argo resolves inputs/outputs.artifacts statically
+  # when the pod spec is built — a variable-length session list cannot be
+  # expressed any other way. Same pattern as subregion-seg's hydrate step.
+  # ---------------------------------------------------------------------------
+
   templates:
 
   ##############################################
-  # 1. Long Segmentation (seg_only --long)
+  # C. Long Segmentation (seg_only --long)
+  #
+  # Reads the base template from step A (seg_only output is sufficient — this is
+  # why C does not wait for the template parcellation in B) and writes the
+  # per-session directories consumed by D.
   ##############################################
 
   - name: fastsurfer-long-segmentation-template
@@ -35,46 +61,224 @@ spec:
       parameters:
         - name: argstring
 
+      artifacts:
+      - name: template-base
+        path: '/work/subjects/{{workflow.parameters.subjID}}_template'
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/template-base.tar.gz'
+
+    outputs:
+      artifacts:
+      - name: ses-00A-seg
+        path: '/work/subjects/ses-00A'
+        optional: true
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-00A.tar.gz'
+
+      - name: ses-02A-seg
+        path: '/work/subjects/ses-02A'
+        optional: true
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-02A.tar.gz'
+
+      - name: ses-04A-seg
+        path: '/work/subjects/ses-04A'
+        optional: true
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-04A.tar.gz'
+
+      - name: ses-06A-seg
+        path: '/work/subjects/ses-06A'
+        optional: true
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-06A.tar.gz'
+
+      - name: ses-08A-seg
+        path: '/work/subjects/ses-08A'
+        optional: true
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-08A.tar.gz'
+
+      - name: ses-10A-seg
+        path: '/work/subjects/ses-10A'
+        optional: true
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-10A.tar.gz'
+
     nodeSelector:
       karpenter.sh/nodepool: gpu-nodepool
 
+    volumes:
+      - name: work
+        emptyDir: {}
+
     initContainers:
-      - name: clear-is-running
-        image: public.ecr.aws/docker/library/alpine:3.21
+      # --seg_only should not touch fsaverage, but the argstring still carries
+      # --fsaparc and under the old shared volume this directory was always
+      # present (step A put it there and every later step saw it). Re-creating
+      # that guarantee costs ~480 MiB of in-region S3 per pod and a few seconds
+      # of GPU node time; discovering the assumption was wrong costs a failed
+      # batch. TODO: drop this once a real run confirms seg_only never reads it.
+      - name: download-fsaverage
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
-            ephemeral-storage: 300M
-        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+            memory: 256M
+            cpu: '1'
         mirrorVolumeMounts: true
+        env:
+          - name: BUCKET
+            value: "{{workflow.parameters.bucket}}"
+        command: [python]
+        args:
+          - -c
+          - |
+            import boto3, os
+            from pathlib import Path
+
+            dest = Path("/work/subjects/fsaverage")
+            if dest.exists():
+                print("fsaverage already present, skipping download.", flush=True)
+            else:
+                s3 = boto3.client('s3')
+                bucket = os.environ['BUCKET']
+                prefix = 'config/fsaverage/'
+                paginator = s3.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for obj in page.get('Contents', []):
+                        key = obj['Key']
+                        rel = key[len(prefix):]
+                        if not rel:
+                            continue
+                        local = dest / rel
+                        local.parent.mkdir(parents=True, exist_ok=True)
+                        s3.download_file(bucket, key, str(local))
+                print("fsaverage downloaded.", flush=True)
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-c36b2605dc6f07a55d0f5a491d8b6820413fa0f3"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
-      - name: "{{=lower(workflow.parameters.subjID)}}"
-        mountPath: /opt/freesurfer/subjects
-        subPath: opt/freesurfer/subjects
+      - name: work
+        mountPath: /work
+
+      env:
+        - name: SUBJECTS_DIR
+          value: /work/subjects
+        # Cap every thread pool at the CPU REQUEST, projected from the pod spec so the
+        # resources block below is the single source of truth. `--threads 1` in the master
+        # template only reaches run_prediction.py's own argument; PyTorch/OpenMP inside
+        # FastSurferCNN still size their pools from the HOST core count, which is why this
+        # step measured cpu_efficiency 1.22 (~1.2 cores against a 1-core request) on the
+        # 2026-07-31 batch. That was harmless only because the pods had landed on 32-vCPU
+        # g4dn.8xlarge nodes; now that gpu-nodepool is capped at xlarge/2xlarge, an
+        # uncapped pool would contend with the co-tenant time-sliced pod on a 4-vCPU node.
+        #
+        # This is a CAP, not a raise — do NOT increase the cpu request to match observed
+        # burst. cpu 1 is what lets two GPU pods share one g4dn.xlarge under time-slicing.
+        #
+        # Cannot be read from the cgroup instead: this container sets no CPU limit, so
+        # /sys/fs/cgroup/cpu.max reads "max" and says nothing about the request.
+        - name: OMP_NUM_THREADS
+          valueFrom: &longSegCpuRequest
+            resourceFieldRef:
+              containerName: main   # Argo's name for the user container
+              resource: requests.cpu
+              divisor: "1"          # rounds UP to whole cores; keep cpu integral
+        - name: MKL_NUM_THREADS
+          valueFrom: *longSegCpuRequest
+        - name: OPENBLAS_NUM_THREADS
+          valueFrom: *longSegCpuRequest
+        - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+          valueFrom: *longSegCpuRequest
 
       resources:
         requests:
-          memory: 2G
-          cpu: '2'
+          # 2G -> 1G. Measured average working set is ~0.63 GB (ram_efficiency 0.33 against
+          # the old 2G request, 11 pods, 2026-07-31 batch). Kubecost's ram_efficiency is
+          # built from AVERAGE usage, so this keeps ~1.6x headroom over the mean rather
+          # than sizing to it. Deliberately no memory LIMIT: the packing benefit comes
+          # entirely from the request, and adding a ceiling where none existed would turn
+          # an underestimate into an OOM on a step whose failure costs a segmentation.
+          memory: 1G
+          # cpu 1 / --threads 1 (was 2/4): fit two GPU pods per g4dn.xlarge under
+          # time-slicing. seg_only is GPU-inference-bound; the CPU-heavy surface work
+          # (surf_only) runs on cpu-heavy-nodepool, so fewer CPU threads here costs
+          # little wall-time. Keep cpu == --threads (master template) to avoid throttling,
+          # and see the env block above, which projects this value into the thread pools.
+          cpu: '1'
+          # Base template (~1.2 GB at k=6) plus one segmented session directory per
+          # timepoint. gpu-nodeclass sets no instanceStorePolicy, so every g4dn/g5/g6
+          # reports the same ~140Gi allocatable from its 150Gi root volume — this
+          # request does not narrow the (already thin) GPU spot pool.
+          ephemeral-storage: 20G
         limits:
           nvidia.com/gpu: '1'
 
       command: [bash, -c]
       args:
         - |
-          nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used \
+          nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
             --format=csv -l 5 >&2 &
           MONITOR=$!
+
+          # See the equivalent note in fast-tmpl: an interrupted upstream step can
+          # exit 0 and publish a tarball carrying scripts/IsRunning.*, which would
+          # wedge FastSurfer here even though this emptyDir is fresh.
+          find /work/subjects -name '*IsRunning*' -delete
+
           /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}}
           EXIT=$?; kill $MONITOR 2>/dev/null; exit $EXIT
 
   ##############################################
-  # 2. Long Parcellation (surf_only --long)
+  # D. Long Parcellation (surf_only --long)
+  #
+  # The terminal anatomical step. Reassembles SUBJECTS_DIR from the parcellated
+  # template (B) and the segmented sessions (C), runs surface reconstruction for
+  # every timepoint, then promotes the real derivatives to S3. Those output keys
+  # are the pipeline's contract with inventory / registration / func-preproc /
+  # subregion-seg and are UNCHANGED by the move off EFS.
   ##############################################
 
   - name: fastsurfer-long-parcellation-template
@@ -96,10 +300,74 @@ spec:
           region: <YOUR_AWS_REGION>
           key: 'config/fslicense'
 
+      # Parcellated template from B — NOT the pre-parcellation one from A.
+      # long_compat_segmentHA.py's cortical-ribbon step needs its white surfaces.
+      - name: template-parcellated
+        path: '/work/subjects/{{workflow.parameters.subjID}}_template'
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/template-parcellated.tar.gz'
+
+      - name: ses-00A-seg
+        path: '/work/subjects/ses-00A'
+        optional: true
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-00A.tar.gz'
+
+      - name: ses-02A-seg
+        path: '/work/subjects/ses-02A'
+        optional: true
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-02A.tar.gz'
+
+      - name: ses-04A-seg
+        path: '/work/subjects/ses-04A'
+        optional: true
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-04A.tar.gz'
+
+      - name: ses-06A-seg
+        path: '/work/subjects/ses-06A'
+        optional: true
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-06A.tar.gz'
+
+      - name: ses-08A-seg
+        path: '/work/subjects/ses-08A'
+        optional: true
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-08A.tar.gz'
+
+      - name: ses-10A-seg
+        path: '/work/subjects/ses-10A'
+        optional: true
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-10A.tar.gz'
+
     outputs:
       artifacts:
       - name: long-template-complete
-        path: '/opt/freesurfer/subjects/{{workflow.parameters.subjID}}_template'
+        path: '/work/subjects/{{workflow.parameters.subjID}}_template'
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
           bucket: "{{workflow.parameters.bucket}}"
@@ -107,15 +375,16 @@ spec:
           key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz'
 
       - name: ses-00A-templated
-        path: '/opt/freesurfer/subjects/ses-00A'
+        path: '/work/subjects/ses-00A'
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
           bucket: "{{workflow.parameters.bucket}}"
           region: <YOUR_AWS_REGION>
           key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz'
+        optional: true
 
       - name: ses-02A-templated
-        path: '/opt/freesurfer/subjects/ses-02A'
+        path: '/work/subjects/ses-02A'
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
           bucket: "{{workflow.parameters.bucket}}"
@@ -124,7 +393,7 @@ spec:
         optional: true
 
       - name: ses-04A-templated
-        path: '/opt/freesurfer/subjects/ses-04A'
+        path: '/work/subjects/ses-04A'
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
           bucket: "{{workflow.parameters.bucket}}"
@@ -133,7 +402,7 @@ spec:
         optional: true
 
       - name: ses-06A-templated
-        path: '/opt/freesurfer/subjects/ses-06A'
+        path: '/work/subjects/ses-06A'
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
           bucket: "{{workflow.parameters.bucket}}"
@@ -142,7 +411,7 @@ spec:
         optional: true
 
       - name: ses-08A-templated
-        path: '/opt/freesurfer/subjects/ses-08A'
+        path: '/work/subjects/ses-08A'
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
           bucket: "{{workflow.parameters.bucket}}"
@@ -151,7 +420,7 @@ spec:
         optional: true
 
       - name: ses-10A-templated
-        path: '/opt/freesurfer/subjects/ses-10A'
+        path: '/work/subjects/ses-10A'
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
           bucket: "{{workflow.parameters.bucket}}"
@@ -166,9 +435,9 @@ spec:
           none: {}
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
+          bucket: "{{workflow.parameters.metrics-bucket}}"
           region: <YOUR_AWS_REGION>
-          key: 'metrics/anat/{{workflow.parameters.subjID}}_ses-00A_anat_qc.json'
+          key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-00A_anat_qc.json'
 
       - name: ses-02A-anat-qc
         path: '/tmp/{{workflow.parameters.subjID}}_ses-02A_anat_qc.json'
@@ -177,9 +446,9 @@ spec:
           none: {}
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
+          bucket: "{{workflow.parameters.metrics-bucket}}"
           region: <YOUR_AWS_REGION>
-          key: 'metrics/anat/{{workflow.parameters.subjID}}_ses-02A_anat_qc.json'
+          key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-02A_anat_qc.json'
 
       - name: ses-04A-anat-qc
         path: '/tmp/{{workflow.parameters.subjID}}_ses-04A_anat_qc.json'
@@ -188,9 +457,9 @@ spec:
           none: {}
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
+          bucket: "{{workflow.parameters.metrics-bucket}}"
           region: <YOUR_AWS_REGION>
-          key: 'metrics/anat/{{workflow.parameters.subjID}}_ses-04A_anat_qc.json'
+          key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-04A_anat_qc.json'
 
       - name: ses-06A-anat-qc
         path: '/tmp/{{workflow.parameters.subjID}}_ses-06A_anat_qc.json'
@@ -199,9 +468,9 @@ spec:
           none: {}
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
+          bucket: "{{workflow.parameters.metrics-bucket}}"
           region: <YOUR_AWS_REGION>
-          key: 'metrics/anat/{{workflow.parameters.subjID}}_ses-06A_anat_qc.json'
+          key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-06A_anat_qc.json'
 
       - name: ses-08A-anat-qc
         path: '/tmp/{{workflow.parameters.subjID}}_ses-08A_anat_qc.json'
@@ -210,9 +479,9 @@ spec:
           none: {}
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
+          bucket: "{{workflow.parameters.metrics-bucket}}"
           region: <YOUR_AWS_REGION>
-          key: 'metrics/anat/{{workflow.parameters.subjID}}_ses-08A_anat_qc.json'
+          key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-08A_anat_qc.json'
 
       - name: ses-10A-anat-qc
         path: '/tmp/{{workflow.parameters.subjID}}_ses-10A_anat_qc.json'
@@ -221,64 +490,235 @@ spec:
           none: {}
         s3:
           endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
+          bucket: "{{workflow.parameters.metrics-bucket}}"
           region: <YOUR_AWS_REGION>
-          key: 'metrics/anat/{{workflow.parameters.subjID}}_ses-10A_anat_qc.json'
+          key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-10A_anat_qc.json'
 
-    # Set the number of CPUs requested to 2x the number of sessions, k; memory to 2k + 2 (GB).
-    # --parallel k --threads 2 runs k concurrent FastSurfer instances: both hemispheres run in
-    # parallel at 1 thread each (threads_hemi = 2//2 = 1, same as --threads 3 which gave
-    # threads_hemi = 3//2 = 1) — identical hemisphere parallelism at 33% less CPU cost.
-    # Rightsized from observed ~44% CPU efficiency and ~1 GiB/session RAM usage across 57 pods.
+    # CPU request is the TOTAL thread count: max(4, 2k) for k sessions, spent as
+    # `--threads cpu/k` across k concurrent --parallel instances. The container
+    # derives --threads from this request via the downward API (see the args
+    # block), so cpu == total threads by construction rather than by keeping two
+    # files in agreement. The division is exact at every k: 4/1, 4/2, 6/3, 8/4.
+    #
+    # Memory stays max(6, 2k) GB and is deliberately NOT tied to this — see below.
+    #
+    # 6 -> max(4, 2k), i.e. the floor drops 6 -> 4 and k>=3 is unchanged.
+    # WHY ONLY THE FLOOR MOVES: --threads 2 is a hard floor per instance, because
+    # recon-surf.sh:319-321 is a cliff rather than a gradient:
+    #
+    #     threads > 1  -> threads_hemi = threads/2, hemispheres in PARALLEL
+    #     threads == 1 -> threads_hemi = 1,         hemispheres SERIAL
+    #
+    # (`--parallel` here is brun_fastsurfer.sh's SUBJECT-level flag and does not
+    # reach that branch; run_fastsurfer.sh consumes its own --parallel as the
+    # obsolete legacy_parallel_hemi and never forwards it to recon-surf.sh.) So
+    # dropping a k>=3 subject to cpu 4 would emit --threads 1 and roughly DOUBLE
+    # the surface stage on the pipeline's longest step. The cut is therefore worth
+    # 2 cores at k<=2 and nothing above it:
+    #
+    #     k=1: cpu 6 -> 4, --threads 6 -> 4 (threads_hemi 3 -> 2)
+    #     k=2: cpu 6 -> 4, --threads 3 -> 2 (threads_hemi 1 -> 1, i.e. FREE)
+    #     k=3: cpu 6,      --threads 2      unchanged
+    #     k=4: cpu 8,      --threads 2      unchanged
+    #
+    # WHY NOT LOWER, given cpu_efficiency 0.473? Because that 0.473 is not an
+    # oversized request. Staging is only ~30 s against 1216-2214 s of compute here
+    # (1-2%, so #123's dilution does not apply — see #128), which means the idle
+    # cores are real. But they are ALGORITHMIC: recon-surf.sh alternates
+    # hemisphere-parallel sections with long serial joint sections, so a k=3 pod
+    # oscillates between 3 and 6 busy cores and averages ~2.9. Trimming the request
+    # to that average does not reclaim the serial sections, it only starves the
+    # parallel ones. This is also why the earlier re-check came back negative:
+    # cpu_efficiency was 0.45 before the floor went to 6 and 0.473 after, because
+    # the extra threads were never the binding constraint.
+    #
+    # Known wart, deliberately not fixed here: k=4 requests 8 and therefore needs a
+    # 4xlarge, and that is 32.2% of subjects — not an edge case. Session counts over
+    # the 11830 subjects in tools/nss_volumes.csv (a BOLD-derived proxy for the T1w
+    # session count, so approximate):
+    #
+    #     k=1  12.3%  cpu 4   2xlarge
+    #     k=2  21.0%  cpu 4   2xlarge
+    #     k=3  34.5%  cpu 6   2xlarge
+    #     k=4  32.2%  cpu 8   4xlarge   <-- here
+    #
+    # (Only ses-00A..ses-06A exist today; the ses-08A/ses-10A artifact declarations
+    # are forward-looking, so k=4 is the current maximum.)
+    #
+    # There is no packing trick available. cpu-heavy-nodepool admits only 2xlarge and
+    # 4xlarge, and 8000m exceeds a 2xlarge's 7910m ALLOCATABLE outright — before the
+    # ~685m of daemonsets (guardduty 200m, cloudwatch 250m, kube-proxy 100m,
+    # fluent-bit 50m, aws-node 25m, ebs-csi 10m, kubecost 50m) that leave ~7225m
+    # schedulable. So trimming daemonsets cannot help either; the constraint is
+    # structural.
+    #
+    # Nor is the request oversized: a k=4 pod runs 4 instances x 2 threads = 8 threads
+    # of real work, ~4/3 of a k=3 pod's. The only waste is stranding — 8000m held on
+    # ~15205m schedulable — and the pod leaves ~7.2 cores that the scheduler fills
+    # with other pipeline pods whenever the batch has pending work. consolidationPolicy
+    # WhenEmpty means Karpenter will not repack it afterwards, so the loss is real
+    # only at the tail of a batch. That makes this a co-packing DENSITY question for
+    # #75, whose levers are batch shape and instance floor — NOT a thread cut. Capping
+    # cpu at 6 would emit --threads 1 at k=4 and serialize hemispheres.
+    #
+    # Memory DID move: ram_efficiency 0.30 against the old max(6,2k)+2, i.e. ~2.25 GB
+    # average at k<=3 and ~4.2 GB at k=4. Dropping the "+ 2" gives 6G/8G, keeping
+    # ~2.7x/1.9x headroom over the mean. ram_efficiency is AVERAGE-based, which is why
+    # the cut is to 2x-ish rather than to the observed mean, and why no memory LIMIT
+    # is set: an underestimate should degrade to burst, not to an OOM.
+    #
+    # ephemeral-storage scales with k here (unlike the other anatomical steps,
+    # which take a flat 20G) because this pod holds the most at once: the
+    # template, every session directory, surface intermediates for all k
+    # timepoints in parallel, and the output tarballs during upload.
     podSpecPatch: |
       containers:
         - name: main
           resources:
             requests:
-              cpu: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2}}'
-              memory: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 + 2}}G'
+              cpu: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 > 4 ? len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 : 4}}'
+              memory: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 > 6 ? len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 : 6}}G'
+              ephemeral-storage: '{{=12 + 4 * len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))}}G'
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
+    volumes:
+      - name: work
+        emptyDir: {}
+
     initContainers:
-      - name: clear-is-running
-        image: public.ecr.aws/docker/library/alpine:3.21
+      # recon-surf.sh registers each timepoint to fsaverage, which is not carried
+      # in either the template or the per-session scratch tarballs.
+      - name: download-fsaverage
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
-            ephemeral-storage: 300M
-        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+            memory: 256M
+            cpu: '1'
         mirrorVolumeMounts: true
+        env:
+          - name: BUCKET
+            value: "{{workflow.parameters.bucket}}"
+        command: [python]
+        args:
+          - -c
+          - |
+            import boto3, os
+            from pathlib import Path
+
+            dest = Path("/work/subjects/fsaverage")
+            if dest.exists():
+                print("fsaverage already present, skipping download.", flush=True)
+            else:
+                s3 = boto3.client('s3')
+                bucket = os.environ['BUCKET']
+                prefix = 'config/fsaverage/'
+                paginator = s3.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for obj in page.get('Contents', []):
+                        key = obj['Key']
+                        rel = key[len(prefix):]
+                        if not rel:
+                            continue
+                        local = dest / rel
+                        local.parent.mkdir(parents=True, exist_ok=True)
+                        s3.download_file(bucket, key, str(local))
+                print("fsaverage downloaded.", flush=True)
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-c36b2605dc6f07a55d0f5a491d8b6820413fa0f3"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
-      - name: "{{=lower(workflow.parameters.subjID)}}"
-        mountPath: /opt/freesurfer/subjects
-        subPath: opt/freesurfer/subjects
+      - name: work
+        mountPath: /work
 
       env:
         - name: FS_LICENSE
           value: /opt/freesurfer/.license
+        - name: SUBJECTS_DIR
+          value: /work/subjects
+
+        # The TOTAL cpu request, from the podSpecPatch above. --threads is derived
+        # from it per --parallel instance rather than written in the master
+        # template, so there is one place to change and no cross-file drift.
+        - name: CPU_REQUEST
+          valueFrom:
+            resourceFieldRef:
+              containerName: main   # Argo's name for the user container
+              resource: requests.cpu
+              divisor: "1"          # rounds UP to whole cores; keep cpu integral
 
       command: [bash, -c]
       args:
         - |
-          /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}}
+          SD=/work/subjects
+          BASE={{workflow.parameters.subjID}}_template
+
+          # See the equivalent note in fast-tmpl: an interrupted upstream step can
+          # exit 0 and publish a tarball carrying scripts/IsRunning.*, which would
+          # wedge FastSurfer here even though this emptyDir is fresh. This step
+          # reassembles SUBJECTS_DIR from TWO upstream tarballs (B and C), so it
+          # has the most inherited state of any anatomical pod.
+          find "$SD" -name '*IsRunning*' -delete
+
+          # --threads is the per-instance share of the pod's TOTAL cpu request, and
+          # the argstring already carries `--parallel K` for the same K. Deriving it
+          # here rather than in the master template is what makes the resources block
+          # the single source of truth for both numbers.
+          K=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" '{{inputs.parameters.T1w_sessions}}')
+          THREADS=$(( CPU_REQUEST / K ))
+          # Floor of 2. Below it recon-surf.sh takes its serial-hemisphere branch
+          # (threads==1 -> ParallelHemi=false), which roughly doubles the surface
+          # stage instead of halving the threads. max(4,2k) never actually trips
+          # this — the guard is here so a future cpu trim fails loudly and visibly
+          # rather than silently paying 2x wall time on the longest step.
+          if [[ "$THREADS" -lt 2 ]]; then
+            echo "WARNING: cpu request ${CPU_REQUEST} over K=${K} sessions gives --threads ${THREADS}," >&2
+            echo "         which serializes hemispheres in recon-surf.sh. Using 2; raise cpu to 2*K." >&2
+            THREADS=2
+          fi
+          echo "cpu request=${CPU_REQUEST} K=${K} --threads=${THREADS} (threads_hemi=$((THREADS / 2)))" >&2
+
+          /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}} --threads "$THREADS"
           FASTSURFER_EXIT=$?
           for ses in $(python3 -c "import json,sys; print(' '.join(json.loads(sys.argv[1])))" '{{inputs.parameters.T1w_sessions}}'); do
             python3 /app/extract_qc.py \
-              --subjects-dir /opt/freesurfer/subjects \
+              --subjects-dir "$SD" \
               --subj {{workflow.parameters.subjID}} \
               --ses "$ses" \
-              --pipeline cloudpipe_minproc || true
+              --pipeline cloudpipe_minproc || true   # QC metrics are non-critical
           done
+
+          # Modify files and add links as necessary to allow future subfield segmentation of
+          # subcortical subfields/subregions using the longitudinal model. This bridge is
+          # what writes the plain `base-tps` timepoint list that the segment-subregions
+          # step reads; its cortical-ribbon step needs the base template's white surfaces
+          # (surf/lh.white, mri/filled.mgz). Do NOT swallow its failure (was `|| true`) —
+          # a missing base-tps otherwise surfaces two steps later as a cryptic
+          # "base-tps: No such file or directory".
           python3 /fastsurfer/recon_surf/long_compat_segmentHA.py \
-            --sd /opt/freesurfer/subjects \
-            --sid {{workflow.parameters.subjID}}_template \
+            --sd "$SD" \
+            --sid "$BASE" \
             --fs_license /opt/freesurfer/.license \
-            --threads 2 || true
+            --threads 2
+          COMPAT_EXIT=$?
+
+          # base-tps is the artifact segment-subregions hard-depends on. If the bridge
+          # did not produce it (e.g. base template surfaces missing after an interrupted
+          # template-parcellation), fail here with a retryable code (75 = EX_TEMPFAIL, per
+          # retryStrategy) so the anatomical phase re-runs rather than promoting an
+          # unusable template.
+          #
+          # This used to exit 137, which collided with a genuine kernel OOMKill and
+          # forced the retry expression to treat both alike. 75 is ours alone; nothing
+          # in the cluster emits it. See issue #115.
+          if [[ ! -s "${SD}/${BASE}/base-tps" ]]; then
+            echo "ERROR: long_compat_segmentHA.py did not produce ${BASE}/base-tps (exit ${COMPAT_EXIT})." >&2
+            echo "       base template is incomplete (white surfaces missing?); forcing retry (exit 75)." >&2
+            exit 75
+          fi
+
           exit $FASTSURFER_EXIT

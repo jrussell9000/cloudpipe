@@ -1,12 +1,12 @@
 # Docker Images
 
-All pipeline images are pushed to ECR Public at `public.ecr.aws/l9e7l1h1/cloudpipe/`. Registry prefix is set in the `cloudpipe-config` ConfigMap and passed as `ecr-registry` to every workflow.
+All pipeline images are dual-pushed to a private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`, now primary) and ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`, secondary — dual-push during the NAT-cost migration, kept as rollback). The registry prefix actually used is set by Terraform (`local.ecr_registry` in `terraform/argowf.tf`) and passed as the `ecr-registry` parameter to every workflow.
 
 ---
 
 ## Build system overview
 
-Three GitHub Actions workflows manage image builds:
+Five GitHub Actions workflows manage image builds: `build-images.yaml`, `build-fmri-first-level-proc.yaml`, `build-prefect-flow-runner.yaml`, `pr-image-build.yaml` (build-only validation on pull requests, no push), and `build-gpu-nodeclass-ami.yaml` (bakes the Karpenter GPU AMI — see [pre-baked-amis.md](pre-baked-amis.md)). The repo's other two workflows, `ci.yaml` and `sync-public.yaml`, are unrelated to images.
 
 ### build-images.yaml (most images)
 
@@ -14,15 +14,20 @@ Triggers on `push` to `main` when any of the following change:
 - `images/**/Dockerfile`
 - `images/**/pixi.toml` or `images/**/pixi.lock`
 - `images/**/*.py`
-- Excludes `images/fmri-first-level-proc/**`
+- `src/**` — library code (e.g. `src/metrics/`, `src/inventory.py`) `COPY`ed into images
+- Excludes `images/fmri-first-level-proc/**` and `images/prefect-flow-runner/**` (each has its own dedicated workflow)
 
 A `changes` job detects which image directories were modified and builds only those. `workflow_dispatch` accepts an optional `image` input to build a specific image (or all, if left blank).
 
-All images except `cloudpipe-controller` build for `linux/amd64` on `ubuntu-latest`. `cloudpipe-controller` builds for `linux/arm64` on `ubuntu-24.04-arm`.
+When `src/` or `images/shared/` changes, every image whose Dockerfile `COPY`s from that path is rebuilt too — self-maintaining: adding a `COPY src/…` (or `COPY images/shared/…`) line to a Dockerfile automatically enrolls that image. `prefect-flow-runner` also `COPY`s `src/metrics/` but is excluded here and rebuilt by its own workflow instead.
 
-**Tagging**: images are tagged `sha-<full-git-sha>` only — no `:latest`. After a successful build, an `update-image-refs` job automatically rewrites all `sha-*` **and** `:latest` image references in `argo/workflows/cloudpipe_minproc/` and `argo/workflows/cloudpipe_fullproc/` to the new SHA and commits with `[skip ci]`. ArgoCD picks up the updated WorkflowTemplates on the next sync. The `:latest` match handles the first-push case when a new image is initially wired in with `:latest` before its first build.
+The `changes` job routes each image to a runner via an `ARM_IMAGES` allow-list, defaulting everything else to `linux/amd64` on `ubuntu-latest`.
 
-Large images (`fastsurfer`, `fireants`, `freesurfer`, `synthmorph`) free GitHub Actions disk space before building.
+> **`ARM_IMAGES` is currently dead.** It is set to `"cloudpipe-controller"`, an image that does not exist in `images/` and has no Dockerfile — so in practice **every** image this workflow builds is amd64. The two images that genuinely need arm64 (`fmri-first-level-proc`, `prefect-flow-runner`) are excluded from this workflow and built as arm64 by their own. If you add an image destined for `first-level-nodepool` (the ARM64/Graviton pool), you must add it to `ARM_IMAGES` — an amd64 image will not run there.
+
+**Tagging**: images are tagged `sha-<full-git-sha>` only — no `:latest`. After a successful build, an `update-image-refs` job automatically rewrites all `sha-*` **and** `:latest` image references in `argo/workflows/cloudpipe_minproc/` (and `argo/workflows/cloudpipe_fullproc/`, once that pipeline exists — see [architecture.md](architecture.md#cloudpipe_fullproc-planned--design-only-not-implemented)) to the new SHA and commits with `[skip ci]`. ArgoCD picks up the updated WorkflowTemplates on the next sync. The `:latest` match handles the first-push case when a new image is initially wired in with `:latest` before its first build.
+
+Large images free GitHub Actions disk space before building. The condition matches `fastsurfer`, `fireANTs`, `freesurfer`, and `synthmorph` — but `images/synthmorph/` no longer exists, so that arm of the test is inert. (The image directory is `fireANTs`, capital letters included; the ECR repo is lowercase `cloudpipe/fireants`.)
 
 ### build-fmri-first-level-proc.yaml
 
@@ -30,11 +35,11 @@ Separate workflow because `fmri-first-level-proc` requires two private repositor
 - `jrussell9000/ABCD_fmri_orchestrator_S3`
 - `jrussell9000/fmri-first-level-proc`
 
-Builds `linux/arm64` on `ubuntu-24.04-arm`. After push, rewrites the SHA tag in `argo/workflows/fmri_first_level_proc/fmri-first-level-proc-workflow-template.yaml` (and `terraform/modules/batch/jobdefs.tf` for legacy Batch) and commits.
+Builds `linux/arm64` on `ubuntu-24.04-arm`. After push, rewrites the SHA tag in `argo/workflows/fmri_first_level_proc/fmri-first-level-proc-workflow-template.yaml` and commits.
 
 ### build-prefect-flow-runner.yaml
 
-Triggers on changes to `images/prefect-flow-runner/**`, `prefect/flows/**`, or `prefect/prefect.yaml`. Uses `:latest` tag (not SHA). After push, warns in the GitHub Actions job summary if `prefect.yaml` changed and `prefect deploy --all` is needed. See operations.md for the full Prefect deployment procedure.
+Triggers on changes to `images/prefect-flow-runner/**`, `src/metrics/**` (`COPY`ed into the image), `prefect/flows/**`, or `prefect/prefect.yaml`. Uses `:latest` tag (not SHA). After push, warns in the GitHub Actions job summary if `prefect.yaml` changed and `prefect deploy --all` is needed. See operations.md for the full Prefect deployment procedure.
 
 ---
 
@@ -46,7 +51,7 @@ Triggers on changes to `images/prefect-flow-runner/**`, `prefect/flows/**`, or `
 **Tag**: SHA-pinned (`:latest` match enables auto-pinning on first build)  
 **Platform**: `linux/amd64`  
 **Base**: `public.ecr.aws/docker/library/python:3.14.2-alpine3.23`  
-**Contents**: Python 3.14 + `boto3` + `botocore` + metrics scripts (`exit_handler.py`, `writer.py`, `schemas.py`).
+**Contents**: Python 3.14 + `boto3` + `botocore` + metrics scripts (`exit_handler.py`, `writer.py`, `schemas.py`), `COPY`ed at build time from `src/metrics/` and `src/inventory.py`.
 
 Used by all lightweight scripting steps that need boto3:
 - `start-globus-instance-template` — EC2 start + SSM waiter
@@ -92,22 +97,6 @@ Requires `nvidia.com/gpu: 1` resource limit. Runs on `gpu-nodepool`.
 
 ---
 
-### synthmorph
-
-**ECR repo**: `cloudpipe/synthmorph`  
-**Tag**: SHA-pinned  
-**Platform**: `linux/amd64`  
-**Base**: `freesurfer/synthmorph:latest`  
-**Contents**: SynthMorph + FreeSurfer utilities + `bold_to_t1w.py`. Runs as UID 1000 (`nonroot`).
-
-Script: `bold_to_t1w.py` — replaces bbregister with `mri_synthmorph` for BOLD→T1w registration. A single neural network forward pass (~5s) vs bbregister's iterative surface-based optimisation (~5–10 min). Contrast-agnostic — no T1-weighted assumption.
-
-Produces: LTA transform, ANTs/ITK `.txt` affine (RAS→LPS coordinate flip for ANTs compatibility), BOLD reference volume, warped QC image, and brain mask in BOLD space. All FreeSurfer CLI dependencies replaced with Python equivalents (`nibabel`, `numpy`, `scipy`) to stay compatible with the lightweight SynthMorph container.
-
-Runs on `cpu-heavy-nodepool` (8 GB RAM, 2 CPU). Called by `bold-to-t1w-template`.
-
----
-
 ### afni
 
 **ECR repo**: `cloudpipe/afni`  
@@ -117,11 +106,28 @@ Runs on `cpu-heavy-nodepool` (8 GB RAM, 2 CPU). Called by `bold-to-t1w-template`
 **Base**: `ghcr.io/prefix-dev/pixi:0.41.4`  
 **Contents**: AFNI + Python environment defined in `pixi.toml`/`pixi.lock`. Entrypoint wraps a pixi shell-hook script.
 
-`preproc.py` is baked into the image at build time but is **also** embedded in the `preproc-script` ConfigMap and mounted over the baked copy at runtime. This allows updating the preprocessing script without rebuilding the image — edit `images/afni/preproc.py`, run `tools/gen-preproc-configmap.sh`, commit both files, push.
+`preproc.py` and `surf_geometry.py` are baked into the image at build time. Changes to them require a normal image rebuild (see the rebuild trigger below).
 
-Runs `preproc.py` with 6 threads, 16 GB RAM, 6 CPU, 10 GB ephemeral storage. Runs on `cpu-heavy-nodepool`. Called by `functional-preprocessing-template`.
+Runs `preproc.py` with 4 GB RAM (6 GB limit), 3 CPU, 20 GB ephemeral storage (30 GB limit). Runs on `cpu-heavy-nodepool`. The `--threads` value is not fixed: the driver reads the pod's own CPU request via the downward API and divides it by `jobs`, so at the default `jobs: 1` it is 3 threads. Called by `functional-preprocessing-session-template`, which also invokes `surf_geometry.py` once per session to export the surface geometry Stage 2 consumes.
 
 Triggered to rebuild on changes to `pixi.toml`, `pixi.lock`, or `.py` files under `images/afni/`.
+
+---
+
+### workbench
+
+**ECR repo**: `cloudpipe/workbench`  
+**Tag**: SHA-pinned  
+**Platform**: `linux/amd64`  
+**Build tool**: [pixi](https://pixi.sh) — reproducible conda-lock environment  
+**Base**: `ghcr.io/prefix-dev/pixi:0.41.4`  
+**Contents**: Connectome Workbench (`wb_command`) plus nibabel/numpy. Uses `connectome-workbench-cli`, **not** the `connectome-workbench` metapackage — the latter also pulls the Qt GUI build, which is dead weight in a headless pod.
+
+`cifti_assemble.py` is baked in. Resamples the cortical grayordinate component to fsLR 32k and assembles a CIFTI-2 dtseries.
+
+Runs on `cpu-light-nodepool`, 4 GB RAM, 2 CPU. Called by `surface-resample-session-template`.
+
+Requires the fsLR meshes staged at `s3://{bucket}/config/fsLR/` — see [pipelines.md](pipelines.md) for the file list and the two traps (the sphere must be the `fs_LR-deformed_to-fsaverage` variant; area correction uses vertex-area *metrics*, not surfaces).
 
 ---
 
@@ -133,13 +139,32 @@ Triggered to rebuild on changes to `pixi.toml`, `pixi.lock`, or `.py` files unde
 **Base**: `deepmi/fastsurfer:latest`  
 **Contents**: FastSurfer with a `nonroot` user (UID/GID 1000) added. `/opt/freesurfer` ownership transferred to 1000.
 
-Used by the four anatomical phase templates (`fastsurfer-template-creation-template`, `fastsurfer-template-segmentation-template`, `fastsurfer-template-parcellation-template`, `fastsurfer-long-segmentation-template`, `fastsurfer-long-parcellation-template`).
+Used by the four anatomical phase templates (`fastsurfer-template-build-template`, `fastsurfer-template-parcellation-template`, `fastsurfer-long-segmentation-template`, `fastsurfer-long-parcellation-template`).
 
-Runs on `gpu-nodepool` for all anatomical steps. The non-root user is required because the workflow-level `securityContext` (`runAsUser: 1000`) would otherwise conflict with FastSurfer's default root execution.
+The anatomical steps are **split across two node pools**, not all on GPU: the segmentation steps take `karpenter.sh/nodepool: gpu-nodepool`, while the parcellation steps (`surf_only`) take `cpu-heavy-nodepool` — surface reconstruction is CPU-bound and gains nothing from a GPU. Note `cpu-heavy-nodepool` admits only 2xlarge/4xlarge, which constrains how those pods can be packed.
+
+The non-root user is required because the workflow-level `securityContext` (`runAsUser: 1000`) would otherwise conflict with FastSurfer's default root execution.
 
 Frees 20+ GB of GitHub Actions disk space before building (Docker image layer cache, Android SDK, .NET, Haskell).
 
 ---
+
+### fsqc
+
+**ECR repo**: `cloudpipe/fsqc`  
+**Tag**: SHA-pinned  
+**Platform**: `linux/amd64`  
+**Base**: `python:3.10-slim-bookworm`  
+**Contents**: [Deep-MI/fsqc](https://github.com/Deep-MI/fsqc) 2.1.7 (MIT), installed `--no-deps` with its runtime requirements listed explicitly. Runs as UID 1000 (`nonroot`).
+
+Runs anatomical QC against FastSurfer + subregion output and emits the `fsqc_qc` metric records (`metrics/fsqc-qc/`). Used by the `fsqc-metrics` WorkflowTemplate.
+
+**This is a ~930 MB python-slim image, not a FastSurfer derivative.** fsqc reads FreeSurfer *output files* through nibabel and never shells out to FreeSurfer binaries, so basing it on the 16 GB `deepmi/fastsurfer` image would carry a CUDA runtime and a full FreeSurfer tree that no enabled module touches.
+
+The dependency trim is deliberate and subtle — the OpenGL/Qt rendering stack (`whippersnappy`, `pyopengl`, `glfw`, `pyrr`, `PyQt6`) is dropped, while `brainprint`, `lapy`, and `psutil` are kept even though they look trimmable. Two traps are documented at length in the Dockerfile header and are worth reading before any version bump or flag change:
+
+- `fsqcMain._check_packages()` hard-fails at **startup** on a missing `brainprint`/`lapy`, ungated by the flags that would need them. A plain import smoke-test passes; only a real `run_fsqc` invocation reaches the gate.
+- Enabling `--surfaces` without restoring the trimmed packages does **not** crash. fsqc catches the ImportError per module, writes `surfaces:1` to `status.txt`, and exits 0 — yielding a quietly incomplete record. Add the deps in the same change as the flag.
 
 ### freesurfer
 
@@ -160,7 +185,11 @@ Downloaded with `aria2c` (16 parallel connections) for speed; the 3 GB tarball i
 
 **Excluded** (to reduce image size): large recon-all GCA atlases (`average/*.gca`), legacy MATLAB-compiled binaries, GUI/GPU libraries (`lib/cuda`, `lib/qt`, `lib/vtk`), `matlab/`, `mni/`, `diffusion/`, `fsfast/`, `subjects/`, Python build headers (`python/include/`, `python/share/`).
 
-Used exclusively by the `subregion-seg` WorkflowTemplate (`segment-thalamus-template`, `segment-brainstem-template`, `segment-deeplearning-template`). All three run on `cpu-heavy-nodepool` — no GPU required.
+**Also carries `bold_to_t1w.py`** — this image, not a separate SynthMorph image, is where BOLD→T1w registration runs. (There is no `images/synthmorph/` and no `cloudpipe/synthmorph` ECR repo; earlier revisions of this doc described one.) The script uses `mri_synthmorph` for a contrast-agnostic rigid fit: a single neural-network forward pass (~5 s) instead of bbregister's iterative surface-based optimisation (~5–10 min), with no T1-weighted assumption. bbregister was removed outright in `61ccff7` — see [ADR 002](decisions/002-synthmorph-over-bbregister.md).
+
+It produces the LTA transform, an ANTs/ITK `.txt` affine (RAS→LPS coordinate flip for ANTs compatibility, hand-rolled in Python to avoid a `lta_convert --outitk` segfault), the BOLD reference volume, a warped QC image, and a brain mask in BOLD space. FreeSurfer CLI dependencies are replaced with Python equivalents (`nibabel`, `numpy`, `scipy`).
+
+Used by the `subregion-seg` WorkflowTemplate (`segment-subregions-gems-template`, `segment-subregions-dl-template`) and by `registration`'s BOLD→T1w step (`bold-to-t1w-session-template`, whose thread-pool env vars are pinned to the CPU request). All three pods run on `cpu-heavy-nodepool` — no GPU required.
 
 ---
 
@@ -202,25 +231,53 @@ Build context is the repo root (not `images/prefect-flow-runner/`) so the `COPY 
 
 | Image | Status | Notes |
 |---|---|---|
-| `fsl` | Unused in current pipelines | FSL tools; retained for potential future use |
-| `fmriprep` | Unused — replaced by cloudpipe_minproc | Legacy full-preproc approach |
-| `diffusion` | Not yet integrated | For future DWI processing |
-| `bravePy` | Removed — consolidated into `python` | Was Python+boto3 without metrics scripts |
+| `fsl` | Unused in current pipelines | FSL/topup groundwork for the planned `cloudpipe_fullproc` pipeline (SDC step) — see [architecture.md](architecture.md#cloudpipe_fullproc-planned--design-only-not-implemented). Parked out of CI (`build-images.yaml`) until that pipeline is implemented. |
+| `diffusion` | Present, not yet integrated | For future DWI processing; unrelated to `cloudpipe_fullproc`, no consumer planned yet |
+| `fmriprep` | **Directory removed** | Legacy full-preproc approach, replaced by cloudpipe_minproc |
+| `ants` | **Directory removed** | Was never buildable (no Dockerfile — only `__pycache__`) |
+| `bravePy` | **Directory removed** — consolidated into `python` | Was Python+boto3 without metrics scripts. Any doc or template still saying `bravepy` is stale; the image is `cloudpipe/python`. |
+
+Only `fsl` and `diffusion` still exist on disk. The other three rows are kept because their names persist in older docs, commit messages, and issues.
 
 ---
 
 ## Adding a new image
 
 1. Create `images/<name>/Dockerfile`. Use a minimal base; run as a non-root UID.
-2. Commit and push to `main` — GitHub Actions detects the new directory and builds it.
-3. The new image tag (`sha-<sha>`) appears in the GitHub Actions job summary.
-4. Reference it in a WorkflowTemplate:
+2. **Add `<name>` to `local.ecr_images` in `terraform/ecr.tf` and apply.** (Root-level Terraform; not in the public repo, which publishes only `terraform/modules/`.) The repositories do not autocreate; without this the first build has nowhere to push.
+3. **If the image uses pixi, generate `pixi.lock` with the pinned builder version — not your workstation's.** See the warning below.
+4. Commit and push to `main` — GitHub Actions detects the new directory and builds it.
+5. The new image tag (`sha-<sha>`) appears in the GitHub Actions job summary.
+6. Reference it in a WorkflowTemplate. Use `:latest` for the first reference — `update-image-refs` matches `sha-*|latest` and rewrites it, but only after confirming the tag reached the registry:
    ```yaml
-   image: "{{workflow.parameters.ecr-registry}}/cloudpipe/<name>:<sha-tag>"
+   image: "{{workflow.parameters.ecr-registry}}/cloudpipe/<name>:latest"
    ```
-5. On the next push that changes the image, the `update-image-refs` job rewrites the SHA automatically.
+7. On the next push that changes the image, the `update-image-refs` job rewrites the SHA automatically.
 
 To trigger a one-off build without changing image source files, use the `workflow_dispatch` trigger on `build-images.yaml` with the image directory name as input.
+
+### pixi.lock must be generated with the builder's pixi version
+
+Dockerfiles build on `ghcr.io/prefix-dev/pixi:0.41.4`, which reads **lockfile format v6 only**. Every `images/*/pixi.lock` here is v6. A current workstation pixi (0.73.x) writes **v7**, and `pixi lock` has no flag to target an older format — so a lock generated locally will build fine on your machine and fail in CI.
+
+Generate it with the pinned version:
+
+```bash
+curl -fsSL -o /tmp/pixi.tar.gz \
+  https://github.com/prefix-dev/pixi/releases/download/v0.41.4/pixi-x86_64-unknown-linux-musl.tar.gz
+tar xzf /tmp/pixi.tar.gz -C /tmp
+cd images/<name> && /tmp/pixi lock
+head -1 pixi.lock          # must say: version: 6
+```
+
+Verify with the Dockerfile's exact command in a clean directory:
+
+```bash
+mkdir /tmp/lockcheck && cp images/<name>/pixi.{toml,lock} /tmp/lockcheck/
+cd /tmp/lockcheck && /tmp/pixi install --locked
+```
+
+`pr-image-build.yaml` builds changed images on pull requests (build-only, no push, no AWS credentials), so a lockfile-format mismatch now fails the PR rather than `main`. It has no registry layer cache, so it is slower than the main-branch build — correctness on the PR, speed on the merge.
 
 ---
 
@@ -238,7 +295,7 @@ The most common cause is using `|` as both the `sed` delimiter and the BRE alter
 
 ```bash
 NEW_SHA=<full-40-char-git-sha-of-the-build-commit>
-for template in argo/workflows/cloudpipe_minproc/*.yaml argo/workflows/cloudpipe_fullproc/*.yaml; do
+for template in argo/workflows/cloudpipe_minproc/*.yaml; do
   sed -i "s#/cloudpipe/<name>:\(sha-[a-zA-Z0-9]*\|latest\)#/cloudpipe/<name>:sha-${NEW_SHA}#g" "$template"
 done
 git diff argo/workflows/  # verify changes look correct

@@ -1,0 +1,161 @@
+# MkDocs config for the PUBLIC documentation site.
+#
+# This builds from the same docs/ tree the internal repo uses, but publishes a
+# deliberately CURATED subset — see `nav` below. Internal-only material
+# (agent instructions, dated investigation handoffs, superpowers plans, the
+# code-health plan) stays in the repo for contributors and is excluded here via
+# `exclude_docs`, not deleted.
+#
+# Two commands matter:
+#   pixi run -e docs docs-serve   — live preview on :8000
+#   pixi run -e docs docs-build   — strict build; CI runs this to fail on broken
+#                                   internal links (see .github/workflows/ci.yaml)
+#
+# `mkdocs build --strict` turns warnings into errors. The validation block below
+# is what makes that useful: unrecognized links and absolute links are demoted
+# to warnings so --strict catches them, rather than passing silently.
+
+site_name: CloudPipe
+site_description: >-
+  Neuroimaging preprocessing pipeline for the ABCD Study — registration and
+  functional preprocessing on Kubernetes, producing MNI-space BOLD with confounds.
+site_url: https://jrussell9000.github.io/cloudpipe/
+repo_url: https://github.com/jrussell9000/cloudpipe
+repo_name: jrussell9000/cloudpipe
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    # Section landing pages: docs/decisions/README.md becomes the Decisions
+    # index rather than appearing twice in the sidebar.
+    - navigation.indexes
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  # These docs are authored to be read on GitHub first, and their in-page links
+  # use GitHub's anchor slugs — which differ from MkDocs' default. GitHub renders
+  # "## `FuncQC` — per BOLD run" as #funcqc--per-bold-run (em dash becomes a
+  # DOUBLE hyphen); MkDocs' default slugifier collapses it to a single one, so
+  # every such link 404s on the site while working fine on GitHub.
+  #
+  # pymdownx's slugify with case="lower" reproduces GitHub's algorithm, so one
+  # setting fixes 14 links at once and keeps both renderings valid. Prefer this
+  # over rewriting the links: hand-editing them would fix the site and break
+  # GitHub, and every new doc would reintroduce the problem.
+  - toc:
+      permalink: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify {kwds: {case: lower}}
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+
+# Internal-only material. Kept in the repo for contributors, excluded from the
+# published site. These are also the files whose links are NOT checked, so keep
+# this list and the nav in agreement.
+#
+# `investigations/` is dated point-in-time handoff material — deliberately
+# unmaintained once its question is answered, and full of links to source paths
+# that only resolve when read on GitHub. Publishing it would put prose that was
+# never meant to stay true in front of outside readers. It stays in the repo.
+exclude_docs: |
+  agents/
+  superpowers/
+  code-health-plan.md
+  investigations/
+
+# What makes --strict worth running. `unrecognized_links: warn` is the setting
+# that turns a typo'd relative link into a build failure; without it MkDocs only
+# emits INFO and CI stays green over broken navigation.
+#
+# `not_in_nav` is explicitly ignored: investigations/ is intentionally published
+# but not in the nav (it is linked from index.md and would bloat the sidebar with
+# a dozen dated handoffs). Without this, --strict would fail on every one.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+  nav:
+    omitted_files: ignore
+
+# Curated five-section structure. Order is deliberate: a newcomer reads top to
+# bottom (what it is -> how to run it -> what the science is -> how it is built ->
+# why it is built that way).
+nav:
+  - Home: index.md
+
+  - Pipelines:
+      - pipelines.md
+      - argo-workflows.md
+      - images.md
+
+  - Methods & QC:
+      - nmi-interpretation.md
+      - observability.md
+      - metrics_data_dictionary.md
+      - how-to-timeframe-metrics-dataframe.md
+
+  - Infrastructure:
+      - architecture.md
+      - infrastructure.md
+      - gitops.md
+      - pre-baked-amis.md
+      - globus.md
+      - globus-setup.md
+
+  - Operations:
+      - operations.md
+
+  - Decisions:
+      - decisions/README.md
+      - decisions/001-s3-gateway-over-posix-staging.md
+      - decisions/002-synthmorph-over-bbregister.md
+      - decisions/003-orig-mgz-for-t1w-registration.md
+      - decisions/004-s3-artifacts-for-inter-step-data.md
+      - decisions/005-preproc-py-in-configmap.md
+      - decisions/006-pod-identity-over-irsa.md
+      - decisions/007-karpenter-for-pipeline-pods.md
+      - decisions/008-prefect-as-queue-manager.md
+      - decisions/009-argo-over-batch.md
+      - decisions/010-globus-ha-subscription.md
+      - decisions/011-s3-athena-for-metrics.md
+      - decisions/012-abcd-matrix-rejected.md
+      - decisions/013-src-scripts-tools-reorg.md
+      - decisions/014-cloudflare-tunnel-over-vpn.md
+      - decisions/015-s3-backend-after-state-loss.md
+      - decisions/016-skipped-producer-deadlock-in-dag-recording.md

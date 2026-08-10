@@ -11,6 +11,7 @@ spec:
     annotations:
       karpenter.sh/do-not-disrupt: "true"
     labels:
+      pipeline: fmri-first-level-proc
       subjectid: "{{workflow.parameters.subjID}}"
 
   podMetadata:
@@ -31,12 +32,29 @@ spec:
   activeDeadlineSeconds: 7200
 
   retryStrategy:
-    limit: "3"
-    retryPolicy: OnFailure
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    # Sized for spot churn: consecutive reclaims on one long step are routine on
+    # the spot-only nodepools. Note activeDeadlineSeconds above (7200) is the real
+    # ceiling here — retries cannot extend it, so the budget below is an upper
+    # bound that the 2h cap may cut short. See issue #115.
+    limit: "8"
+    # Was OnFailure, which could never honour the spot clause in the expression
+    # below: a reclaimed pod lands in phase Error, not Failed, and OnFailure
+    # retries Failed only. The expression is what filters retries here; the policy
+    # just has to be permissive enough to let it run.
+    retryPolicy: Always
+    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
+    # never emitted by our scripts. 75 = EX_TEMPFAIL, reserved for the "a reclaim
+    # truncated my output, re-run me" guards in the fastsurfer templates. 137 is
+    # deliberately absent: a real OOMKill is deterministic (#120, #129, #134 each
+    # needed a config change, not a retry), so retrying it only burns the enlarged
+    # budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
     backoff:
       duration: "1m"
       factor: "2"
+      # cap bounds each individual delay (maxDuration would abort the retries
+      # instead): 1+2+4+5+5+5+5+5 = 32m worst case, vs 7m at the old limit of 3.
+      cap: "5m"
 
   arguments:
     parameters:

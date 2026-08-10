@@ -1,0 +1,85 @@
+# GitHub Pages deploy for the PUBLIC repo (jrussell9000/cloudpipe).
+#
+# ─── This file is INERT here. It is a template, not a live workflow. ───
+#
+# It lives in scripts/ rather than .github/workflows/ for two reasons:
+#
+#   1. sync-public.sh does not sync `.github/` — the public repo's Actions are
+#      deliberately not a mirror of the internal ones (the internal CI needs
+#      AWS credentials and private runners; the public repo needs neither).
+#   2. Even if it did, the sync pushes with a PAT (`secrets.PUBLIC_REPO_TOKEN`).
+#      GitHub rejects a push that creates or edits a file under
+#      `.github/workflows/` unless that token carries the `workflow` scope, so
+#      auto-syncing this file would break the whole sync job, not just itself.
+#
+# INSTALL (one time, by hand, in the public repo):
+#
+#   cp scripts/public-pages-workflow.yaml \
+#      /path/to/cloudpipe-public/.github/workflows/pages.yaml
+#   # then in the public repo: Settings → Pages → Source: "GitHub Actions"
+#
+# After that it is self-maintaining: every sync that touches docs/ or
+# mkdocs.yml lands on the public main and this workflow rebuilds the site.
+# Broken links are already caught upstream by the internal CI's docs_build job,
+# so this deploy should never be the first place a docs problem shows up.
+
+name: Deploy docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "pixi.toml"
+      - "pixi.lock"
+      - ".github/workflows/pages.yaml"
+  workflow_dispatch:
+
+# Least privilege: read the tree, write the Pages artifact, mint the OIDC token
+# the deploy step exchanges for a Pages deployment. No `contents: write`.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race for the live site. `cancel-in-progress: false`
+# because a half-finished Pages deploy is worse than a slightly stale one — let
+# the running deploy finish, then supersede it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Build through pixi, using the same `docs` environment and the same
+      # `docs-build` task the internal CI runs, so the published site cannot be
+      # produced by a different toolchain than the one that gated it.
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          environments: docs
+          cache: true
+
+      - name: mkdocs build --strict
+        run: pixi run -e docs docs-build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

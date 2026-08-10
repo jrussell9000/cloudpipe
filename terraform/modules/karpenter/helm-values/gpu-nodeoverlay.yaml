@@ -1,0 +1,43 @@
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: g6f-fractional-gpu
+spec:
+  # g6f instances expose a *fractional* NVIDIA L4 (vGPU), so the EC2
+  # DescribeInstanceTypes API reports GpuInfo Count=0 for them. Karpenter builds
+  # its instance-type model from that API, so without this overlay it believes
+  # g6f has zero nvidia.com/gpu capacity and will NEVER provision a g6f for a pod
+  # requesting nvidia.com/gpu — even though g6f is listed in the gpu-nodepool
+  # instance-family requirement.
+  #
+  # This overlay injects nvidia.com/gpu: 1 into Karpenter's SCHEDULING SIMULATION
+  # only (NodeOverlay cannot change real node capacity). The launched g6f node
+  # still advertises the vGPU via the NVIDIA device plugin (gitops/apps/
+  # nvidia-device-plugin), which is what kubelet actually allocates against.
+  #
+  # GATE TO g6f.2xlarge AND LARGER. g6f partitions GPU memory by size:
+  #   large  (2 vCPU) = 1/8 L4 = ~2.79 GiB VRAM   <- too small
+  #   xlarge (4 vCPU) = 1/8 L4 = ~2.79 GiB VRAM   <- too small
+  #   2xlarge(8 vCPU) = 1/4 L4 = ~5.59 GiB VRAM   <- fits
+  #   4xlarge(16 vCPU)= 1/4 L4 = ~5.59 GiB VRAM   <- fits
+  # Our GPU steps (FastSurfer VINN segmentation) have a measured, subject-
+  # independent peak working set of ~3.7 GiB (3694 MiB; brains are conformed to a
+  # fixed 256^3 volume). That does NOT fit the ~2.79 GiB large/xlarge slices — a
+  # pod placed there would OOM at inference. Only 1/4-L4 slices (5.59 GiB) hold it
+  # with headroom, so we require >= 8 vCPU (= 2xlarge+). instance-cpu is used as
+  # the gate because Karpenter does not populate GPU-memory labels for g6f (the
+  # same Count=0 gap this overlay works around), whereas vCPU is always reported.
+  #
+  # Requires the NodeOverlay feature gate on the controller
+  # (settings.featureGates.nodeOverlay: true in values-karpenter.yaml).
+  # Alpha API (karpenter.sh/v1alpha1) — see
+  # https://karpenter.sh/docs/concepts/nodeoverlays/
+  requirements:
+    - key: karpenter.k8s.aws/instance-family
+      operator: In
+      values: ["g6f"]
+    - key: karpenter.k8s.aws/instance-cpu
+      operator: Gt
+      values: ["7"]
+  capacity:
+    nvidia.com/gpu: "1"

@@ -6,19 +6,17 @@ data "aws_subnet" "public" {
   id = var.public_subnet_id
 }
 
-# Ubuntu 22.04 LTS x86_64
+# Ubuntu 22.04 LTS x86_64 — pinned to the AMI the live instance was launched
+# from. `most_recent = true` previously caused this data source to drift to
+# newer Canonical AMIs over time, forcing an unwanted instance replacement on
+# every apply. Bump image-id deliberately (and expect a replacement) when
+# actually upgrading the base image.
 data "aws_ami" "ubuntu_2204" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
+  owners = ["099720109477"] # Canonical
 
   filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
+    name   = "image-id"
+    values = ["ami-0cf6185a5bb26f705"]
   }
 }
 
@@ -29,7 +27,7 @@ resource "aws_security_group" "globus" {
   vpc_id      = var.vpc_id
 }
 
-# Port 443 and GridFTP (50000-51000) must be open to 0.0.0.0/0 per Globus Connect Server v5
+# Ports for SSH (443) and GridFTP (50000-51000) must be open to 0.0.0.0/0 per Globus Connect Server v5
 # architecture. HTTPS collections are accessed directly by clients (not relayed through Globus
 # infrastructure), and GridFTP data channels are peer-to-peer between endpoints worldwide.
 # Restricting either to specific CIDRs breaks interoperability with other institutions.
@@ -165,14 +163,16 @@ resource "aws_instance" "globus" {
   iam_instance_profile   = aws_iam_instance_profile.globus.name
 
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
-    name                    = var.name
-    region                  = var.region
-    globus_org_name         = var.globus_org_name
-    globus_contact_email    = var.globus_contact_email
-    globus_s3_bucket        = var.globus_s3_bucket
-    globus_collection_name  = var.globus_collection_name
-    globus_client_id        = var.globus_client_id
-    globus_use_s3_gateway   = var.globus_use_s3_gateway
+    name                   = var.name
+    region                 = var.region
+    globus_org_name        = var.globus_org_name
+    globus_contact_email   = var.globus_contact_email
+    globus_s3_bucket       = var.globus_s3_bucket
+    globus_collection_name = var.globus_collection_name
+    globus_client_id       = var.globus_client_id
+    globus_use_s3_gateway  = var.globus_use_s3_gateway
+    globus_owner_email     = var.globus_owner_email
+    globus_identity_domain = var.globus_identity_domain
   })
 
   user_data_replace_on_change = false
@@ -449,9 +449,9 @@ resource "aws_iam_role_policy" "runner_globus_ssm" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "SSMSendCommandGlobusInstance"
-        Effect   = "Allow"
-        Action   = ["ssm:SendCommand"]
+        Sid    = "SSMSendCommandGlobusInstance"
+        Effect = "Allow"
+        Action = ["ssm:SendCommand"]
         Resource = [
           "arn:${var.partition}:ec2:${var.region}:${var.account_id}:instance/${aws_instance.globus.id}",
           "arn:${var.partition}:ssm:${var.region}::document/AWS-RunShellScript",

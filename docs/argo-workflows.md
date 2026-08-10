@@ -17,23 +17,20 @@ argo/workflows/
     registration-workflow-template.yaml            (name: registration)
     functional-preprocessing-workflow-template.yaml   (name: functional-preprocessing)
     subregion-segmentation-workflow-template.yaml  (name: subregion-seg)   ← optional; standalone
+    surface-resample-workflow-template.yaml        (name: surface-resample)
+    fsqc-metrics-workflow-template.yaml            (name: fsqc-metrics)
+    metrics-workflow-template.yaml                 (name: metrics-exit-handler)
+    outcome-recorder-workflow-template.yaml        (name: outcome-recorder)
     cloudpipe-semaphores-configmap.yaml
-    globus-credentials-external-secret.yaml
-
-  cloudpipe_fullproc/            ← in-development pipeline (raw DICOM input)
-    cloudpipe-long-master-workflow-template.yaml   (name: cloudpipe-fullproc)
-    globus-transfer-workflow-template.yaml
-    inventory-workflow-template.yaml
-    fastsurfer-template-phase-workflow-template.yaml
-    fastsurfer-long-phase-workflow-template.yaml
-    registration-workflow-template.yaml
-    functional-preprocessing-workflow-template.yaml
-    unpack-and-convert-workflow-template.yaml.yaml
     globus-credentials-external-secret.yaml
 
   fmri_first_level_proc/         ← first-level GLM analysis
     fmri-first-level-proc-workflow-template.yaml  (name: fmri-first-level-proc)
 ```
+
+That is **13** WorkflowTemplates in `cloudpipe_minproc/` plus one in `fmri_first_level_proc/`. The last three above are infrastructure rather than processing phases: `metrics-exit-handler` runs as the master workflow's exit handler and writes the `WorkflowRun` summary, and `outcome-recorder` writes per-step `StepOutcome` records.
+
+**`cloudpipe_fullproc/` does not exist yet.** It's a planned pipeline (raw DICOM input) — see [architecture.md](architecture.md#cloudpipe_fullproc-planned--design-only-not-implemented) for the design. The `workflow-templates` ArgoCD Application carries a placeholder `exclude: 'cloudpipe_fullproc/**'` so a future directory there won't auto-sync mid-development.
 
 All files are synced from git by the `workflow-templates` ArgoCD Application. `selfHeal: true` means any manual `kubectl apply` to `argo-workflows` namespace is reverted within seconds — always push to git.
 
@@ -41,16 +38,35 @@ All files are synced from git by the `workflow-templates` ArgoCD Application. `s
 
 ## Controller configuration
 
-Managed by Terraform in the `argo-workflows-controller-configmap` ConfigMap (not by ArgoCD values.yaml). Key settings:
+`parallelism`, `namespaceParallelism` and `resourceRateLimit` are set by **Terraform**, in the `argo-workflows-controller-configmap` ConfigMap (`terraform/modules/argo-workflows/main.tf`) — alongside the persistence/DB and `sso` config. They are deliberately *not* in the Helm values; see the note under [Concurrency controls](#concurrency-controls) for why setting them there does nothing. Key settings:
 
 | Setting | Value | Effect |
 |---|---|---|
-| `parallelism` | `1000` | Global max concurrently running workflow pods |
-| `resourceRateLimit.limit` | `20` | Max pod create calls per second to the K8s API |
-| `resourceRateLimit.burst` | `35` | Burst ceiling above the rate limit |
-| Artifact repository | S3 bucket from `var.globus_s3_destination_bucket` | All artifacts stored in `abcd-v7` |
+| `parallelism` | `1000` | Global max concurrently running **workflows** (not pods — pod concurrency is unbounded, controlled only by `resourceRateLimit`) |
+| `namespaceParallelism` | `100` | Max active workflows in `argo-workflows`; the server-side backstop for the Prefect queue gate (#206) |
+| `resourceRateLimit.limit` | `50` | Max pod create calls per second to the K8s API |
+| `resourceRateLimit.burst` | `90` | Burst ceiling above the rate limit |
+| Artifact repository | S3 bucket from `var.globus_s3_destination_bucket` | All artifacts stored in `<YOUR_S3_BUCKET>` |
+| `persistence.postgresql.host` | `pgbouncer` | DB connections go through PgBouncer, not directly to RDS |
 
-The controller and server deployments have `secret.reloader.stakater.com/reload: "argo-db"` annotations — Reloader automatically rolls them when the `argo-db` Secret changes (RDS password rotation).
+The controller and server deployments carry two Reloader annotations:
+- `secret.reloader.stakater.com/reload: "argo-db"` — rolls pods on RDS password rotation
+- `configmap.reloader.stakater.com/reload: "argo-workflows-controller-configmap"` — rolls pods when Terraform updates the persistence or SSO config
+
+---
+
+## PgBouncer connection pooler
+
+PgBouncer runs as a Deployment in the `argo-workflows` namespace and sits between Argo components and the RDS instance. Argo's persistence config points to `pgbouncer:5432`; PgBouncer forwards to the RDS endpoint it reads from the `argo-db` Secret at startup.
+
+| Setting | Value | Reason |
+|---|---|---|
+| Pool mode | `session` | Argo uses pgx with prepared statement caching; transaction mode drops server-side statements between transactions and causes errors |
+| `default_pool_size` | `20` | Caps real connections to RDS well below the `db.t4g.micro` max (~112) |
+| `max_client_conn` | `200` | Allows Argo goroutines to queue during bulk operations instead of failing immediately |
+| `server_tls_sslmode` | `require` | Enforces SSL on the PgBouncer → RDS leg |
+
+PgBouncer is defined in `gitops/apps/argo-workflows/templates/pgbouncer.yaml` (managed by ArgoCD). Credentials are pulled from the `argo-db` Secret (`host`, `username`, `password` keys) — the same secret used by the Argo controller. The Deployment has `secret.reloader.stakater.com/reload: "argo-db"` so it restarts on password rotation.
 
 ---
 
@@ -64,10 +80,9 @@ These settings appear at the top level of the `cloudpipe` master WorkflowTemplat
 | `activeDeadlineSeconds` | `43200` (12 hours max runtime) |
 | `ttlStrategy.secondsAfterCompletion` | `86400` (24 hours before deletion) |
 | `podGC.strategy` | `OnWorkflowCompletion` (pods deleted when workflow finishes) |
-| `volumeClaimGC.strategy` | `OnWorkflowCompletion` (EFS PVC deleted when workflow finishes) |
 | `podDisruptionBudget.minAvailable` | `100%` (prevents voluntary disruption of workflow pods) |
 | `securityContext` | `runAsUser/Group/fsGroup: 1000` (required for artifact file permissions across containers) |
-| `retryStrategy` | Limit 3, retry on spot interruption (`pod deleted`, `imminent node shutdown`) and exit codes 64/137/143, exponential backoff starting 1 min |
+| `retryStrategy` | Limit 8, retry on spot interruption (`pod deleted`, `imminent node shutdown`) and exit codes 64/75/143, exponential backoff from 1 min capped at 5 min. Exit 137 is **not** retried — the budget is for infrastructure churn, not workload failures (see [operations.md](operations.md#retries)) |
 
 All pods get `karpenter.sh/do-not-disrupt: "true"` annotation to block Karpenter from draining nodes with active workflow pods.
 
@@ -75,14 +90,14 @@ All pods get `karpenter.sh/do-not-disrupt: "true"` annotation to block Karpenter
 
 ## Artifact storage
 
-All inter-step data is passed via S3 artifacts, not the Argo artifact repository default. Each template declares its own `inputs.artifacts` (S3 download on start) and `outputs.artifacts` (S3 upload on completion), pointing directly to keys in `abcd-v7`.
+All inter-step data is passed via S3 artifacts, not the Argo artifact repository default. Each template declares its own `inputs.artifacts` (S3 download on start) and `outputs.artifacts` (S3 upload on completion), pointing directly to keys in `<YOUR_S3_BUCKET>`.
 
 This means:
 - Steps can be re-run independently (artifacts are already in S3)
 - The workflow does not need a shared PVC to pass data between steps that run on different nodes
 - Artifacts are persisted across workflow retries (no re-work on retry)
 
-The EFS PVC (50 Gi, `ReadWriteMany`) is used only where multiple containers in the same pod need shared scratch space (FastSurfer steps). It is named after the subject ID (lowercased) and deleted when the workflow completes.
+There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregion-seg` was the last consumer (its two segmentation pods now stage FastSurfer outputs onto their own private `emptyDir`s and checkpoint per-region progress to S3 instead — see [pipelines.md](pipelines.md#subregion-seg), tracked in [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77)). The EFS filesystem, StorageClass, and CSI driver have since been removed from the cluster entirely.
 
 ---
 
@@ -90,27 +105,40 @@ The EFS PVC (50 Gi, `ReadWriteMany`) is used only where multiple containers in t
 
 | Mechanism | Value | Scope |
 |---|---|---|
-| `master-pipeline-dag.parallelism` | `3` | Max pods running simultaneously within one workflow |
-| `functional-preprocessing-session-level-dag-template.parallelism` | `2` | Max func-preproc pods per session |
+| `master-pipeline-dag.parallelism` | `3` | Max pods running simultaneously within one workflow. This is the only `parallelism` setting in the whole template set — sessions fan out simultaneously but are throttled by it. |
 | `globus-transfer` semaphore | `8` | Max concurrent Globus transfers cluster-wide (ConfigMap `cloudpipe-semaphores`) |
-| Prefect `max_concurrent` | `50` (cloudpipe) / `25` (first-level) | Max active Argo workflows submitted by Prefect |
+| Prefect Variable `cloudpipe-max-concurrent` / `first-level-max-concurrent` | `50` (cloudpipe) / `25` (first-level), when the Variable is unset | Max active Argo workflows submitted by Prefect; set live with `prefect variable set <name> <N>`, not a deployment-run parameter |
+| `namespaceParallelism` | `100` | Max active workflows in `argo-workflows`, **all pipelines combined**; enforced by the controller, excess workflows held `Pending` |
+| `parallelism` | `1000` | Max active workflows cluster-wide — a second, looser ceiling above `namespaceParallelism` |
+| `resourceRateLimit` | `50/s`, burst `90` | Rate at which the controller creates pods, cluster-wide |
+
+These three live in `terraform/modules/argo-workflows/main.tf`, **not** in the Helm values. The chart renders them only via `templates/controller/workflow-controller-config-map.yaml`, and `controller.configMap.create` is `false` because Terraform owns that ConfigMap — so setting them under `controller:` in `values.yaml` is silently inert. That is exactly how this repo shipped a documented pod-creation rate limit that was never in effect, and no namespace cap at all, until [#206](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/206).
 
 Semaphores are defined in `cloudpipe-semaphores-configmap.yaml` and referenced by name in the `globus-transfer-template`. Adding a new semaphore requires adding a key to that ConfigMap and a `synchronization.semaphore.configMapKeyRef` block in the relevant template.
+
+`namespaceParallelism` and `resourceRateLimit` live in the **Terraform-owned** controller ConfigMap (`terraform/modules/argo-workflows/main.tf`), not in `gitops/apps/argo-workflows/values.yaml`. The Argo Helm chart accepts these keys under `controller:`, but its only consumer of them is the controller ConfigMap template — and this deployment sets `controller.configMap.create: false` so Terraform can own that ConfigMap's dynamic DB credentials. Anything set for them in `values.yaml` therefore renders nowhere and is **silently inert**; that is exactly how the repo shipped a documented pod-creation rate limit that was never in effect (#206). `tests/argo/test_controller_config.py` guards both directions.
+
+The two layers exist for different reasons. The Prefect Variables are the hot-reconfigurable working caps but are *advisory* — a client polling the API cannot see workflows the controller has not labeled yet, which is what let 100 workflows out under a cap of 50. `namespaceParallelism` is enforced by the component that owns the state, so it cannot be raced. See [ADR 008](decisions/008-prefect-as-queue-manager.md).
 
 ---
 
 ## Skip / resume logic
 
-The inventory step drives which subsequent steps are skipped. It checks S3 for existing derivatives and sets flags:
+The inventory step (`src/inventory.py`) drives which subsequent steps are skipped. It `head_object`s S3 for each step's **completion marker** and sets flags:
 
-| Flag | Check | Skips |
+| Flag | Completion marker checked | Skips |
 |---|---|---|
-| `fastsurfer-exists` | All sessions have `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz` with `size > 1 KB` | Entire anatomical processing phase |
-| `t1w_to_mni_exists` (per session) | `derivatives/registration/{subj}/{ses}/t1w_to_mni.tar.gz` with `size > 1 KB` | `t1w-to-mni-step` for that session |
-| `b2t_exists` (per run) | `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}.tar.gz` with `size > 1 KB` | `bold-to-t1w-step` for that run |
-| `func_exists` (per run) | `derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz` with `size > 1 KB` | `functional-preprocessing-dagtask` for that run |
+| `fastsurfer_exists` | All sessions have a valid `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz` | Entire anatomical processing phase |
+| `subregions_exists` | All four subregion output tarballs exist | `subregion-segmentation-dagtask` |
+| `t1w_to_mni_exists` (per session) | `…_desc-t1w2mni_affine.mat` — terminal output of `fst1w_to_mni.py` | `t1w-to-mni-step` for that session |
+| `b2t_exists` (per run) | `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_itk.txt` | `bold-to-t1w-step` for that run |
+| `func_exists` (per run) | `derivatives/func/{subj}/{ses}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz` | `functional-preprocessing-dagtask` for that run |
+| `surf_exists` (per run) | `derivatives/func_surf/{subj}/{ses}/components/{prefix}_desc-grayordcomponents_bold.tar.gz` | Grayordinate extraction for that run |
+| `surf_target_exists` (per run) | `derivatives/func_surf/{subj}/{ses}/fsLR32k/{prefix}_space-fsLR32k_bold.dtseries.nii` | `surface-resample` for that run |
 
-The `size > 1 KB` guard prevents treating Argo's zero-byte artifact uploads (written on step failure) as valid completed outputs.
+**Markers, not size thresholds.** Each key above is the file its step writes *last*, so its presence proves the step ran to completion — there is no `size > 1 KB` guard anywhere in `inventory.py`. This replaced a size heuristic that existed to reject Argo's zero-byte failure artifacts; a terminal-file check needs no threshold and cannot be fooled by a large-but-truncated output.
+
+`func_exists` and `surf_exists` gate **independently** even though one pod produces both derivatives, because either can be missing on its own — `preproc.py` takes a short path when only the grayordinate output is wanted. `surf_target_exists` gates the separate `surface-resample` step, which consumes the grayordinate components and cannot run before `surf_exists` is true.
 
 Resubmitting a partially processed subject is safe: inventory runs fresh, finds what is already done, and only the incomplete steps execute.
 
@@ -122,12 +150,12 @@ Every pipeline pod is labelled for Kubecost cost attribution:
 
 | Label | Values | Set by |
 |---|---|---|
-| `cloudpipe.io/phase` | `transfer`, `inventory`, `anatomical`, `registration`, `functional`, `subregion-segmentation` | Template `metadata.labels` |
-| `cloudpipe.io/step` | `start-globus-instance`, `globus-transfer`, `globus-s3-sync`, `subject-data-inventory`, `template-creation`, `t1w-to-mni`, `bold-to-t1w`, `bold-preprocessing`, `thalamus`, `brainstem`, `deeplearning` | Template `metadata.labels` |
+| `cloudpipe.io/phase` | `transfer`, `inventory`, `anatomical`, `registration`, `functional`, `subregion-segmentation`, `observability`, `cleanup`, `first-level` | Template `metadata.labels` |
+| `cloudpipe.io/step` | `start-globus-instance`, `globus-transfer`, `globus-s3-sync`, `delete-globus-input`, `subject-data-inventory`, `template-build`, `template-parcellation`, `long-segmentation`, `long-parcellation`, `fsqc-metrics`, `t1w-to-mni`, `bold-to-t1w`, `bold-preprocessing`, `surface-resample`, `segment-gems`, `segment-dl`, `orchestrate`, `workflow-start-marker`, `workflow-run-metrics`, `record-step-outcome` | Template `metadata.labels` |
 | `subjectid` | `{subjID}` | `podMetadata.labels` in master WorkflowTemplate |
 | `app` | `cloudpipe` | `podMetadata.labels` in master WorkflowTemplate |
 
-`tools/cloudpipe_minproc_costs.py` filters on `cloudpipe.io/phase` to isolate cloudpipe pods from other workloads sharing the namespace.
+`scripts/cloudpipe_minproc_costs.py` filters on `cloudpipe.io/phase` to isolate cloudpipe pods from other workloads sharing the namespace.
 
 ---
 
@@ -145,8 +173,9 @@ Parameters (all read from `cloudpipe-config` ConfigMap by default):
 | Parameter | Default | Description |
 |---|---|---|
 | `subjID` | — | Subject ID (required) |
-| `bucket` | from ConfigMap | S3 data bucket |
-| `ecr-registry` | from ConfigMap | ECR Public registry prefix |
+| `bucket` | from ConfigMap | S3 data bucket (inputs and derivatives) |
+| `metrics-bucket` | from ConfigMap | Separate versioned QC-metrics bucket (`cloudpipe-metrics`). Distinct from `bucket` so metrics survive a derivative flush — see [observability.md](observability.md). |
+| `ecr-registry` | from ConfigMap | Container registry prefix. Now the **private** ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com`) — set from `local.ecr_registry` in `terraform/argowf.tf`. ECR Public remains a dual-push secondary kept for rollback; it is no longer what workflows pull from. |
 | `globus-source-collection-id` | — | Source Globus collection UUID |
 | `globus-source-base-path` | — | Root path on source collection |
 | `globus-dest-collection-id` | — | Destination GCS collection UUID |
@@ -170,11 +199,11 @@ start-globus-instance → globus-transfer → [globus-s3-sync (skipped with S3 g
 
 Three templates, called in sequence by the master DAG:
 
-**`start-globus-instance-template`** — Reads instance ID from SSM (`/cloudpipe/globus/instance-id`), starts the EC2 instance if not running, waits for status checks. Idempotent. Node pool: `cpu-light`. Image: `bravepy`.
+**`start-globus-instance-template`** — Reads instance ID from SSM (`/cloudpipe/globus/instance-id`), starts the EC2 instance if not running, waits for status checks. Idempotent. Node pool: `cpu-light`. Image: `python`.
 
 **`globus-transfer-template`** — Submits the Globus transfer and polls until completion. Semaphore `globus-transfer` limits to 8 concurrent transfers. Credentials come from the `globus-credentials` K8s Secret (synced from Secrets Manager via ExternalSecret every hour). Node pool: `cpu-light`. Image: `globus`.
 
-**`globus-s3-sync-template`** — POSIX staging path only (skipped when `globus-use-s3-gateway == "true"`). SSM `send-command` runs `aws s3 sync` on the GCS instance, then cleans up local staging data. Polls SSM for up to 2 hours. Node pool: `cpu-light`. Image: `bravepy`.
+**`globus-s3-sync-template`** — POSIX staging path only (skipped when `globus-use-s3-gateway == "true"`). SSM `send-command` runs `aws s3 sync` on the GCS instance, then cleans up local staging data. Polls SSM for up to 2 hours. Node pool: `cpu-light`. Image: `python`.
 
 ### inventory (`inventory-workflow-template.yaml`)
 
@@ -183,17 +212,15 @@ Single template `subject-data-inventory-template`. Scans S3 to discover sessions
 - `result` (stdout JSON): array of session objects, each with `session`, `runs`, `t1w_to_mni_exists`, `nss_frames`; runs contains `task`, `run`, `b2t_exists`, `func_exists`
 - `fastsurfer-exists` (file parameter): `"True"` or `"False"`
 
-Node pool: `cpu-light`. Image: `bravepy` (pinned SHA).
+Node pool: `cpu-light`. Image: `python` (pinned SHA).
 
 ### fast-tmpl (`fastsurfer-template-phase-workflow-template.yaml`)
 
-Three templates for the longitudinal template phase:
+Two templates for the longitudinal template phase:
 
-**`fastsurfer-template-creation-template`** — Runs `long_prepare_template.sh`. Downloads T1w inputs from S3 via an init container (`bravepy`), runs the FastSurfer template creation on GPU. Node pool: `gpu-nodepool`. Image: `fastsurfer`.
+**`fastsurfer-template-build-template`** — Runs `long_prepare_template.sh` and then, only if that succeeded, `run_fastsurfer.sh --seg_only --base --threads 1`. Downloads T1w inputs and `fsaverage` from S3 via init containers (`cloudpipe/python`). Creation and segmentation share this pod because both are GPU-bound and strictly sequential. Node pool: `gpu-nodepool`. Image: `fastsurfer`.
 
-**`fastsurfer-template-segmentation-template`** — Segmentation (`--seg_only --base`), 4 threads. Node pool: `gpu-nodepool`.
-
-**`fastsurfer-template-parcellation-template`** — Surface reconstruction (`--surf_only --base --3T --fsaparc`), 4 threads. Node pool: `gpu-nodepool`.
+**`fastsurfer-template-parcellation-template`** — Surface reconstruction (`--surf_only --base --3T --fsaparc`). Node pool: `cpu-heavy-nodepool`, 3G/4CPU. `--threads` is **derived from the cpu request** via the downward API (`resourceFieldRef` on `requests.cpu`) rather than written into the master template, so the resources block is the single source of truth and the two cannot drift. Cut 6→4 threads from measured `cpu_efficiency` 0.577; do not cut below 2 — `recon-surf.sh` runs the hemispheres serially at `threads == 1`, which roughly *doubles* the surface stage.
 
 ### fast-long (`fastsurfer-long-phase-workflow-template.yaml`)
 
@@ -201,9 +228,9 @@ Two templates for the longitudinal session-level phase:
 
 **`fastsurfer-long-segmentation-template`** — All sessions in parallel (`--subjects ses-00A=from-base ses-02A=from-base ...`), `--seg_only --long`. Node pool: `gpu-nodepool`.
 
-**`fastsurfer-long-parcellation-template`** — All sessions, surface reconstruction, `--long --parallel N` where N = number of sessions, 3 threads each. Waits for both long segmentation and template parcellation to complete. Node pool: `gpu-nodepool`.
+**`fastsurfer-long-parcellation-template`** — All sessions, surface reconstruction, `--long --parallel N` where N = number of sessions. Waits for both long segmentation and template parcellation to complete. Node pool: `cpu-heavy-nodepool`.
 
-FastSurfer outputs are uploaded to `derivatives/fastsurfer/{subj}/` as per-session `_templated.tar.gz` archives. The EFS PVC is used as working space during these steps.
+**No shared volume.** Each step works in a private `emptyDir` at `/work` with `SUBJECTS_DIR=/work/subjects`, passing state through `scratch/{workflow.name}/anat/` in S3 (reaped by the `scratch-expiration` lifecycle rule). Final FastSurfer outputs are uploaded to `derivatives/fastsurfer/{subj}/` as per-session `_templated.tar.gz` archives — those keys are the contract with every downstream phase and are unchanged.
 
 ### registration (`registration-workflow-template.yaml`)
 
@@ -211,9 +238,9 @@ Entry point `registration-dag-template`, called once per session:
 
 **`t1w-to-mni-template`** — FireANTs affine + SyN registration of FreeSurfer conformed `orig.mgz` to MNI152NLin2009cAsym. Skipped when `t1w-to-mni-exists == "true"`. Downloads FastSurfer tarball and MNI template from S3 as artifacts. GPU-accelerated (nvidia-smi monitor in background). Output: `t1w_to_mni.tar.gz` → `derivatives/registration/{subj}/{ses}/`. Node pool: `gpu-nodepool`. Image: `fireants`.
 
-**`bold-to-t1w-template`** — SynthMorph contrast-agnostic deep learning affine registration of BOLD reference to T1w. One pod per run, fanned out via `withParam`. Skipped when `b2t_exists == "true"`. Downloads BOLD NIfTI and FastSurfer tarball from S3. Uses EFS PVC for output staging. Output: `bold_to_t1w_{task}_{run}.tar.gz` → `derivatives/registration/{subj}/{ses}/`. Node pool: `cpu-heavy-nodepool`. Image: `synthmorph`.
+**`bold-to-t1w-session-template`** — SynthMorph contrast-agnostic deep learning affine registration of BOLD reference to T1w. **One pod per session**, looping over that session's runs internally (previously one pod per run via `withParam`). The task is skipped when `b2t_exists == "true"` for every run; individual complete runs are skipped inside the pod. Downloads the session's whole `func/` prefix and the FastSurfer tarball from S3 — the tarball once per session rather than once per run, which is the point of the change. No EFS PVC: outputs stage in `/tmp` and upload as one directory artifact to `derivatives/registration/{subj}/{ses}/`, preserving the per-run `bold_to_t1w_{task}_{run}/` keys. Node pool: `cpu-heavy-nodepool`. Image: `freesurfer` (which carries `bold_to_t1w.py` — there is no separate `synthmorph` image).
 
-The T1w→MNI step uses `orig.mgz` (FreeSurfer conformed space) rather than the BIDS T1w to ensure the source space matches the BOLD→T1w transform, which bbregister produces in conformed space.
+The T1w→MNI step uses `orig.mgz` (FreeSurfer conformed space) rather than the BIDS T1w to ensure the source space matches the BOLD→T1w transform, which **SynthMorph** produces in conformed space (its fixed image is `brainmask.mgz`). bbregister was removed in `61ccff7` — see [ADR 002](decisions/002-synthmorph-over-bbregister.md) and [ADR 003](decisions/003-orig-mgz-for-t1w-registration.md).
 
 ### functional-preprocessing (`functional-preprocessing-workflow-template.yaml`)
 
@@ -230,27 +257,27 @@ argo submit --from workflowtemplate/functional-preprocessing \
   -p nss-frames=15
 ```
 
-**`functional-preprocessing-template`** — One pod per `(session, task, run)`. Downloads from S3: BOLD NIfTI + BIDS sidecar, motion params, brain mask and ITK affine (from bold-to-t1w), ANTs transforms (from t1w-to-mni), FreeSurfer aseg (for aCompCor), MNI template. Runs `preproc.py` (AFNI). Skipped when `func_exists == "true"`.
+**`functional-preprocessing-session-template`** — **One pod per session**, looping over the session's `(task, run)` pairs (previously one pod per `(session, task, run)`). Downloads from S3 as whole-prefix directory artifacts: the session's `func/` (BOLD + BIDS sidecars + motion params) and `registration/` (bold-to-t1w brain masks and ITK affines, plus the shared t1w-to-mni transforms), along with the FastSurfer tarball (for aCompCor's aseg) and the MNI template — the last two once per session rather than once per run. Runs `preproc.py` (AFNI) per run and tars each run's output itself. The task is skipped when `func_exists == "true"` for every run; individual complete runs are skipped inside the pod.
 
-Resources: 16 GB RAM, 6 CPU, 10 GB ephemeral storage requested. Node pool: `cpu-heavy-nodepool`. Image: `afni`.
+Resources: 4 GB RAM (6 GB limit), 3 CPU, 20 GB ephemeral storage (30 GB limit) requested. Node pool: `cpu-heavy-nodepool`. Image: `afni`.
 
 Output: `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz` → `derivatives/func/{subj}/{ses}/`.
 
-Retry limit: 6 (higher than other templates due to compute cost of re-running preprocessing).
+Retry limit: 8 — the same as every other template. (An earlier revision set this to 6 and justified it as "higher than other templates"; the fleet-wide limit is now 8 and this template is not special.)
 
-`preproc.py` is embedded in the `preproc-script` ConfigMap and mounted at runtime, so it can be updated without rebuilding the AFNI image. Update path: edit `images/afni/preproc.py` → run `tools/gen-preproc-configmap.sh` → commit both files → push (ArgoCD syncs the ConfigMap).
+`preproc.py` is baked into the `afni` image at build time; updating it requires a normal image rebuild (edit `images/afni/preproc.py` → commit → push → CI rebuilds and updates the SHA-pinned reference).
 
 ### subregion-seg (`subregion-segmentation-workflow-template.yaml`)
 
-Optional standalone WorkflowTemplate for subcortical subregion segmentation. Not called by the master pipeline DAG — submitted independently after FastSurfer longitudinal outputs exist.
+Subcortical subregion segmentation. Runs as a phase inside the master pipeline DAG (`subregion-segmentation-dagtask`, gated on `subregions-exist == "False"`), and is also submittable standalone once FastSurfer longitudinal outputs exist. Full walkthrough in [pipelines.md](pipelines.md#subregion-seg).
 
 **Standalone submission:**
 ```bash
 argo submit --from workflowtemplate/subregion-seg \
   -n argo-workflows \
   -p subjID=NDARINVXXXXXXXX \
-  -p bucket=abcd-v7 \
-  -p ecr-registry=public.ecr.aws/l9e7l1h1 \
+  -p bucket=<YOUR_S3_BUCKET> \
+  -p ecr-registry=<account-id>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com \
   -p T1w_sessions='["ses-00A","ses-02A"]'
 ```
 
@@ -260,19 +287,15 @@ argo submit --from workflowtemplate/subregion-seg \
 - `derivatives/fastsurfer/{subjID}/{subjID}_long-template.tar.gz`
 - `derivatives/fastsurfer/{subjID}/{subjID}_{session}_templated.tar.gz` — ses-00A is required; ses-02A through ses-10A are `optional: true`
 
-**Three templates run in parallel** (`failFast: false`):
+**Two templates: `gems` ∥ `dl`**, running concurrently under `failFast: false`, both on `cpu-heavy-nodepool`, both using the `freesurfer` image. No shared PVC and no hydrate step (GitHub #77) — each pod independently declares the FastSurfer S3 tarballs as input artifacts, extracted onto its own private `emptyDir`.
 
-**`segment-thalamus-template`** — Runs `segment_subregions thalamus --long-base` (GEMS/Bayesian atlas). ~30–45 min with 4 threads. Symlinks FastSurfer bare session IDs (`ses-00A`) to the `{tp}.long.{base}` naming convention that `segment_subregions --long-base` expects. Output: `ThalamicNuclei.v13.T1.mgz` per session + template → `derivatives/subregions/{subjID}/{subjID}_thalamus.tar.gz`. Resources: 12G/4CPU. Node pool: `cpu-heavy-nodepool`. Image: `freesurfer`.
+**`segment-subregions-gems-template`** — `segment_subregions {thalamus,brainstem,hippo-amygdala} --long-base`, GEMS/Bayesian, CPU-only, ~50 min at 4 threads. Symlinks FastSurfer bare session IDs (`ses-00A`) to the `{tp}.long.{base}` naming `--long-base` expects; `segment_subregions` writes through the symlinks into the real directories. Before each region runs, the script checks S3 for that region's final key (`derivatives/subregions/{subjID}/{subjID}_{region}.tar.gz`) and restores it instead of recomputing if present; after a region completes it uploads to that same key immediately, so a pod retry or workflow resubmit resumes per-region rather than redoing completed work. Outputs → `{subjID}_{thalamus,brainstem,hippoamyg}.tar.gz`. **4.5G/4CPU** (provisional — see pipelines.md).
 
-**`segment-brainstem-template`** — Runs `segment_subregions brainstem --long-base` (GEMS/Bayesian atlas). ~15–25 min with 4 threads. Same symlink setup as thalamus. Output: `brainstemSsLabels.v13.T1.mgz` per session + template → `derivatives/subregions/{subjID}/{subjID}_brainstem.tar.gz`. Resources: 12G/4CPU. Node pool: `cpu-heavy-nodepool`. Image: `freesurfer`.
+**`segment-subregions-dl-template`** — two TensorFlow tools, ~30 s total, reading model files from `$FREESURFER_HOME/models/`, with the same per-region S3 checkpoint/restore as the GEMS pod:
+1. `mri_segment_hypothalamic_subunits` — CNN, ~10 sec/session, 5 bilateral hypothalamic subregions → `{subjID}_hypothalamic.tar.gz`
+2. `mri_sclimbic_seg` — U-Net, <1 min/session, hypothalamus (coarse), mammillary bodies, basal forebrain, septal nuclei, NAcc, fornix → `{subjID}_sclimbic.tar.gz`
 
-**`segment-deeplearning-template`** — Runs two fast deep-learning tools sequentially:
-1. `mri_segment_hypothalamic_subunits` — TensorFlow CNN, ~10 sec/session, 5 bilateral hypothalamic subregions. Output: `hypothalamic_subunits_seg.v1.mgz` + `hypothalamic_subunits_volumes.v1.csv` per session → `derivatives/subregions/{subjID}/{subjID}_hypothalamic.tar.gz`
-2. `mri_sclimbic_seg` — U-Net, <1 min/session, hypothalamus (coarse), mammillary bodies, basal forebrain, septal nuclei, NAcc, fornix. Output: `sclimbic.mgz` + `sclimbic.stats` per session → `derivatives/subregions/{subjID}/{subjID}_sclimbic.tar.gz`
-
-Both tools read model files from `$FREESURFER_HOME/models/` (included in the `freesurfer` image). Resources: 8G/4CPU. Node pool: `cpu-heavy-nodepool`. Image: `freesurfer`.
-
-**Implementation note**: `segment_subregions --long-base` expects timepoints named `{tp}.long.{base}`. FastSurfer writes bare session IDs (`ses-00A`). Each template creates symlinks in `$SUBJECTS_DIR` to bridge this gap (`ln -sfn ses-00A ses-00A.long.{base}`); `segment_subregions` writes outputs into the real directories through the symlinks.
+**13G/4CPU** with `TF_ENABLE_ONEDNN_OPTS=0` — a measured 11.87 GB peak lasting ~30 s, which is why it is its own pod ([#129](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/129), [#134](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/134)). Needs no symlinks and no GEMS output: both tools read only `mri/nu.mgz` (plus an optional `talairach.xfm.lta`), which this pod has already staged for itself.
 
 ### fmri-first-level-proc (`fmri-first-level-proc-workflow-template.yaml`)
 
@@ -280,9 +303,9 @@ Separate pipeline for first-level GLM analysis. Submitted by `first-level-queue-
 
 - `activeDeadlineSeconds: 7200` (2 hour cap)
 - Scratch volume: 300 Gi emptyDir (no EFS PVC)
-- Retry: 3, on spot interruption only
+- Retry: limit 8 with `retryPolicy: Always`, filtered to infrastructure causes by expression (spot reclaim, exit codes 64/75/143). `Always` is deliberate: a reclaimed pod lands in phase **Error**, not Failed, so the earlier `OnFailure` policy could never honour the spot clause it was paired with. The 2 h deadline is the real ceiling — retries cannot extend it, so the limit is an upper bound the cap may cut short ([#115](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/115)).
 - Input: `subjID` parameter; reads its own config
-- Output: `derivatives/first_levels/{subj}/` in `<YOUR_INPUT_S3_BUCKET>` bucket
+- Output: `derivatives/first_levels/{subj}/` in `<YOUR_S3_BUCKET>` bucket
 
 ---
 
@@ -307,6 +330,24 @@ The Argo server runs with `--auth-mode=sso --auth-mode=client`:
 - **Client token**: CLI access using a service account token (`kubectl get secret argo-admin.service-account-token -n argo-workflows`). Used by scripts and the `argo` CLI with `--token`.
 
 TLS is terminated at the ALB; the Argo server runs `--secure=false` internally.
+
+### CLI access to the Argo Server (archive commands, etc.)
+
+Commands that hit the Kubernetes API directly (`argo submit`, `argo delete`, `argo list`, ...) work via kubeconfig with no extra setup. Commands that must go through the Argo Server itself (`argo archive list`, `argo archive delete`, ...) need explicit auth — SSO tokens copied from the browser session are not reliable for this. Use the client service-account token instead:
+
+```bash
+export ARGO_SERVER=argo.<YOUR_DOMAIN>:443
+export ARGO_HTTP1=true   # ALB in front of the server doesn't support gRPC (HTTP/2)
+export ARGO_TOKEN="Bearer $(kubectl get secret -n argo-workflows argo-admin.service-account-token -o=jsonpath='{.data.token}' | base64 --decode)"
+```
+
+Example — bulk-delete succeeded/failed workflows from the archive (the archive is a separate Postgres-backed store; `argo delete` alone only removes live Workflow CRs and does not clear entries shown in the UI's workflow list):
+
+```bash
+argo -n argo-workflows archive list -o json | \
+  jq -r '.[] | select(.status.phase=="Succeeded" or .status.phase=="Failed") | .metadata.uid' | \
+  xargs -r -n1 argo -n argo-workflows archive delete
+```
 
 ---
 

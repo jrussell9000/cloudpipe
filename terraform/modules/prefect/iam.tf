@@ -9,34 +9,42 @@ data "aws_caller_identity" "current" {}
 data "aws_iam_policy_document" "worker" {
   # Read subject lists and scan for S3 completion markers
   statement {
-    sid     = "S3ReadWrite"
-    actions = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
+    sid       = "S3ReadWrite"
+    actions   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
     resources = ["arn:aws:s3:::${var.bucket}/*"]
   }
 
   statement {
-    sid     = "S3ListBucket"
-    actions = ["s3:ListBucket"]
+    sid       = "S3ListBucket"
+    actions   = ["s3:ListBucket"]
     resources = ["arn:aws:s3:::${var.bucket}"]
   }
 
   statement {
-    sid     = "S3GetBucketLocation"
-    actions = ["s3:GetBucketLocation"]
+    sid       = "S3GetBucketLocation"
+    actions   = ["s3:GetBucketLocation"]
     resources = ["arn:aws:s3:::*"]
   }
 
-  # Read subject CSVs stored in <YOUR_INPUT_S3_BUCKET> (e.g. first-level-subjects.csv)
+  # The kubecost-cost-scraper flow writes CostAllocation records to the dedicated
+  # metrics bucket. That scraper was repointed from the data bucket to this one,
+  # but this role was not updated, so every nightly run with cost data to write
+  # failed with AccessDenied on s3:PutObject (first observed 2026-07-24 02:00 UTC;
+  # earlier nightlies passed only because they had nothing to write).
+  #
+  # PutObject/GetObject but NOT DeleteObject, matching the argo-workflows module:
+  # the metrics bucket is the run of record, and nothing that flushes derivatives
+  # should be able to delete from it. See terraform/metrics_bucket.tf.
   statement {
-    sid       = "AbcdV6S3Read"
-    actions   = ["s3:GetObject"]
-    resources = ["arn:aws:s3:::<YOUR_INPUT_S3_BUCKET>/*"]
+    sid       = "ListMetricsBucket"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = ["arn:aws:s3:::${var.metrics_bucket}"]
   }
 
   statement {
-    sid       = "AbcdV6S3List"
-    actions   = ["s3:ListBucket"]
-    resources = ["arn:aws:s3:::<YOUR_INPUT_S3_BUCKET>"]
+    sid       = "S3MetricsReadWrite"
+    actions   = ["s3:PutObject", "s3:GetObject"]
+    resources = ["arn:aws:s3:::${var.metrics_bucket}/*"]
   }
 
   # cloudpipe_queue_manager reads the Globus dest collection UUID at runtime

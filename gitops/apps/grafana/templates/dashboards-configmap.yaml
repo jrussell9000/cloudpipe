@@ -14,3 +14,11 @@ data:
 {{ .Files.Get "dashboards/anatomical-qc.json" | indent 4 }}
   cost-overview.json: |
 {{ .Files.Get "dashboards/cost-overview.json" | indent 4 }}
+  karpenter.json: |
+{{ .Files.Get "dashboards/karpenter.json" | indent 4 }}
+  infra-health.json: |
+{{ .Files.Get "dashboards/infra-health.json" | indent 4 }}
+  registration-qc.json: |
+{{ .Files.Get "dashboards/registration-qc.json" | indent 4 }}
+  failure-triage.json: |
+{{ .Files.Get "dashboards/failure-triage.json" | indent 4 }}

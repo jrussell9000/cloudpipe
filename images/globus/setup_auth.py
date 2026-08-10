@@ -27,7 +27,6 @@ import boto3
 import globus_sdk
 from globus_sdk.scopes import GCSCollectionScopes
 
-
 SECRET_ID = "globus/refresh-token"
 
 
@@ -55,9 +54,7 @@ def main() -> None:
         args.client_id or os.environ.get("GLOBUS_NATIVE_APP_CLIENT_ID", "")
     ).strip()
     if not native_app_client_id:
-        raise SystemExit(
-            "Provide a client ID via --client-id or set GLOBUS_NATIVE_APP_CLIENT_ID."
-        )
+        raise SystemExit("Provide a client ID via --client-id or set GLOBUS_NATIVE_APP_CLIENT_ID.")
 
     if args.dest_collection_id:
         dest_collection_scopes = GCSCollectionScopes(args.dest_collection_id)
@@ -82,10 +79,12 @@ def main() -> None:
     tokens = client.oauth2_exchange_code_for_tokens(auth_code)
     refresh_token = tokens.by_resource_server["transfer.api.globus.org"]["refresh_token"]
 
-    secret_value = json.dumps({
-        "native-app-client-id": native_app_client_id,
-        "refresh-token": refresh_token,
-    })
+    secret_value = json.dumps(
+        {
+            "native-app-client-id": native_app_client_id,
+            "refresh-token": refresh_token,
+        }
+    )
 
     sm = boto3.client("secretsmanager")
     try:
@@ -102,8 +101,12 @@ def main() -> None:
     )
     subprocess.run(
         [
-            "kubectl", "annotate", "externalsecret", "globus-credentials",
-            "-n", "argo-workflows",
+            "kubectl",
+            "annotate",
+            "externalsecret",
+            "globus-credentials",
+            "-n",
+            "argo-workflows",
             f"force-sync={int(time.time())}",
             "--overwrite",
         ],

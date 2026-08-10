@@ -23,3 +23,9 @@ settings:
   clusterEndpoint: ${clusterEndpoint}
   interruptionQueue: ${interruptionQueue}
   eksControlPlane: true
+  featureGates:
+    # Enables the alpha NodeOverlay API (karpenter.sh/v1alpha1). Required for
+    # gpu-nodeoverlay.yaml, which teaches Karpenter that g6f fractional-GPU
+    # instances carry nvidia.com/gpu (the EC2 API reports Count=0 for them).
+    # Off by default; toggling this restarts the Karpenter controller.
+    nodeOverlay: true

@@ -139,7 +139,7 @@ echo "=== Step 1: Endpoint setup (requires browser login) ==="
 globus-connect-server endpoint setup "\$NAME" \
   --organization "\$ORG" \
   --contact-email "\$EMAIL" \
-  --owner "globusadmins@<YOUR_INSTITUTION_DOMAIN>" \
+  --owner "${globus_owner_email}" \
   --client-id "\$GCS_CLIENT_ID" \
   --public \
   --agree-to-letsencrypt-tos
@@ -155,7 +155,7 @@ aws ssm put-parameter \
 echo "Endpoint ID saved to SSM at /\$NAME/globus/endpoint-id"
 echo ""
 echo "=== ACTION REQUIRED: Request UW-Madison subscription association ==="
-echo "Email globusadmins@<YOUR_INSTITUTION_DOMAIN> with the following information:"
+echo "Email ${globus_owner_email} with the following information:"
 echo "  Subject: Add endpoint to Globus subscription <YOUR_GLOBUS_SUBSCRIPTION_UUID>"
 echo "  Body:    Please associate endpoint \$ENDPOINT_ID with the UW-Madison High Assurance subscription."
 echo "You can continue setup while waiting for confirmation."
@@ -192,7 +192,7 @@ echo "=== Step 4: Create native S3 storage gateway ==="
 GATEWAY_ID=\$(globus-connect-server storage-gateway create s3 "\$COLLECTION_NAME" \
   --bucket "${globus_s3_bucket}" \
   --s3-endpoint "https://s3.${region}.amazonaws.com" \
-  --domain <YOUR_INSTITUTION_DOMAIN> \
+  --domain ${globus_identity_domain} \
   --high-assurance \
   --authentication-timeout-mins \$((60 * 24 * 7)) \
   --s3-user-credential \
@@ -224,7 +224,7 @@ PYEOF
 chmod +x /usr/local/bin/gcs-identity-map.py
 
 GATEWAY_ID=\$(globus-connect-server storage-gateway create posix "\$COLLECTION_NAME" \
-  --domain <YOUR_INSTITUTION_DOMAIN> \
+  --domain ${globus_identity_domain} \
   --identity-mapping "external:/usr/local/bin/gcs-identity-map.py" \
   --format json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 echo "Storage gateway ID: \$GATEWAY_ID"

@@ -1,5 +1,5 @@
 [workspace]
-authors = ["Justin Russell <jrussell9000@gmail.com>"]
+authors = ["Justin Russell <<YOUR_MAINTAINER_EMAIL>>"]
 channels = ["conda-forge"]
 name = "afni"
 platforms = ["linux-64"]

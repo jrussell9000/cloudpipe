@@ -1,0 +1,71 @@
+kube-prometheus-stack:
+  # CRDs already installed by the prometheus-operator-crds app (v23.0.0 = operator v0.85.0)
+  crds:
+    enabled: false
+
+  # Not needed — cloudpipe has a standalone Grafana deployment
+  grafana:
+    enabled: false
+
+  # Not needed for scheduling observability
+  alertmanager:
+    enabled: false
+
+  # Not needed — tracking pod scheduling, not host-level metrics
+  nodeExporter:
+    enabled: false
+
+  # Skip default alert/recording rules (no Alertmanager to fire them)
+  defaultRules:
+    create: false
+
+  # ── Prometheus server ──────────────────────────────────────────────────────
+  prometheus:
+    prometheusSpec:
+      retention: 30d
+      retentionSize: "18GB"
+
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: ebs-sc
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 20Gi
+
+      # Watch ServiceMonitors/PodMonitors in all namespaces.
+      # Required to scrape Karpenter running in kube-system.
+      serviceMonitorNamespaceSelector: {}
+      serviceMonitorSelector: {}
+      podMonitorNamespaceSelector: {}
+      podMonitorSelector: {}
+
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: backend
+      tolerations:
+        - key: CriticalAddonsOnly
+          value: "true"
+          effect: NoSchedule
+
+  # ── kube-state-metrics ────────────────────────────────────────────────────
+  # Expose Argo template labels and the karpenter nodepool node label so
+  # PromQL can group pending time by step name and nodepool.
+  kube-state-metrics:
+    extraArgs:
+      - --metric-labels-allowlist=pods=[workflows.argoproj.io/workflow-template,workflows.argoproj.io/template-name,workflows.argoproj.io/workflow],nodes=[karpenter.sh/nodepool]
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+    tolerations:
+      - key: CriticalAddonsOnly
+        value: "true"
+        effect: NoSchedule
+
+  # ── Prometheus Operator ───────────────────────────────────────────────────
+  prometheusOperator:
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+    tolerations:
+      - key: CriticalAddonsOnly
+        value: "true"
+        effect: NoSchedule

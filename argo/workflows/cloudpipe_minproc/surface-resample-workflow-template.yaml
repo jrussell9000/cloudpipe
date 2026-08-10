@@ -1,0 +1,473 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: surface-resample
+  namespace: argo-workflows
+
+spec:
+  retryStrategy:
+    # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
+    # design, so consecutive reclaims on one long step are routine (2 back-to-back
+    # observed 2026-08-03). See issue #115.
+    limit: "8"
+    retryPolicy: Always
+    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
+    # never emitted by our scripts. 75 = EX_TEMPFAIL, reserved for the "a reclaim
+    # truncated my output, re-run me" guards in the fastsurfer templates. 137 is
+    # deliberately absent: a real OOMKill here is deterministic (#120, #129, #134
+    # each needed a config change, not a retry), so retrying it only burns the
+    # enlarged budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    backoff:
+      duration: "1m"
+      factor: "2"
+      # cap bounds each individual delay (maxDuration would abort the retries
+      # instead): 1+2+4+5+5+5+5+5 = 32m worst case.
+      cap: "5m"
+
+  podMetadata:
+    labels:
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  podDisruptionBudget:
+    minAvailable: "100%"
+
+  workflowMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+
+  # Standalone submissions use these defaults; production submissions inherit
+  # them from the cloudpipe master workflow (where configmap defaults are set).
+  arguments:
+    parameters:
+      - name: subjID
+      - name: session
+      # JSON array of the session's runs, as produced by inventory:
+      #   [{"task": "rest", "run": "run-01", "surf_target_exists": false}, ...]
+      - name: runs
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  entrypoint: surface-resample-entrypoint
+
+  templates:
+
+  ###########################################################################
+  # Standalone entrypoint — maps workflow-level parameters to the template's
+  # input parameters so this can be submitted directly for testing or
+  # reprocessing. Not used when called via templateRef from the master DAG.
+  ###########################################################################
+
+  - name: surface-resample-entrypoint
+    steps:
+    - - name: surface-resample
+        template: surface-resample-session-template
+        arguments:
+          parameters:
+            - name: session
+              value: '{{workflow.parameters.session}}'
+            - name: runs
+              value: '{{workflow.parameters.runs}}'
+
+  ###########################################################################
+  # Core template — ONE pod per session, looping over that session's runs.
+  #
+  # Stage 2 of surface functional processing: resample the cortical components
+  # from fsnative to fsLR 32k and assemble a CIFTI-2 dense timeseries.
+  #
+  # WHY THIS IS CHEAP TO ISOLATE (unlike Stage 1): everything it reads was
+  # already reduced by Stage 1 inside the func-preproc pod. It downloads the
+  # per-run grayordinate components (vertices x frames, not voxels x frames),
+  # the session's surface geometry, and the static fsLR meshes — never the raw
+  # BOLD, the MNI BOLD, or the ~2 GB FastSurfer tarball. That is the whole
+  # reason the stage boundary sits at the output-format line.
+  # See the openspec change `add-surface-func-processing`.
+  #
+  # Downloads from S3 (once per session):
+  #   derivatives/func_surf/{subj}/{ses}/components → /data/components
+  #   derivatives/func_surf/{subj}/{ses}/anat       → /data/anat
+  #   config/fsLR                                    → /data/meshes
+  #
+  # Uploads to S3, one dtseries per run (built by the driver):
+  #   derivatives/func_surf/{subj}/{ses}/fsLR32k/
+  #     {subj}_{ses}_{task}_{run}_space-fsLR32k_bold.dtseries.nii
+  ###########################################################################
+
+  - name: surface-resample-session-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: functional
+        cloudpipe.io/step: surface-resample
+        session: "{{inputs.parameters.session}}"
+    inputs:
+      parameters:
+        - name: session
+        - name: runs
+        # Static mesh filenames, templated on {hemi}. Parameters rather than
+        # constants because they come from the HCP standard_mesh_atlases
+        # package staged in config/ — restaging under different names should
+        # be a parameter change, not a code change.
+        #
+        # target-sphere MUST be the fs_LR-deformed_to-fsaverage variant.
+        # FreeSurfer's sphere.reg registers into fsaverage space, so a plain
+        # fsLR sphere is not in register with it — and since both are valid
+        # spheres, wb_command will happily resample and produce anatomically
+        # scrambled output that looks entirely normal.
+        - name: target-sphere
+          default: 'fs_LR-deformed_to-fsaverage.{hemi}.sphere.32k_fs_LR.surf.gii'
+        # standard_mesh_atlases ships the fsLR target area as a vertex-area
+        # METRIC, not a midthickness surface, so area-mode defaults to metrics
+        # and the subject side is converted with -surface-vertex-areas. Set
+        # area-mode=surfs only if the staging supplies a 32k midthickness surf.
+        - name: target-area
+          default: 'fs_LR.{hemi}.midthickness_va_avg.32k_fs_LR.shape.gii'
+        - name: area-mode
+          default: 'metrics'
+        # Atlas ROI removes the medial wall, yielding the standard 59412
+        # cortical grayordinates. Empty string keeps all 32492 per hemisphere.
+        - name: target-roi
+          default: '{hemi}.atlasroi.32k_fs_LR.shape.gii'
+
+      artifacts:
+        # NO TRAILING SLASH on input directory keys — see the func-preproc
+        # template for the measured reason (a zero-byte directory-marker object
+        # makes Argo download nothing and still exit 0).
+        - name: components
+          path: /data/components
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/components'
+
+        - name: anat
+          path: /data/anat
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/anat'
+
+        # Static fsLR registration meshes, staged once (see docs/pipelines.md).
+        - name: meshes
+          path: /data/meshes
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'config/fsLR'
+
+    outputs:
+      artifacts:
+        # Per-run StepOutcome JSON records, written directly by the driver
+        # (see ADR 016) instead of a separate outcome-recorder pod per run —
+        # see the equivalent block in functional-preprocessing-workflow-template.yaml.
+        - name: step-outcomes
+          optional: true
+          path: /tmp/step_outcomes
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.metrics-bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
+
+        # Trailing slash REQUIRED on output directory keys (Argo artifact GC).
+        - name: dtseries
+          optional: true
+          path: /tmp/cifti_out
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/fsLR32k/'
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    script:
+      # :latest is the deliberate bootstrap value for a brand-new image, not an
+      # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
+      # rewrites this to sha-<commit> once the first build lands, and only after
+      # confirming that tag actually reached the registry.
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench:sha-2a68d1ff59f502694429e3dd9608ecde51af3ee0"
+      imagePullPolicy: IfNotPresent
+
+      resources:
+        # Small by construction: the inputs are already-reduced grayordinate
+        # components, and wb_command streams rather than loading whole 4D
+        # volumes. Sized for one run at a time.
+        requests:
+          memory: 4G
+          cpu: '2'
+          ephemeral-storage: 8G
+        limits:
+          memory: 6G
+          ephemeral-storage: 12G
+
+      command: [/entrypoint.sh, python, -u]
+      source: |
+        """Assemble a CIFTI dtseries for every pending run in one session.
+
+        Mirrors the func-preproc driver: a failing run is logged and skipped,
+        and the step exits non-zero only when every run failed.
+
+        The original rationale was that Argo discards a failed pod's output
+        artifacts. Measured 2026-07-22 (dagval-330e63gh-tarerr), that is NOT
+        what happens: the pod exited 1 and the dtseries artifact still uploaded
+        seven seconds later. What a non-zero exit does cost is the output
+        *parameters* — Argo skips those whose file is missing — and it marks the
+        session failed, which the outcome fan-out then stamps onto every sibling
+        run. Those are the reasons to keep the rule.
+        """
+        import json
+        import re
+        import shutil
+        import subprocess
+        import sys
+        import tarfile
+        import traceback
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        SUBJ = "{{workflow.parameters.subjID}}"
+        SES = "{{inputs.parameters.session}}"
+        RUNS = json.loads(r"""{{inputs.parameters.runs}}""")
+        TARGET_SPHERE = "{{inputs.parameters.target-sphere}}"
+        TARGET_AREA = "{{inputs.parameters.target-area}}"
+        AREA_MODE = "{{inputs.parameters.area-mode}}"
+        TARGET_ROI = "{{inputs.parameters.target-roi}}"
+        WORKFLOW_NAME = "{{workflow.name}}"
+
+        # See ADR 016 (docs/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
+        # this pod records its own StepOutcome facts instead of exposing them
+        # as a DAG output parameter for a sibling recorder task to read.
+        STEP_OUTCOMES_DIR = Path("/tmp/step_outcomes")
+        STEP_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Mirrors src/metrics/outcome_recorder.py's _TAXONOMY exactly — kept in
+        # sync by tests/images/afni/test_driver_gating.py::
+        # test_driver_taxonomy_matches_canonical. Duplicated inline rather than
+        # imported because this container has no access to src/metrics (see
+        # ADR 016 and issue #67).
+        _TAXONOMY: list[tuple[str, list[str]]] = [
+            (
+                "infrastructure",
+                [
+                    r"OOMKilled",
+                    r"exit\s+code\s+137",
+                    r"evicted",
+                    r"node\s+cordoned",
+                    r"deadline\s+exceeded",
+                    r"pod\s+unschedul",
+                    r"Unschedulable",
+                    r"insufficient\s+memory",
+                ],
+            ),
+            (
+                "data",
+                [
+                    r"NoSuchKey",
+                    r"NoSuchBucket",
+                    r"nss_volumes",
+                    r"missing\s+input",
+                    r"corrupt",
+                    r"Unable\s+to\s+open",
+                    r"Input\s+file\s+not\s+found",
+                ],
+            ),
+            (
+                "algorithm",
+                [
+                    r"AssertionError",
+                    r"ValueError",
+                    r"segmentation\s+fault",
+                    r"Segmentation\s+fault",
+                    r"SIGSEGV",
+                    r"RuntimeError",
+                    r"CalledProcessError",
+                    r"non-zero\s+exit\s+code",
+                    r"ERROR:",
+                ],
+            ),
+            (
+                "dependency",
+                [
+                    r"depended\s+on\s+task",
+                    r"upstream\s+task\s+failed",
+                    r"Skipped",
+                ],
+            ),
+        ]
+
+        def classify_failure(message):
+            msg = message or ""
+            for category, patterns in _TAXONOMY:
+                for pat in patterns:
+                    if re.search(pat, msg, re.IGNORECASE):
+                        return category
+            return "unknown"
+
+        def write_outcome(step, task, run, status, failure_reason=""):
+            record = {
+                "workflow_name": WORKFLOW_NAME,
+                "step": step,
+                "subject": SUBJ,
+                "session": SES,
+                "task": task,
+                "run": run,
+                "status": status,
+                "failure_category": "" if status == "succeeded" else classify_failure(failure_reason),
+                "failure_reason": failure_reason,
+                "upstream_failed_step": "",
+                "outputs_verified": [],
+                "pipeline": "cloudpipe_minproc",
+                "schema_version": "1.0",
+                "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            key = f"{WORKFLOW_NAME}__{step}__{SUBJ}__{SES}__{task}__{run}_outcome.json"
+            (STEP_OUTCOMES_DIR / key).write_text(json.dumps(record))
+
+        COMPONENTS = Path("/data/components")
+        ANAT = Path("/data/anat")
+        MESHES = Path("/data/meshes")
+        OUT_DIR = Path("/tmp/cifti_out")
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        pending = [r for r in RUNS if not r.get("surf_target_exists")]
+        print(f"[driver] {SES}: {len(pending)} of {len(RUNS)} runs need assembly")
+
+        # Stage 1 writes the session geometry once; without it nothing can be
+        # resampled, so fail fast rather than once per run.
+        missing_anat = [
+            p for p in (
+                ANAT / f"{SUBJ}_{SES}_hemi-L_sphere.reg.surf.gii",
+                ANAT / f"{SUBJ}_{SES}_hemi-R_sphere.reg.surf.gii",
+            ) if not p.exists()
+        ]
+        if pending and missing_anat:
+            print(f"[driver] FATAL: session geometry missing: "
+                  f"{', '.join(p.name for p in missing_anat)}")
+            sys.exit(1)
+
+        failed = []
+        reason_by_prefix = {}
+        try:
+            for run in pending:
+                task, rid = run["task"], run["run"]
+                prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+                comp_dir = COMPONENTS / f"{task}_{rid}"
+                print(f"[driver] === {prefix} ===")
+
+                # Last-resort guard. The partial-failure rule is only real if a
+                # single run can never abort the pod; anything unforeseen here
+                # would otherwise discard every sibling's assembled output.
+                try:
+                    # Stage 1 tars each run's components rooted at {task}_{run}/,
+                    # and this artifact is declared archive:none, so Argo lands
+                    # the tarball itself rather than its contents — unpack here.
+                    tarball = COMPONENTS / f"{prefix}_desc-grayordcomponents_bold.tar.gz"
+                    if not comp_dir.is_dir() and tarball.exists():
+                        # A truncated upload raises EOFError from the gzip
+                        # layer, NOT tarfile.TarError — catching only the latter
+                        # still lets one bad run take the pod down.
+                        try:
+                            with tarfile.open(tarball) as tar:
+                                tar.extractall(COMPONENTS)
+                        except (tarfile.TarError, EOFError, OSError) as exc:
+                            print(f"[driver] FAILED {prefix}: corrupt components "
+                                  f"tarball ({type(exc).__name__}: {exc})")
+                            failed.append(prefix)
+                            reason_by_prefix[prefix] = (
+                                f"corrupt components tarball: {type(exc).__name__}: {exc}"
+                            )
+                            continue
+
+                    if not comp_dir.is_dir():
+                        # The components tarball is per run and may legitimately
+                        # be absent if Stage 1 failed for this run alone.
+                        print(f"[driver] FAILED {prefix}: no components at {comp_dir}")
+                        failed.append(prefix)
+                        reason_by_prefix[prefix] = f"no components at {comp_dir}"
+                        continue
+
+                    rc = subprocess.run([
+                        "python", "/app/cifti_assemble.py",
+                        "--components", str(comp_dir),
+                        "--anat", str(ANAT),
+                        "--meshes", str(MESHES),
+                        "--outdir", str(OUT_DIR),
+                        "--subj", SUBJ,
+                        "--session", SES,
+                        "--task", task,
+                        "--run", rid,
+                        "--target-sphere", TARGET_SPHERE,
+                        "--target-area", TARGET_AREA,
+                        "--area-mode", AREA_MODE,
+                        "--target-roi", TARGET_ROI,
+                    ]).returncode
+
+                    if rc != 0:
+                        print(f"[driver] FAILED {prefix} (exit {rc})")
+                        failed.append(prefix)
+                        reason_by_prefix[prefix] = f"cifti_assemble.py exited {rc}"
+                except Exception as exc:
+                    print(f"[driver] FAILED {prefix}: unexpected error")
+                    traceback.print_exc()
+                    failed.append(prefix)
+                    reason_by_prefix[prefix] = f"{type(exc).__name__}: {exc}"
+                finally:
+                    # Reclaim ephemeral storage: a session's extracted
+                    # components would otherwise accumulate alongside the
+                    # tarballs they came from.
+                    shutil.rmtree(comp_dir, ignore_errors=True)
+        finally:
+            # Record every run's outcome directly (see ADR 016). Written in a
+            # `finally`: the loop is sequential and each iteration is fully
+            # resolved (success or a caught failure) before the next starts,
+            # so by the time this runs every pending prefix is accounted for
+            # in `failed` one way or the other — unless the pod itself was
+            # killed outright, which skips this block entirely and falls back
+            # to the master template's aggregate Failed/Skipped recorder.
+            for r in RUNS:
+                task, rid = r["task"], r["run"]
+                prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+                if prefix in failed:
+                    status, reason = "failed", reason_by_prefix.get(prefix, "")
+                else:
+                    status, reason = "succeeded", ""
+                write_outcome("surface-resample", task, rid, status, reason)
+        print(f"[driver] {len(pending) - len(failed)} succeeded, {len(failed)} failed")
+
+        if pending and len(failed) == len(pending):
+            sys.exit(1)

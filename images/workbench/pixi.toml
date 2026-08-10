@@ -1,0 +1,17 @@
+[workspace]
+authors = ["Justin Russell <<YOUR_MAINTAINER_EMAIL>>"]
+channels = ["conda-forge"]
+name = "workbench"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+# -cli, not the full connectome-workbench: the metapackage also pulls the Qt
+# GUI build, which is dead weight in a headless pod.
+connectome-workbench-cli = ">=2.1.0,<3"
+python = ">=3.12,<3.14"
+# For reading the assembled dtseries back in for QC.
+nibabel = ">=5.0.0,<6"
+numpy = ">=1.26.0,<3"

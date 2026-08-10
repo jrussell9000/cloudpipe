@@ -1,0 +1,406 @@
+{
+  "uid": "cloudpipe-failure-triage",
+  "title": "CloudPipe — Failure Triage",
+  "description": "Failed and skipped pipeline steps with their category and reason, from step_outcomes. Skipped is a normal outcome, not a problem — see the dashboard notes.",
+  "tags": [
+    "cloudpipe",
+    "failures",
+    "operations"
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "CloudPipe dashboards",
+      "tags": [
+        "cloudpipe"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 900,
+      "type": "text",
+      "title": "How to read this",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 9,
+        "h": 5
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### 🔧 What went wrong, and where\n\nEvery pipeline step records its own outcome, per participant and per scan. This dashboard shows the two non-successful ones.\n\n**Skipped is normal.** A step is skipped when its output already exists — reprocessing a participant whose anatomical was already done skips the whole anatomical branch on purpose. A high skip count usually means work was *saved*, not lost.\n\n**Failed needs a person.** `failure_category` groups causes; `upstream_failed_step` tells you when a step failed only because something before it did — fix the root step, not the symptom.\n\n**History is kept, not replaced.** Records are per workflow attempt, so a failure that has since been fixed by reprocessing still appears here. Narrow the time range to the batch you care about."
+      }
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Participants affected",
+      "gridPos": {
+        "x": 9,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT COUNT(DISTINCT subject) AS failed_subjects FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        }
+      },
+      "description": "Distinct participants with at least one failed step in range. Reprocessed-and-since-fixed participants still count while their failed attempt is in the window.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Failed steps",
+      "gridPos": {
+        "x": 14,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT COUNT(*) AS failed_steps FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        }
+      },
+      "description": "Total failed step records — larger than the participant count, since one workflow can fail several steps, and one upstream failure cascades.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Skipped steps",
+      "gridPos": {
+        "x": 19,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT COUNT(*) AS skipped_steps FROM cloudpipe_metrics.step_outcomes WHERE status = 'skipped' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Steps that did not need to run because their output already existed. This is the pipeline working as designed — high is good, not bad.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "🔎 What failed",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Most common cause",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT failure_category FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND failure_category <> '' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) GROUP BY failure_category ORDER BY COUNT(*) DESC LIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "infrastructure": {
+                  "color": "yellow",
+                  "index": 0
+                },
+                "algorithm": {
+                  "color": "red",
+                  "index": 1
+                },
+                "data": {
+                  "color": "orange",
+                  "index": 2
+                },
+                "dependency": {
+                  "color": "purple",
+                  "index": 3
+                },
+                "unknown": {
+                  "color": "gray",
+                  "index": 4
+                }
+              }
+            }
+          ]
+        }
+      },
+      "description": "The failure_category appearing most often in range. Start here, then filter the table below to that category.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Every failed & skipped step",
+      "gridPos": {
+        "x": 6,
+        "y": 6,
+        "w": 18,
+        "h": 12
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT recorded_at, subject, session, task, run, step, status, failure_category, failure_reason, upstream_failed_step FROM cloudpipe_metrics.step_outcomes WHERE status IN ('failed', 'skipped') AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) ORDER BY recorded_at DESC"
+        }
+      ],
+      "options": {
+        "cellHeight": "auto",
+        "sortBy": [
+          {
+            "displayName": "recorded_at",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "failed": {
+                        "text": "failed",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "skipped": {
+                        "text": "skipped",
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failure_category"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "infrastructure": {
+                        "text": "infrastructure",
+                        "color": "yellow",
+                        "index": 0
+                      },
+                      "algorithm": {
+                        "text": "algorithm",
+                        "color": "red",
+                        "index": 1
+                      },
+                      "data": {
+                        "text": "data",
+                        "color": "orange",
+                        "index": 2
+                      },
+                      "dependency": {
+                        "text": "dependency",
+                        "color": "purple",
+                        "index": 3
+                      },
+                      "unknown": {
+                        "text": "unknown",
+                        "color": "gray",
+                        "index": 4
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failure_reason"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "wrapText": true
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "description": "Most recent first. Sort or filter by `status` to separate the two — they are very different things. When `upstream_failed_step` is populated, this step is a casualty rather than a cause."
+    }
+  ]
+}
