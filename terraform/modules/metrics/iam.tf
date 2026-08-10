@@ -2,6 +2,13 @@ data "aws_caller_identity" "current" {}
 
 ################################################################################
 # Glue crawler service role
+#
+# NOTE: no crawler currently uses this role — the scheduled crawlers were
+# removed on 2026-07-30 (see main.tf). It is kept, unattached, so a one-off
+# `aws glue create-crawler` + `start-crawler` against a scratch database is
+# possible during a schema investigation without re-deriving the trust policy
+# and S3 grants. Nothing assumes it on a schedule, so it grants no standing
+# access to anything.
 ################################################################################
 
 data "aws_iam_policy_document" "crawler_assume" {

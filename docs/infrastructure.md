@@ -11,25 +11,36 @@ All infrastructure lives in `terraform/`. Run all Terraform commands from within
 | `eks.tf` | EKS cluster, managed node groups, KMS keys, CloudWatch log group |
 | `vpc.tf` | VPC, subnets, NAT gateway, S3 VPC endpoint, VPC flow logs |
 | `vpn.tf` | AWS Client VPN endpoint, client certificates |
-| `addons.tf` | Pod Identity associations for EBS/EFS CSI, External DNS, CloudWatch agent |
+| `addons.tf` | Pod Identity associations for EBS CSI, External DNS, CloudWatch agent |
 | `karpenter.tf` | Karpenter Helm release (via module) |
-| `storage.tf` | EFS file system + mount targets, StorageClasses (ebs-sc, efs-sc) |
+| `storage.tf` | StorageClass (`ebs-sc`) |
 | `argowf.tf` | Argo Workflows SSO secrets, RBAC, Prefect→Argo cross-namespace bindings |
 | `argocd.tf` | ArgoCD Helm release, Dex OIDC config (UW-Madison NetID), bootstrap ApplicationSet |
 | `prefect.tf` | Prefect module call, oauth2-proxy secret |
 | `globus.tf` | Globus module call |
 | `finops.tf` | Kubecost + Athena CUR module |
-| `metrics.tf` | Pipeline observability module (Glue database + crawlers, Athena workgroup, Grafana Pod Identity) |
-| `queue.tf` | (Placeholder — SQS/Argo Events removed; Prefect submits directly to Argo API) |
-| `batch.tf` | AWS Batch (legacy, not used by current pipelines) |
+| `metrics.tf` | Pipeline observability module (Glue database + hand-declared catalog tables, Athena workgroup, Grafana Pod Identity) |
+| `metrics_bucket.tf` | The `cloudpipe-metrics` bucket (versioned) that holds all QC/cost records |
+| `abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix |
+| `grafana.tf` | Grafana Helm release, ALB ingress, OIDC |
 | `logging.tf` | S3 log bucket, CloudTrail, Container Insights log groups |
 | `dns.tf` | Route53 zone lookup, ACM certificates (us-east-1 + <YOUR_AWS_REGION>) |
-| `ecr.tf` | ECR Public registry reference |
+| `ecr.tf` | ECR private repositories (primary registry for pipeline images) |
 | `s3_lifecycle.tf` | S3 lifecycle rules for data bucket |
+| `kube-system-network-policy.tf` | Default-deny/allow network policies in `kube-system` |
 | `locals.tf` | Derived locals — service URLs, VPC DNS resolver |
 | `variables.tf` | All input variables with defaults |
-| `versions.tf` + `providers.tf` | Provider pins, AWS provider aliases |
+| `versions.tf` + `providers.tf` | Provider pins, AWS provider aliases, S3 backend config |
 | `modules/` | Reusable sub-modules (see module reference below) |
+| `bootstrap/` | Separate Terraform root that creates the `cloudpipe-terraform-state` S3 bucket itself — its own local backend, not part of the main stack's state. Rarely touched; see [ADR 015](decisions/015-s3-backend-after-state-loss.md). |
+
+---
+
+## State management
+
+Terraform state lives in the `cloudpipe-terraform-state` S3 bucket (versioned, SSE-encrypted, public access blocked), configured via the `backend "s3"` block in `versions.tf` with native state locking (`use_lockfile = true`, requires Terraform >= 1.10). This bucket is itself managed by a separate, small Terraform config in `terraform/bootstrap/` — deliberately kept off the main stack's backend to avoid a chicken-and-egg dependency.
+
+This replaced a local-only backend (no remote state at all) after a 2026-07 incident where the machine holding the only state file was lost, requiring a full `terraform import` recovery of the entire stack. See [ADR 015](decisions/015-s3-backend-after-state-loss.md) for the incident writeup, what was recovered, two pieces of pre-existing infrastructure drift it surfaced (Globus AMI pinning, Karpenter `expireAfter`), and a list of diffs that are now permanent/expected rather than bugs.
 
 ---
 
@@ -37,10 +48,9 @@ All infrastructure lives in `terraform/`. Run all Terraform commands from within
 
 | Resource | Value |
 |---|---|
-| Primary CIDR | `10.0.0.0/16` |
+| Primary CIDR | `10.0.0.0/16` — the only CIDR in use. `var.secondary_cidr_blocks` is declared, and the VPN has routes/auth rules that iterate over it, but `vpc.tf` never associates it, so it is empty in practice. |
 | Private subnets | Three AZs (<YOUR_AWS_REGION>a/b/c), `/20` each — EKS nodes |
 | Public subnets | Three AZs, `/24` each — ALBs, Globus EC2 |
-| Intra subnets | EKS control plane ENIs |
 | NAT gateway | Single (cost optimisation) — private subnets route through it |
 | S3 VPC Gateway endpoint | All route tables — S3 traffic stays on AWS backbone |
 | VPC flow logs | → `cloudpipe-logging` S3 bucket under `vpc-flow-logs/`, 60s aggregation |
@@ -49,12 +59,11 @@ All infrastructure lives in `terraform/`. Run all Terraform commands from within
 
 AWS Client VPN provides private access to the EKS API (which has no public endpoint in steady state) and internal services. Required before using `kubectl`, `argo`, or the web UIs.
 
-- Client CIDR: `10.3.0.0/22` (split tunnel — public internet still uses local route)
+- Client CIDR: `10.3.0.0/22`
+- **Full tunnel** (`var.split_tunnel` defaults to `false`) — *all* client traffic, including public internet, goes through the VPN. This is deliberate and load-bearing: with split tunnel, traffic to the web UIs' **public** ALB IPs never enters the tunnel, so it is never NAT'd into the client CIDR that the ALB security groups trust, and Grafana/ArgoCD/Argo become unreachable. See the comment on `variable "split_tunnel"` in `terraform/variables.tf` and the SG rules in `vpn.tf`, `grafana.tf`, `argocd.tf`.
 - Certificates: managed by Terraform (`certificate_validity_period_hours = 8760`, i.e. 1 year)
 
-### EC2 Instance Connect Endpoint (EICE)
-
-Used for operator access to the RDS instances (PostgreSQL on port 5432) without a bastion host. The EICE security group is referenced in the RDS security groups to allow inbound connections.
+A replacement (Cloudflare Tunnel + Access, reusing the UW-Madison OIDC identity already federated for ArgoCD/Argo Workflows) is designed but **not implemented** — [ADR 014](decisions/014-cloudflare-tunnel-over-vpn.md) is still `Proposed`. There is no `terraform/cloudflare.tf` and no `gitops/apps/cloudflared/`; the VPN is the only remote-access path.
 
 ---
 
@@ -96,29 +105,28 @@ The `backend` group is pinned to <YOUR_AWS_REGION>a so it is always co-located w
 
 ### Karpenter node pools (on-demand provisioning for pipeline workloads)
 
-| Node pool | Instance family | Capacity type | Max resources | Used by |
-|---|---|---|---|---|
-| `cpu-light-nodepool` | t-series (AMD64) | spot + on-demand | 64 CPU / 128 Gi | Globus control, inventory, S3 sync |
-| `cpu-heavy-nodepool` | c/m/r 2xl–4xl (AMD64) | spot | 256 CPU / 1024 Gi | BOLD→T1w registration, functional preprocessing |
-| `gpu-nodepool` | g4dn/g6 xlarge, NVIDIA GPU (AMD64) | spot + on-demand | 128 CPU / 512 Gi | T1w→MNI registration (FireANTs) |
+There are **four** node pools. All are **spot-only** — no pool allows on-demand, and there is no on-demand fallback anywhere in the cluster.
 
-All Karpenter nodes consolidate to zero when empty (`consolidateAfter: 10m`). Disruption budgets allow removing up to 20% of nodes at a time. Startup taint `efs.csi.aws.com/agent-not-ready` prevents pods from scheduling before the EFS CSI driver is ready.
+| Node pool | Instance selection | Capacity type | Pool limits | Used by |
+|---|---|---|---|---|
+| `cpu-light-nodepool` | category `t` | spot | 160 CPU / 640 Gi | Globus control, inventory, S3 sync |
+| `cpu-heavy-nodepool` | category `c`,`m`; sizes 2xlarge, 4xlarge; nitro | spot | 2560 CPU / 10240 Gi | BOLD→T1w registration, functional preprocessing |
+| `first-level-nodepool` | families `m6gd`/`m7gd`/`r6gd`/`r7gd`/`c6gd`/`c7gd` (**Graviton/ARM64**, local NVMe); sizes xlarge–4xlarge | spot | 512 CPU / 4096 Gi | First-level (task-based) analysis |
+| `gpu-nodepool` | families `g4dn`/`g5`/`g6`/`g6e`; sizes xlarge, 2xlarge; nitro; zones <YOUR_AWS_REGION>a/b/c | spot | 512 CPU / 2048 Gi | T1w→MNI registration (FireANTs), FastSurfer template-build + long-segmentation |
+
+The `Pool limits` column is the Karpenter `spec.limits` ceiling on aggregate provisioned capacity — a safety stop, not a reservation and not a statement of what a pool typically runs.
+
+`first-level-nodepool` is the only ARM64 pipeline pool; the `*gd` families are chosen for their local NVMe scratch. Images that run there must be built for ARM64 (see [images.md](images.md)).
+
+**GPU time-slicing.** A `NodeOverlay` (`gpu-timeslice-3x`) advertises **3** schedulable GPU slices per physical GPU, so up to 3 pods share one card. The count is capped by the smallest card in the pool — the g4dn's T4 has 15 GiB — not by the largest. A separate `g6f-fractional-gpu` overlay covers the fractional-GPU g6f family.
+
+All Karpenter nodes consolidate to zero when empty (`consolidateAfter: 10m`). Disruption budgets allow removing up to 20% of nodes at a time.
 
 ---
 
 ## Storage
 
-### EFS
-
-Single encrypted EFS file system with mount targets in all three private subnets (one per AZ). Used for per-workflow shared PVCs.
-
-| Attribute | Value |
-|---|---|
-| Performance mode | `generalPurpose` |
-| Throughput mode | `elastic` |
-| Encryption | AES-256 (AWS-managed key) |
-| StorageClass | `efs-sc` (`ReadWriteMany`, dynamic provisioning) |
-| PVC lifecycle | 50 Gi per workflow, deleted on workflow completion (`volumeClaimGC: OnWorkflowCompletion`) |
+There is no shared cluster filesystem. All inter-step data passes through S3 artifacts (see [ADR 004](decisions/004-s3-artifacts-for-inter-step-data.md)); the EFS filesystem, its `efs-sc` StorageClass, and the EFS CSI driver were removed once `subregion-seg` (the last consumer) moved to per-pod `emptyDir`s + S3 checkpointing (GitHub #77).
 
 ### EBS
 
@@ -130,18 +138,28 @@ Default StorageClass `ebs-sc` — gp3, encrypted, `WaitForFirstConsumer` binding
 
 Two separate RDS instances share the same subnet group but have independent security groups.
 
-| Instance | Identifier | Database | User | Used by |
-|---|---|---|---|---|
-| Argo | `cloudpipe-argo` | `argoworkflows` | `argouser` | Argo Workflows persistence (workflow history, artifacts metadata) |
-| Prefect | (in `modules/prefect`) | `prefect` | `prefectuser` | Prefect server metadata (flow runs, deployments, work pools) |
+| Instance | Identifier | Class | Database | User | Used by |
+|---|---|---|---|---|---|
+| Argo | `cloudpipe-argo` | `db.m7g.large` | `argoworkflows` | `argouser` | Argo Workflows persistence (workflow history, artifacts metadata) |
+| Prefect | `cloudpipe-prefect` | `db.t4g.micro` | `prefect` | `prefectuser` | Prefect server metadata (flow runs, deployments, work pools) |
+
+The classes differ deliberately. Prefect stores a little flow-run metadata and stays on the burstable `db.t4g.micro`. The Argo instance was upsized to `db.m7g.large` because it takes write traffic from every workflow pod in a batch.
 
 Both instances:
 - `storage_type = gp3`, encrypted
 - Master password managed natively by RDS (`manage_master_user_password = true`) — password lives in RDS-owned Secrets Manager secret
 - CloudWatch log exports: `postgresql`, `upgrade`
 - Auto minor version upgrade enabled
-- Not publicly accessible; reachable from within VPC (pods) and via EICE (operators)
+- Not publicly accessible; reachable from within the VPC (pods) and, for operators, over the Client VPN
 - `deletion_protection = false` (set to `true` before production promotion)
+
+### PgBouncer (Argo RDS only)
+
+PgBouncer was introduced while the Argo instance was still a `db.t4g.micro`, whose `max_connections ≈ 112`: bulk workflow operations (large deletes, parallel status updates from many workflow pods) burst past that ceiling and return `SQLSTATE 53300: too many clients`. PgBouncer caps real server connections at 20 and queues excess client requests.
+
+The instance has since been upsized to `db.m7g.large`, which raises the ceiling considerably — but PgBouncer stays. Connection *count* scales with batch concurrency rather than instance size, so pooling is the durable fix; the upsize addressed throughput, not the connection ceiling.
+
+Argo components never connect to RDS directly — all traffic goes through the `pgbouncer` Service (`pgbouncer:5432` in the `argo-workflows` namespace). See [argo-workflows.md — PgBouncer](argo-workflows.md#pgbouncer-connection-pooler) for configuration details.
 
 ### Secrets flow: RDS → pods
 
@@ -160,11 +178,17 @@ The `ClusterSecretStore` and `ExternalSecret` resources are gated behind `crds_a
 
 ## S3 buckets
 
-| Bucket | Purpose |
-|---|---|
-| `abcd-v7` | Primary data — input BOLD, derivatives, config files (see architecture.md for key layout) |
-| `<YOUR_INPUT_S3_BUCKET>` | Legacy — first-level subject CSVs; Prefect worker and Argo runner have read access |
-| `cloudpipe-logging` | Aggregated log archive: VPC flow logs, CloudTrail, ALB access logs, S3 access logs |
+| Bucket | Versioned | Purpose |
+|---|---|---|
+| `<YOUR_S3_BUCKET>` | **No** | Primary data — input BOLD, derivatives, first-level subject CSVs, config files (see architecture.md for key layout), plus archived pod logs under `logs/` |
+| `cloudpipe-metrics` | **Yes** | All QC/cost metric records (`metrics/*`) and their compacted Parquet copies |
+| `cloudpipe-finops` | — | CUR cost-and-usage reports, Athena query results (`grafana-query-results/`) |
+| `cloudpipe-logging` | — | Aggregated log archive: VPC flow logs, CloudTrail, ALB access logs, S3 access logs |
+| `cloudpipe-terraform-state` | **Yes** | Terraform remote state (managed by `terraform/bootstrap/`) |
+
+Metrics live on their own **versioned** bucket, deliberately separated from the derivative data: `<YOUR_S3_BUCKET>` derivative prefixes are flushed before each test batch, which previously destroyed QC history along with them. Writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix are now actively **denied** by bucket policy (`terraform/abcd_v7_metrics_retire.tf`) so a misconfigured writer fails loudly instead of silently orphaning records from Athena.
+
+Note that `<YOUR_S3_BUCKET>` is **not** versioned — deletes there are unrecoverable without reprocessing. Several earlier data buckets still exist in the account; they are historical and not written by the current pipeline.
 
 `cloudpipe-logging` lifecycle: → Glacier after 90 days → expire after 3 years (satisfies NIST 800-171 3.3.1 log retention).
 
@@ -178,19 +202,20 @@ All pod-level AWS permissions use EKS Pod Identity (not IRSA). Each service acco
 
 | Service account | Namespace | Key permissions |
 |---|---|---|
-| `argo-workflows-controller` | `argo-workflows` | S3 read/write on `abcd-v7` (artifact storage) |
-| `argo-workflows-runner` | `argo-workflows` | S3 read/write on `abcd-v7` + `<YOUR_INPUT_S3_BUCKET>`, SSM read on `/cloudpipe/globus/*`, EC2 start/stop (via globus module), `workflowtaskresults` create/patch |
-| `argo-workflows-server` | `argo-workflows` | S3 read on `abcd-v7` (serve archived logs) |
-| `prefect-worker` | `prefect` | S3 read/write on `abcd-v7`, S3 read on `<YOUR_INPUT_S3_BUCKET>`, SSM read on Globus params; K8s RBAC to create/manage Jobs in `prefect` ns and list/create Workflows in `argo-workflows` ns |
+| `argo-workflows-controller` | `argo-workflows` | S3 read/write on `<YOUR_S3_BUCKET>` (artifact storage) |
+| `argo-workflows-runner` | `argo-workflows` | S3 read/write on `<YOUR_S3_BUCKET>`, SSM read on `/cloudpipe/globus/*`, EC2 start/stop (via globus module), `workflowtaskresults` create/patch |
+| `argo-workflows-server` | `argo-workflows` | S3 read on `<YOUR_S3_BUCKET>` (serve archived logs) |
+| `prefect-worker` | `prefect` | S3 read/write on `<YOUR_S3_BUCKET>`, SSM read on Globus params; K8s RBAC to create/manage Jobs in `prefect` ns and list/create Workflows in `argo-workflows` ns |
 | `ebs-csi-controller-sa` | `aws-ebs-csi-driver` | EBS CSI managed policy |
-| `efs-csi-controller-sa` | `aws-efs-csi-driver` | EFS CSI managed policy |
 | `external-dns` | `external-dns` | Route53 record management on `<YOUR_DOMAIN>` zone |
 | `cloudwatch-agent` | `amazon-cloudwatch` | CloudWatch agent policy |
 | `external-secrets` | `external-secrets` | Secrets Manager `GetSecretValue` (for ClusterSecretStore) |
-| `grafana` | `grafana` | Athena query + Glue read on `cloudpipe_metrics`; S3 read on `abcd-v7/metrics/*`; S3 write on `cloudpipe-finops/grafana-query-results/*` |
+| `grafana` | `grafana` | Athena query on `cloudpipe_metrics_workgroup` + Glue read on the `cloudpipe_metrics` catalog/database/tables; S3 read on `cloudpipe-metrics/metrics/*`; S3 read+write on `cloudpipe-finops/grafana-query-results/*` |
+
+A `cloudpipe-metrics-crawler` IAM role also exists in `modules/metrics/iam.tf`, but **no crawler uses it** — the scheduled crawlers were removed on 2026-07-30. It is kept unattached so a one-off crawler against a scratch database is possible during a schema investigation without re-deriving the trust policy. Its presence is not evidence that anything crawls on a schedule. (The one crawler that *does* still run is `cur_report_crawler` in `modules/finops/`, for AWS cost-and-usage reports — unrelated to pipeline metrics.)
 
 Cross-namespace RBAC (defined in `argowf.tf`):
-- `prefect-worker` → `argo-workflows` namespace: `argo-workflows-view` ClusterRole (for `count_running()`), custom `prefect-worker-argo-submit` Role (for `submit()`)
+- `prefect-worker` → `argo-workflows` namespace: `argo-workflows-view` ClusterRole (for the concurrency gate's workflow list), custom `prefect-worker-argo-submit` Role (for `submit()`)
 
 ---
 
@@ -239,7 +264,7 @@ External DNS (running in `external-dns` namespace, managed by ArgoCD) automatica
 | EKS control plane (api, audit, authenticator) | CloudWatch log group `/aws/eks/cloudpipe/cluster` | 365 days, KMS encrypted |
 | Container Insights (basic mode) | CloudWatch | Default (15 months) |
 | VPC flow logs | `cloudpipe-logging/vpc-flow-logs/` | 90d → Glacier → 3y expiry |
-| CloudTrail (all regions, all mgmt events + S3 data events on `abcd-v7`) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
+| CloudTrail (all regions, all mgmt events + S3 data events on `<YOUR_S3_BUCKET>`) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
 | ALB access logs | `cloudpipe-logging/*/AWSLogs/` | 90d → Glacier → 3y expiry |
 
 Pipeline pod logs are **not** forwarded to CloudWatch. Use the Argo UI or `argo logs` to access them while the workflow is running, or the Argo server's S3-backed log archive for completed workflows.
@@ -257,7 +282,7 @@ The Globus Connect Server runs on a standalone EC2 instance in a public subnet, 
 | AMI | Ubuntu 22.04 LTS x86_64 (Canonical) |
 | Subnet | Public (<YOUR_AWS_REGION>a) |
 | Public IP | Elastic IP (fixed — used for endpoint registration) |
-| Storage | S3 storage gateway (`globus_use_s3_gateway = true`) — GridFTP writes directly to `abcd-v7` |
+| Storage | S3 storage gateway (`globus_use_s3_gateway = true`) — GridFTP writes directly to `<YOUR_S3_BUCKET>` |
 
 Security group inbound rules (mandated by Globus Connect Server v5 architecture):
 
@@ -287,13 +312,12 @@ The Globus instance is stopped when not actively transferring; `start-globus-ins
 | Module | Path | Manages |
 |---|---|---|
 | `addons` | `modules/addons` | Pod Identity associations for cert-manager, External Secrets, AWS LBC |
-| `argo-workflows` | `modules/argo-workflows` | RDS instance, IAM/Pod Identity, RBAC, network policies, metrics |
+| `argo-workflows` | `modules/argo-workflows` | RDS instance, IAM/Pod Identity, RBAC, network policies, metrics; PgBouncer Deployment + Service in `gitops/apps/argo-workflows/templates/` |
 | `finops` | `modules/finops` | Kubecost Helm release, Athena CUR table, IAM for cost data |
 | `globus` | `modules/globus` | EC2 instance, EIP, security group, IAM role, SSM parameters |
 | `karpenter` | `modules/karpenter` | Karpenter Helm release, NodePool/NodeClass manifests |
-| `metrics` | `modules/metrics` | Glue catalog database + 5 crawlers, Athena `cloudpipe_metrics_workgroup`, Grafana Pod Identity |
+| `metrics` | `modules/metrics` | Glue catalog database + 9 raw and 9 compacted hand-declared catalog tables (**no crawlers**), Athena `cloudpipe_metrics_workgroup`, Grafana Pod Identity |
 | `prefect` | `modules/prefect` | RDS instance, IAM/Pod Identity, RBAC, network policies |
-| `argo-events` | `modules/argo-events` | Argo Events resources (retained for future use; no active EventSources) |
 
 ---
 
@@ -307,10 +331,19 @@ A fresh cluster install follows the phased sequence in `install.sh`. Do not run 
 | 2 | EKS add-ons, Pod Identity, Karpenter, ArgoCD, service modules |
 | 3 | kube-system NetworkPolicies applied before strict VPC CNI mode |
 | 4 | Full apply (`crds_available=false`) — VPN created here |
-| 5 | Wait for ArgoCD to sync and install CRDs (external-secrets, Argo Events, Prometheus) |
+| 5 | Wait for ArgoCD to sync and install CRDs (external-secrets, Prometheus) |
 | 6 | Final apply: `crds_available=true`, `vpc_cni_strict_mode=true`, public endpoint disabled |
 
 After Phase 6 the EKS API is private-only — connect via VPN for all subsequent `kubectl`/`terraform` operations.
+
+> **Known bug — a fresh install fails in Phase 2.** `install.sh:45` still runs
+> `apply_target "module.aws_efs_csi_pod_identity"`, and `cleanup.sh:52` still
+> destroys it, but that module was deleted along with EFS (GitHub #77) and exists
+> in no `.tf` file. Both scripts will error on a targeted apply/destroy of a
+> nonexistent module. This has gone unnoticed because no fresh cluster has been
+> bootstrapped since the EFS removal. Delete both lines before relying on either
+> script. An orphaned `efs.csi.aws.com` CSIDriver object also survives in-cluster
+> with no owning ArgoCD Application; it is inert but can be deleted by hand.
 
 ### Key Terraform variables
 
@@ -321,6 +354,6 @@ After Phase 6 the EKS API is private-only — connect via VPN for all subsequent
 | `vpc_cni_strict_mode` | `false` | Set `true` after kube-system NetworkPolicies are in place (Phase 6) |
 | `admin_netid` | — | NetID (without @<YOUR_INSTITUTION_DOMAIN>) granted ArgoCD + Argo admin access |
 | `globus_client_id` | — | Globus service account app client ID (no default — must be provided) |
-| `globus_s3_destination_bucket` | `abcd-v7` | Change to target a different S3 bucket |
+| `globus_s3_destination_bucket` | `<YOUR_S3_BUCKET>` | Change to target a different S3 bucket |
 | `kubernetes_version` | `1.35` | Bump for EKS version upgrades |
 | `domain` | `<YOUR_DOMAIN>` | Change for different deployment environments |

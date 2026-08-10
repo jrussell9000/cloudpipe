@@ -1,146 +1,1159 @@
 {
   "uid": "cloudpipe-funcqc",
   "title": "CloudPipe — Functional QC",
-  "description": "BOLD run quality metrics: framewise displacement, DVARS, tSNR, and confound regressor counts.",
-  "tags": ["cloudpipe", "qc", "functional"],
+  "description": "BOLD run quality: head motion, signal-to-noise, confound regressors, and runtime. One row per BOLD run (subject x session x task x run), deduplicated to the most recent attempt per run.",
+  "tags": [
+    "cloudpipe",
+    "qc",
+    "functional"
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "CloudPipe dashboards",
+      "tags": [
+        "cloudpipe"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "refresh": "5m",
-  "time": { "from": "now-30d", "to": "now" },
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "subject",
+        "type": "query",
+        "label": "Subject",
+        "datasource": {
+          "uid": "cloudpipe-athena",
+          "type": "grafana-athena-datasource"
+        },
+        "query": {
+          "rawSQL": "SELECT DISTINCT subject FROM cloudpipe_metrics.func_preproc ORDER BY subject",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          }
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false
+      },
+      {
+        "name": "session",
+        "type": "query",
+        "label": "Session",
+        "datasource": {
+          "uid": "cloudpipe-athena",
+          "type": "grafana-athena-datasource"
+        },
+        "query": {
+          "rawSQL": "SELECT DISTINCT session FROM cloudpipe_metrics.func_preproc ORDER BY session",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          }
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false
+      },
+      {
+        "name": "task",
+        "type": "query",
+        "label": "Task",
+        "datasource": {
+          "uid": "cloudpipe-athena",
+          "type": "grafana-athena-datasource"
+        },
+        "query": {
+          "rawSQL": "SELECT DISTINCT task FROM cloudpipe_metrics.func_preproc ORDER BY task",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          }
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false
+      }
+    ]
+  },
   "panels": [
     {
-      "id": 1,
-      "type": "stat",
-      "title": "Mean FD (all runs)",
-      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
-      "targets": [
-        {
-          "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(AVG(mean_fd), 3) AS mean_fd FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "mm",
-          "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.2 }, { "color": "red", "value": 0.5 }] }
-        }
+      "id": 900,
+      "type": "text",
+      "title": "About this dashboard",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### 🌊 Quality of the functional (BOLD) scans\n\nEach number describes **one BOLD run** — one task, one acquisition, for one participant and session. The dominant quality problem in child and adolescent fMRI is **head motion**, so that is the first row.\n\n**Reading the colours**\n\n| | |\n|---|---|\n| 🟢 🟡 🔴 | A conventional range exists — colour is a judgement |\n| 🔵 | Descriptive only — compare across the cohort |\n\nA run is counted once. Reprocessed runs write a new record each time, and only the latest is shown."
       }
     },
     {
-      "id": 2,
+      "id": 12,
       "type": "stat",
-      "title": "% Runs with >10% FD > 0.5 mm",
-      "gridPos": { "x": 4, "y": 0, "w": 5, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Runs QC'd",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(100.0 * SUM(CASE WHEN pct_fd_above_0p5 > 10 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_high_motion FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 20 }, { "color": "red", "value": 40 }] }
-        }
-      }
-    },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "Median tSNR",
-      "gridPos": { "x": 9, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
-      "targets": [
-        {
-          "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(AVG(tsnr_median), 1) AS avg_tsnr FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_runs FROM d WHERE rn = 1"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 30 }, { "color": "green", "value": 50 }] }
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
         }
+      },
+      "description": "Distinct BOLD runs represented on this dashboard, after deduplicating to the latest attempt per run. This is the denominator for every average and percentage below — read it first.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
       }
     },
     {
-      "id": 4,
+      "id": 1,
       "type": "stat",
-      "title": "Mean Runtime (min)",
-      "gridPos": { "x": 13, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Head motion (mean FD)",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 4,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(AVG(total_runtime_s) / 60.0, 1) AS mean_min FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(mean_fd), 3) AS mean_fd FROM d WHERE rn = 1"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "m" } }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: mm",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.2
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "decimals": 3
+        }
+      },
+      "description": "Framewise displacement averaged over the run, in mm — how much the head moved between consecutive frames. The field's conventional concern threshold is ~0.2 mm, with ~0.5 mm considered high.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "High-motion runs",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 4,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN pct_fd_above_0p5 > 10 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_high_motion FROM d WHERE rn = 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 20
+              },
+              {
+                "color": "red",
+                "value": 40
+              }
+            ]
+          }
+        }
+      },
+      "description": "Share of runs where more than 10% of frames exceed FD > 0.5 mm. This is the primary motion exclusion criterion — these runs are the ones most likely to be dropped from analysis.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Signal quality (median tSNR)",
+      "gridPos": {
+        "x": 20,
+        "y": 0,
+        "w": 4,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(tsnr_median), 1) AS avg_tsnr FROM d WHERE rn = 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 30
+              },
+              {
+                "color": "green",
+                "value": 50
+              }
+            ]
+          },
+          "decimals": 1
+        }
+      },
+      "description": "Temporal signal-to-noise ratio over in-brain voxels — how stable each voxel's timeseries is. Higher is better; low tSNR means the run carries little usable signal regardless of motion.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "🏃 Head motion",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Worst frame in a run (max FD)",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(max_fd), 3) AS avg_max_fd FROM d WHERE rn = 1 AND max_fd IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: mm",
+          "decimals": 3,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Each run's single largest frame-to-frame displacement, averaged over runs. A single lurch does not condemn a run the way sustained motion does — this is context for mean FD, not a gate, so it is left uncoloured.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Frames above FD 0.2 mm",
+      "gridPos": {
+        "x": 8,
+        "y": 6,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(n_fd_above_0p2) / NULLIF(SUM(n_frames), 0), 1) AS pct_frames_above_0p2 FROM d WHERE rn = 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Share of all frames, pooled across runs, exceeding FD > 0.2 mm. The stricter companion to the 0.5 mm criterion: it captures low-grade continuous motion that never trips the exclusion threshold but still inflates connectivity estimates. Deliberately uncoloured — there is no conventional cohort-level cutoff for this pooled figure.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Signal change per frame (DVARS)",
+      "gridPos": {
+        "x": 16,
+        "y": 6,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(mean_dvars), 2) AS mean_dvars FROM d WHERE rn = 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Root-mean-square change in BOLD intensity between consecutive frames. Complements FD: FD measures how much the head moved, DVARS measures how much the image actually changed as a result. In arbitrary scanner intensity units, so it is comparable across runs within a batch but not across sites.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
     },
     {
       "id": 5,
       "type": "histogram",
-      "title": "Mean FD Distribution",
-      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Head motion — spread across runs",
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT mean_fd FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND mean_fd IS NOT NULL"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_fd FROM d WHERE rn = 1 AND mean_fd IS NOT NULL"
         }
       ],
-      "options": { "bucketSize": "auto", "fillOpacity": 80 }
+      "options": {
+        "fillOpacity": 70,
+        "bucketSize": 0.1,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "description": "One bar per band of mean-FD values. A long right tail is the high-motion population; the bulk should sit well under 0.2 mm.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: mm",
+          "decimals": 3
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "histogram",
+      "title": "Signal change (DVARS) — spread across runs",
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_dvars FROM d WHERE rn = 1 AND mean_dvars IS NOT NULL"
+        }
+      ],
+      "options": {
+        "fillOpacity": 70,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2
+        }
+      },
+      "description": "Paired with the FD histogram to its left. The two tails should largely be the same runs — motion moves the head (FD) and that shows up as changed intensity (DVARS). A DVARS tail with no matching FD tail points at something other than motion: a spike artefact, a coil fault, or a scaling problem."
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "📶 Signal quality",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Global correlation (GCOR)",
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(gcor), 3) AS gcor FROM d WHERE rn = 1 AND gcor IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 3,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Average correlation of every in-brain voxel with the global mean timeseries, matching AFNI's @compute_gcor. Elevated GCOR means a signal common to the whole brain is dominating — typically motion or respiration rather than neural activity. Descriptive: compare across the cohort, no fixed cutoff. Note the emitter records 0.0 when the IQM computation fails, so an exact 0.000 means 'not measured', not 'no global signal'.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Outlier fraction (AOR)",
+      "gridPos": {
+        "x": 8,
+        "y": 19,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(aor), 4) AS aor FROM d WHERE rn = 1 AND aor IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "AFNI outlier ratio — mean fraction of voxels flagged as outliers per frame, matching 3dToutcount. Frame-level spike detection, arrived at independently of the FD estimate. Descriptive only; an exact 0.0000 also encodes a failed IQM computation.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Quality index (AQI)",
+      "gridPos": {
+        "x": 16,
+        "y": 19,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(aqi), 4) AS aqi FROM d WHERE rn = 1 AND aqi IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "AFNI quality index — mean distance of each frame from the run's median frame, matching 3dTqual. Lower is better. Computed in numpy here rather than by AFNI itself, so it agrees with AFNI's value only to about 1e-5; that gap is expected, not drift. Descriptive only; an exact 0.0000 also encodes a failed IQM computation.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
     },
     {
       "id": 6,
       "type": "histogram",
-      "title": "tSNR Distribution",
-      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Signal quality (tSNR) — spread across runs",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT tsnr_median FROM cloudpipe_metrics.func_preproc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND tsnr_median IS NOT NULL"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT tsnr_median FROM d WHERE rn = 1 AND tsnr_median IS NOT NULL"
         }
       ],
-      "options": { "bucketSize": "auto", "fillOpacity": 80 }
+      "options": {
+        "fillOpacity": 70,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1
+        }
+      },
+      "description": "Median temporal SNR per run. Unlike motion, this is driven mostly by the acquisition itself — sequence, coil, and run length — so a batch from one site tends to form a tight cluster. A low-tSNR tail that does NOT coincide with the high-motion tail usually indicates an acquisition problem, not a restless participant."
+    },
+    {
+      "id": 20,
+      "type": "histogram",
+      "title": "Global signal level — spread across runs",
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_global_signal FROM d WHERE rn = 1 AND mean_global_signal IS NOT NULL"
+        }
+      ],
+      "options": {
+        "fillOpacity": 70,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1
+        }
+      },
+      "description": "Mean in-brain BOLD intensity per run, in arbitrary scanner units. Its absolute value carries no quality information — what matters is the shape. One tight cluster is one consistent acquisition; distinct clumps mean the batch mixes scanners, coils, or intensity-scaling conventions, which makes raw DVARS non-comparable across those groups."
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "⚙️ Processing cost",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Mean processing time",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(total_runtime_s) / 60.0, 1) AS mean_min FROM d WHERE rn = 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Wall-clock time to preprocess one run. A cost and capacity number, not a quality one — this step on the cpu-heavy nodepool is the pipeline bottleneck, and variance across subjects tracks BOLD run count and length.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Peak memory per run, 95th pct",
+      "gridPos": {
+        "x": 8,
+        "y": 32,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(APPROX_PERCENTILE(peak_memory_gb, 0.95), 1) AS peak_mem_p95_gb FROM d WHERE rn = 1 AND peak_memory_gb IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Per-run peak RSS — stays flat across a multi-run session, so this is the cost of one run in isolation. Do NOT size the pod memory limit against this figure; use the container-lifetime peak to its right, which is the number that actually has to fit under the limit.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "Peak memory per pod, 95th pct",
+      "gridPos": {
+        "x": 16,
+        "y": 32,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(APPROX_PERCENTILE(container_peak_memory_gb, 0.95), 1) AS container_peak_mem_p95_gb FROM d WHERE rn = 1 AND container_peak_memory_gb IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 24
+              },
+              {
+                "color": "red",
+                "value": 30
+              }
+            ]
+          },
+          "decimals": 1
+        }
+      },
+      "description": "Container-lifetime peak memory, so on a multi-run session it grows run over run. This is the figure pod memory limits must be sized against: the cpu-heavy nodepool gives 32 GB, so the amber and red marks sit below that ceiling.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 10,
+      "type": "bargauge",
+      "title": "Where processing time goes (per stage)",
+      "description": "Mean wall time per preprocessing stage. Note 4d_warp must be quoted as stage_timings_s.\"4d_warp\" in any query you write — its leading digit otherwise fails the WHOLE query, not just that column.",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(stage_timings_s.boldref) / 60, 2) AS boldref, ROUND(AVG(stage_timings_s.composite_warp) / 60, 2) AS composite_warp, ROUND(AVG(stage_timings_s.\"4d_warp\") / 60, 2) AS warp_4d, ROUND(AVG(stage_timings_s.mask_warp) / 60, 2) AS mask_warp, ROUND(AVG(stage_timings_s.masking) / 60, 2) AS masking, ROUND(AVG(stage_timings_s.confounds) / 60, 2) AS confounds, ROUND(AVG(stage_timings_s.grayordinates) / 60, 2) AS grayordinates FROM d WHERE rn = 1 AND stage_timings_s IS NOT NULL"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "decimals": 2
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "bargauge",
+      "title": "Confound regressors produced",
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(n_acompcor_wm), 1) AS aCompCor_WM, ROUND(AVG(n_acompcor_csf), 1) AS aCompCor_CSF, ROUND(AVG(n_tcompcor), 1) AS tCompCor, ROUND(AVG(n_cosines), 1) AS Cosines FROM d WHERE rn = 1"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1
+        }
+      },
+      "description": "Mean count of each confound type written to the run's regressor file: aCompCor (white matter and CSF), tCompCor, and the cosine drift basis. These are counts of available regressors, not a quality signal — but a count that collapses toward zero means the confound stage produced little usable output for those runs."
+    },
+    {
+      "id": 400,
+      "type": "row",
+      "title": "🔍 Needs review",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
     },
     {
       "id": 7,
       "type": "table",
-      "title": "High-Motion Runs (mean FD > 0.5 mm)",
-      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Runs to review — highest motion first",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT subject, session, task, run, ROUND(mean_fd, 3) AS mean_fd, ROUND(pct_fd_above_0p5, 1) AS pct_fd_above_0p5, ROUND(tsnr_median, 1) AS tsnr_median, n_frames, completed_at FROM cloudpipe_metrics.func_preproc WHERE mean_fd > 0.5 AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() ORDER BY mean_fd DESC LIMIT 100"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT subject, session, task, run, ROUND(mean_fd, 3) AS mean_fd, ROUND(max_fd, 3) AS max_fd, ROUND(pct_fd_above_0p5, 1) AS pct_fd_above_0p5, ROUND(mean_dvars, 2) AS mean_dvars, ROUND(tsnr_median, 1) AS tsnr_median, n_frames, completed_at FROM d WHERE rn = 1 AND mean_fd > 0.5 ORDER BY mean_fd DESC LIMIT 100"
         }
-      ]
+      ],
+      "description": "Runs whose mean FD exceeds 0.5 mm. Empty is the good outcome. Sorted worst-first and capped at 100 — if exactly 100 rows appear, compare against 'Runs QC'd' in the header, because the tail is being truncated. tSNR is included so you can tell a merely restless run from one that also carries no usable signal.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "mean_fd"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: mm"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "max_fd"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: mm"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pct_fd_above_0p5"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "mean_dvars"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tsnr_median"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      }
     }
   ]
 }

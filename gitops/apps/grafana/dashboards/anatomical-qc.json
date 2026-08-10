@@ -1,141 +1,1609 @@
 {
   "uid": "cloudpipe-anatqc",
   "title": "CloudPipe — Anatomical QC",
-  "description": "FastSurfer volumetric and cortical thickness QC metrics per subject and session.",
-  "tags": ["cloudpipe", "qc", "anatomical"],
+  "description": "T1w-derived QC per subject and session. Rows are grouped by what the metric measures, not by which table it came from: FastSurfer's anat_qc and fsqc's fsqc_qc both describe the same T1w image at the same subject×session grain, and neither is complete alone (WM/GM SNR left anat_qc at schema 1.2 and lives only in fsqc_qc; volumes and thickness live only in anat_qc).",
+  "tags": [
+    "cloudpipe",
+    "qc",
+    "anatomical",
+    "fsqc"
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "CloudPipe dashboards",
+      "tags": [
+        "cloudpipe"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "refresh": "5m",
-  "time": { "from": "now-30d", "to": "now" },
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "subject",
+        "type": "query",
+        "label": "Subject",
+        "datasource": {
+          "uid": "cloudpipe-athena",
+          "type": "grafana-athena-datasource"
+        },
+        "query": {
+          "rawSQL": "SELECT subject FROM (SELECT subject FROM cloudpipe_metrics.anat_qc UNION SELECT subject FROM cloudpipe_metrics.fsqc_qc) t ORDER BY subject",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          }
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false
+      },
+      {
+        "name": "session",
+        "type": "query",
+        "label": "Session",
+        "datasource": {
+          "uid": "cloudpipe-athena",
+          "type": "grafana-athena-datasource"
+        },
+        "query": {
+          "rawSQL": "SELECT session FROM (SELECT session FROM cloudpipe_metrics.anat_qc UNION SELECT session FROM cloudpipe_metrics.fsqc_qc) t ORDER BY session",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          }
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false
+      }
+    ]
+  },
   "panels": [
     {
       "id": 1,
-      "type": "stat",
-      "title": "Mean eTIV (mm³)",
-      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
-      "targets": [
-        {
-          "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(AVG(etiv_mm3)) AS mean_etiv FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
-        }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short" } }
+      "type": "text",
+      "title": "About this dashboard",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 9,
+        "h": 5
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### 🧠 Quality of the structural (T1w) scans\n\nEvery number here describes **one anatomical scan** of one participant, in one session. Rows below are grouped by *what is being measured* — image quality, volumes, cortical shape, head position — rather than by which tool produced it.\n\n**Reading the colours**\n\n| | |\n|---|---|\n| 🟢 🟡 🔴 | A calibrated range exists — colour is a judgement |\n| 🔵 | No calibrated threshold yet — compare across the cohort, don't read as pass/fail |\n\nUse the **Subject** and **Session** pickers above to drill into one scan, and the time range to pick a batch.\n\n*Two sources, one picture:* FastSurfer supplies volumes and cortical thickness, fsqc supplies signal-to-noise and outlier counts. Neither is complete alone, so they sit side by side."
+      }
     },
     {
       "id": 2,
       "type": "stat",
-      "title": "Mean Brain Volume (mm³)",
-      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Scans QC'd",
+      "description": "Distinct subject×session pairs with an fsqc record in the selected time range. fsqc-metrics runs on every workflow, so this is the batch's true session count — anat_qc alone undercounts it whenever FastSurfer derivatives were reused.",
+      "gridPos": {
+        "x": 9,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(AVG(total_brain_vol_mm3)) AS mean_brain FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT COUNT(DISTINCT subject || '|' || session) AS n_scans FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "short" } }
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
     },
     {
       "id": 3,
       "type": "stat",
-      "title": "Mean LH Thickness (mm)",
-      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Participants",
+      "gridPos": {
+        "x": 14,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(AVG(lh_mean_thickness_mm), 3) AS mean_lh_thick FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT COUNT(DISTINCT subject) AS n_subjects FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
         }
       ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "lengthmm",
-          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 2.0 }, { "color": "green", "value": 2.2 }] }
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
         }
-      }
+      },
+      "description": "Distinct participants with an fsqc record in range. Compare against the scan count beside it: several sessions per participant is normal (ABCD is longitudinal), so scans will usually exceed participants."
     },
     {
       "id": 4,
       "type": "stat",
-      "title": "Mean RH Thickness (mm)",
-      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Scans needing a look",
+      "description": "Sessions where an fsqc module reported a real failure. Uncovered hypothalamic sessions are deliberately excluded — see the triage table lower down for why that distinction matters.",
+      "gridPos": {
+        "x": 19,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(AVG(rh_mean_thickness_mm), 3) AS mean_rh_thick FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo()"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, hypothalamus_whole_left_mm3, metrics_status, hippocampus_status, hypothalamus_status, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_degraded FROM d WHERE rn = 1 AND (metrics_status <> 0 OR hippocampus_status <> 0 OR (hypothalamus_status <> 0 AND hypothalamus_whole_left_mm3 IS NOT NULL))"
         }
       ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "lengthmm",
-          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 2.0 }, { "color": "green", "value": 2.2 }] }
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
         }
       }
     },
     {
-      "id": 5,
-      "type": "histogram",
-      "title": "Brain Volume Distribution",
-      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "id": 100,
+      "type": "row",
+      "title": "✨ Image quality & signal-to-noise",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Tissue contrast (CNR)",
+      "description": "How cleanly white matter separates from grey matter. Higher is better. From anat_qc, using FastSurfer's own aseg labels. Sits beside the fsqc SNR stats because they answer a similar question from two implementations — they are NOT interchangeable numbers.",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT total_brain_vol_mm3 FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND total_brain_vol_mm3 > 0"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, cnr, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(cnr), 3) AS mean_cnr FROM d WHERE rn = 1 AND cnr > 0"
         }
       ],
-      "options": { "bucketSize": "auto", "fillOpacity": 80 }
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 3,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
     },
     {
-      "id": 6,
-      "type": "histogram",
-      "title": "Mean Cortical Thickness Distribution",
-      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "id": 11,
+      "type": "stat",
+      "title": "Tissue overlap (CJV)",
+      "description": "Coefficient of joint variation between white and grey matter. LOWER is better — the opposite sense of the CNR panel beside it. From anat_qc.",
+      "gridPos": {
+        "x": 4,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT (lh_mean_thickness_mm + rh_mean_thickness_mm) / 2.0 AS mean_thickness FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND lh_mean_thickness_mm > 0"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, cjv, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(cjv), 3) AS mean_cjv FROM d WHERE rn = 1 AND cjv > 0"
         }
       ],
-      "options": { "bucketSize": "auto", "fillOpacity": 80 }
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 3,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
     },
     {
-      "id": 7,
+      "id": 12,
+      "type": "stat",
+      "title": "White-matter SNR",
+      "description": "fsqc wm_snr_norm — signal-to-noise in white matter, measured on the bias-corrected norm.mgz. NOT comparable to anat_qc's retired snr_wm, which ran 2.19× lower (median, 23 paired sessions): fsqc uses a broader label set and a 3-voxel erosion. No colour thresholds, because no calibrated pass/fail range exists.",
+      "gridPos": {
+        "x": 8,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, wm_snr_norm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(wm_snr_norm), 2) AS mean_wm_snr FROM d WHERE rn = 1 AND wm_snr_norm IS NOT NULL"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Grey-matter SNR",
+      "description": "fsqc gm_snr_norm. Uncalibrated — read as a cohort-relative number, not a pass/fail.",
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, gm_snr_norm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(gm_snr_norm), 2) AS mean_gm_snr FROM d WHERE rn = 1 AND gm_snr_norm IS NOT NULL"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "White/grey contrast SNR",
+      "description": "fsqc — hemisphere-averaged con_snr_lh/con_snr_rh, from surf/[lr]h.w-g.pct.mgh. Averaged only over sessions where BOTH hemispheres reported.",
+      "gridPos": {
+        "x": 16,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, con_snr_lh, con_snr_rh, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG((con_snr_lh + con_snr_rh) / 2.0), 2) AS mean_con_snr FROM d WHERE rn = 1 AND con_snr_lh IS NOT NULL AND con_snr_rh IS NOT NULL"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Image sharpness (FWHM)",
+      "description": "anat_qc fwhm_avg_mm — image smoothness via Forman's adjacent-voxel-variance estimator. Coarser than mriqc/AFNI's ACF fit. Higher means blurrier, usually from head motion during the scan.",
+      "gridPos": {
+        "x": 20,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, fwhm_avg_mm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(fwhm_avg_mm), 3) AS mean_fwhm FROM d WHERE rn = 1 AND fwhm_avg_mm > 0"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: mm",
+          "decimals": 3,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "histogram",
+      "title": "White-matter SNR — spread across scans",
+      "description": "One bar per band of SNR values. A long left tail is where the noisy scans are.",
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, wm_snr_norm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT wm_snr_norm FROM d WHERE rn = 1 AND wm_snr_norm IS NOT NULL"
+        }
+      ],
+      "options": {
+        "bucketSize": 1,
+        "fillOpacity": 70,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "gradientMode": "hue"
+          }
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "histogram",
+      "title": "Tissue contrast — spread across scans",
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, cnr, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT cnr FROM d WHERE rn = 1 AND cnr > 0"
+        }
+      ],
+      "options": {
+        "bucketSize": 0.05,
+        "fillOpacity": 70,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          },
+          "custom": {
+            "gradientMode": "hue"
+          }
+        }
+      },
+      "description": "One bar per band of CNR values, one scan per observation. A single tight peak is a healthy batch. A second cluster at low CNR usually means a scanner or protocol difference rather than a processing fault — check whether those scans share a site."
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "🧠 Volumes",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 20,
+      "type": "stat",
+      "title": "Head size (eTIV)",
+      "description": "anat_qc — estimated total intracranial volume, in mm³. The denominator for every other volume here: raw volumes are eTIV-confounded across participants of different head size.",
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, etiv_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(etiv_mm3)) AS mean_etiv FROM d WHERE rn = 1"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "gauge",
+      "title": "Brain as % of head size",
+      "description": "total_brain_vol_mm3 / etiv_mm3. The ICV-normalized figure to compare across participants — the raw brain volume on its own is head-size confounded.",
+      "gridPos": {
+        "x": 5,
+        "y": 19,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, etiv_mm3, total_brain_vol_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(total_brain_vol_mm3 / etiv_mm3 * 100), 2) AS mean_brain_pct_icv FROM d WHERE rn = 1 AND etiv_mm3 > 0"
+        }
+      ],
+      "options": {
+        "showThresholdMarkers": true,
+        "showThresholdLabels": false,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 55,
+          "max": 90,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 68
+              },
+              {
+                "color": "green",
+                "value": 72
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Corpus callosum size",
+      "description": "fsqc cc_size — corpus callosum volume as a fraction of eTIV, and fsqc's proxy for a failed or truncated talairach registration. Grouped with the volumes because that is what it is, but read it together with the head-tilt panel further down.",
+      "gridPos": {
+        "x": 10,
+        "y": 19,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, cc_size, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(cc_size), 4) AS mean_cc_size FROM d WHERE rn = 1 AND cc_size IS NOT NULL"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "gauge",
+      "title": "Hypothalamus coverage",
+      "description": "Share of fsqc sessions carrying hypothalamus_whole_* volumes. Well under 100% is EXPECTED, not a failure: the hypothalamic tarball is subject-level but ships empty per-session mri/ dirs, so 'tarball present' ≠ 'session covered' — 13 of 23 sessions were uncovered on the 2026-08-09 pilot. Deliberately uncoloured for that reason.",
+      "gridPos": {
+        "x": 15,
+        "y": 19,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, hypothalamus_whole_left_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(COUNT(hypothalamus_whole_left_mm3) * 100.0 / NULLIF(COUNT(*), 0), 1) AS pct_covered FROM d WHERE rn = 1"
+        }
+      ],
+      "options": {
+        "showThresholdMarkers": false,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 24,
+      "type": "histogram",
+      "title": "Brain volume — spread across scans",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, total_brain_vol_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT total_brain_vol_mm3 FROM d WHERE rn = 1 AND total_brain_vol_mm3 > 0"
+        }
+      ],
+      "options": {
+        "bucketSize": 20000,
+        "fillOpacity": 70,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "custom": {
+            "gradientMode": "hue"
+          }
+        }
+      },
+      "description": "Absolute brain volume in mm³, before any head-size normalisation, so the natural spread here is wide and mostly reflects real anatomy. Use Brain as % of head size above for anything comparative; a genuinely suspicious value shows up there, not here."
+    },
+    {
+      "id": 25,
       "type": "table",
-      "title": "All Sessions — Volumetric Summary",
-      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Volumes per scan",
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT subject, session, ROUND(etiv_mm3) AS etiv, ROUND(total_brain_vol_mm3) AS brain_vol, ROUND(lh_cortex_vol_mm3) AS lh_cortex, ROUND(rh_cortex_vol_mm3) AS rh_cortex, ROUND(lh_mean_thickness_mm, 3) AS lh_thick, ROUND(rh_mean_thickness_mm, 3) AS rh_thick, completed_at FROM cloudpipe_metrics.anat_qc WHERE from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() ORDER BY completed_at DESC LIMIT 100"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, etiv_mm3, total_brain_vol_mm3, lh_cortex_vol_mm3, rh_cortex_vol_mm3, wm_vol_mm3, subcort_gm_vol_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT subject, session, ROUND(etiv_mm3) AS etiv, ROUND(total_brain_vol_mm3) AS brain_vol, ROUND(lh_cortex_vol_mm3) AS lh_cortex, ROUND(rh_cortex_vol_mm3) AS rh_cortex, ROUND(wm_vol_mm3) AS wm_vol, ROUND(subcort_gm_vol_mm3) AS subcort_gm, completed_at FROM d WHERE rn = 1 ORDER BY completed_at DESC LIMIT 100"
         }
-      ]
+      ],
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        }
+      },
+      "description": "Every volume FastSurfer reports, one row per scan, most recent first. Columns are raw mm³ — divide by eTIV before comparing across participants. Reprocessed scans appear once, showing the most recent run."
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "📏 Cortical shape",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 30,
+      "type": "stat",
+      "title": "Cortical thickness — left",
+      "description": "Healthy adolescent/adult cortex runs roughly 2.2–2.9 mm. Values below ~2.0 mm usually mean the surface reconstruction went wrong, not that the cortex is thin.",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, lh_mean_thickness_mm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(lh_mean_thickness_mm), 3) AS mean_lh_thick FROM d WHERE rn = 1"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: mm",
+          "decimals": 3,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 2.0
+              },
+              {
+                "color": "green",
+                "value": 2.2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "Cortical thickness — right",
+      "description": "Should track the left hemisphere closely. A large left/right gap is a reconstruction problem, not biology.",
+      "gridPos": {
+        "x": 6,
+        "y": 32,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, rh_mean_thickness_mm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(rh_mean_thickness_mm), 3) AS mean_rh_thick FROM d WHERE rn = 1"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: mm",
+          "decimals": 3,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 2.0
+              },
+              {
+                "color": "green",
+                "value": 2.2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Cortical surface area — left (mm²)",
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, lh_surface_area_mm2, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(lh_surface_area_mm2)) AS mean_lh_area FROM d WHERE rn = 1 AND lh_surface_area_mm2 > 0"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Total pial surface area of the left hemisphere. Read it together with the right: the two should track closely, and a large asymmetry points at a surface reconstruction failure rather than at biology."
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Cortical surface area — right (mm²)",
+      "gridPos": {
+        "x": 18,
+        "y": 32,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, rh_surface_area_mm2, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(rh_surface_area_mm2)) AS mean_rh_area FROM d WHERE rn = 1 AND rh_surface_area_mm2 > 0"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Total pial surface area of the right hemisphere. See the note on the left hemisphere panel — the pair matters more than either number alone."
+    },
+    {
+      "id": 34,
+      "type": "histogram",
+      "title": "Cortical thickness — spread across scans",
+      "description": "Hemisphere-averaged. A tight single peak is what a healthy batch looks like; a second bump at low thickness is a batch of failed surface reconstructions.",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, lh_mean_thickness_mm, rh_mean_thickness_mm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT (lh_mean_thickness_mm + rh_mean_thickness_mm) / 2.0 AS mean_thickness FROM d WHERE rn = 1 AND lh_mean_thickness_mm > 0"
+        }
+      ],
+      "options": {
+        "bucketSize": 0.02,
+        "fillOpacity": 70,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: mm",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          },
+          "custom": {
+            "gradientMode": "hue"
+          }
+        }
+      }
+    },
+    {
+      "id": 400,
+      "type": "row",
+      "title": "🧭 Head position, outliers & module status",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 40,
+      "type": "stat",
+      "title": "Head tilt vs template",
+      "description": "fsqc rot_tal_x/y/z magnitude, converted from radians to degrees. Large values mean the head was acquired far off the template orientation. 0.0 is a legitimate measurement here, so the filter is IS NOT NULL rather than > 0.",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, rot_tal_x, rot_tal_y, rot_tal_z, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(degrees(sqrt(power(rot_tal_x, 2) + power(rot_tal_y, 2) + power(rot_tal_z, 2)))), 2) AS mean_rot_deg FROM d WHERE rn = 1 AND rot_tal_x IS NOT NULL AND rot_tal_y IS NOT NULL AND rot_tal_z IS NOT NULL"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "degree",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 41,
+      "type": "stat",
+      "title": "Atypical regions per scan",
+      "description": "fsqc n_outlier_norms — how many aseg/aparc regions fall outside fsqc's built-in normative ranges. 0 is a real value, so this filters on IS NOT NULL, not > 0. The cohort-relative counts (n_outlier_sample_*) are NULL on every row: they need a reference cohort the driver does not pass.",
+      "gridPos": {
+        "x": 6,
+        "y": 45,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, n_outlier_norms, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(n_outlier_norms), 1) AS mean_outliers FROM d WHERE rn = 1 AND n_outlier_norms IS NOT NULL"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "id": 42,
+      "type": "histogram",
+      "title": "Head tilt — spread across scans",
+      "gridPos": {
+        "x": 12,
+        "y": 45,
+        "w": 12,
+        "h": 12
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, rot_tal_x, rot_tal_y, rot_tal_z, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT degrees(sqrt(power(rot_tal_x, 2) + power(rot_tal_y, 2) + power(rot_tal_z, 2))) AS rot_tal_deg FROM d WHERE rn = 1 AND rot_tal_x IS NOT NULL AND rot_tal_y IS NOT NULL AND rot_tal_z IS NOT NULL"
+        }
+      ],
+      "options": {
+        "bucketSize": 0.5,
+        "fillOpacity": 70,
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "degree",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "yellow"
+          },
+          "custom": {
+            "gradientMode": "hue"
+          }
+        }
+      },
+      "description": "How far each head was rotated away from the template orientation, in degrees. Expect a peak near zero with a modest tail. 0.0 is a legitimate measurement, so this filters on IS NOT NULL rather than > 0 — filtering on > 0 would silently drop perfectly aligned scans."
+    },
+    {
+      "id": 43,
+      "type": "table",
+      "title": "Scans with a degraded fsqc module",
+      "description": "Triage list — empty is the good outcome. The hypothalamus clause is deliberately NOT 'hypothalamus_status <> 0': that code has two causes that only the PAIR (status, volumes) separates. status=1 with NO volumes is a session the hypothalamic segmentation never covered (common and expected — 13 of 23 on the 2026-08-09 pilot); status=1 WITH volumes is the upstream indexing crash (Deep-MI/fsqc#105), whose volumes survive because they are read from all.regions.stats before it. Only the second is actionable, so only it is listed. A blank status means the module never reported, which is not the same as 0.",
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH d AS (SELECT subject, session, hypothalamus_whole_left_mm3, hypothalamus_whole_right_mm3, metrics_status, hippocampus_status, hypothalamus_status, fsqc_version, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT subject, session, metrics_status, hippocampus_status, hypothalamus_status, ROUND(hypothalamus_whole_left_mm3) AS hypo_left_mm3, ROUND(hypothalamus_whole_right_mm3) AS hypo_right_mm3, fsqc_version, completed_at FROM d WHERE rn = 1 AND (metrics_status <> 0 OR hippocampus_status <> 0 OR (hypothalamus_status <> 0 AND hypothalamus_whole_left_mm3 IS NOT NULL)) ORDER BY completed_at DESC LIMIT 100"
+        }
+      ],
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*_status"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 500,
+      "type": "row",
+      "title": "📋 Everything per scan — the two sources side by side",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 50,
+      "type": "table",
+      "title": "Combined anatomical QC per scan",
+      "description": "Both T1w-derived halves on one row, joined on subject+session. ONLY the fsqc side is scoped to the dashboard time range: fsqc-metrics runs on every workflow, while anat_qc is written only when FastSurfer actually reprocesses, so on a reused-derivative batch its rows carry a dt= from the original run days or weeks earlier. Scoping both sides to the same window would blank the anat columns for exactly those sessions. Each side is reduced to its most recent record per subject×session before the join, so a reprocessed subject contributes one row, not one per re-run. Blank anat columns mean FastSurfer derivatives were reused (or predate anat_qc), not that the metrics are missing.",
+      "gridPos": {
+        "x": 0,
+        "y": 58,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH a AS (SELECT subject, session, etiv_mm3, total_brain_vol_mm3, lh_mean_thickness_mm, rh_mean_thickness_mm, cnr, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}')), f AS (SELECT subject, session, wm_snr_norm, gm_snr_norm, cc_size, n_outlier_norms, metrics_status, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT f.subject, f.session, ROUND(a.total_brain_vol_mm3) AS brain_vol, ROUND(a.total_brain_vol_mm3 / NULLIF(a.etiv_mm3, 0) * 100, 2) AS brain_pct_icv, ROUND(a.lh_mean_thickness_mm, 3) AS lh_thick, ROUND(a.rh_mean_thickness_mm, 3) AS rh_thick, ROUND(a.cnr, 3) AS cnr, ROUND(f.wm_snr_norm, 2) AS wm_snr, ROUND(f.gm_snr_norm, 2) AS gm_snr, ROUND(f.cc_size, 4) AS cc_size, ROUND(f.n_outlier_norms) AS n_outliers, f.metrics_status, a.completed_at AS anat_completed_at, f.completed_at AS fsqc_completed_at FROM (SELECT * FROM f WHERE rn = 1) f LEFT JOIN (SELECT * FROM a WHERE rn = 1) a ON a.subject = f.subject AND a.session = f.session ORDER BY f.subject, f.session LIMIT 200"
+        }
+      ],
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "brain_pct_icv"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 68
+                    },
+                    {
+                      "color": "green",
+                      "value": 72
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
     }
   ]
 }

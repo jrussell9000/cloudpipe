@@ -54,3 +54,13 @@ variable "inbound_prefix_list_id" {
   type        = string
   description = "ID of the managed prefix list controlling inbound HTTPS access to the Kubecost ALB."
 }
+
+variable "vpc_cidr" {
+  type        = string
+  description = "VPC CIDR block. Trusted as an inbound source so AWS Client VPN clients (which source-NAT to this CIDR for VPC-internal destinations) can reach the Kubecost ALB."
+}
+
+variable "nat_gateway_ip" {
+  type        = string
+  description = "Public Elastic IP of the VPC's NAT gateway. Full-tunnel Client VPN traffic to this ALB's public IP hairpins out through the NAT gateway and back in over the internet, so the ALB security group must trust it as a source."
+}

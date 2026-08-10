@@ -1,0 +1,62 @@
+# Ad-hoc: run `wb_command -file-information` against a produced dtseries.
+# Closes the surface-validation check that the CIFTI really carries 59412
+# cortical grayordinates and 19 subcortical structures, rather than inferring
+# it from the assembly log.
+#
+# An Argo Workflow rather than a bare Pod because the workbench image carries
+# no S3 client (see images/workbench/pixi.toml) — the artifact fetcher in the
+# init container is how that image always gets its inputs.
+#
+#   kubectl create -f scripts/manifests/wb-inspect-dtseries.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wb-inspect-
+  namespace: argo-workflows
+spec:
+  serviceAccountName: argo-workflows-runner
+  entrypoint: inspect
+  arguments:
+    parameters:
+      - name: key
+        value: >-
+          derivatives/func_surf/sub-7GTT6FAU/ses-00A/fsLR32k/sub-7GTT6FAU_ses-00A_task-rest_run-01_space-fsLR32k_bold.dtseries.nii
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+  templates:
+    - name: inspect
+      nodeSelector:
+        karpenter.sh/nodepool: cpu-light-nodepool
+      inputs:
+        artifacts:
+          - name: dtseries
+            path: /tmp/in.dtseries.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: "{{workflow.parameters.key}}"
+      container:
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench:sha-2a68d1ff59f502694429e3dd9608ecde51af3ee0"
+        command: [/entrypoint.sh, bash, -lc]
+        args:
+          - |
+            set -euo pipefail
+            echo "=== wb_command -file-information ==="
+            wb_command -file-information /tmp/in.dtseries.nii
+        resources:
+          requests:
+            memory: 2G
+            cpu: '1'
+            ephemeral-storage: 4G
+          limits:
+            memory: 4G
+            ephemeral-storage: 6G

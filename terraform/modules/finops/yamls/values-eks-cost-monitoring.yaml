@@ -34,6 +34,12 @@ localStore:
     eks.amazonaws.com/nodegroup: backend
 
 finopsagent:
+  agent:
+    collectorDataSource:
+      # Chart 3.2.1 raised the default to 60s. cloudpipe's cost model is per-pod
+      # on short-lived workflow pods, which is the case the upstream comment
+      # calls out as the reason to keep the finer interval — so pin it.
+      scrapeInterval: 30s
   image:
     repository: kubecost/agent
   tolerations:

@@ -1,0 +1,308 @@
+# t1w-to-mni affine thread scaling — PHASE B (the decision number, under contention)
+#
+# Issue #164. Run AFTER t1w-to-mni-affine-threads-perf.yaml (Phase A) and never at
+# the same time — overlapping workflows would put unrelated pods on the cards and
+# nodes both probes depend on owning.
+#
+# QUESTION
+# --------
+# Phase A measures thread scaling with a pod alone on an 8-vCPU node. That is an
+# upper bound and NOT what production would get. Production packs THREE GPU pods per
+# card (#102 raised time-slice replicas to 3) and each requests `cpu: 1`, against a
+# g4dn.xlarge's ~3920m allocatable. Raising the affine's thread count means those
+# three pods contend for four cores.
+#
+# So the real question is not "does the affine scale with threads" (Phase A) but
+# "does it still scale when its neighbours are doing the same thing" — and whether
+# the per-node throughput gain survives.
+#
+# DESIGN — contention x thread count, because either factor alone is misleading
+# -----------------------------------------------------------------------------
+#   solo,      itk=1        production today, no neighbours (latency reference)
+#   solo,      itk=4        Phase A's result reproduced on a 4-vCPU node
+#   co-packed, itk=1        production today, as it actually runs
+#   co-packed, itk=2        the conservative proposal (1.5x oversubscribed)
+#   co-packed, itk=4        the aggressive proposal (3x oversubscribed)
+#
+# The decision compares the CO-PACKED rows against each other. The solo rows exist to
+# separate "the affine got faster" from "the affine got faster until the neighbours
+# showed up", which a co-packed-only experiment cannot distinguish.
+#
+# Two co-packed thread levels rather than one: with three pods on four cores every
+# increase oversubscribes, so a null result at itk=4 would leave "threads never help
+# under contention" and "4 was simply too many" indistinguishable. Phase A already
+# showed oversubscription can REVERSE a gain — its all-four-vars-at-8 arm was slower
+# than ITK-alone-at-8 (53.5s vs 43.5s), entirely in the GPU-bound window.
+#
+# Aggregate reasoning says this should not work at all: three pods sharing ~3920m
+# means ~1.3 cores each, so raising per-pod threads cannot create CPU that is not
+# there. The reason to measure anyway is that the three pods' affine phases are NOT
+# synchronised — a pod in its CPU-bound affine can borrow cores from neighbours busy
+# in their GPU-bound SyN. Whether that offset is enough is exactly what is unknown.
+#
+# EVERYTHING is pinned to ONE instance type and ONE AZ, including the solo arms —
+# see the `instance-type` parameter for why that is g5.xlarge rather than the
+# g4dn.xlarge originally planned (spot capacity; the two are identical at 4 vCPU /
+# 16 GiB, which is all this probe depends on).
+#
+# Phase A uses a 2xlarge to have 8 real cores for its 8-thread arm, which makes its
+# absolute numbers non-comparable to these — hence the solo arms here. The xlarge is
+# the binding case: the smallest node the pool provisions, the size #107's `cpu: 1`
+# was chosen for, and per gpu-nodepool.yaml the one that "must hold TWO time-sliced
+# GPU pods" (three since #102). If threads are safe here they are safe pool-wide.
+#
+# CO-LOCATION IS VERIFIED, NOT ASSUMED
+# ------------------------------------
+# The three co-packed arms run as parallel steps with the same instance-type pin, and
+# Karpenter should bin-pack them onto one node: 3 x 1000m fits ~3920m allocatable and
+# the device plugin advertises 3 slices per card. But nothing FORCES it — Karpenter
+# could provision two nodes.
+#
+# Pod anti-affinity cannot express what is wanted here (it repels rather than
+# attracts), and a required podAffinity would deadlock the first pod, which has
+# nothing to attract to yet. So each arm logs `node=` from the downward API and the
+# analysis MUST confirm all three of a trio share one value. If they do not, the
+# co-packed rows measure nothing and the workflow has to be re-run — do not read a
+# contention number off pods that were never on the same node.
+#
+# It has to be the downward API (`fieldRef: spec.nodeName`), NOT `hostname`: inside a
+# pod `hostname` returns the POD name. Earlier probes in this series logged
+# `host=<pod-name>` and could not have verified co-location at all.
+#
+# SAFETY: writes nothing to derivatives/ or the metrics corpus. reg-qc goes to
+# scratch/. Same reasoning as scripts/manifests/t1w-to-mni-fused-ops-ab.yaml.
+#
+# USAGE
+#   # itk-high should be whatever Phase A found to be the knee of the curve
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-affine-threads-packing.yaml \
+#     -p itk-high=4
+#
+#   WF=<workflow-name>
+#   mkdir -p /tmp/affine-packing
+#   aws s3api list-objects-v2 --bucket <YOUR_S3_BUCKET> --prefix "logs/$WF" \
+#     --query 'Contents[].Key' --output text | tr '\t' '\n' \
+#     | while read -r k; do aws s3 cp "s3://<YOUR_S3_BUCKET>/$k" "/tmp/affine-packing/$(echo "$k" | tr / _)" --quiet; done
+#
+#   # FIRST: confirm each trio of co-packed arms shared ONE node. Three distinct
+#   # node= values for a `packlow`/`packhigh` scope means those arms never contended
+#   # and the rows are meaningless — re-run rather than reinterpret.
+#   rg -o 'SCOPE=\S+ .*node=\S+' /tmp/affine-packing/*.log | sort
+#   # THEN: read the timings
+#   python handoffs/fireants-fused-ops/parse_gpu_logs.py /tmp/affine-packing/
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: t1w-mni-affine-packing-
+  namespace: argo-workflows
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    annotations:
+      # Load-bearing here beyond the usual reason: a consolidation mid-step could
+      # move one of the three co-packed pods to another node and silently turn a
+      # contention measurement into a solo one.
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+
+  activeDeadlineSeconds: 10800
+
+  entrypoint: packing
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      # The binding case is the SIZE, not the family. Do NOT change this to 2xlarge —
+      # see the header.
+      #
+      # g5.xlarge rather than the g4dn.xlarge originally planned: on 2026-08-05 every
+      # g4dn and g6 size scored 1 (the floor) for spot in all three AZs while g5
+      # scored 3 in <YOUR_AWS_REGION>c. The substitution is sound because g5.xlarge and
+      # g4dn.xlarge are IDENTICAL on both dimensions this probe depends on —
+      # 4 vCPU and 16384 MiB — so the packing constraint (3 pods x cpu:1 against
+      # ~3920m allocatable) is unchanged. Switching SIZE would have invalidated the
+      # experiment; switching family does not.
+      #
+      # The A10G's larger VRAM is irrelevant here: the affine is CPU-bound, and the
+      # time-slice replica count is a cluster-wide device-plugin setting (3), not a
+      # per-card one. Re-check capacity before a re-run.
+      - name: instance-type
+        value: g5.xlarge
+      # Held fixed so all four cells of the 2x2 share one AZ and one host generation.
+      - name: zone
+        value: <YOUR_AWS_REGION>c
+      - name: fireants-tag
+        value: sha-24a26a89159e0b61336b57ee4cbc496028a36266
+      # Production today.
+      - name: itk-low
+        value: "1"
+      # TWO candidate levels, both co-packed, because the oversubscription ratio is
+      # what is in question and a single level cannot distinguish "threads don't help
+      # under contention" from "4 was simply too many". On a 4-vCPU node with three
+      # pods: itk=2 is 6 threads on 4 cores (1.5x oversubscribed), itk=4 is 12 on 4
+      # (3x). Phase A measured 1.49x and 1.95x total-step speedup at these levels,
+      # solo on 8 cores.
+      - name: itk-mid
+        value: "2"
+      - name: itk-high
+        value: "4"
+      - name: run-label
+        value: run1
+
+  templates:
+    - name: packing
+      steps:
+        # ── solo reference arms, one at a time ─────────────────────────────────
+        - - {name: solo-low,  template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "{{workflow.parameters.itk-low}}"},  {name: scope, value: solo}]}}
+        - - {name: solo-high, template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "{{workflow.parameters.itk-high}}"}, {name: scope, value: solo}]}}
+
+        # ── three at once, production's thread count ───────────────────────────
+        # Three DIFFERENT sessions so no two pods read the same artifact at the same
+        # time — identical inputs would let page-cache sharing on the node flatter
+        # the I/O phase in a way production (different subjects per node) would not.
+        - - {name: packlow-a, template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "{{workflow.parameters.itk-low}}"}, {name: scope, value: packlow}]}}
+          - {name: packlow-b, template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: itk, value: "{{workflow.parameters.itk-low}}"}, {name: scope, value: packlow}]}}
+          - {name: packlow-c, template: arm, arguments: {parameters: [{name: subject, value: sub-VMT7W436}, {name: session, value: ses-00A}, {name: itk, value: "{{workflow.parameters.itk-low}}"}, {name: scope, value: packlow}]}}
+
+        # ── three at once, itk-mid (1.5x oversubscribed) ───────────────────────
+        - - {name: packmid-a, template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "{{workflow.parameters.itk-mid}}"}, {name: scope, value: packmid}]}}
+          - {name: packmid-b, template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: itk, value: "{{workflow.parameters.itk-mid}}"}, {name: scope, value: packmid}]}}
+          - {name: packmid-c, template: arm, arguments: {parameters: [{name: subject, value: sub-VMT7W436}, {name: session, value: ses-00A}, {name: itk, value: "{{workflow.parameters.itk-mid}}"}, {name: scope, value: packmid}]}}
+
+        # ── three at once, itk-high (3x oversubscribed) ────────────────────────
+        - - {name: packhigh-a, template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "{{workflow.parameters.itk-high}}"}, {name: scope, value: packhigh}]}}
+          - {name: packhigh-b, template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: itk, value: "{{workflow.parameters.itk-high}}"}, {name: scope, value: packhigh}]}}
+          - {name: packhigh-c, template: arm, arguments: {parameters: [{name: subject, value: sub-VMT7W436}, {name: session, value: ses-00A}, {name: itk, value: "{{workflow.parameters.itk-high}}"}, {name: scope, value: packhigh}]}}
+
+    - name: arm
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: itk
+          # solo | packlow | packhigh — also the scratch key prefix.
+          - name: scope
+        artifacts:
+          - name: fastsurfer-output
+            path: /fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{inputs.parameters.subject}}/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_templated.tar.gz'
+
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
+      outputs:
+        artifacts:
+          - name: reg-qc
+            path: '/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/affine-packing/{{workflow.parameters.run-label}}/{{inputs.parameters.scope}}-itk{{inputs.parameters.itk}}_{{inputs.parameters.subject}}_{{inputs.parameters.session}}_reg_qc.json'
+
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-nodepool
+        node.kubernetes.io/instance-type: "{{workflow.parameters.instance-type}}"
+        topology.kubernetes.io/zone: "{{workflow.parameters.zone}}"
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:{{workflow.parameters.fireants-tag}}"
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: work
+            mountPath: /work
+
+        env:
+          # THE field this probe depends on. `hostname` inside a pod returns the POD
+          # name, not the node — the earlier probes' logs show `host=t1w-mni-...-arm-
+          # 2018867551`, which is useless for proving co-location. Only the downward
+          # API exposes the node. Thread variables are still exported from bash below
+          # (they must be able to differ from requests.cpu); this is the one value
+          # that has to come from Kubernetes.
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+
+        resources:
+          requests:
+            memory: 2G
+            # PRODUCTION'S VALUE, on every arm including the high-thread ones. That
+            # is the proposal being tested: decouple the thread count from the CPU
+            # request so the affine can burst, WITHOUT giving up the packing that
+            # #107 bought by cutting the request to 1. Raising the request instead
+            # would strand the third GPU slice, which is the outcome this whole
+            # issue is trying to avoid.
+            cpu: '1'
+            ephemeral-storage: 10G
+          limits:
+            nvidia.com/gpu: '1'
+
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+            ITK='{{inputs.parameters.itk}}'
+            SCOPE='{{inputs.parameters.scope}}'
+
+            export USE_FFO=False
+            export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS="$ITK"
+            # ITK only, as in Phase A: this isolates the affine, and holding the BLAS
+            # pools at production's value keeps the two phases comparable.
+            export OMP_NUM_THREADS=1
+            export MKL_NUM_THREADS=1
+            export OPENBLAS_NUM_THREADS=1
+
+            # `node=` is the load-bearing field: the co-packed arms are only valid if
+            # all three report the SAME node. Check that BEFORE reading any timing.
+            # `pod=` is kept only because it identifies the arm in the archive.
+            echo "=== ITK_THREADS=$ITK SCOPE=$SCOPE subj={{inputs.parameters.subject}} ses={{inputs.parameters.session}} node=${NODE_NAME:-UNKNOWN} pod=$(hostname) cores=$(nproc --all) ===" >&2
+            nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv >&2
+
+            python /app/fst1w_to_mni.py \
+              --t1w '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/orig.mgz' \
+              --brainmask '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/brainmask.mgz' \
+              --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+              --out-dir '/work/registration/{{inputs.parameters.session}}/t1w_to_mni' \
+              --prefix '{{inputs.parameters.subject}}_{{inputs.parameters.session}}_desc-t1w2mni' \
+              --subj '{{inputs.parameters.subject}}' \
+              --ses '{{inputs.parameters.session}}' \
+              --pipeline cloudpipe_minproc
+            EXIT=$?
+
+            echo "=== ITK_THREADS=$ITK SCOPE=$SCOPE exit=$EXIT (65 = QC fail) ===" >&2
+
+            QC="/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json"
+            if [ ! -f "$QC" ]; then
+              echo "FATAL: no QC record written — arm produced no measurement" >&2
+              exit 1
+            fi
+            exit 0

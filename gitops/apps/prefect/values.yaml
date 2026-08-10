@@ -3,6 +3,10 @@
 ################################################################################
 
 prefect-server:
+  # Restart the server deployment when prefect-db-credentials secret changes (e.g. RDS password rotation).
+  commonAnnotations:
+    secret.reloader.stakater.com/reload: "prefect-db-credentials"
+
   # Disable the embedded PostgreSQL subchart — we use an external RDS instance.
   postgresql:
     enabled: false

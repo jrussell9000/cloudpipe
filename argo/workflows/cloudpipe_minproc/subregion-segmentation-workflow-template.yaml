@@ -15,24 +15,26 @@ spec:
       - name: ecr-registry
       - name: T1w_sessions
 
-  volumeClaimTemplates:
-    - metadata:
-        name: "{{=lower(workflow.parameters.subjID)}}"
-        generateName: "{{=lower(workflow.parameters.subjID)}}"
-      spec:
-        accessModes: ["ReadWriteMany"]
-        storageClassName: efs-sc
-        resources:
-          requests:
-            storage: 50Gi
-
   retryStrategy:
-    limit: "3"
+    # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
+    # design, so consecutive reclaims on one long step are routine (2 back-to-back
+    # observed 2026-08-03). At limit 3, four in a row lose the subject outright.
+    # See issue #115.
+    limit: "8"
     retryPolicy: Always
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
+    # never emitted by our scripts. 75 = EX_TEMPFAIL, reserved for the "a reclaim
+    # truncated my output, re-run me" guards in the fastsurfer templates. 137 is
+    # deliberately absent: a real OOMKill here is deterministic — #129/#134 split
+    # this very step's TensorFlow tail out to fix one, and no retry would have —
+    # so retrying it only burns the enlarged budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
     backoff:
       duration: "1m"
       factor: "2"
+      # cap bounds each individual delay (maxDuration would abort the retries
+      # instead): 1+2+4+5+5+5+5+5 = 32m worst case, vs 7m at the old limit of 3.
+      cap: "5m"
 
   artifactRepositoryRef:
     key: cloudpipe-artifacts
@@ -40,14 +42,61 @@ spec:
   securityContext:
     runAsNonRoot: true
     runAsUser: 1000
+    fsGroup: 1000
 
   templates:
 
   ##############################################
   # Entry-point DAG
-  # All three steps run in parallel — thalamus
-  # and brainstem are the long poles (~30-45 min
-  # each); hypothalamic + sclimbic are ~5 min.
+  #
+  #   segment-gems (~50 min, 4.5G)
+  #   segment-dl   (~1 min, 13G)
+  #
+  # No shared EFS volume (GitHub #77) and no hydrate
+  # step. Each pod independently declares the
+  # FastSurfer tarballs as S3 input artifacts and
+  # extracts them onto its own private emptyDir
+  # (mirrors fast-tmpl/fast-long post-PR #82). The
+  # two tasks have no dependency on each other and run
+  # CONCURRENTLY. That the DL task does not depend on
+  # the GEMS one is a property of the tools, not a
+  # scheduling gamble: in `--s` mode
+  # mri_segment_hypothalamic_subunits reads exactly
+  # one subject file, mri/nu.mgz, and
+  # mri_sclimbic_seg reads mri/nu.mgz plus an
+  # optional mri/transforms/talairach.xfm.lta
+  # (verified against the FreeSurfer 7.4.1 sources).
+  # Both are FastSurfer outputs both pods stage for
+  # themselves. Neither tool opens ThalamicNuclei*,
+  # brainstemSs* or *hippoAmygLabels*. If a future
+  # FreeSurfer bump changes that, re-check before
+  # trusting this fan-out.
+  #
+  # Why split at all (GitHub #134): the DL tools
+  # peak at 11.87 GB for about 30 seconds while the
+  # GEMS regions hold ~3.5 GB for ~50 minutes. Fused
+  # into one pod, the whole ~55 minutes had to be
+  # reserved at 13G to cover 0.9% of its lifetime.
+  # Split, a c8i-flex.4xlarge (31.44 GB / 15.89 CPU
+  # allocatable, measured 2026-08-03) fits three
+  # GEMS pods where it fit two fused ones.
+  #
+  # The two pods write DISJOINT filenames into their
+  # own per-timepoint mri/ directories: GEMS writes
+  # ThalamicNuclei*/brainstemSs*/*hippoAmyg*, DL
+  # writes hypothalamic_subunits*/sclimbic*. Each pod
+  # collects and checkpoints only its own regions.
+  #
+  # Per-region resume now comes from S3, not a
+  # retry-persistent volume: each region's derivative
+  # key (derivatives/subregions/{subjID}/{subjID}_
+  # {region}.tar.gz — the same key the pod's final
+  # Argo output.artifacts upload uses) is checked
+  # before that region runs and written to
+  # immediately after it completes, so a pod retry —
+  # or a full workflow resubmit — skips regions
+  # already done rather than only surviving an
+  # in-workflow pod retry as the old PVC guard did.
   ##############################################
 
   - name: subregion-seg-dag-template
@@ -58,43 +107,68 @@ spec:
     dag:
       failFast: false
       tasks:
-        - name: thalamus-dagtask
-          template: segment-thalamus-template
+        # failFast: false above means one of these failing does not cancel the
+        # other. That is deliberate: the two produce independent derivatives, so
+        # a DL failure should not throw away 50 minutes of GEMS work (and vice
+        # versa). The phase still reports Failed to the master DAG.
+        - name: segment-gems-dagtask
+          template: segment-subregions-gems-template
           arguments:
             parameters:
               - name: T1w_sessions
                 value: "{{inputs.parameters.T1w_sessions}}"
 
-        - name: brainstem-dagtask
-          template: segment-brainstem-template
-          arguments:
-            parameters:
-              - name: T1w_sessions
-                value: "{{inputs.parameters.T1w_sessions}}"
-
-        - name: deeplearning-dagtask
-          template: segment-deeplearning-template
+        - name: segment-dl-dagtask
+          template: segment-subregions-dl-template
           arguments:
             parameters:
               - name: T1w_sessions
                 value: "{{inputs.parameters.T1w_sessions}}"
 
   ##############################################
-  # Thalamic Nuclei
-  # segment_subregions thalamus --long-base
-  # GEMS/Bayesian atlas deformation, CPU-only.
-  # ~30-45 min per subject with 4 threads.
+  # Segmentation, part 1 of 2 — the GEMS regions.
+  #
+  # Long and cheap: ~50 minutes at a ~3.5 GB plateau.
+  # Stages the FastSurfer outputs from S3 onto its own
+  # private emptyDir (Argo's native input-artifact
+  # loader, same extraction semantics fastsurfer-long
+  # used to archive them — no hydrate step). Every
+  # per-session artifact is optional: true — not every
+  # subject has a ses-00A (baseline) scan, e.g. missed
+  # baseline visit with only follow-ups present — so no
+  # single session can be assumed mandatory. Runs, in
+  # order:
+  #
+  #   1. segment_subregions thalamus  (~30-45 min)
+  #   2. segment_subregions brainstem (~15-25 min)
+  #   3. segment_subregions hippo-amygdala (~30-60 min)
+  #
+  # All three are GEMS/Bayesian and CPU-only — no
+  # TensorFlow is imported in this pod at all, which
+  # is what lets the request drop to 4.5G.
+  #
+  # Per-region resume now checks S3 (GitHub #77): before
+  # each region runs, the script HEADs its final
+  # derivatives/subregions/... key; if present (and past
+  # the size floor) it downloads+extracts that tarball
+  # instead of recomputing, and uploads the tarball
+  # itself immediately after a region completes — not
+  # only via Argo's own outputs.artifacts upload at pod
+  # completion. This survives a full workflow resubmit,
+  # not just an in-workflow pod retry. This is the pod
+  # where that matters: 50 minutes of work to lose.
   #
   # Outputs (per-session + template, in mri/):
-  #   ThalamicNuclei.v13.T1.mgz
-  #   ThalamicNuclei.v13.T1.volumes.txt
+  #   ThalamicNuclei.v13.T1.mgz / .volumes.txt
+  #   brainstemSsLabels.v13.T1.mgz / brainstemSsVolumes.v13.txt
+  #   {lh,rh}.hippoAmygLabels*.mgz / .hippoSfVolumes*.txt / .amygNucVolumes*.txt
   ##############################################
 
-  - name: segment-thalamus-template
+  - name: segment-subregions-gems-template
     metadata:
       labels:
         cloudpipe.io/phase: subregion-segmentation
-        cloudpipe.io/step: thalamus
+        cloudpipe.io/step: segment-gems
     inputs:
       parameters:
         - name: T1w_sessions
@@ -118,6 +192,7 @@ spec:
 
         - name: ses-00A-templated
           path: /opt/freesurfer/subjects/ses-00A
+          optional: true
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
@@ -179,153 +254,6 @@ spec:
             region: <YOUR_AWS_REGION>
             key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_thalamus.tar.gz
 
-    nodeSelector:
-      karpenter.sh/nodepool: cpu-heavy-nodepool
-
-    container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-d014d4417575d8c1f8c3d942a959cd9df485695b"
-      imagePullPolicy: IfNotPresent
-
-      volumeMounts:
-        - name: "{{=lower(workflow.parameters.subjID)}}"
-          mountPath: /opt/freesurfer/subjects
-          subPath: opt/freesurfer/subjects
-
-      resources:
-        requests:
-          memory: 12G
-          cpu: '4'
-          ephemeral-storage: 5G
-
-      env:
-        - name: SUBJECTS_DIR
-          value: /opt/freesurfer/subjects
-        - name: FS_LICENSE
-          value: /opt/freesurfer/.license
-
-      command: [bash, -c]
-      args:
-        - |
-          set -euo pipefail
-          SD=/opt/freesurfer/subjects
-          BASE={{workflow.parameters.subjID}}_template
-
-          source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" 2>/dev/null
-
-          # segment_subregions --long-base expects timepoints named {tp}.long.{base}.
-          # FastSurfer writes bare session IDs (ses-00A, ses-02A, ...). Symlinks bridge
-          # the naming gap; writes from segment_subregions land in the real directories.
-          while IFS= read -r tp; do
-            [[ -n "$tp" ]] && ln -sfn "${SD}/${tp}" "${SD}/${tp}.long.${BASE}"
-          done < "${SD}/${BASE}/base-tps"
-
-          segment_subregions thalamus \
-            --long-base "$BASE" \
-            --sd "$SD" \
-            --threads 4
-
-          # Collect outputs into a flat structure: {session}/mri/ThalamicNuclei* and
-          # {template}/mri/ThalamicNuclei* — preserving directory layout for downstream use.
-          mkdir -p /out/thalamus
-          while IFS= read -r tp; do
-            [[ -n "$tp" ]] || continue
-            mkdir -p "/out/thalamus/${tp}/mri"
-            cp "${SD}/${tp}/mri/"ThalamicNuclei* "/out/thalamus/${tp}/mri/" 2>/dev/null || true
-          done < "${SD}/${BASE}/base-tps"
-          mkdir -p "/out/thalamus/${BASE}/mri"
-          cp "${SD}/${BASE}/mri/"ThalamicNuclei* "/out/thalamus/${BASE}/mri/" 2>/dev/null || true
-
-  ##############################################
-  # Brainstem Substructures
-  # segment_subregions brainstem --long-base
-  # GEMS/Bayesian, CPU-only. ~15-25 min.
-  #
-  # Outputs (per-session + template, in mri/):
-  #   brainstemSsLabels.v13.T1.mgz
-  #   brainstemSsVolumes.v13.txt
-  ##############################################
-
-  - name: segment-brainstem-template
-    metadata:
-      labels:
-        cloudpipe.io/phase: subregion-segmentation
-        cloudpipe.io/step: brainstem
-    inputs:
-      parameters:
-        - name: T1w_sessions
-
-      artifacts:
-        - name: fslicense
-          path: /opt/freesurfer/.license
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: config/fslicense
-
-        - name: long-template
-          path: /opt/freesurfer/subjects/{{workflow.parameters.subjID}}_template
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz
-
-        - name: ses-00A-templated
-          path: /opt/freesurfer/subjects/ses-00A
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz
-
-        - name: ses-02A-templated
-          path: /opt/freesurfer/subjects/ses-02A
-          optional: true
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-02A_templated.tar.gz
-
-        - name: ses-04A-templated
-          path: /opt/freesurfer/subjects/ses-04A
-          optional: true
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-04A_templated.tar.gz
-
-        - name: ses-06A-templated
-          path: /opt/freesurfer/subjects/ses-06A
-          optional: true
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-06A_templated.tar.gz
-
-        - name: ses-08A-templated
-          path: /opt/freesurfer/subjects/ses-08A
-          optional: true
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-08A_templated.tar.gz
-
-        - name: ses-10A-templated
-          path: /opt/freesurfer/subjects/ses-10A
-          optional: true
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-10A_templated.tar.gz
-
-    outputs:
-      artifacts:
         - name: brainstem-segmentation
           path: /out/brainstem
           s3:
@@ -334,22 +262,68 @@ spec:
             region: <YOUR_AWS_REGION>
             key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_brainstem.tar.gz
 
+        - name: hippoamyg-segmentation
+          path: /out/hippoamyg
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_hippoamyg.tar.gz
+
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
+    # /out is the packaging scratch dir the script collects results into before
+    # artifact upload. The container runs as non-root (UID 1000), which cannot
+    # mkdir at the image root filesystem, so /out and the FastSurfer subjects
+    # dir must both be writable emptyDirs (no shared PVC — GitHub #77).
+    volumes:
+      - name: out
+        emptyDir: {}
+      - name: subjects
+        emptyDir: {}
+
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-d014d4417575d8c1f8c3d942a959cd9df485695b"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-c2ba15155f39af001ca6bd2f0045f759234ab879"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
-        - name: "{{=lower(workflow.parameters.subjID)}}"
+        - name: out
+          mountPath: /out
+        - name: subjects
           mountPath: /opt/freesurfer/subjects
-          subPath: opt/freesurfer/subjects
 
       resources:
         requests:
-          memory: 12G
+          # PROVISIONAL — 3.5 G observed plateau + ~1 G headroom. This is the
+          # one number in this file that has NOT been read from cgroup v2
+          # memory.peak; it comes from the 1 Hz trace in
+          # scripts/manifests/subregion-oom-probe.yaml, which sampled ~3.5 G
+          # flat across steps 1-3 but can miss a short spike between samples —
+          # exactly the failure mode that produced #129. Re-run the probe
+          # against steps 1-3 alone and set this from memory.peak. Until then
+          # the 1 G is deliberate slack, not a measurement.
+          #
+          # History, so nobody re-derives it: this template was 16G -> 5G (#95)
+          # -> 13G (#129) as ONE fused pod. The 5G came from ram_efficiency
+          # 0.117-0.211 (a 3.38 GB lifetime average) and was right for these
+          # three regions and catastrophically wrong for the fused pod, because
+          # ram_efficiency is an AVERAGE and is structurally blind to the
+          # TensorFlow tail's 25-second, 11.87 GB spike. #134 removed that tail
+          # from this pod, so a GEMS-sized request is now correct here for the
+          # first time. Do not restore 13G; the DL template below owns it.
+          #
+          # Do not lower this from an averaged efficiency metric either. Use the
+          # probe, which reads the peak directly.
+          memory: 4.5G
+          # Keep in sync with `--threads 4` on every segment_subregions call
+          # below, or the pod throttles. The 90% mean CPU efficiency measured for
+          # the fused pod was dominated by these three regions, so it carries
+          # over; the DL pod's is unmeasured.
           cpu: '4'
+          # The three GEMS regions are the bulk of /out — per-timepoint label
+          # volumes plus the template dir. Unchanged from the fused pod's 5G
+          # rather than re-apportioned, since these outputs dominated it.
           ephemeral-storage: 5G
 
       env:
@@ -364,54 +338,229 @@ spec:
           set -euo pipefail
           SD=/opt/freesurfer/subjects
           BASE={{workflow.parameters.subjID}}_template
+          SUBJ={{workflow.parameters.subjID}}
+          BUCKET={{workflow.parameters.bucket}}
+          # FreeSurfer's bundled interpreter shadows /usr/bin/python3 earlier on
+          # PATH (FREESURFER_HOME/python/bin precedes it) — call the apt-installed
+          # interpreter (python3-boto3, images/freesurfer/Dockerfile) explicitly.
+          PY=/usr/bin/python3
 
-          source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" 2>/dev/null
+          # SetUpFreeSurfer.sh is not `set -u`-safe (references unbound vars, e.g.
+          # FUNCTIONALS_DIR) and returns non-zero, so it must be sourced with the
+          # strict flags relaxed — otherwise the shell aborts silently before any
+          # segmentation runs. Re-enable strict mode immediately after.
+          set +eu
+          source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" >/dev/null 2>&1 || true
+          set -eu
 
+          # segment_subregions --long-base expects timepoints named {tp}.long.{base}.
+          # FastSurfer writes bare session IDs (ses-00A, ses-02A, ...). Symlinks bridge
+          # the naming gap; writes from segment_subregions land in the real directories.
           while IFS= read -r tp; do
             [[ -n "$tp" ]] && ln -sfn "${SD}/${tp}" "${SD}/${tp}.long.${BASE}"
           done < "${SD}/${BASE}/base-tps"
 
-          segment_subregions brainstem \
-            --long-base "$BASE" \
-            --sd "$SD" \
-            --threads 4
+          mapfile -t SESSIONS < <(grep -v '^$' "${SD}/${BASE}/base-tps")
 
-          mkdir -p /out/brainstem
-          while IFS= read -r tp; do
-            [[ -n "$tp" ]] || continue
-            mkdir -p "/out/brainstem/${tp}/mri"
-            cp "${SD}/${tp}/mri/"brainstemSs* "/out/brainstem/${tp}/mri/" 2>/dev/null || true
-          done < "${SD}/${BASE}/base-tps"
-          mkdir -p "/out/brainstem/${BASE}/mri"
-          cp "${SD}/${BASE}/mri/"brainstemSs* "/out/brainstem/${BASE}/mri/" 2>/dev/null || true
+          # S3 checkpoint helpers (GitHub #77). Each region's checkpoint key IS its
+          # final derivative key (derivatives/subregions/{subj}/{subj}_{region}.tar.gz
+          # — the same key this template's outputs.artifacts uploads at pod
+          # completion, and the same key src/inventory.py:check_subregions_derivatives
+          # checks), so "checkpoint restored" and "already done in a prior run" are
+          # the same check. Argo's own end-of-pod upload still fires afterward and
+          # re-uploads identical bytes to the same key — redundant but harmless, and
+          # it avoids reworking the declarative outputs.artifacts wiring.
+          #
+          # Applies the size-floor convention from
+          # src/metrics/outcome_recorder.py's _MIN_OUTPUT_BYTES / ADR 004's "size >
+          # 1 KB" guard: a checkpoint object that exists but is implausibly small is
+          # treated as absent rather than trusted. A checkpoint is only ever written
+          # AFTER a region's tool exits 0 and its output is collected into
+          # /out/<region> — never before — and a single boto3 upload is one atomic
+          # S3 PUT, so there is no window where a partially-written object becomes
+          # visible under this key.
+          checkpoint_restore() {
+            local region=$1 outdir=$2
+            local key="derivatives/subregions/${SUBJ}/${SUBJ}_${region}.tar.gz"
+            "$PY" - "$BUCKET" "$key" "$outdir" <<'PYEOF'
+          import io, sys, tarfile
+          import boto3
+          from botocore.exceptions import ClientError
+
+          bucket, key, outdir = sys.argv[1:4]
+          MIN_BYTES = 1024
+
+          s3 = boto3.client("s3", region_name="<YOUR_AWS_REGION>")
+          try:
+              head = s3.head_object(Bucket=bucket, Key=key)
+          except ClientError as exc:
+              if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                  sys.exit(1)
+              raise
+
+          if head["ContentLength"] < MIN_BYTES:
+              print(f"checkpoint {key} is only {head['ContentLength']} bytes -- treating as absent", file=sys.stderr)
+              sys.exit(1)
+
+          buf = io.BytesIO()
+          s3.download_fileobj(bucket, key, buf)
+          buf.seek(0)
+          with tarfile.open(fileobj=buf, mode="r:gz") as tf:
+              tf.extractall(outdir)
+          PYEOF
+          }
+
+          checkpoint_save() {
+            local region=$1 outdir=$2
+            local key="derivatives/subregions/${SUBJ}/${SUBJ}_${region}.tar.gz"
+            "$PY" - "$BUCKET" "$key" "$outdir" <<'PYEOF'
+          import io, sys, tarfile
+          import boto3
+
+          bucket, key, outdir = sys.argv[1:4]
+          buf = io.BytesIO()
+          with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+              tf.add(outdir, arcname=".")
+          buf.seek(0)
+          boto3.client("s3", region_name="<YOUR_AWS_REGION>").upload_fileobj(buf, bucket, key)
+          PYEOF
+          }
+
+          # Local-disk fallback guard: true only when EVERY timepoint already has an
+          # output matching the pattern on THIS pod's emptyDir. Only fires within a
+          # single still-running pod (e.g. a region's collection step ran but a later
+          # region in this same script failed) — an emptyDir does not survive a pod
+          # retry, so cross-attempt resume is checkpoint_restore's job now, not this.
+          # Duplicated verbatim in segment-subregions-dl-template — see the note
+          # there for why it is not shared. The two pods guard DISJOINT patterns, so
+          # running them concurrently never races on the same check.
+          #
+          # Both weaker forms are actively harmful here:
+          #
+          #   ${BASE}/mri/<pat>  — segment_subregions --long-base writes per-timepoint
+          #     and never into the base dir, so a base-dir guard never fires and the
+          #     region recomputes from scratch on every retry (verified: the template
+          #     mri/ dir is empty in every subject's uploaded tarball).
+          #
+          #   ${SESSIONS[0]}/mri/<pat> — the segmentation tools process all timepoints
+          #     in one invocation, so an interruption can leave the first timepoint
+          #     complete and later ones missing. A first-timepoint guard would skip the
+          #     region and silently upload a PARTIAL segmentation.
+          have_all_tps() {
+            local pattern=$1 tp
+            [[ ${#SESSIONS[@]} -gt 0 ]] || return 1
+            for tp in "${SESSIONS[@]}"; do
+              compgen -G "${SD}/${tp}/mri/${pattern}" >/dev/null || return 1
+            done
+            return 0
+          }
+
+          mkdir -p /out/thalamus /out/brainstem /out/hippoamyg
+
+          # 1. Thalamic nuclei — GEMS/Bayesian, CPU.
+          if checkpoint_restore thalamus /out/thalamus; then
+            echo "thalamus checkpoint found in S3 -- restored, skipping recompute"
+          else
+            if have_all_tps 'ThalamicNuclei*'; then
+              echo "thalamus outputs present for all timepoints on local disk -- skipping compute"
+            else
+              segment_subregions thalamus --long-base "$BASE" --sd "$SD" --threads 4
+            fi
+            while IFS= read -r tp; do
+              [[ -n "$tp" ]] || continue
+              mkdir -p "/out/thalamus/${tp}/mri"
+              cp "${SD}/${tp}/mri/"ThalamicNuclei* "/out/thalamus/${tp}/mri/" 2>/dev/null || true
+            done < "${SD}/${BASE}/base-tps"
+            mkdir -p "/out/thalamus/${BASE}/mri"
+            cp "${SD}/${BASE}/mri/"ThalamicNuclei* "/out/thalamus/${BASE}/mri/" 2>/dev/null || true
+            checkpoint_save thalamus /out/thalamus
+          fi
+
+          # 2. Brainstem substructures — GEMS/Bayesian, CPU.
+          if checkpoint_restore brainstem /out/brainstem; then
+            echo "brainstem checkpoint found in S3 -- restored, skipping recompute"
+          else
+            if have_all_tps 'brainstemSs*'; then
+              echo "brainstem outputs present for all timepoints on local disk -- skipping compute"
+            else
+              segment_subregions brainstem --long-base "$BASE" --sd "$SD" --threads 4
+            fi
+            while IFS= read -r tp; do
+              [[ -n "$tp" ]] || continue
+              mkdir -p "/out/brainstem/${tp}/mri"
+              cp "${SD}/${tp}/mri/"brainstemSs* "/out/brainstem/${tp}/mri/" 2>/dev/null || true
+            done < "${SD}/${BASE}/base-tps"
+            mkdir -p "/out/brainstem/${BASE}/mri"
+            cp "${SD}/${BASE}/mri/"brainstemSs* "/out/brainstem/${BASE}/mri/" 2>/dev/null || true
+            checkpoint_save brainstem /out/brainstem
+          fi
+
+          # 3. Hippocampal subfields + amygdala nuclei — GEMS/Bayesian, CPU.
+          #    Uses the HippoSF atlas already kept in the image (see
+          #    images/freesurfer/Dockerfile). Longitudinal timepoints are inferred
+          #    from base-tps, same as thalamus/brainstem. Emits per-hemisphere label
+          #    maps (lh./rh.) plus subfield and amygdala-nuclei volume tables; globs
+          #    stay loose because the version suffix (e.g. .v22) varies across
+          #    FreeSurfer releases.
+          if checkpoint_restore hippoamyg /out/hippoamyg; then
+            echo "hippo-amygdala checkpoint found in S3 -- restored, skipping recompute"
+          else
+            if have_all_tps '*hippoAmygLabels*'; then
+              echo "hippo-amygdala outputs present for all timepoints on local disk -- skipping compute"
+            else
+              segment_subregions hippo-amygdala --long-base "$BASE" --sd "$SD" --threads 4
+            fi
+            while IFS= read -r tp; do
+              [[ -n "$tp" ]] || continue
+              mkdir -p "/out/hippoamyg/${tp}/mri"
+              cp "${SD}/${tp}/mri/"*hippoAmygLabels* "/out/hippoamyg/${tp}/mri/" 2>/dev/null || true
+              cp "${SD}/${tp}/mri/"*hippoSfVolumes*  "/out/hippoamyg/${tp}/mri/" 2>/dev/null || true
+              cp "${SD}/${tp}/mri/"*amygNucVolumes*  "/out/hippoamyg/${tp}/mri/" 2>/dev/null || true
+            done < "${SD}/${BASE}/base-tps"
+            mkdir -p "/out/hippoamyg/${BASE}/mri"
+            cp "${SD}/${BASE}/mri/"*hippoAmygLabels* "/out/hippoamyg/${BASE}/mri/" 2>/dev/null || true
+            checkpoint_save hippoamyg /out/hippoamyg
+          fi
 
   ##############################################
-  # Deep-Learning Segmentation
-  # Runs two fast CNN/U-Net tools sequentially:
+  # Segmentation, part 2 of 2 — the TensorFlow tail.
   #
-  # 1. mri_segment_hypothalamic_subunits
-  #    TensorFlow CNN. ~10 sec/session CPU.
-  #    5 bilateral hypothalamic subregions.
-  #    Output: hypothalamic_subunits_seg.v1.mgz
-  #            hypothalamic_subunits_volumes.v1.csv
+  # Short and expensive: ~30 seconds at an 11.87 GB
+  # peak. Stages the FastSurfer outputs from S3 onto
+  # its own private emptyDir, same as the GEMS pod
+  # (no hydrate step, no shared volume — GitHub #77),
+  # and runs concurrently with it (see the DAG comment
+  # for why that is safe):
   #
-  # 2. mri_sclimbic_seg
-  #    U-Net. <1 min/session CPU.
-  #    Hypothalamus (coarse), mammillary bodies,
-  #    basal forebrain, septal nuclei, NAcc, fornix.
-  #    Output: sclimbic.mgz, sclimbic.stats
+  #   4. mri_segment_hypothalamic_subunits (~25 s total)
+  #   5. mri_sclimbic_seg                  (~8 s total)
   #
-  # NOTE: Both tools require model files from
-  # $FREESURFER_HOME/models/. The freesurfer image
-  # must be built with models/ included (see
-  # images/freesurfer/Dockerfile).
+  # Both read only mri/nu.mgz (sclimbic additionally
+  # reads mri/transforms/talairach.xfm.lta if
+  # present), so this pod's own artifact-staged copy
+  # already has everything they need. Peak does not
+  # scale with timepoint count — 11.91 G at one
+  # timepoint vs 11.87 G at three — because both
+  # tools loop over sessions and free between them.
+  #
+  # No symlink bridge here: that exists for
+  # segment_subregions --long-base, and these tools
+  # take bare session IDs via --s.
+  #
+  # Per-region resume checks S3 the same way the GEMS
+  # pod does — see the checkpoint_restore/checkpoint_save
+  # comment there.
+  #
+  # Outputs (per-session, in mri/ and stats/):
+  #   hypothalamic_subunits_seg.v1.mgz / _volumes.v1.csv
+  #   sclimbic.mgz / sclimbic.stats
   ##############################################
 
-  - name: segment-deeplearning-template
+  - name: segment-subregions-dl-template
     metadata:
       labels:
         cloudpipe.io/phase: subregion-segmentation
-        cloudpipe.io/step: deeplearning
+        cloudpipe.io/step: segment-dl
     inputs:
       parameters:
         - name: T1w_sessions
@@ -435,6 +584,7 @@ spec:
 
         - name: ses-00A-templated
           path: /opt/freesurfer/subjects/ses-00A
+          optional: true
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
@@ -507,20 +657,73 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
+    # /out is the packaging scratch dir the script collects results into before
+    # artifact upload. The container runs as non-root (UID 1000), which cannot
+    # mkdir at the image root filesystem, so /out and the FastSurfer subjects
+    # dir must both be writable emptyDirs (no shared PVC — GitHub #77).
+    volumes:
+      - name: out
+        emptyDir: {}
+      - name: subjects
+        emptyDir: {}
+
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-d014d4417575d8c1f8c3d942a959cd9df485695b"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-c2ba15155f39af001ca6bd2f0045f759234ab879"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
-        - name: "{{=lower(workflow.parameters.subjID)}}"
+        - name: out
+          mountPath: /out
+        - name: subjects
           mountPath: /opt/freesurfer/subjects
-          subPath: opt/freesurfer/subjects
 
       resources:
         requests:
-          memory: 8G
+          # Measured 2026-08-03 (scripts/manifests/subregion-oom-probe.yaml),
+          # cgroup v2 memory.peak — an exact high-water mark, not a sample:
+          #
+          #                       step-4 peak   step-4 wall
+          #     oneDNN on (was)     16.28 G         15 s
+          #     oneDNN off (now)    11.87 G         25 s
+          #
+          # 13G is the oneDNN-off peak plus ~1 GB. What makes it sufficient is
+          # that the request EXCEEDS the peak, so the scheduler reserves the
+          # memory the pod will actually take and cannot pack a co-tenant into
+          # it. That, not the node size, is the fix (#129).
+          #
+          # It does NOT exclude the 16 GiB instance type, and do not write a
+          # comment here claiming it does — measured 2026-08-03, a
+          # c8i-flex.2xlarge has 14.82 GB allocatable and only 0.554 GB of
+          # daemonset memory REQUESTS (cloudwatch-agent, fluent-bit, guardduty,
+          # ebs-csi; aws-node / kube-proxy / efs-csi request none), leaving
+          # 14.27 GB for a workload pod. 13G fits that with room. In the
+          # 2026-08-03 batch the split was total — 7/7 attempts on the 16 GiB
+          # type OOMKilled at 5G, 10/10 on 32 GiB types did not.
+          #
+          # THERE IS NO MEMORY LIMIT. With no limit an OOM kill is not a
+          # container-limit kill, it is the kernel firing inside `kubepods`
+          # (capped at allocatable) and choosing this container — so Burstable
+          # protects nothing once the node is full. The limit is omitted because
+          # the request is sized to the measured peak, so the scheduler, not the
+          # OOM killer, is what keeps this pod off a node it does not fit.
+          #
+          # #134 changed how LONG this is held (~1 min instead of ~55), not how
+          # much. Do not lower it from an averaged efficiency metric — on a pod
+          # this short ram_efficiency is more misleading than ever, since the
+          # peak is now most of the pod's life rather than 0.9% of it. Re-measure
+          # with the probe, which reads the peak directly.
+          memory: 13G
+          # Keep in sync with `--threads 4` on both calls below. Carried over
+          # from the fused pod; the 90% mean CPU efficiency that justified it was
+          # dominated by the GEMS regions, so it is NOT evidence for this pod.
+          # Worth revisiting: at 4 CPU this pod competes for the last core slot
+          # on a 4xlarge already holding three GEMS pods (3x4 + 4 = 16 vs 15.89
+          # allocatable), so it may briefly wait. Lowering it is unmeasured, and
+          # doubling a 33-second step costs little — but measure before changing.
           cpu: '4'
-          ephemeral-storage: 5G
+          # Small: two per-session label volumes and two stats files. The fused
+          # pod's 5G was sized for the GEMS label volumes, which do not land here.
+          ephemeral-storage: 2G
 
       env:
         - name: SUBJECTS_DIR
@@ -528,49 +731,159 @@ spec:
         - name: FS_LICENSE
           value: /opt/freesurfer/.license
 
+        # Cuts step 4's peak 16.28 G -> 11.87 G for +10 s (#129, A/B measured
+        # 2026-08-03 — see the memory request above). Steps 4 and 5 are
+        # TensorFlow; oneDNN's blocked layouts pad channels to the AVX512
+        # register width and allocate reorder scratchpads, and these are 3D
+        # convs with few channels, so that padding dominates. Same mechanism and
+        # same fix as bold-to-t1w (#120,
+        # registration-workflow-template.yaml:653).
+        #
+        # Output is unchanged where it matters: hypothalamic_subunits_seg.v1.mgz
+        # is BYTE-IDENTICAL across arms, and every sclimbic structure has the
+        # same voxel count — only the float volume estimate moves in the 7th
+        # significant figure (485.0140 vs 485.0139), which is float
+        # associativity from a different kernel order. This changes how the
+        # convolutions are computed, not what they produce.
+        #
+        # Read by TensorFlow at import, so this is env-only: no image rebuild and
+        # no `ci: pin workflow images to sha-...` commit.
+        - name: TF_ENABLE_ONEDNN_OPTS
+          value: "0"
+
       command: [bash, -c]
       args:
         - |
           set -euo pipefail
           SD=/opt/freesurfer/subjects
           BASE={{workflow.parameters.subjID}}_template
+          SUBJ={{workflow.parameters.subjID}}
+          BUCKET={{workflow.parameters.bucket}}
+          # FreeSurfer's bundled interpreter shadows /usr/bin/python3 earlier on
+          # PATH (FREESURFER_HOME/python/bin precedes it) — call the apt-installed
+          # interpreter (python3-boto3, images/freesurfer/Dockerfile) explicitly.
+          PY=/usr/bin/python3
 
-          source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" 2>/dev/null
+          # SetUpFreeSurfer.sh is not `set -u`-safe (references unbound vars, e.g.
+          # FUNCTIONALS_DIR) and returns non-zero, so it must be sourced with the
+          # strict flags relaxed — otherwise the shell aborts silently before any
+          # segmentation runs. Re-enable strict mode immediately after.
+          set +eu
+          source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" >/dev/null 2>&1 || true
+          set -eu
 
-          # Build space-separated session list from base-tps for tools that
-          # accept multiple --s arguments in one call (faster than per-session invocations).
           mapfile -t SESSIONS < <(grep -v '^$' "${SD}/${BASE}/base-tps")
+
+          # S3 checkpoint helpers, same contract as the GEMS pod's — see the
+          # comment there for the full rationale (checkpoint key == final
+          # derivative key, size-floor guard, atomic-PUT truncation safety). It is
+          # duplicated rather than shared because the alternative is baking a
+          # shell fragment into the freesurfer image, which costs an image rebuild
+          # and a pin commit for a few dozen lines. If you change one copy, change
+          # both — and note the two pods guard DISJOINT patterns, so they never
+          # race on the same key.
+          checkpoint_restore() {
+            local region=$1 outdir=$2
+            local key="derivatives/subregions/${SUBJ}/${SUBJ}_${region}.tar.gz"
+            "$PY" - "$BUCKET" "$key" "$outdir" <<'PYEOF'
+          import io, sys, tarfile
+          import boto3
+          from botocore.exceptions import ClientError
+
+          bucket, key, outdir = sys.argv[1:4]
+          MIN_BYTES = 1024
+
+          s3 = boto3.client("s3", region_name="<YOUR_AWS_REGION>")
+          try:
+              head = s3.head_object(Bucket=bucket, Key=key)
+          except ClientError as exc:
+              if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                  sys.exit(1)
+              raise
+
+          if head["ContentLength"] < MIN_BYTES:
+              print(f"checkpoint {key} is only {head['ContentLength']} bytes -- treating as absent", file=sys.stderr)
+              sys.exit(1)
+
+          buf = io.BytesIO()
+          s3.download_fileobj(bucket, key, buf)
+          buf.seek(0)
+          with tarfile.open(fileobj=buf, mode="r:gz") as tf:
+              tf.extractall(outdir)
+          PYEOF
+          }
+
+          checkpoint_save() {
+            local region=$1 outdir=$2
+            local key="derivatives/subregions/${SUBJ}/${SUBJ}_${region}.tar.gz"
+            "$PY" - "$BUCKET" "$key" "$outdir" <<'PYEOF'
+          import io, sys, tarfile
+          import boto3
+
+          bucket, key, outdir = sys.argv[1:4]
+          buf = io.BytesIO()
+          with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+              tf.add(outdir, arcname=".")
+          buf.seek(0)
+          boto3.client("s3", region_name="<YOUR_AWS_REGION>").upload_fileobj(buf, bucket, key)
+          PYEOF
+          }
+
+          # Local-disk fallback guard, same contract as the GEMS pod's: true only
+          # when EVERY timepoint already has a matching output on THIS pod's
+          # emptyDir. Only fires within a single still-running pod — cross-attempt
+          # resume is checkpoint_restore's job now, not this.
+          #
+          # Weaker forms are actively harmful: the tools process all timepoints
+          # in one invocation, so an interruption can leave the first timepoint
+          # complete and later ones missing. A first-timepoint guard would skip
+          # the region and silently upload a PARTIAL segmentation.
+          have_all_tps() {
+            local pattern=$1 tp
+            [[ ${#SESSIONS[@]} -gt 0 ]] || return 1
+            for tp in "${SESSIONS[@]}"; do
+              compgen -G "${SD}/${tp}/mri/${pattern}" >/dev/null || return 1
+            done
+            return 0
+          }
+
+          # Space-separated --s args for the deep-learning tools (one call, all sessions).
           SESSION_ARGS=()
           for tp in "${SESSIONS[@]}"; do SESSION_ARGS+=(--s "$tp"); done
 
-          # 1. Hypothalamic subunits — TensorFlow CNN, ~10 sec/session
-          mri_segment_hypothalamic_subunits \
-            "${SESSION_ARGS[@]}" \
-            --sd "$SD" \
-            --threads 4
+          mkdir -p /out/hypothalamic /out/sclimbic
 
-          # 2. ScLimbic — U-Net, <1 min/session
-          mri_sclimbic_seg \
-            "${SESSION_ARGS[@]}" \
-            --sd "$SD" \
-            --threads 4
+          # 4. Hypothalamic subunits — TensorFlow CNN, ~10 sec/session. This is
+          #    the 11.87 GB peak; everything else in this pod is small.
+          if checkpoint_restore hypothalamic /out/hypothalamic; then
+            echo "hypothalamic checkpoint found in S3 -- restored, skipping recompute"
+          else
+            if have_all_tps 'hypothalamic_subunits*'; then
+              echo "hypothalamic outputs present for all timepoints on local disk -- skipping compute"
+            else
+              mri_segment_hypothalamic_subunits "${SESSION_ARGS[@]}" --sd "$SD" --threads 4
+            fi
+            for tp in "${SESSIONS[@]}"; do
+              mkdir -p "/out/hypothalamic/${tp}/mri" "/out/hypothalamic/${tp}/stats"
+              cp "${SD}/${tp}/mri/"hypothalamic_subunits*   "/out/hypothalamic/${tp}/mri/"   2>/dev/null || true
+              cp "${SD}/${tp}/stats/"hypothalamic_subunits* "/out/hypothalamic/${tp}/stats/" 2>/dev/null || true
+            done
+            checkpoint_save hypothalamic /out/hypothalamic
+          fi
 
-          # Collect hypothalamic outputs
-          mkdir -p /out/hypothalamic
-          for tp in "${SESSIONS[@]}"; do
-            mkdir -p "/out/hypothalamic/${tp}/mri" "/out/hypothalamic/${tp}/stats"
-            cp "${SD}/${tp}/mri/"hypothalamic_subunits* \
-               "/out/hypothalamic/${tp}/mri/" 2>/dev/null || true
-            cp "${SD}/${tp}/stats/"hypothalamic_subunits* \
-               "/out/hypothalamic/${tp}/stats/" 2>/dev/null || true
-          done
-
-          # Collect sclimbic outputs
-          mkdir -p /out/sclimbic
-          for tp in "${SESSIONS[@]}"; do
-            mkdir -p "/out/sclimbic/${tp}/mri" "/out/sclimbic/${tp}/stats"
-            cp "${SD}/${tp}/mri/sclimbic"* \
-               "/out/sclimbic/${tp}/mri/" 2>/dev/null || true
-            cp "${SD}/${tp}/stats/sclimbic"* \
-               "/out/sclimbic/${tp}/stats/" 2>/dev/null || true
-          done
+          # 5. ScLimbic — U-Net, <1 min/session. Peaks ~3.7 G.
+          if checkpoint_restore sclimbic /out/sclimbic; then
+            echo "sclimbic checkpoint found in S3 -- restored, skipping recompute"
+          else
+            if have_all_tps 'sclimbic*'; then
+              echo "sclimbic outputs present for all timepoints on local disk -- skipping compute"
+            else
+              mri_sclimbic_seg "${SESSION_ARGS[@]}" --sd "$SD" --threads 4
+            fi
+            for tp in "${SESSIONS[@]}"; do
+              mkdir -p "/out/sclimbic/${tp}/mri" "/out/sclimbic/${tp}/stats"
+              cp "${SD}/${tp}/mri/sclimbic"*   "/out/sclimbic/${tp}/mri/"   2>/dev/null || true
+              cp "${SD}/${tp}/stats/sclimbic"* "/out/sclimbic/${tp}/stats/" 2>/dev/null || true
+            done
+            checkpoint_save sclimbic /out/sclimbic
+          fi

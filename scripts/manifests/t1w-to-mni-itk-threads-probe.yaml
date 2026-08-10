@@ -1,0 +1,259 @@
+# t1w-to-mni ITK thread-count probe — issue #138
+#
+# QUESTION
+# --------
+# `t1w-to-mni` QC failures jumped from 1.1% to 12.3% of sessions on 2026-08-01.
+# The suspect is e12a249 (#107), which introduced
+# `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS <- requests.cpu` (= 1) at the same time
+# as `cpu: 2 -> 1`. Before it, no thread env was set at all and ITK sized its
+# pool from the HOST core count.
+#
+# SimpleITK's registration overview names exactly two sources of run-to-run
+# variability: metric-sampling randomization (we fix it, `seed=42` at
+# fst1w_to_mni.py:149) and MULTITHREADING. ITK partitions metric sampling across
+# threads, so a fixed seed reproduces only at a FIXED THREAD COUNT. A different
+# sampled point set moves where the Mattes-MI affine lands, and for a brain near
+# a basin boundary SyN cannot recover.
+#
+# Prediction: `sub-HGNA569Y/ses-00A` scores ~0.645 (fail) at 1 thread and
+# ~0.79 (pass) at the pre-#107 thread count. If all four arms agree, the thread
+# hypothesis is dead and the secondary suspect (#102, time-slice replicas 2 -> 3,
+# merged 08-01 10:14) is next.
+#
+# WHY A PINNED PROBE IS RIGHT HERE — AND WRONG FOR PHASE FRACTIONS
+# ----------------------------------------------------------------
+# Pinning `instance-type` + `do-not-disrupt` provisions a FRESH DEDICATED NODE
+# per arm. That holds the host constant, which is exactly what A/B-ing one
+# variable needs. It is also why a pinned probe must never be used to measure
+# anything expressed as a fraction of pod lifetime — every arm pays a cold
+# multi-GB image pull. See scripts/collect_pod_phase_split.py's docstring and
+# issue #123, where that mistake produced a 3.5x wrong number.
+#
+# EXPERIMENT DESIGN
+# -----------------
+# Only the thread count varies. Specifically:
+#   - `cpu: 2` on EVERY arm, including the ones emulating today's `cpu: 1`.
+#     The container sets no CPU LIMIT, so on a dedicated 8-vCPU node the actual
+#     compute available is identical regardless of the request; holding the
+#     request fixed removes it as a confound and leaves thread count alone.
+#   - Threads are exported from bash, NOT from the downward API, so an arm can
+#     express "unset" — which the env block cannot.
+#   - g4dn.2xlarge (8 vCPU) so the 8-thread arm has 8 real cores to use.
+#
+# ARMS
+#   itk=1       today's production value (cpu 1 projected through the downward API)
+#   itk=4       g4dn.xlarge core count — one plausible pre-#107 value
+#   itk=8       g4dn.2xlarge core count — the other plausible pre-#107 value
+#   itk=unset   TRUE pre-#107 control: all four thread vars unset, ITK's own default
+#
+# SEQUENTIAL, NOT PARALLEL: each arm requests `nvidia.com/gpu: 1`, and with
+# time-slicing at 3 replicas per card three arms could co-tenant a single GPU and
+# contend. Steps run in series so each arm owns its node outright.
+#
+# SAFETY
+# ------
+# Writes NOTHING to the metrics corpus or to derivatives/. The production
+# template sends its reg-qc artifact to
+# `metrics/registration/dt=.../{subj}_{ses}_t1w_to_mni_reg_qc.json`; this probe
+# redirects to `scratch/itk-thread-probe/`, because landing four synthetic
+# records in the corpus would corrupt the very analysis that found #138.
+# On a QC fail fst1w_to_mni.py exits 65 BEFORE promoting outputs, so no
+# derivative is written on those arms either way.
+#
+# USAGE
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-itk-threads-probe.yaml --watch
+#
+#   # then read the four verdicts:
+#   aws s3 cp --recursive s3://<YOUR_S3_BUCKET>/scratch/itk-thread-probe/ /tmp/probe/
+#   for f in /tmp/probe/*/*.json; do
+#     echo "$f $(jq -r '"lncc=\(.lncc) verdict=\(.verdict) jacneg=\(.jac_det_frac_negative)"' "$f")"
+#   done
+#
+# Re-run against another session with -p subjID=... -p session=...
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: t1w-mni-itk-probe-
+  namespace: argo-workflows
+spec:
+  # REQUIRED — carries the IRSA role with S3 access for the artifact init
+  # container. Set on the `cloudpipe` WorkflowTemplate's spec; a standalone
+  # Workflow inherits nothing, so it must be named here or the init container
+  # fails as `exit code 64 ... Access Denied`.
+  serviceAccountName: argo-workflows-runner
+
+  # The fireANTs image runs as UID 1000 and fst1w_to_mni.py mkdir's under /work.
+  # Without this the init container stages artifacts as root and main cannot read
+  # them.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    annotations:
+      # Karpenter must not consolidate the node mid-arm: a disruption surfaces as
+      # a failure that looks like, but is not, the effect being measured.
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+
+  # Four arms x (cold image pull + ~90 s registration). Generous, but bounded so
+  # a hung arm cannot sit on a pinned GPU node indefinitely.
+  activeDeadlineSeconds: 5400
+
+  # NO retryStrategy, deliberately. Exit 65 is the QC verdict — the measurement
+  # itself — and retrying it would either hide an arm's result or re-run an
+  # identical deterministic failure for nothing.
+  entrypoint: probe
+
+  arguments:
+    parameters:
+      - name: subjID
+        value: sub-HGNA569Y
+      - name: session
+        # ses-00A is the session that flipped 0.799 -> 0.645. ses-06A passed in
+        # both eras and is the natural negative control.
+        value: ses-00A
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      - name: instance-type
+        value: g4dn.2xlarge
+
+  templates:
+    - name: probe
+      steps:
+        - - name: itk-1
+            template: arm
+            arguments:
+              parameters: [{name: itk, value: "1"}]
+        - - name: itk-4
+            template: arm
+            arguments:
+              parameters: [{name: itk, value: "4"}]
+        - - name: itk-8
+            template: arm
+            arguments:
+              parameters: [{name: itk, value: "8"}]
+        - - name: itk-unset
+            template: arm
+            arguments:
+              parameters: [{name: itk, value: "unset"}]
+
+    - name: arm
+      inputs:
+        parameters:
+          - name: itk
+        artifacts:
+          - name: fastsurfer-output
+            path: /fastsurfer/{{workflow.parameters.subjID}}_{{workflow.parameters.session}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{workflow.parameters.session}}_templated.tar.gz'
+
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
+      outputs:
+        artifacts:
+          # The ONLY output. Written by fst1w_to_mni.py before its exit-65, so it
+          # exists on pass and fail alike — the verdict and lncc are the result.
+          # Keyed by arm, into scratch/, NEVER into metrics/registration/.
+          - name: reg-qc
+            path: '/tmp/{{workflow.parameters.subjID}}_{{workflow.parameters.session}}_t1w_to_mni_reg_qc.json'
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/itk-thread-probe/{{workflow.parameters.subjID}}_{{workflow.parameters.session}}/itk-{{inputs.parameters.itk}}_reg_qc.json'
+
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-nodepool
+        node.kubernetes.io/instance-type: "{{workflow.parameters.instance-type}}"
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-47f3e20fc7dd28bb163804d098f3e984474c0c96"
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: work
+            mountPath: /work
+
+        # NO env block on purpose — see the args below. The production template
+        # projects four thread vars from requests.cpu via the downward API, which
+        # cannot express "unset", and "unset" is the pre-#107 control arm.
+
+        resources:
+          requests:
+            memory: 2G
+            # Held at 2 on every arm. No CPU limit is set, so on a dedicated
+            # 8-vCPU node this does not bound real compute; fixing it removes the
+            # request as a confound so only thread count varies.
+            cpu: '2'
+            ephemeral-storage: 10G
+          limits:
+            nvidia.com/gpu: '1'
+
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+            ARM='{{inputs.parameters.itk}}'
+
+            if [ "$ARM" = "unset" ]; then
+              # TRUE pre-#107 state: let ITK and the BLAS pools size themselves
+              # from the host. Explicitly unsetting rather than omitting, because
+              # the image or a base layer may export its own defaults.
+              unset ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS \
+                    OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS
+            else
+              export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS="$ARM"
+              export OMP_NUM_THREADS="$ARM"
+              export MKL_NUM_THREADS="$ARM"
+              export OPENBLAS_NUM_THREADS="$ARM"
+            fi
+
+            # Host facts, so an arm's result can be read against what it actually
+            # ran on. `nproc` is what an unset ITK pool sizes itself from.
+            echo "=== ARM=$ARM host=$(hostname) nproc=$(nproc) ===" >&2
+            echo "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=${ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS:-<unset>}" >&2
+            echo "OMP_NUM_THREADS=${OMP_NUM_THREADS:-<unset>}" >&2
+            nvidia-smi --query-gpu=name,memory.total --format=csv >&2
+
+            python /app/fst1w_to_mni.py \
+              --t1w '/fastsurfer/{{workflow.parameters.subjID}}_{{workflow.parameters.session}}/mri/orig.mgz' \
+              --brainmask '/fastsurfer/{{workflow.parameters.subjID}}_{{workflow.parameters.session}}/mri/brainmask.mgz' \
+              --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+              --out-dir '/work/registration/{{workflow.parameters.session}}/t1w_to_mni' \
+              --prefix '{{workflow.parameters.subjID}}_{{workflow.parameters.session}}_desc-t1w2mni' \
+              --subj '{{workflow.parameters.subjID}}' \
+              --ses '{{workflow.parameters.session}}' \
+              --pipeline cloudpipe_minproc
+            EXIT=$?
+
+            echo "=== ARM=$ARM fst1w_to_mni exit=$EXIT (65 = QC fail) ===" >&2
+            QC="/tmp/{{workflow.parameters.subjID}}_{{workflow.parameters.session}}_t1w_to_mni_reg_qc.json"
+            [ -f "$QC" ] && cat "$QC" >&2
+
+            # Exit 0 regardless: exit 65 is a RESULT, not an error, and a
+            # non-zero exit here would abort the remaining arms mid-experiment.
+            exit 0

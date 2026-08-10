@@ -1,0 +1,248 @@
+# bold-to-t1w OOM probe — pin ONE instance type and measure peak `anon`.
+#
+# Why this exists: the OOM is decided by which host Karpenter draws, and the
+# draw is random (spot). Across three batches (2x 2026-08-01, 1x 2026-08-02)
+# the type that splits the last confound — a 4xlarge Skylake: AVX512F, NO VNNI,
+# 16 vCPU — has appeared ZERO times. Passive resampling is not going to deliver
+# it. This runs the real step against a fixed session on a host you choose.
+#
+# See docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.7.
+#
+#   c5.4xlarge  -> AVX512F, no VNNI, 16 vCPU   <- THE decisive one
+#   c6i.4xlarge -> AVX512F + VNNI,   16 vCPU   <- positive control (must OOM)
+#   c5.2xlarge  -> AVX512F, no VNNI,  8 vCPU   <- negative control (must not)
+#
+# Read the result as:
+#   c5.4xlarge OOMs / peak anon >6G  -> AVX512 x thread count.
+#                                       Fix = pin OPENBLAS/MKL/NUMEXPR_NUM_THREADS.
+#   c5.4xlarge clean, c6i OOMs       -> Ice Lake / VNNI specific.
+#                                       Fix = raise the limit or pin the family.
+#
+# Submit one per type:
+#   argo -n argo-workflows submit scripts/manifests/b2t-oom-instance-probe.yaml \
+#     -p instance-type=c5.4xlarge
+#
+# Since the OOM was settled (§9.9) this doubles as the harness for any
+# single-variable resource question on this step — see the `cpu` and `onednn`
+# parameters below. Issue #106 uses it as:
+#   -p instance-type=c6i.4xlarge -p onednn=0 -p cpu=4   # control
+#   -p instance-type=c6i.4xlarge -p onednn=0 -p cpu=2
+#
+# PREREQUISITES (verified present 2026-08-03; re-check before running):
+#   s3://<YOUR_S3_BUCKET>/mmps_mproc/sub-T1GJUT9Z/                     119 obj, 11.9 GiB
+#   s3://<YOUR_S3_BUCKET>/derivatives/fastsurfer/sub-T1GJUT9Z/sub-T1GJUT9Z_ses-00A_templated.tar.gz
+# If the input was reaped by delete-globus-input-template, restore it — this is
+# exactly what the backup exists for, and it avoids a Globus re-transfer:
+#   aws s3 sync s3://<YOUR_S3_BUCKET>/backup/pre-b2t-diagnostic-2026-08-01/mmps_mproc/sub-T1GJUT9Z/ \
+#               s3://<YOUR_S3_BUCKET>/mmps_mproc/sub-T1GJUT9Z/
+#
+# SIDE EFFECTS, on purpose — this writes through the real template:
+#   - overwrites derivatives/registration/sub-T1GJUT9Z/ses-00A/
+#   - appends step-outcomes + registration QC to the metrics bucket under
+#     today's dt= partition
+# Both are flushed by prep_test_batch.py before any real batch, so this is safe
+# to leave behind. It is NOT safe to run against a subject you care about.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: b2t-oom-probe-
+  namespace: argo-workflows
+spec:
+  # REQUIRED — this carries the IRSA role with S3 access. It is set on the
+  # `cloudpipe` WorkflowTemplate's spec, NOT on `registration`, and there are no
+  # controller workflowDefaults to fall back on. A templateRef inherits
+  # templates, not the parent workflow's pod-level identity, so this standalone
+  # Workflow has to name it itself.
+  #
+  # Getting this wrong fails as `init: Error (exit code 64): artifact
+  # func-inputs failed to load: failed to get file: Access Denied` — measured,
+  # not theoretical. Note it is NOT visible on a submitted workflow's
+  # `.spec.serviceAccountName`: `submit --from workflowtemplate/cloudpipe`
+  # stores a workflowTemplateRef and leaves that field empty, so reading it off
+  # a prior run reports "(unset)" and is misleading. Read the TEMPLATE's spec.
+  serviceAccountName: argo-workflows-runner
+
+  # Everything from here to `entrypoint` is copied from the `cloudpipe`
+  # WorkflowTemplate's spec. THIS IS THE RULE: a templateRef inherits templates
+  # and nothing else — every pod-level field on the parent spec must be
+  # replicated here or the step runs in a subtly different pod. Diff against
+  # `kubectl -n argo-workflows get workflowtemplate cloudpipe -o json | jq .spec`
+  # before trusting a probe result.
+  #
+  # Without this securityContext the init container stages the artifacts as
+  # root and the main container cannot read them: `[staged] func_in=0` and
+  # `PermissionError: [Errno 13] Permission denied:
+  # /data/func/..._bold.nii.gz` — measured, not theoretical.
+  securityContext:
+    fsGroup: 1000
+    runAsGroup: 1000
+    runAsUser: 1000
+
+  # Karpenter must not consolidate the node out from under a probe. These pods
+  # are pinned to one instance type on SPOT, and a mid-run disruption would
+  # surface as a failure that looks like — but is not — the OOM being measured.
+  podMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+
+  # A probe that hangs should not hold a pinned spot node for 12h (cloudpipe's
+  # value). Registration of one 6-run session takes minutes.
+  activeDeadlineSeconds: 3600
+
+  # AUDITED OMISSIONS from cloudpipe's spec — each checked, not assumed:
+  #   onExit: emit-workflow-metrics-template
+  #       Deliberately dropped. It only emits workflow-level metrics, and a
+  #       probe is not a subject run — including it would write junk aggregates.
+  #       Verified it performs no cleanup or deletion.
+  #   volumeClaimTemplates: [<subjID>]
+  #       Not needed: bold-to-t1w-session-template declares NO volumeMounts
+  #       (verified) — it writes to /tmp and uploads via artifacts. Omitting it
+  #       avoids provisioning an EBS volume per probe.
+  #   retryStrategy: limit 3, expression matches exitCode 64/137/143
+  #       Deliberately dropped so the probe FAILS FAST. Retrying exit 64 would
+  #       have hidden the serviceAccount and securityContext bugs above behind
+  #       three silent retries. Reproducibility of the OOM is not in question
+  #       either — 2026-08-01 already has c6i at 31/31.
+  #   podGC / ttlStrategy: housekeeping only; logs are archived to
+  #       s3://<YOUR_S3_BUCKET>/logs/ regardless, which is where §9.7 reads them from.
+  entrypoint: probe
+  # Single pod, so a workflow-level patch is unambiguous. nodeSelector is a
+  # plain map with no patchStrategy, so strategic merge ADDS this key rather
+  # than replacing the template's `karpenter.sh/nodepool: cpu-heavy-nodepool`.
+  # Both constraints then apply and Karpenter provisions exactly this type.
+  # Verify rather than trust — `kubectl get pod <p> -o jsonpath='{.spec.nodeSelector}'`
+  # must show BOTH keys.
+  # `containers` merges on `name` and `env` merges on `name` too, so naming the
+  # `main` container here ADDS one env var rather than replacing the container.
+  # Verify rather than trust:
+  #   kubectl -n argo-workflows get pod <p> -o jsonpath='{.spec.containers[?(@.name=="main")].env[*].name}'
+  # must still list the four *_NUM_THREADS vars alongside TF_ENABLE_ONEDNN_OPTS.
+  #
+  # `resources.requests` is likewise a map, so setting `cpu` here overrides ONLY
+  # cpu and leaves the template's memory / ephemeral-storage requests intact.
+  # This is also how the cpu A/B stays honest: podSpecPatch is applied before
+  # the pod is created, so the four `*_NUM_THREADS` resourceFieldRefs resolve
+  # against the PATCHED request and the thread pools follow it. The driver
+  # echoes them on its first line — check that `OMP=` matches the arm before
+  # believing any timing, because a patch that silently failed to apply would
+  # look like "cpu made no difference".
+  podSpecPatch: |
+    nodeSelector:
+      node.kubernetes.io/instance-type: "{{workflow.parameters.instance-type}}"
+    containers:
+      - name: main
+        resources:
+          requests:
+            cpu: "{{workflow.parameters.cpu}}"
+        env:
+          - name: TF_ENABLE_ONEDNN_OPTS
+            value: "{{workflow.parameters.onednn}}"
+
+  arguments:
+    parameters:
+      - name: instance-type
+        value: c5.4xlarge
+
+      # oneDNN A/B. Set EXPLICITLY on both arms rather than leaving the control
+      # unset, so the two runs differ in exactly one character.
+      #   "1" = TF default (oneDNN on)
+      #   "0" = oneDNN off
+      #
+      # Testing whether Ice Lake's 1.9x anon peak comes from oneDNN selecting
+      # different kernels/scratchpads on that ISA. The sign is genuinely
+      # unknown: oneDNN's dominant memory effect is operator FUSION, which
+      # *reduces* peak by eliminating intermediate tensors, so disabling it may
+      # make this worse. Treat as an experiment, not a candidate fix
+      # (see §8.4 item 4 — an earlier draft of the investigation got this wrong).
+      #
+      # If c6i drops from 8.67 G toward the 4.25 G that every other host shows,
+      # this is the cause and the real fix; peak, limit and the under-request
+      # risk in §9.8.1 all resolve at once.
+      - name: onednn
+        value: "1"
+
+      # CPU request A/B (issue #106). Because requests.cpu is projected into the
+      # thread-pool env vars, this is NOT a pure accounting change: it resizes
+      # the TF intra-op pool, so each arm trades wall clock against cores held.
+      #
+      # Compare arms on the driver's per-run `took Ns` lines, NOT on pod
+      # duration — the pod also spends near-serial minutes on artifact download
+      # and upload, and folding that in is exactly what made the lifetime
+      # `cpu_efficiency` of 0.484 look like "only 1.9 of 4 cores are used".
+      #
+      # The decision rule is cores x time, because CPU is the binding packing
+      # dimension here: at cpu 4 / memory 3G a c-family 2xlarge (~7.6 allocatable
+      # cores) fits exactly ONE of these pods, while 3G would allow four. So
+      # cutting to 2 is a win unless per-run time more than doubles.
+      #
+      # Run all arms on ONE pinned instance type — SynthMorph's parallel
+      # efficiency is a property of the host, and c6i is the type that must be
+      # covered (§9.7.1: it appears more often than not).
+      - name: cpu
+        value: "4"
+
+      # Fixed session: sub-T1GJUT9Z ses-00A, the 6-run session of the subject
+      # that OOMed 9 times on 2026-08-01. Holding the data constant is the
+      # entire point — the 2026-08-02 run already showed the same session
+      # succeeds or fails purely on host draw.
+      - name: subjID
+        value: sub-T1GJUT9Z
+      - name: session
+        value: ses-00A
+      - name: nss-frames
+        value: "8"
+      # b2t_exists is forced false so the step re-registers even though the
+      # 2026-08-02 run left outputs behind. Inventory is not consulted here.
+      - name: runs
+        value: |
+          [{"b2t_exists":false,"func_exists":false,"run":"run-01","surf_exists":false,"surf_target_exists":false,"task":"task-nback"},
+           {"b2t_exists":false,"func_exists":false,"run":"run-02","surf_exists":false,"surf_target_exists":false,"task":"task-nback"},
+           {"b2t_exists":false,"func_exists":false,"run":"run-01","surf_exists":false,"surf_target_exists":false,"task":"task-rest"},
+           {"b2t_exists":false,"func_exists":false,"run":"run-02","surf_exists":false,"surf_target_exists":false,"task":"task-rest"},
+           {"b2t_exists":false,"func_exists":false,"run":"run-03","surf_exists":false,"surf_target_exists":false,"task":"task-rest"},
+           {"b2t_exists":false,"func_exists":false,"run":"run-04","surf_exists":false,"surf_target_exists":false,"task":"task-rest"}]
+
+      # Same indirection the cloudpipe template uses, so these cannot drift
+      # from the cluster's config.
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  templates:
+    - name: probe
+      # templateRef, NOT a copy of the step. A copy would drift from the
+      # template being diagnosed and silently measure something else. This
+      # resolves the live `registration` WorkflowTemplate, so it inherits the
+      # image, the resources block, the four pinned thread-pool env vars, the
+      # deliberately UNPINNED BLAS vars, and the [host]/[cgroup]/[staged]
+      # sampler — all of which are the thing under test.
+      #
+      # NOTE the WorkflowTemplate is named `registration`; the filename
+      # `registration-workflow-template.yaml` is not its name.
+      steps:
+        - - name: bold-to-t1w
+            templateRef:
+              name: registration
+              template: bold-to-t1w-session-template
+            arguments:
+              parameters:
+                - name: session
+                  value: "{{workflow.parameters.session}}"
+                - name: runs
+                  value: "{{workflow.parameters.runs}}"
+                - name: nss-frames
+                  value: "{{workflow.parameters.nss-frames}}"

@@ -11,15 +11,29 @@ spec:
       workflows.argoproj.io/title: "{{workflow.parameters.subjID}}"
       workflows.argoproj.io/description: "{{workflow.parameters.subjID}}"
     labels:
+      pipeline: cloudpipe
       subjectid: "{{workflow.parameters.subjID}}"
 
   retryStrategy:
-    limit: "3"
+    # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
+    # design, so consecutive reclaims on one long step are routine (2 back-to-back
+    # observed 2026-08-03). At limit 3, four in a row lose the subject outright.
+    # See issue #115.
+    limit: "8"
     retryPolicy: Always
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
+    # never emitted by our scripts. 75 = EX_TEMPFAIL, reserved for the "a reclaim
+    # truncated my output, re-run me" guards in the fastsurfer templates. 137 is
+    # deliberately absent: a real OOMKill here is deterministic (#120, #129, #134
+    # each needed a config change, not a retry), so retrying it only burns the
+    # enlarged budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
     backoff:
       duration: "1m"
       factor: "2"
+      # cap bounds each individual delay (maxDuration would abort the retries
+      # instead): 1+2+4+5+5+5+5+5 = 32m worst case, vs 7m at the old limit of 3.
+      cap: "5m"
 
   podMetadata:
     annotations:
@@ -28,33 +42,17 @@ spec:
       app: cloudpipe
       subjectid: "{{workflow.parameters.subjID}}"
 
-  # Create the following persistent volume claim for this workflow
-  volumeClaimTemplates:
-    # Naming the volume claim after the subject ID (for tracking)
-    - metadata:
-        # "Name" should be used to reference this PVC further down the workflow
-        name: "{{=lower(workflow.parameters.subjID)}}"
-        # Specify a string that will be appended to the string created by generateName in the workflow metadata
-        # By introducing the random character sequence from the metadata, we create a unique PVC for each workflow
-        # run, even if it's for the same subject ID. Neat!
-        generateName: "{{=lower(workflow.parameters.subjID)}}"
-      spec:
-        accessModes: [ "ReadWriteMany" ]
-        storageClassName: efs-sc
-        resources:
-          requests:
-            storage: 50Gi
+  # No workflow-scoped PVC (GitHub #77): subregion-seg, the last consumer of
+  # the shared EFS volume, moved to per-pod emptyDirs + S3 checkpointing. See
+  # docs/decisions/004-s3-artifacts-for-inter-step-data.md.
 
-  # Workflow pods should be deleted on workflow completion
+  # Workflow pods should be deleted when they succeed, leaving only failed pods for debugging.
+  # This is the default behavior, but we explicitly specify it here for clarity.
   podGC:
-    strategy: OnWorkflowCompletion
+    strategy: OnPodSuccess
 
   # Maximum workflow runtime (https://argo-workflows.readthedocs.io/en/latest/walk-through/timeouts/)
   activeDeadlineSeconds: 43200
-
-  # Clean up persistent volume claims when the workflow completes (success or failure)
-  volumeClaimGC:
-    strategy: OnWorkflowCompletion
 
   # IRSA for running the workflow
   serviceAccountName: argo-workflows-runner
@@ -85,6 +83,17 @@ spec:
           configMapKeyRef:
             name: cloudpipe-config
             key: bucket
+
+      # Dedicated, versioned metrics bucket — set by Terraform in
+      # cloudpipe-config. Kept separate from `bucket` so QC records survive the
+      # derivative flushes that precede every test batch, and so nothing that
+      # deletes derivatives holds delete permission on the run of record.
+      # See terraform/metrics_bucket.tf.
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
 
       # ECR Public registry prefix — set by Terraform in cloudpipe-config.
       # Override at submission time to pull images from a different registry.
@@ -122,7 +131,9 @@ spec:
   # This is the master DAG for the entire pipeline
   - name: master-pipeline-dag
 
-    # Maximum number of pods (job steps) that can run at any one time
+    # Limits concurrent major-phase pods within a single subject's workflow.
+    # Prevents simultaneous GPU + CPU-heavy tasks from saturating a node;
+    # at most 3 task pods (e.g. anatomical + 2 session instances) run at once.
     parallelism: 3
     dag:
       # Do NOT stop the workflow if one part of the DAG fails
@@ -136,6 +147,26 @@ spec:
           templateRef:
             name: globus-transfer
             template: start-globus-instance-template
+
+        # Records the real wall-clock time the DAG began running, for the exit
+        # handler's pending_duration_s (#147). No `depends`, so it starts
+        # immediately alongside start-globus-instance-dagtask. Written to S3
+        # rather than threaded through workflow.outputs.parameters: Argo's
+        # onExit templates never see workflow-level outputs in `argo lint
+        # --offline`'s static resolution (confirmed against argo v4.0.7 with
+        # the documented globalName export — lint still fails), even though
+        # it works at runtime. S3 is the channel StepOutcome already uses for
+        # this kind of cross-step signal, and it isn't lint-fragile.
+        - name: record-workflow-start-dagtask
+          templateRef:
+            name: metrics-exit-handler
+            template: record-workflow-start-template
+          arguments:
+            parameters:
+              - name: workflow-name
+                value: '{{workflow.name}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
 
         # Pull all subject files from the remote Globus collection directly into
         # the cloudpipe S3 bucket via the GCS S3 storage gateway.
@@ -189,15 +220,24 @@ spec:
           arguments:
             parameters:
               # Extract session strings from the enriched inventory array for anatomical templates,
-              # which expect a flat ["ses-00A", "ses-02A", ...] list.
+              # which expect a flat ["ses-00A", "ses-02A", ...] list. Filtered to sessions with a
+              # T1w source in S3 — not every longitudinal session has an anatomical scan, and
+              # feeding an anat-less session into FastSurfer template creation crashes the
+              # download-t1w-inputs step (see cloudpipe-wpft5 incident).
               - name: T1w_sessions
-                value: '{{= toJson(map(jsonpath(tasks["subject-data-inventory-dagtask"].outputs.result, "$[*]"), {#.session})) }}'
+                value: '{{= toJson(map(filter(jsonpath(tasks[''subject-data-inventory-dagtask''].outputs.result, "$[*]"), {#.t1w_available == true}), {#.session})) }}'
           # Skip anatomical processing if the FastSurfer derivatives were already created
           when: '{{tasks.subject-data-inventory-dagtask.outputs.parameters.fastsurfer-exists}} == "False"'
 
         # Run registration and functional preprocessing per session once anatomical
         # derivatives are available. Depends on anatomical succeeding OR being
         # skipped (derivatives already exist).
+        # Fans out per-session processing over sessions with a T1w source discovered by
+        # inventory. Sessions without a T1w scan are excluded — they have no FastSurfer
+        # template/derivatives to register against — so their BOLD data is intentionally
+        # left unprocessed.
+        # Each instance runs registration then functional preprocessing sequentially.
+        # All instances start simultaneously, subject to the master parallelism: 3 limit.
         - name: session-level-pipeline-dagtask
           template: session-level-pipeline-dag-template
           depends: "anatomical-processing-pipeline-dagtask.Succeeded || anatomical-processing-pipeline-dagtask.Skipped"
@@ -211,7 +251,156 @@ spec:
                 value: '{{item.nss_frames}}'
               - name: t1w-to-mni-exists
                 value: '{{item.t1w_to_mni_exists}}'
-          withParam: '{{tasks.subject-data-inventory-dagtask.outputs.result}}'
+          withParam: '{{= toJson(filter(jsonpath(tasks[''subject-data-inventory-dagtask''].outputs.result, "$[*]"), {#.t1w_available == true})) }}'
+
+        # Subcortical subfield/subregion segmentation (thalamus, brainstem,
+        # hippo-amygdala, hypothalamic, ScLimbic). Runs as a single sequential
+        # pod in parallel with the session-level (functional preprocessing)
+        # branch — same anatomical gate as that branch, so it starts once the
+        # longitudinal FastSurfer derivatives are in S3 (written by the anatomical
+        # phase on a fresh run, or already present on a reprocess). Each of the
+        # template's two segmentation pods stages those derivatives onto its own
+        # private emptyDir directly (no shared volume — GitHub #77). Skipped
+        # only when all five subregion output tarballs already exist — hippoamyg
+        # is part of that gate, so a subject segmented before hippo-amygdala was
+        # added re-enters this phase to acquire it.
+        - name: subregion-segmentation-dagtask
+          templateRef:
+            name: subregion-seg
+            template: subregion-seg-dag-template
+          depends: "anatomical-processing-pipeline-dagtask.Succeeded || anatomical-processing-pipeline-dagtask.Skipped"
+          when: '{{tasks.subject-data-inventory-dagtask.outputs.parameters.subregions-exist}} == "False"'
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: '{{= toJson(map(filter(jsonpath(tasks[''subject-data-inventory-dagtask''].outputs.result, "$[*]"), {#.t1w_available == true}), {#.session})) }}'
+
+        # fsqc anatomical QC — one pod per subject, covering all sessions.
+        # A third sibling of session-level-pipeline-dagtask and
+        # subregion-segmentation-dagtask, but with a CONJOINED gate: fsqc reads
+        # derivatives from both the anatomical branch (per-session FastSurfer
+        # templated tarballs) and the subregion branch (hippoamyg, hypothalamic),
+        # so unlike its two siblings it cannot start on the anatomical gate alone.
+        #
+        # `.Skipped` is required on BOTH halves, and for different reasons:
+        #   anatomical  — Skipped when FastSurfer derivatives already exist.
+        #   subregion   — that task is `when:`-gated on subregions-exist ==
+        #                 "False", so on any already-segmented subject it reports
+        #                 Skipped. Without `.Skipped` here, fsqc would never run
+        #                 on a reprocess, which is most of them.
+        #
+        # No `when:` clause of its own, deliberately: there is no metrics-exist
+        # gate in this change. Recomputation is the idempotency mechanism — see
+        # the template's header and the change's design.md § Idempotency.
+        #
+        # Failure is non-fatal to the workflow by construction: master DAG
+        # failFast is false and nothing depends on this task, so a QC failure
+        # cannot hold back registration, functional preprocessing, or the
+        # derivatives themselves.
+        - name: fsqc-metrics-dagtask
+          templateRef:
+            name: fsqc-metrics
+            template: fsqc-metrics-template
+          depends: >-
+            (anatomical-processing-pipeline-dagtask.Succeeded ||
+             anatomical-processing-pipeline-dagtask.Skipped) &&
+            (subregion-segmentation-dagtask.Succeeded ||
+             subregion-segmentation-dagtask.Skipped)
+
+        # Record fsqc-metrics outcome (non-fatal). Runs on all terminal
+        # statuses, including Skipped — which here means an upstream branch
+        # failed rather than that the work was already done, since the task
+        # itself carries no `when:` clause.
+        - name: record-outcome-fsqc-metrics-dagtask
+          depends: >-
+            fsqc-metrics-dagtask.Succeeded ||
+            fsqc-metrics-dagtask.Failed ||
+            fsqc-metrics-dagtask.Skipped
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fsqc-metrics
+              - name: status
+                value: '{{tasks.fsqc-metrics-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        # Record subregion-segmentation phase outcome (non-fatal). Runs on all
+        # terminal statuses, including Skipped (outputs already existed).
+        - name: record-outcome-subregion-seg-dagtask
+          depends: >-
+            subregion-segmentation-dagtask.Succeeded ||
+            subregion-segmentation-dagtask.Failed ||
+            subregion-segmentation-dagtask.Skipped
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: subregion-segmentation
+              - name: status
+                value: '{{tasks.subregion-segmentation-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        # Record anatomical phase outcome (phase-level: covers all FastSurfer steps).
+        # Runs unconditionally — succeeds, fails, or was skipped (derivatives existed).
+        - name: record-outcome-anatomical-dagtask
+          depends: >-
+            anatomical-processing-pipeline-dagtask.Succeeded ||
+            anatomical-processing-pipeline-dagtask.Failed ||
+            anatomical-processing-pipeline-dagtask.Skipped
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: anatomical-phase
+              - name: status
+                value: '{{tasks.anatomical-processing-pipeline-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        # Record session-level pipeline outcome (aggregate over all sessions).
+        # Fine-grained per-step outcomes for each session are recorded within the
+        # session-level and registration sub-DAGs.
+        - name: record-outcome-session-dagtask
+          depends: >-
+            session-level-pipeline-dagtask.Succeeded ||
+            session-level-pipeline-dagtask.Failed ||
+            session-level-pipeline-dagtask.Skipped
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: session-phase
+              - name: status
+                value: '{{tasks.session-level-pipeline-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
 
 #######################################
 #----- Anatomical Processing DAG -----#
@@ -223,10 +412,13 @@ spec:
         - name: T1w_sessions
     dag:
       tasks:
-        - name: fastsurfer-template-creation-dagtask
+        # Template creation + segmentation in one pod. Both are gpu-nodepool and
+        # strictly sequential, so splitting them cost a second GPU node provision
+        # plus an S3 round-trip of the whole template for no parallelism gain.
+        - name: fastsurfer-template-build-dagtask
           templateRef:
             name: fast-tmpl
-            template: fastsurfer-template-creation-template
+            template: fastsurfer-template-build-template
           arguments:
             parameters:
               - name: fastsurfer-command-string
@@ -238,48 +430,52 @@ spec:
                         "/anat/" + workflow.parameters.subjID + "_" + # + "_run-01_T1w.nii.gz"}), " ") +
                      " --tpids " +
                      join(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), " ") +
-                     " --threads 8" }}
+                     " --threads 1" }}
+              - name: seg-argstring
+                value: >-
+                  {{= "--sid " + workflow.parameters.subjID +
+                     "_template --sd /work/subjects --base --edits --seg_only --threads 1" }}
               - name: T1w_sessions
                 value: "{{inputs.parameters.T1w_sessions}}"
 
-        - name: fastsurfer-template-segmentation-dagtask
-          templateRef:
-            name: fast-tmpl
-            template: fastsurfer-template-segmentation-template
-          depends: fastsurfer-template-creation-dagtask
-          arguments:
-            parameters:
-              - name: argstring
-                value: >-
-                  {{= "--sid " + workflow.parameters.subjID +
-                     "_template --sd /opt/freesurfer/subjects --base --edits --seg_only --threads 4" }}
-
+        # NOTE: no --threads here. The step appends it from its own cpu request via
+        # the downward API, so the resources block is the single source of truth and
+        # cpu cannot drift from threads across two files. See fast-tmpl.
         - name: fastsurfer-template-parcellation-dagtask
           templateRef:
             name: fast-tmpl
             template: fastsurfer-template-parcellation-template
-          depends: fastsurfer-template-segmentation-dagtask
+          depends: fastsurfer-template-build-dagtask
           arguments:
             parameters:
               - name: argstring
                 value: >-
                   {{= "--sid " + workflow.parameters.subjID +
-                     "_template --sd /opt/freesurfer/subjects --surf_only --base --edits --3T --fsaparc --threads 4" }}
+                     "_template --sd /work/subjects --surf_only --base --edits --3T --fsaparc" }}
 
         - name: fastsurfer-long-segmentation-dagtask
           templateRef:
             name: fast-long
             template: fastsurfer-long-segmentation-template
-          depends: fastsurfer-template-segmentation-dagtask
+          # Depends only on the template build, not parcellation — the base brain model
+          # from seg_only is sufficient to start longitudinal segmentation. Waiting for
+          # surface reconstruction (parcellation) would add ~30 min of unnecessary latency.
+          depends: fastsurfer-template-build-dagtask
           arguments:
             parameters:
               - name: argstring
                 value: >-
                   {{= "--subjects " +
                      join(map(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), {# + "=from-base"}), " ") +
-                     " --sd /opt/freesurfer/subjects --seg_only --edits --fsaparc --long " +
-                     workflow.parameters.subjID + "_template --threads 4" }}
+                     " --sd /work/subjects --seg_only --edits --fsaparc --long " +
+                     workflow.parameters.subjID + "_template --threads 1" }}
 
+        # NOTE: no --threads here. It used to be a ternary (1 session → 6, 2 → 3,
+        # 3+ → 2) that had to be kept equal to the fast-long cpu request by hand,
+        # across two files. The step now derives it as `cpu_request / k` from the
+        # downward API, which reproduces the same per-instance counts exactly at
+        # every k and cannot drift. --parallel stays here: it is a function of the
+        # session count, not of the CPU budget.
         - name: fastsurfer-long-parcellation-dagtask
           templateRef:
             name: fast-long
@@ -291,12 +487,66 @@ spec:
                 value: >-
                   {{= "--subjects " +
                      join(map(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), {# + "=from-base"}), " ") +
-                     " --sd /opt/freesurfer/subjects --surf_only --edits --3T --long " +
+                     " --sd /work/subjects --surf_only --edits --3T --long " +
                      workflow.parameters.subjID + "_template" +
-                     " --parallel " + string(len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))) +
-                     " --threads 2" }}
+                     " --parallel " + string(len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))) }}
               - name: T1w_sessions
                 value: "{{inputs.parameters.T1w_sessions}}"
+
+        # Outcome recording — one data-driven loop over all four FastSurfer
+        # steps, non-fatal. Collapsed from four near-identical tasks (#73):
+        # Argo resolves a DAG task's `depends` statically before withItems
+        # expansion, so a single loop can only share ONE combined gate across
+        # its items, not a per-item dependency. That's fine here because the
+        # four producers are already a near-serial chain (build -> parc/long-seg
+        # -> long-parc), so waiting on all four before recording costs
+        # negligible extra latency. Do NOT apply this pattern to producers that
+        # run in parallel with independent finish times (see the top-level
+        # anatomical/subregion-seg/session recorders below, deliberately left
+        # unmerged) — that would delay early-failure visibility.
+        #
+        # Covers template creation AND segmentation, which now share a pod. The
+        # step name stays `fastsurfer-template` so historical StepOutcome
+        # records remain comparable; `fastsurfer-template-seg` is retired with
+        # the split.
+        - name: record-outcome-fastsurfer-dagtask
+          depends: >-
+            (fastsurfer-template-build-dagtask.Succeeded ||
+             fastsurfer-template-build-dagtask.Failed ||
+             fastsurfer-template-build-dagtask.Skipped) &&
+            (fastsurfer-template-parcellation-dagtask.Succeeded ||
+             fastsurfer-template-parcellation-dagtask.Failed ||
+             fastsurfer-template-parcellation-dagtask.Skipped) &&
+            (fastsurfer-long-segmentation-dagtask.Succeeded ||
+             fastsurfer-long-segmentation-dagtask.Failed ||
+             fastsurfer-long-segmentation-dagtask.Skipped) &&
+            (fastsurfer-long-parcellation-dagtask.Succeeded ||
+             fastsurfer-long-parcellation-dagtask.Failed ||
+             fastsurfer-long-parcellation-dagtask.Skipped)
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: '{{item.step}}'
+              - name: status
+                value: '{{item.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+          withItems:
+            - step: fastsurfer-template
+              status: '{{tasks.fastsurfer-template-build-dagtask.status}}'
+            - step: fastsurfer-template-parc
+              status: '{{tasks.fastsurfer-template-parcellation-dagtask.status}}'
+            - step: fastsurfer-long-seg
+              status: '{{tasks.fastsurfer-long-segmentation-dagtask.status}}'
+            - step: fastsurfer-long-parc
+              status: '{{tasks.fastsurfer-long-parcellation-dagtask.status}}'
 
 
 ##################################################
@@ -333,8 +583,18 @@ spec:
 
         # Functional preprocessing runs once per (session, task, run) after all
         # registration steps (t1w-to-mni + bold-to-t1w) have completed.
+        #
+        # registration-dagtask reports Succeeded even when t1w-to-mni-step
+        # failed (its outcome-recorder absorbs the failure), so gate
+        # explicitly on the real t1w-to-mni-step outcome: every func-preproc
+        # task in this session needs the shared t1w-to-mni transform, and
+        # spinning up cpu-heavy-nodepool pods just to fail on a missing
+        # artifact download is wasted cost.
         - name: functional-preprocessing-dagtask
           depends: registration-dagtask.Succeeded
+          when: >-
+            '{{tasks.registration-dagtask.outputs.parameters.t1w-to-mni-status}}' == 'Succeeded' ||
+            '{{tasks.registration-dagtask.outputs.parameters.t1w-to-mni-status}}' == 'Skipped'
           template: functional-preprocessing-session-level-dag-template
           arguments:
             parameters:
@@ -347,12 +607,11 @@ spec:
 
 ########################################################
 #----- Functional Preprocessing Per-Session DAG ------#
-# Fans out func-preproc over all (task, run) pairs     #
-# discovered during the registration phase.            #
+# One func-preproc pod per session; the loop over all  #
+# (task, run) pairs lives inside that pod.             #
 ########################################################
 
   - name: functional-preprocessing-session-level-dag-template
-    parallelism: 2
     inputs:
       parameters:
         - name: session
@@ -362,22 +621,134 @@ spec:
     dag:
       failFast: false
       tasks:
+        # Single pod per session — previously one pod per (task, run), each
+        # paying node provisioning, an AFNI image pull and a redundant
+        # re-download of the same per-session FastSurfer tarball. The whole task
+        # is skipped when inventory found an output tarball for every run, so a
+        # fully-complete session never provisions a node.
         - name: functional-preprocessing-dagtask
           templateRef:
             name: functional-preprocessing
-            template: functional-preprocessing-template
+            template: functional-preprocessing-session-template
           arguments:
             parameters:
               - name: session
                 value: '{{inputs.parameters.session}}'
-              - name: task
-                value: '{{item.task}}'
-              - name: run
-                value: '{{item.run}}'
+              - name: runs
+                value: '{{inputs.parameters.bold-runs}}'
               - name: nss-frames
                 value: '{{inputs.parameters.nss-frames}}'
-          withParam: '{{inputs.parameters.bold-runs}}'
-          when: "'{{item.func_exists}}' != 'true'"
+          # Bracket access, not inputs.parameters.bold-runs — expr would read the
+          # hyphen as subtraction.
+          #
+          # Runs when EITHER derivative is missing for any run: the volumetric
+          # tarball (func_exists) or the grayordinate components (surf_exists).
+          # A run with the volumetric output but no grayordinates still needs
+          # this pod, on preproc.py's short path.
+          when: '{{= len(filter(jsonpath(inputs.parameters[''bold-runs''], "$[*]"), {#.func_exists == false || #.surf_exists == false})) }} > 0'
+
+        # Fallback aggregate records — functional-preprocessing-session-template
+        # now records its own per-run outcomes for both derivatives directly
+        # before it exits (see ADR 016), so these only fire when there is no
+        # worker pod to have recorded anything: the step was skipped (every
+        # run already complete) or the pod died before it could write its own
+        # records. Never on bare success, so a healthy session pays for zero
+        # recorder pods instead of up to 2 * (session's run count).
+        #
+        # status only — no exit-code or output-parameter reference. See ADR
+        # 016: referencing functional-preprocessing-dagtask's outputs here
+        # deadlocks the session DAG whenever it is Skipped.
+        - name: record-outcome-func-preproc-dagtask
+          depends: functional-preprocessing-dagtask.Failed || functional-preprocessing-dagtask.Skipped
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: func-preproc
+              - name: status
+                value: '{{tasks.functional-preprocessing-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: session
+                value: '{{inputs.parameters.session}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        # Stage 1 (grayordinate extraction) has no Argo task of its own — it
+        # runs inside the func-preproc pod — so this fallback hangs off the
+        # same producer task and distinguishes itself only by `step:`.
+        - name: record-outcome-surface-sample-dagtask
+          depends: functional-preprocessing-dagtask.Failed || functional-preprocessing-dagtask.Skipped
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: surface-sample
+              - name: status
+                value: '{{tasks.functional-preprocessing-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: session
+                value: '{{inputs.parameters.session}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        # Stage 2: resample cortex to fsLR 32k and assemble the CIFTI dtseries.
+        # Depends on the func-preproc task rather than on registration, because
+        # it consumes the grayordinate components that task produces. Runs on
+        # Failed too: func-preproc fails only when EVERY run failed, and a
+        # partial failure still leaves usable components for its siblings.
+        - name: surface-resample-dagtask
+          depends: >-
+            functional-preprocessing-dagtask.Succeeded ||
+            functional-preprocessing-dagtask.Failed ||
+            functional-preprocessing-dagtask.Skipped
+          templateRef:
+            name: surface-resample
+            template: surface-resample-session-template
+          arguments:
+            parameters:
+              - name: session
+                value: '{{inputs.parameters.session}}'
+              - name: runs
+                value: '{{inputs.parameters.bold-runs}}'
+          # Skip when every run already has its dtseries. Note this reads the
+          # inventory taken at submission, so a run whose components were only
+          # just written still shows surf_target_exists false — which is what
+          # we want, since it does need assembling.
+          when: '{{= len(filter(jsonpath(inputs.parameters[''bold-runs''], "$[*]"), {#.surf_target_exists == false})) }} > 0'
+
+        # Fallback aggregate record — surface-resample-session-template now
+        # records its own per-run outcomes directly (see ADR 016). Fires only
+        # on Failed || Skipped (surface-resample is skipped once every
+        # dtseries already exists), never on bare success.
+        - name: record-outcome-surface-resample-dagtask
+          depends: surface-resample-dagtask.Failed || surface-resample-dagtask.Skipped
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: surface-resample
+              - name: status
+                value: '{{tasks.surface-resample-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: session
+                value: '{{inputs.parameters.session}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
 
 ##################################################
 #----- Workflow Exit Handler -----#
@@ -405,8 +776,8 @@ spec:
               value: '{{workflow.creationTimestamp}}'
             - name: duration-s
               value: '{{workflow.duration}}'
-            - name: bucket
-              value: '{{workflow.parameters.bucket}}'
+            - name: metrics-bucket
+              value: '{{workflow.parameters.metrics-bucket}}'
             - name: pipeline
               value: cloudpipe_minproc
     - - name: delete-globus-input
@@ -427,7 +798,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

@@ -1,0 +1,40 @@
+# Throwaway debug GPU pod for T1w->MNI re-run experiments (Phase 5).
+# NOT managed by ArgoCD. Delete when done:  kubectl -n argo-workflows delete pod fst1w-rerun-debug
+#
+# Inputs are copied in with `kubectl cp` (orig.mgz, brainmask.mgz, MNI template)
+# rather than pulled from S3 in-cluster, so no IRSA/S3 plumbing is needed:
+#   kubectl -n argo-workflows cp <local>/orig.mgz      fst1w-rerun-debug:/work/orig.mgz
+#   kubectl -n argo-workflows cp <local>/brainmask.mgz fst1w-rerun-debug:/work/brainmask.mgz
+#   kubectl -n argo-workflows cp <local>/mni.nii       fst1w-rerun-debug:/work/mni.nii
+# Then run experiments (one knob per invocation), capturing the "QC:" stdout line:
+#   kubectl -n argo-workflows exec fst1w-rerun-debug -- python /app/fst1w_to_mni.py \
+#     --t1w /work/orig.mgz --brainmask /work/brainmask.mgz --template /work/mni.nii \
+#     --out-dir /work/out --prefix rerun --subj SUBJ --ses SES <EXTRA_ARGS>
+#
+# Image tag mirrors t1w-to-mni-template in registration-workflow-template.yaml
+# (re-check that file for the current pinned sha before use).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fst1w-rerun-debug
+  namespace: argo-workflows
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    karpenter.sh/nodepool: gpu-nodepool
+  containers:
+    - name: rerun
+      image: public.ecr.aws/l9e7l1h1/cloudpipe/fireants:sha-9620b80d0a343bc97ef27044764697c3c59a3702
+      command: ["sleep", "infinity"]
+      resources:
+        requests:
+          memory: 4G
+          cpu: "2"
+        limits:
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: work
+          mountPath: /work
+  volumes:
+    - name: work
+      emptyDir: {}

@@ -40,12 +40,12 @@ resource "aws_vpc_security_group_egress_rule" "db" {
 }
 
 resource "aws_db_instance" "this" {
-  identifier        = "${var.cluster_name}-prefect"
-  engine            = "postgres"
-  engine_version    = var.db_engine_version
-  instance_class    = var.db_instance_class
-  db_name           = var.db_name
-  username          = var.db_username
+  identifier     = "${var.cluster_name}-prefect"
+  engine         = "postgres"
+  engine_version = var.db_engine_version
+  instance_class = var.db_instance_class
+  db_name        = var.db_name
+  username       = var.db_username
   # Native secret management and rotation for this password
   manage_master_user_password = true
 

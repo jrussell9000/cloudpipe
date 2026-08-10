@@ -18,7 +18,7 @@ deployments:
         finished_job_ttl: 60
     schedules: []
     parameters:
-      subjects_file: s3://abcd-v7/subjects.csv
+      subjects_file: s3://<YOUR_S3_BUCKET>/subjects.csv
       start_index: 0
 
   - name: first-level-queue-manager
@@ -33,7 +33,7 @@ deployments:
         finished_job_ttl: 60
     schedules: []
     parameters:
-      subjects_file: s3://abcd-v7/first-level-subjects.csv
+      subjects_file: s3://<YOUR_S3_BUCKET>/first-level-subjects.csv
       start_index: 0
 
   - name: kubecost-cost-scraper
@@ -49,8 +49,42 @@ deployments:
     schedules:
       - cron: "0 2 * * *"
         timezone: UTC
-        active: false
+        active: true
     parameters:
-      bucket: abcd-v7
+      # Metrics run of record — the dedicated versioned bucket, NOT the <YOUR_S3_BUCKET>
+      # data bucket. Cost records must land where the Glue `costs` table reads
+      # (cloudpipe-metrics/metrics/costs/); pointing this at <YOUR_S3_BUCKET> silently
+      # orphans them from Athena. See terraform/metrics_bucket.tf.
+      bucket: cloudpipe-metrics
       region: <YOUR_AWS_REGION>
       pipeline: cloudpipe_minproc
+
+  - name: metrics-compactor
+    entrypoint: ./flows/metrics_compactor_flow.py:metrics_compactor
+    work_pool:
+      name: cloudpipe-k8s-pool
+      job_variables:
+        namespace: prefect
+        service_account_name: prefect-worker
+        image: public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
+        image_pull_policy: Always
+        finished_job_ttl: 60
+    schedules:
+      # 30 min after kubecost-cost-scraper's 0 2 * * * run, so yesterday's
+      # costs records exist before that day is ever compacted.
+      - cron: "30 2 * * *"
+        timezone: UTC
+        active: true
+    parameters:
+      bucket: cloudpipe-metrics
+      region: <YOUR_AWS_REGION>
+      # Must stay > kubecost_scraper.SETTLED_AGE_DAYS (3). The 02:00 scrape
+      # re-scrapes the report-date 3 days back with reconciled costs; anchored
+      # on yesterday, a lookback of 4 re-compacts dt=today-4..today-1 and so
+      # covers it. At lookback_days: 1 the Parquet copy of that day would keep
+      # the unreconciled day+1 numbers forever while the raw JSON held settled
+      # ones, and `costs(compacted=True)` reads Parquet for every closed day.
+      # Compaction is idempotent, so the extra days cost only S3 reads (plus a
+      # Put per orphan schema_version= partition it reconciles away — see #180;
+      # a version bump inside this window is exactly what strands one).
+      lookback_days: 4

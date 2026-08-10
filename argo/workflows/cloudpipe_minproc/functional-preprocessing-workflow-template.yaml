@@ -6,12 +6,24 @@ metadata:
 
 spec:
   retryStrategy:
-    limit: "5"
+    # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
+    # design, so consecutive reclaims on one long step are routine (2 back-to-back
+    # observed 2026-08-03). See issue #115.
+    limit: "8"
     retryPolicy: Always
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
+    # never emitted by our scripts. 75 = EX_TEMPFAIL, reserved for the "a reclaim
+    # truncated my output, re-run me" guards in the fastsurfer templates. 137 is
+    # deliberately absent: a real OOMKill here is deterministic (#120, #129, #134
+    # each needed a config change, not a retry), so retrying it only burns the
+    # enlarged budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
     backoff:
       duration: "1m"
       factor: "2"
+      # cap bounds each individual delay (maxDuration would abort the retries
+      # instead): 1+2+4+5+5+5+5+5 = 32m worst case.
+      cap: "5m"
 
   podMetadata:
     labels:
@@ -43,8 +55,9 @@ spec:
     parameters:
       - name: subjID
       - name: session
-      - name: task
-      - name: run
+      # JSON array of the session's runs, as produced by inventory:
+      #   [{"task": "rest", "run": "run-01", "func_exists": false}, ...]
+      - name: runs
       - name: nss-frames
       - name: bucket
         valueFrom:
@@ -63,123 +76,158 @@ spec:
 
   ###########################################################################
   # Standalone entrypoint — maps workflow-level parameters (subjID, session,
-  # task, run) to the template's input parameters so the template can be
-  # submitted directly without the registration steps wrapper.
+  # runs) to the template's input parameters so the template can be submitted
+  # directly without the registration steps wrapper.
   # Not used when called via templateRef from the registration workflow.
   ###########################################################################
 
   - name: functional-preprocessing-entrypoint
+    # Standalone submission entry point — maps workflow-level parameters to template
+    # inputs so this WorkflowTemplate can be submitted directly for testing or
+    # reprocessing. To reprocess a single run, pass a one-element runs array:
+    #   -p runs='[{"task":"rest","run":"run-01","func_exists":false}]'
+    # Not used when called via templateRef from the master pipeline.
     steps:
     - - name: functional-preprocessing
-        template: functional-preprocessing-template
+        template: functional-preprocessing-session-template
         arguments:
           parameters:
             - name: session
               value: '{{workflow.parameters.session}}'
-            - name: task
-              value: '{{workflow.parameters.task}}'
-            - name: run
-              value: '{{workflow.parameters.run}}'
+            - name: runs
+              value: '{{workflow.parameters.runs}}'
             - name: nss-frames
               value: '{{workflow.parameters.nss-frames}}'
 
   ###########################################################################
-  # Core template — called once per (session, task, run) from the master
-  # per-session DAG, after registration (t1w-to-mni + bold-to-t1w) completes.
+  # Core template — ONE pod per session, looping over that session's runs,
+  # called from the master per-session DAG after registration (t1w-to-mni +
+  # bold-to-t1w) completes.
   #
-  # Downloads from S3 → /tmp/bold_to_t1w/{task}_{run}:
-  #   …_desc-bold2t1w_brainmask.nii.gz
-  #   …_desc-bold2t1w_itk.txt
-  # Downloads from S3 → /tmp/t1w_to_mni:
-  #   …_desc-t1w2mni_affine.mat
-  #   …_desc-t1w2mni_warp.nii.gz
-  # Downloads from S3 → /tmp/fastsurfer/{subjID}_{session}:
-  #   mri/aseg.mgz  (for WM/CSF masks used in aCompCor)
+  # WHY ONE POD PER SESSION (cost): this step was previously fanned out per
+  # (task, run). Each pod pulled the large AFNI image, provisioned or waited on
+  # a cpu-heavy node, and re-downloaded the *same* per-session FastSurfer
+  # tarball, MNI template and t1w→MNI warp — a dozen times over for a dozen
+  # runs — for a few minutes of real compute. Looping inside one pod amortises
+  # all of that across the session.
+  # See docs/investigations/2026-07-20-cloudpipe-cost-reduction-deep-dive.md §3.2.
   #
-  # Downloads from S3:
-  #   BOLD (4D NIfTI) from mmps_mproc/
-  #   MNI152NLin2009cAsym reference template from config/
+  # Downloads from S3 (once per session, not once per run):
+  #   mmps_mproc/{subj}/{ses}/func/     → /data/func   every run's BOLD + sidecar + motion
+  #   derivatives/registration/{subj}/{ses}/ → /tmp/registration
+  #                                     t1w_to_mni/ and bold_to_t1w_{task}_{run}/
+  #   derivatives/fastsurfer/…_templated.tar.gz → /tmp/fastsurfer/{subj}_{ses}
+  #                                     (mri/aseg.auto.mgz for aCompCor WM/CSF masks)
+  #   config/MNI152NLin2009cAsym…       reference template
   #
-  # Uploads to S3:
+  #   derivatives/func/{subjID}/{session}/ → /tmp/existing_func  (optional)
+  #                                     only read on the grayordinate-only
+  #                                     short path, to recover an MNI BOLD
+  #                                     rather than recompute the warp chain
+  #
+  # Uploads to S3, one tarball per run (built by the driver — see the outputs):
   #   derivatives/func/{subjID}/{session}/
   #     {subjID}_{session}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
+  #   derivatives/func_surf/{subjID}/{session}/components/
+  #     {subjID}_{session}_{task}_{run}_desc-grayordcomponents_bold.tar.gz
+  #
+  # The two derivatives gate independently on inventory's func_exists and
+  # surf_exists, and --emit selects the cheapest path producing what is absent:
+  #   neither present → both        full pipeline
+  #   func only       → grayordinate  skips the composite warp and 4D warp
+  #   surf only       → volumetric    skips ribbon sampling
   ###########################################################################
 
-  - name: functional-preprocessing-template
+  - name: functional-preprocessing-session-template
     metadata:
       labels:
         cloudpipe.io/phase: functional
         cloudpipe.io/step: bold-preprocessing
         session: "{{inputs.parameters.session}}"
     retryStrategy:
-      limit: "6"
-      retryPolicy: OnFailure
-      expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+      # Per-template override of the spec-level budget. This is the pipeline's
+      # bottleneck step and it runs on spot-only cpu-heavy-nodepool, so it is the
+      # single most reclaim-exposed pod in the workflow. See issue #115.
+      limit: "8"
+      # Was OnFailure, which only half-honoured the spot clause below: a node
+      # shutdown lands in phase Failed (retried), but a reclaimed pod lands in
+      # phase Error (NOT retried under OnFailure). The expression is what filters
+      # retries; the policy just has to be permissive enough to let it run.
+      retryPolicy: Always
+      # Infrastructure codes only — see the spec-level block above for why 137 is
+      # deliberately absent and what 75 is reserved for.
+      expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
       backoff:
         duration: "1m"
         factor: "2"
+        cap: "5m"
     inputs:
       parameters:
         - name: session
-        - name: task
-        - name: run
+        # JSON array from inventory:
+        #   [{"task": ..., "run": ..., "b2t_exists": bool, "func_exists": bool}, ...]
+        - name: runs
         - name: nss-frames
+        # Runs processed concurrently inside the pod. Left at 1 (sequential) so
+        # each run gets the whole CPU request. Raising it splits --threads
+        # across jobs and multiplies peak memory — re-check the memory limit
+        # and the QC JSONs' peak_memory_gb before going above 1. Note the
+        # request is now 3 CPU (issue #96), so jobs=3 would leave one thread
+        # per run and jobs>3 would floor at 1 while still tripling peak memory.
+        - name: jobs
+          default: "1"
 
       artifacts:
-        - name: bold
-          path: /data/bold.nii.gz
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.nii.gz'
+        # Argo resolves inputs.artifacts statically when the pod spec is built,
+        # so a per-run list cannot be declared for a varying run count. Instead
+        # each per-run input arrives as one directory artifact covering the
+        # whole session; Argo fetches a prefix key recursively.
+        #
+        # NO TRAILING SLASH on these input keys — measured, not stylistic. When
+        # a prefix contains a zero-byte "directory marker" object whose key
+        # equals the prefix (the Globus S3 gateway leaves one under
+        # mmps_mproc/), a trailing slash makes Argo download *nothing* while
+        # still exiting 0. Without the slash the same prefix downloads
+        # correctly. Output artifacts are the opposite — they must keep the
+        # trailing slash (Argo docs: artifact GC).
 
-        - name: bids-sidecar
-          path: /data/bold.json
+        # Every run's _bold.nii.gz, _bold.json and _motion.tsv.
+        - name: func-inputs
+          path: /data/func
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.json'
+            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func'
 
         - name: mni-template
-          path: /data/MNI152NLin2009cAsym_T1w_brain.nii
+          path: /data/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: config/MNI152NLin2009cAsym_T1w_brain.nii
+            key: config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii
 
-        - name: motion-params
-          path: /data/motion.tsv
+        # The session's registration outputs: t1w_to_mni/ (shared by every run)
+        # and bold_to_t1w_{task}_{run}/ (per run). Pulled from S3 rather than a
+        # PVC so this template still runs standalone when bold-to-t1w was
+        # skipped on a rerun. Costs a few extra QC NIfTIs the driver ignores.
+        - name: registration-outputs
+          path: /tmp/registration
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_motion.tsv'
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}'
 
-        # bold-to-t1w outputs (brainmask + ITK affine) — uploaded to S3 by the
-        # bold-to-t1w step so func-preproc can run standalone without a PVC
-        # dependency and bold-to-t1w can be skipped on reruns.
-        - name: bold-to-t1w
-          path: '/tmp/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/bold_to_t1w_{{inputs.parameters.task}}_{{inputs.parameters.run}}.tar.gz'
-
-        # t1w-to-mni transforms — always downloaded from S3 so this template
-        # works standalone regardless of whether the registration step ran.
-        - name: t1w-to-mni-transforms
-          path: /tmp/t1w_to_mni
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni.tar.gz'
-
-        # FastSurfer outputs (for aseg.mgz → WM/CSF masks in aCompCor).
+        # FastSurfer outputs. Supplies mri/aseg.auto.mgz (WM/CSF masks for
+        # aCompCor, and the subcortical labels for the CIFTI volume block) and
+        # surf/?h.white + ?h.pial (the cortical ribbon).
+        # Downloaded and decompressed ONCE per session instead of once per run.
         - name: fastsurfer-output
           path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}'
           s3:
@@ -188,79 +236,652 @@ spec:
             region: <YOUR_AWS_REGION>
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
 
-    outputs:
-      artifacts:
-        - name: mni-bold
-          path: '/tmp/func/{{inputs.parameters.session}}/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: 'derivatives/func/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_space-MNI152NLin2009cAsym_bold.tar.gz'
-
-        - name: func-qc
-          path: '/tmp/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_qc.json'
+        # Existing volumetric derivatives, for the grayordinate-only short
+        # path: it skips the warp chain, so the CIFTI subcortical block needs
+        # the MNI BOLD recovered from the run's finished tarball rather than
+        # recomputed. optional + empty on a fresh session, where nothing here
+        # exists yet and nothing needs recovering.
+        - name: existing-func
+          optional: true
+          path: /tmp/existing_func
           archive:
             none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'metrics/func-preproc/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_qc.json'
+            key: 'derivatives/func/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}'
+
+    outputs:
+      artifacts:
+        # Per-run StepOutcome JSON records, written directly by the driver
+        # (see ADR 016) instead of a separate outcome-recorder pod per run.
+        # The driver knows each run's real success/failure the moment it
+        # happens; a sibling DAG task re-deriving the same fact from an S3
+        # head_object is strictly worse information at higher cost. Filenames
+        # match StepOutcome.s3_key() exactly, so this uploads straight into
+        # the existing metrics/step-outcomes/ layout Athena already reads.
+        # optional: a session where every run was already complete writes no
+        # local files here, only the fallback aggregate record covers a pod
+        # that dies before this `finally` block runs (see the master
+        # template's record-outcome-func-preproc-dagtask /
+        # record-outcome-surface-sample-dagtask).
+        - name: step-outcomes
+          optional: true
+          path: /tmp/step_outcomes
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.metrics-bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
+        # Per-run tarballs, built by the driver rather than by Argo's archiver:
+        # one static artifact declaration cannot emit N differently-named
+        # tarballs. The driver writes them with exactly the filename inventory
+        # treats as the func_exists completion marker, so this uploads to the
+        # same keys as the old per-run mni-bold artifact.
+        # optional: every run may have been skipped, leaving the dir empty.
+        - name: mni-bold
+          optional: true
+          path: /tmp/func_out
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/func/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/'
+
+        # Per-run QC JSONs, collected flat by the driver. Filenames are
+        # unchanged; only the destination prefix gained a dt= partition segment.
+        - name: func-qc
+          optional: true
+          path: /tmp/func_qc
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            # Metrics artifact → versioned metrics bucket, not the data bucket.
+            bucket: "{{workflow.parameters.metrics-bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'metrics/func-preproc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
+
+        # Per-run grayordinate components (Stage 1): per-hemisphere fsnative
+        # GIFTI plus the MNI subcortical block and its label volume. Built and
+        # named by the driver, same as the volumetric tarball — the filename is
+        # inventory's surf_exists marker.
+        - name: grayord-components
+          optional: true
+          path: /tmp/surf_out
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/components/'
+
+        # Session-level surface geometry (sphere.reg + midthickness as GIFTI),
+        # written once per session. Small, and the reason the Stage 2 pod can
+        # skip the FastSurfer tarball entirely.
+        - name: grayord-anat
+          optional: true
+          path: /tmp/surf_anat
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/anat/'
+
+        # Grayordinate QC from the short path. The full path folds its surface
+        # metrics into the func-preproc QC JSON instead, so this only carries
+        # runs that skipped the warp chain.
+        - name: surf-qc
+          optional: true
+          path: /tmp/surf_qc
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            # Metrics artifact → versioned metrics bucket, not the data bucket.
+            bucket: "{{workflow.parameters.metrics-bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'metrics/surface-sample/'
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
-    container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-91a27beb1e3c6a2f588b43e0ee234fd5be02de73"
       imagePullPolicy: IfNotPresent
 
       resources:
+        # TODO(perf): validate memory limits against observed peak usage in CloudWatch.
+        # The float16 BOLD output reduces Stage 3 peak substantially, but intermediate
+        # ANTs warp operations may exceed the 6G limit on longer runs. Check
+        # metrics/func-preproc QC JSONs for peak_memory_gb before adjusting.
+        # Memory is still sized for ONE run: runs execute sequentially at jobs=1.
         requests:
           memory: 4G
-          cpu: '6'
-          ephemeral-storage: 4G
+          # Was '6', measured down to '3' (issue #96): across 26
+          # bold-preprocessing pods in the 2026-07-30/31 ten-subject batch,
+          # cpu_efficiency averaged 0.347 — ~2.1 of 6 cores, the largest single
+          # CPU over-request in the batch. This step runs on the most contended
+          # nodepool and is the documented pipeline bottleneck, so the 3.9
+          # idle cores each pod held for ~19 min were also costing throughput:
+          # fewer pods fit per node than needed to.
+          #
+          # The driver does NOT hardcode this number — it reads it back out of
+          # the pod spec via the CPU_REQUEST env var below and derives
+          # --threads from it. Change this value alone and the thread count
+          # follows automatically.
+          cpu: '3'
+          # Was 4G for one run. Now holds the session's entire func/ prefix
+          # (every run's BOLD, ~0.3-0.5 GB each), the extracted FastSurfer tree
+          # (~2 GB), the registration prefix, plus the current run's
+          # intermediates and the finished tarballs awaiting upload. The driver
+          # deletes each run's working directory once tarred to bound this.
+          ephemeral-storage: 20G
         limits:
           memory: 6G
-          ephemeral-storage: 8G
+          ephemeral-storage: 30G
 
       env:
-        - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
-          value: '6'
+        # Provenance only — the driver strips the tag and stamps it into each QC
+        # JSON, which is otherwise blank and cannot say which build produced a
+        # result. Deliberately repeats the image ref above rather than deriving
+        # it: build-images.yaml re-pins image refs in this directory with a
+        # global sed, so it rewrites this one too and the pair cannot drift.
+        # (Keep any prose here clear of a literal image ref, or that sed will
+        # rewrite the comment on every build.) A workflow-level parameter would
+        # be the obvious alternative, but this template is also reached by
+        # templateRef from the master workflow, where {{workflow.parameters}}
+        # resolves against the *caller* — an undefined parameter there would
+        # break the image ref itself rather than just its provenance.
+        - name: CLOUDPIPE_IMAGE
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-91a27beb1e3c6a2f588b43e0ee234fd5be02de73"
 
-      command: [/entrypoint.sh, python, /app/preproc.py]
-      args:
-        - --bold
-        - /data/bold.nii.gz
-        - --bids-sidecar
-        - /data/bold.json
-        - --brainmask
-        - '/tmp/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_desc-bold2t1w_brainmask.nii.gz'
-        - --bold2t1w-affine
-        - '/tmp/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_desc-bold2t1w_itk.txt'
-        - --t1w2mni-affine
-        - '/tmp/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_affine.mat'
-        - --t1w2mni-warp
-        - '/tmp/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_warp.nii.gz'
-        - --mni-template
-        - /data/MNI152NLin2009cAsym_T1w_brain.nii
-        - --outdir
-        - '/tmp/func/{{inputs.parameters.session}}/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
-        - --subj
-        - '{{workflow.parameters.subjID}}'
-        - --session
-        - '{{inputs.parameters.session}}'
-        - --task
-        - '{{inputs.parameters.task}}'
-        - --run
-        - '{{inputs.parameters.run}}'
-        - --threads
-        - '6'
-        - --aseg
-        - '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/aseg.auto.mgz'
-        - --motion-file
-        - /data/motion.tsv
-        - --nss-frames
-        - '{{inputs.parameters.nss-frames}}'
-        - --pipeline
-        - cloudpipe_minproc
+        # Single source of truth for the CPU request: the driver derives
+        # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather
+        # than from a hardcoded constant, so the thread count cannot drift
+        # from the resources block above. (Before issue #96 the driver carried
+        # `CPU_REQUEST = 6` inline, coupled to the pod spec by convention
+        # only — editing one without the other would have left preproc.py
+        # spawning N threads inside a smaller cgroup share and throttling.)
+        #
+        # Deliberately resourceFieldRef and not a cgroup read: this container
+        # sets no CPU *limit*, so /sys/fs/cgroup/cpu.max reports "max" and
+        # carries no information about the request.
+        #
+        # containerName must be `main` — that is what Argo names the user
+        # container in a script template.
+        - name: CPU_REQUEST
+          valueFrom:
+            resourceFieldRef:
+              containerName: main
+              resource: requests.cpu
+              divisor: "1"
+
+      # NOTE: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS is no longer set here. The
+      # driver sets it per run alongside --threads, so that raising jobs splits
+      # the CPU request across concurrent runs instead of letting each one grab
+      # all 6 and over-subscribe the node.
+
+      # /entrypoint.sh sources the pixi shell-hook, then execs the interpreter
+      # against the script Argo stages — so the driver and everything it spawns
+      # run inside the activated afni environment.
+      command: [/entrypoint.sh, python, -u]
+      source: |
+        """Run preproc.py for every pending run in one session.
+
+        A failing run is logged and skipped rather than aborting the session:
+        the runs are independent, and one bad BOLD should not discard the
+        preprocessing already completed for its siblings.
+        """
+        import json
+        import os
+        import re
+        import shutil
+        import subprocess
+        import sys
+        import tarfile
+        import traceback
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        SUBJ = "{{workflow.parameters.subjID}}"
+        SES = "{{inputs.parameters.session}}"
+        NSS = "{{inputs.parameters.nss-frames}}"
+        JOBS = max(1, int("{{inputs.parameters.jobs}}"))
+        RUNS = json.loads(r"""{{inputs.parameters.runs}}""")
+        WORKFLOW_NAME = "{{workflow.name}}"
+
+        # See ADR 016 (docs/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
+        # this pod records its own StepOutcome facts rather than exposing them
+        # as a DAG output parameter for a sibling recorder task to read, which
+        # is what deadlocked the session DAG (dagval-330e63gh-tarerr2) whenever
+        # this task was skipped.
+        STEP_OUTCOMES_DIR = Path("/tmp/step_outcomes")
+        STEP_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Mirrors src/metrics/outcome_recorder.py's _TAXONOMY exactly — kept in
+        # sync by tests/images/afni/test_driver_gating.py::
+        # test_driver_taxonomy_matches_canonical. Duplicated inline rather than
+        # imported because this container has no access to src/metrics (see
+        # ADR 016 and issue #67).
+        _TAXONOMY: list[tuple[str, list[str]]] = [
+            (
+                "infrastructure",
+                [
+                    r"OOMKilled",
+                    r"exit\s+code\s+137",
+                    r"evicted",
+                    r"node\s+cordoned",
+                    r"deadline\s+exceeded",
+                    r"pod\s+unschedul",
+                    r"Unschedulable",
+                    r"insufficient\s+memory",
+                ],
+            ),
+            (
+                "data",
+                [
+                    r"NoSuchKey",
+                    r"NoSuchBucket",
+                    r"nss_volumes",
+                    r"missing\s+input",
+                    r"corrupt",
+                    r"Unable\s+to\s+open",
+                    r"Input\s+file\s+not\s+found",
+                ],
+            ),
+            (
+                "algorithm",
+                [
+                    r"AssertionError",
+                    r"ValueError",
+                    r"segmentation\s+fault",
+                    r"Segmentation\s+fault",
+                    r"SIGSEGV",
+                    r"RuntimeError",
+                    r"CalledProcessError",
+                    r"non-zero\s+exit\s+code",
+                    r"ERROR:",
+                ],
+            ),
+            (
+                "dependency",
+                [
+                    r"depended\s+on\s+task",
+                    r"upstream\s+task\s+failed",
+                    r"Skipped",
+                ],
+            ),
+        ]
+
+        def classify_failure(message):
+            msg = message or ""
+            for category, patterns in _TAXONOMY:
+                for pat in patterns:
+                    if re.search(pat, msg, re.IGNORECASE):
+                        return category
+            return "unknown"
+
+        def write_outcome(step, task, run, status, failure_reason=""):
+            record = {
+                "workflow_name": WORKFLOW_NAME,
+                "step": step,
+                "subject": SUBJ,
+                "session": SES,
+                "task": task,
+                "run": run,
+                "status": status,
+                "failure_category": "" if status == "succeeded" else classify_failure(failure_reason),
+                "failure_reason": failure_reason,
+                "upstream_failed_step": "",
+                "outputs_verified": [],
+                "pipeline": "cloudpipe_minproc",
+                "schema_version": "1.0",
+                "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            key = f"{WORKFLOW_NAME}__{step}__{SUBJ}__{SES}__{task}__{run}_outcome.json"
+            (STEP_OUTCOMES_DIR / key).write_text(json.dumps(record))
+
+        # Read back from this container's own resources block via the
+        # downward API (see the CPU_REQUEST env var in the template). Was a
+        # hardcoded `6` until issue #96; hardcoding meant a change to the pod
+        # spec silently left the thread count too high, over-subscribing the
+        # cgroup share and throttling the step. The fallback only applies if
+        # the env var is missing entirely, which would mean the template and
+        # this script have been separated.
+        CPU_REQUEST = max(1, int(os.environ.get("CPU_REQUEST") or 3))
+        THREADS = max(1, CPU_REQUEST // JOBS)
+
+        # Tag half of the container's own image ref, for QC provenance. Empty
+        # if the env var is unset, which preproc.py already tolerates.
+        IMAGE_TAG = os.environ.get("CLOUDPIPE_IMAGE", "").rpartition(":")[2]
+
+        FUNC_DIR = Path("/data/func")
+        REG_DIR = Path("/tmp/registration")
+        EXISTING_FUNC = Path("/tmp/existing_func")
+        WORK_ROOT = Path("/tmp/func")
+        OUT_DIR = Path("/tmp/func_out")
+        QC_DIR = Path("/tmp/func_qc")
+        SURF_OUT = Path("/tmp/surf_out")
+        SURF_QC = Path("/tmp/surf_qc")
+        ANAT_OUT = Path("/tmp/surf_anat")
+        for d in (WORK_ROOT, OUT_DIR, QC_DIR, SURF_OUT, SURF_QC, ANAT_OUT):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Shared across every run in the session — downloaded once.
+        T1W2MNI_AFFINE = REG_DIR / "t1w_to_mni" / f"{SUBJ}_{SES}_desc-t1w2mni_affine.mat"
+        T1W2MNI_WARP = REG_DIR / "t1w_to_mni" / f"{SUBJ}_{SES}_desc-t1w2mni_warp.nii.gz"
+        FS_ROOT = Path(f"/tmp/fastsurfer/{SUBJ}_{SES}")
+        ASEG = FS_ROOT / "mri" / "aseg.auto.mgz"
+        SURF_DIR = FS_ROOT / "surf"
+
+        # Grayordinate components are named for the CIFTI files Stage 2 builds
+        # from them, not for the surface alone — the tarball carries the
+        # cortical GIFTIs and the subcortical volume block together.
+        def surf_tarball(prefix):
+            return SURF_OUT / f"{prefix}_desc-grayordcomponents_bold.tar.gz"
+
+        # func_exists and surf_exists gate independently, so a run needs work if
+        # EITHER is missing. --emit picks the cheapest path that produces what
+        # is actually absent.
+        def emit_for(run):
+            if not run.get("func_exists") and not run.get("surf_exists"):
+                return "both"
+            if not run.get("surf_exists"):
+                return "grayordinate"
+            if not run.get("func_exists"):
+                return "volumetric"
+            return None
+
+        pending = [r for r in RUNS if emit_for(r) is not None]
+        print(f"[driver] {SES}: {len(pending)} of {len(RUNS)} runs need work")
+        for r in pending:
+            print(f"[driver]   {r['task']}_{r['run']}: --emit {emit_for(r)}")
+        print(f"[driver] jobs={JOBS}, threads per run={THREADS}")
+
+        # Session-level surface geometry, exported once. Stage 2 resamples along
+        # sphere.reg and needs midthickness for area correction; both live in the
+        # FastSurfer tarball, which is already extracted here. Exporting them now
+        # means the resample pod never downloads that ~2 GB tarball itself.
+        if any(emit_for(r) in ("grayordinate", "both") for r in pending):
+            rc = subprocess.run([
+                "python", "/app/surf_geometry.py",
+                "--surf-dir", str(SURF_DIR),
+                "--outdir", str(ANAT_OUT),
+                "--subj", SUBJ,
+                "--session", SES,
+            ]).returncode
+            if rc != 0:
+                # Non-fatal: the per-run components are still valid and useful,
+                # and Stage 2 is gated on its own marker, so it simply will not
+                # run for this session until the geometry exists.
+                print(f"[driver] WARNING: surface geometry export failed (exit {rc})")
+                for f in ANAT_OUT.iterdir():
+                    f.unlink()
+
+        def recover_mni_bold(prefix, task, rid, work_dir):
+            """Unpack the MNI BOLD from this run's finished volumetric tarball.
+
+            The short path skips the warp chain, so the CIFTI subcortical block
+            has no freshly-warped MNI BOLD to read. Extracting the one already
+            in S3 is far cheaper than recomputing the composite warp and the 4D
+            warp just to rebuild a file that exists.
+            """
+            src = EXISTING_FUNC / f"{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
+            if not src.exists():
+                raise FileNotFoundError(
+                    f"{src.name} absent but func_exists was true for {prefix} — "
+                    "inventory and S3 disagree"
+                )
+            with tarfile.open(src) as tar:
+                tar.extractall(work_dir)
+            member = work_dir / f"{task}_{rid}" / \
+                f"{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz"
+            if not member.exists():
+                raise FileNotFoundError(f"{member} missing from {src.name}")
+            return member
+
+        def process(run):
+            """Run one BOLD run. Never raises — see _process below.
+
+            ThreadPoolExecutor.map re-raises on iteration, so a single run
+            raising here would abort list(pool.map(...)) and lose every
+            sibling's tarball. The wrapper turns that into an ordinary failure.
+
+            Returns (prefix, func_failed, surf_failed, produced, message): the
+            two derivatives fail independently (a run can emit a valid
+            volumetric tarball while its surface sampling failed — see
+            preproc.py Stage 5b), so they are tracked and recorded separately.
+            `produced` is True when the run wrote at least one new tarball,
+            which is what the exit rule checks. `message` is this run's real
+            failure detail (empty on success) — recorded as this run's
+            StepOutcome.failure_reason (see write_outcome / ADR 016), which is
+            the whole point of recording in-pod rather than via a DAG task
+            that never sees more than Argo's aggregate pod status. An
+            unexpected error fails exactly the derivatives this run was asked
+            to emit.
+            """
+            prefix = f"{SUBJ}_{SES}_{run['task']}_{run['run']}"
+            emit = emit_for(run)
+            try:
+                return _process(run)
+            except Exception as exc:
+                print(f"[driver] FAILED {prefix}: unexpected error")
+                traceback.print_exc()
+                return (prefix,
+                        emit in ("volumetric", "both"),
+                        emit in ("grayordinate", "both"),
+                        False,
+                        f"{type(exc).__name__}: {exc}")
+
+        def _process(run):
+            task, rid = run["task"], run["run"]
+            prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+            emit = emit_for(run)
+            func_needed = emit in ("volumetric", "both")
+            surf_needed = emit in ("grayordinate", "both")
+            b2t = REG_DIR / f"bold_to_t1w_{task}_{rid}"
+            work_dir = WORK_ROOT / SES / f"{task}_{rid}"
+            print(f"[driver] === {prefix} (--emit {emit}) ===")
+
+            env = dict(os.environ)
+            # Without this ITK defaults to every core on the node and
+            # over-subscribes shared cpu-heavy instances.
+            env["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(THREADS)
+
+            cmd = [
+                "python", "/app/preproc.py",
+                "--bold", str(FUNC_DIR / f"{prefix}_bold.nii.gz"),
+                "--motion-file", str(FUNC_DIR / f"{prefix}_motion.tsv"),
+                "--brainmask", str(b2t / f"{prefix}_desc-bold2t1w_brainmask.nii.gz"),
+                "--bold2t1w-affine", str(b2t / f"{prefix}_desc-bold2t1w_itk.txt"),
+                "--t1w2mni-affine", str(T1W2MNI_AFFINE),
+                "--t1w2mni-warp", str(T1W2MNI_WARP),
+                "--mni-template", "/data/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii",
+                "--aseg", str(ASEG),
+                "--outdir", str(work_dir),
+                "--subj", SUBJ,
+                "--session", SES,
+                "--task", task,
+                "--run", rid,
+                "--nss-frames", NSS,
+                "--threads", str(THREADS),
+                "--pipeline", "cloudpipe_minproc",
+                "--emit", emit,
+                "--image-tag", IMAGE_TAG,
+            ]
+            if emit in ("grayordinate", "both"):
+                cmd += ["--surf-dir", str(SURF_DIR)]
+            try:
+                if emit == "grayordinate":
+                    work_dir.mkdir(parents=True, exist_ok=True)
+                    cmd += ["--mni-bold-in",
+                            str(recover_mni_bold(prefix, task, rid, work_dir))]
+            # EOFError, not just tarfile.TarError: a truncated .tar.gz (the
+            # shape a partial S3 upload takes) raises out of the gzip layer and
+            # would otherwise escape this handler and abort the whole pod.
+            except (FileNotFoundError, tarfile.TarError, EOFError, OSError) as exc:
+                # Only reachable on the grayordinate short path (recover_mni_bold),
+                # so the failure is the surface run; the volumetric already exists
+                # in S3, untouched.
+                print(f"[driver] FAILED {prefix}: {type(exc).__name__}: {exc}")
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return prefix, False, True, False, f"{type(exc).__name__}: {exc}"
+
+            rc = subprocess.run(cmd, env=env).returncode
+
+            # preproc.py writes QC to flat /tmp paths — collect before handling
+            # rc so a failed run still reports. The short path writes _surf_qc;
+            # the full path folds surface metrics into the main QC JSON.
+            for src, dest in ((f"/tmp/{prefix}_qc.json", QC_DIR),
+                              (f"/tmp/{prefix}_surf_qc.json", SURF_QC)):
+                if Path(src).exists():
+                    shutil.move(src, str(dest / Path(src).name))
+
+            if rc != 0:
+                # preproc.py exits 0 when it downgrades a Stage 5b failure to
+                # volumetric-only, so a non-zero exit means the volumetric
+                # pipeline itself failed — every derivative this run was asked
+                # for is lost.
+                print(f"[driver] FAILED {prefix} (exit {rc})")
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return prefix, func_needed, surf_needed, False, f"preproc.py exited {rc}"
+
+            # Argo's archiver used to build these tarballs from the artifact
+            # path; one static declaration cannot emit N per-run tarballs, so
+            # build them here. arcname keeps each tar rooted at {task}_{run}/.
+            # The filenames are inventory's func_exists / surf_exists markers —
+            # changing either would make every rerun redo finished work.
+            if func_needed:
+                tarball = OUT_DIR / f"{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
+                # On --emit both the work dir also holds the surface components,
+                # which the components tarball below already carries — tarring
+                # the whole dir would duplicate ~320 MB of GIFTIs/subcort into
+                # this volumetric tarball, whose real payload (MNI BOLD +
+                # confounds + boldref + brainmask) is ~125 MB. Exclude them by
+                # name, using the exact globs the components step uses below so
+                # the two can't drift. On --emit volumetric there are no surface
+                # files, so this set is empty and the filter is a no-op.
+                surf_names = {p.name for p in dict.fromkeys(
+                    sorted(work_dir.glob(f"{prefix}_hemi-*_space-fsnative_bold.func.gii"))
+                    + sorted(work_dir.glob(f"{prefix}_*desc-subcort*"))
+                    + sorted(work_dir.glob(f"{prefix}_desc-subcort_labellist.txt")))}
+                # ti.name is arcname-prefixed ({task}_{rid}/<file>); match on the
+                # basename so the top-level dir entry is always kept.
+                def _vol_only(ti, _names=surf_names):
+                    return None if Path(ti.name).name in _names else ti
+                with tarfile.open(tarball, "w:gz") as tar:
+                    tar.add(str(work_dir), arcname=f"{task}_{rid}", filter=_vol_only)
+                print(f"[driver] wrote {tarball.name}")
+
+            surf_failed = False
+            surf_message = ""
+            if surf_needed:
+                # Only the grayordinate components, not the whole work dir —
+                # on --emit both that directory also holds the volumetric
+                # outputs, which are already tarred above.
+                gray = sorted(work_dir.glob(f"{prefix}_hemi-*_space-fsnative_bold.func.gii"))
+                gray += sorted(work_dir.glob(f"{prefix}_*desc-subcort*"))
+                gray += sorted(work_dir.glob(f"{prefix}_desc-subcort_labellist.txt"))
+                if not gray:
+                    # No components while rc==0 means preproc.py downgraded a
+                    # Stage 5b failure (only possible on --emit both). The
+                    # volumetric tarball above is valid and uploads; only the
+                    # surface derivative failed for this run.
+                    print(f"[driver] {prefix}: no grayordinate components — "
+                          "surface downgraded to volumetric-only, volumetric kept")
+                    surf_failed = True
+                    surf_message = ("grayordinate components missing after preproc.py "
+                                     "exit 0 (Stage 5b downgrade to volumetric-only)")
+                else:
+                    with tarfile.open(surf_tarball(prefix), "w:gz") as tar:
+                        for f in dict.fromkeys(gray):   # de-dup overlapping globs
+                            tar.add(str(f), arcname=f"{task}_{rid}/{f.name}")
+                    print(f"[driver] wrote {surf_tarball(prefix).name}")
+
+            # Reclaim ephemeral storage: a session's worth of full-resolution
+            # intermediates would otherwise accumulate across runs.
+            shutil.rmtree(work_dir, ignore_errors=True)
+            # produced: at least one new tarball landed. On the success path the
+            # volumetric always did (--emit both/volumetric) or the surface did
+            # (--emit grayordinate, which re-raises rather than downgrades), so
+            # this is True whenever func was emitted or the surface survived.
+            produced = func_needed or not surf_failed
+            return prefix, False, surf_failed, produced, surf_message
+
+        results = []
+        pending_prefixes = {f"{SUBJ}_{SES}_{r['task']}_{r['run']}" for r in pending}
+        try:
+            with ThreadPoolExecutor(max_workers=JOBS) as pool:
+                results = list(pool.map(process, pending))
+        finally:
+            # Record every run's outcome directly (see ADR 016) instead of
+            # emitting failed-run lists for a sibling DAG task to fan out
+            # over. Two independent statuses per run — func-preproc and
+            # surface-sample fail independently (a run downgraded to
+            # volumetric-only records func-preproc succeeded and
+            # surface-sample failed). Written in a `finally` so a run that
+            # completed before an unrelated sibling crashes the pool still
+            # gets its record; a run whose result never came back at all
+            # (the pod was killed mid-`process`) is recorded failed rather
+            # than silently omitted or defaulted to success.
+            result_by_prefix = {r[0]: r[1:] for r in results}
+            for r in RUNS:
+                task, rid = r["task"], r["run"]
+                prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+                emit = emit_for(r)
+                func_needed = emit in ("volumetric", "both")
+                surf_needed = emit in ("grayordinate", "both")
+                if prefix in result_by_prefix:
+                    func_failed, surf_failed, _prod, message = result_by_prefix[prefix]
+                elif prefix in pending_prefixes:
+                    # Pool started this run but the pod died before process()
+                    # returned (e.g. OOMKilled) — no result to trust.
+                    func_failed, surf_failed = func_needed, surf_needed
+                    message = "pod terminated before this run's result was recorded"
+                else:
+                    # Not pending: both derivatives already existed coming in.
+                    func_failed = surf_failed = False
+                    message = ""
+                write_outcome(
+                    "func-preproc", task, rid,
+                    "failed" if (func_needed and func_failed) else "succeeded",
+                    message if (func_needed and func_failed) else "",
+                )
+                write_outcome(
+                    "surface-sample", task, rid,
+                    "failed" if (surf_needed and surf_failed) else "succeeded",
+                    message if (surf_needed and surf_failed) else "",
+                )
+            failed_func = [p for p, ff, sf, prod, msg in results if ff]
+            failed_surf = [p for p, ff, sf, prod, msg in results if sf]
+        produced = [p for p, ff, sf, prod, msg in results if prod]
+        print(f"[driver] {len(produced)}/{len(results)} runs produced output; "
+              f"func failed={len(failed_func)}, surface failed={len(failed_surf)}")
+        if failed_func:
+            print(f"[driver] volumetric failed: {' '.join(failed_func)}")
+        if failed_surf:
+            print(f"[driver] surface failed: {' '.join(failed_surf)}")
+
+        # Fail the step only when the session produced nothing at all — no run
+        # wrote any new tarball. A partial failure (some runs, or some
+        # derivatives, succeeded) exits 0 so their artifacts and per-run records
+        # survive.
+        #
+        # The original rationale was that Argo does not save output artifacts
+        # from a failed pod. Measured 2026-07-22 (dagval-330e63gh-tarerr), it
+        # does — the artifact uploaded after a non-zero exit. What a non-zero
+        # exit actually costs is the output *parameters* (skipped when their
+        # file is missing) and the session's status, which the outcome fan-out
+        # stamps onto every sibling run. Those are the reasons to keep this.
+        if results and not produced:
+            sys.exit(1)
