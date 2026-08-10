@@ -5,7 +5,7 @@ FROM ghcr.io/prefix-dev/pixi:0.41.4 AS build
 
 # copy source code, pixi.toml and pixi.lock to the container
 WORKDIR /app
-COPY . .
+COPY images/diffusion/ .
 # install dependencies to `/app/.pixi/envs/prod`
 # use `--locked` to ensure the lockfile is up to date with pixi.toml
 RUN pixi install --locked

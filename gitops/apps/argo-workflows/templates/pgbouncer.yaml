@@ -1,0 +1,2 @@
+# pgbouncer resources migrated to icoretech/pgbouncer subchart (see Chart.yaml + values.yaml).
+# The Deployment, Service, and ConfigMap are now rendered by the subchart.

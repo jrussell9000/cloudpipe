@@ -6,12 +6,24 @@ metadata:
 spec:
 
   retryStrategy:
-    limit: "3"
+    # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
+    # design, so consecutive reclaims on one long step are routine (2 back-to-back
+    # observed 2026-08-03). At limit 3, four in a row lose the subject outright.
+    # See issue #115.
+    limit: "8"
     retryPolicy: Always
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
+    # never emitted by our scripts. 75 = EX_TEMPFAIL, the truncated-surface guard
+    # below. 137 is deliberately absent: a real OOMKill here is deterministic
+    # (#120, #129, #134 each needed a config change, not a retry), so retrying it
+    # only burns the enlarged budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
     backoff:
       duration: "1m"
       factor: "2"
+      # cap bounds each individual delay (maxDuration would abort the retries
+      # instead): 1+2+4+5+5+5+5+5 = 32m worst case, vs 7m at the old limit of 3.
+      cap: "5m"
 
   artifactRepositoryRef:
     key: cloudpipe-artifacts
@@ -20,21 +32,43 @@ spec:
     runAsNonRoot: true
     runAsUser: 1000
 
+  # ---------------------------------------------------------------------------
+  # No shared EFS volume. Each step works in a private emptyDir at /work and
+  # hands the FreeSurfer SUBJECTS_DIR to the next step through S3, per ADR 004.
+  #
+  # SUBJECTS_DIR is /work/subjects (NOT the image's /opt/freesurfer/subjects) so
+  # nothing masks the image's own content and the working set lands on the node's
+  # ephemeral storage, which is what `ephemeral-storage` requests actually govern.
+  #
+  # Intermediates go to scratch/{{workflow.name}}/anat/ and are reaped by an S3
+  # lifecycle rule on the scratch/ prefix. They are not derivatives and must
+  # never be read by anything outside this workflow.
+  # ---------------------------------------------------------------------------
+
   templates:
 
   ##############################################
-  # 1. Template Creation (long_prepare_template)
+  # A. Template creation + segmentation
+  #
+  # long_prepare_template.sh then run_fastsurfer.sh --seg_only --base, in ONE
+  # pod. Both are gpu-nodepool and strictly sequential, so splitting them cost a
+  # second GPU node provision (slow, and the pool is thin — see
+  # docs/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md)
+  # plus an S3 round-trip of the whole template, for no parallelism gain.
+  #
+  # long_prepare_template.sh handles single-timepoint subjects automatically —
+  # it produces a within-subject template equivalent to a standard cross-sectional run.
   ##############################################
 
-  # NOTE: The code in long_prepare_template.sh will automagically handle timepoints with only baseline data
-  - name: fastsurfer-template-creation-template
+  - name: fastsurfer-template-build-template
     metadata:
       labels:
         cloudpipe.io/phase: anatomical
-        cloudpipe.io/step: template-creation
+        cloudpipe.io/step: template-build
     inputs:
       parameters:
         - name: fastsurfer-command-string
+        - name: seg-argstring
         - name: T1w_sessions
 
       artifacts:
@@ -46,16 +80,36 @@ spec:
           region: <YOUR_AWS_REGION>
           key: 'config/fslicense'
 
+    outputs:
+      artifacts:
+      # The base template, pre-parcellation. Consumed by BOTH template
+      # parcellation (B) and longitudinal segmentation (C) — the seg_only brain
+      # model is all C needs, which is why C does not wait for B.
+      - name: template-base
+        path: '/work/subjects/{{workflow.parameters.subjID}}_template'
+        archive:
+          tar:
+            # .mgz payloads are already gzip-compressed internally, so heavy
+            # recompression burns CPU on both ends for very little size win.
+            compressionLevel: 1
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/template-base.tar.gz'
+
     nodeSelector:
       karpenter.sh/nodepool: gpu-nodepool
 
     volumes:
+      - name: work
+        emptyDir: {}
       - name: t1w-inputs
         emptyDir: {}
 
     initContainers:
       - name: download-t1w-inputs
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -92,17 +146,20 @@ spec:
 
             print(f"Downloaded T1w files for {len(sessions)} session(s).", flush=True)
 
+      # fsaverage must be present in SUBJECTS_DIR before long_prepare_template.sh
+      # runs surface registration. It is not included in per-subject tarballs, so it
+      # is fetched per pod from config/fsaverage/ in S3 (~480 MiB, 312 objects).
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
             memory: 256M
             cpu: '1'
+        mirrorVolumeMounts: true
         env:
           - name: BUCKET
             value: "{{workflow.parameters.bucket}}"
-        mirrorVolumeMounts: true
         command: [python]
         args:
           - -c
@@ -110,7 +167,7 @@ spec:
             import boto3, os
             from pathlib import Path
 
-            dest = Path("/opt/freesurfer/subjects/fsaverage")
+            dest = Path("/work/subjects/fsaverage")
             if dest.exists():
                 print("fsaverage already present, skipping download.", flush=True)
             else:
@@ -129,97 +186,99 @@ spec:
                         s3.download_file(bucket, key, str(local))
                 print("fsaverage downloaded.", flush=True)
 
-      - name: clear-is-running
-        image: public.ecr.aws/docker/library/alpine:3.21
-        imagePullPolicy: IfNotPresent
-        resources:
-          requests:
-            ephemeral-storage: 300M
-        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
-        mirrorVolumeMounts: true
-
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-c36b2605dc6f07a55d0f5a491d8b6820413fa0f3"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad"
       imagePullPolicy: IfNotPresent
       volumeMounts:
-      - name: "{{=lower(workflow.parameters.subjID)}}"
-        mountPath: /opt/freesurfer/subjects
-        subPath: opt/freesurfer/subjects
+      - name: work
+        mountPath: /work
       - name: t1w-inputs
         mountPath: /home/nonroot
 
       env:
         - name: FS_LICENSE
           value: /opt/freesurfer/.license
+        - name: SUBJECTS_DIR
+          value: /work/subjects
+        # Cap every thread pool at the CPU REQUEST, projected from the pod spec so the
+        # resources block below is the single source of truth. `--threads 1` in the master
+        # template reaches run_prediction.py only; PyTorch/OpenMP inside FastSurferCNN, and
+        # mri_robust_template's own OpenMP region, still size their pools from the HOST core
+        # count — this step measured cpu_efficiency 1.10 (2026-07-31 batch) while requesting
+        # 1 core. Harmless only because the pods had landed on 32-vCPU g4dn.8xlarge nodes;
+        # with gpu-nodepool now capped at xlarge/2xlarge, an uncapped pool would contend
+        # with the co-tenant time-sliced pod on a 4-vCPU node.
+        #
+        # This is a CAP, not a raise — do NOT increase the cpu request to match observed
+        # burst. cpu 1 is what lets two GPU pods share one g4dn.xlarge under time-slicing.
+        #
+        # Cannot be read from the cgroup instead: this container sets no CPU limit, so
+        # /sys/fs/cgroup/cpu.max reads "max" and says nothing about the request.
+        - name: OMP_NUM_THREADS
+          valueFrom: &templateBuildCpuRequest
+            resourceFieldRef:
+              containerName: main   # Argo's name for the user container
+              resource: requests.cpu
+              divisor: "1"          # rounds UP to whole cores; keep cpu integral
+        - name: MKL_NUM_THREADS
+          valueFrom: *templateBuildCpuRequest
+        - name: OPENBLAS_NUM_THREADS
+          valueFrom: *templateBuildCpuRequest
+        - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+          valueFrom: *templateBuildCpuRequest
 
       resources:
         requests:
-          memory: 4G
-          cpu: '2'
-        limits:
-          nvidia.com/gpu: '1'
-
-      command: [bash, -c]
-      args:
-        - |
-          nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used \
-            --format=csv -l 5 >&2 &
-          MONITOR=$!
-          /fastsurfer/recon_surf/long_prepare_template.sh {{inputs.parameters.fastsurfer-command-string}}
-          EXIT=$?; kill $MONITOR 2>/dev/null; exit $EXIT
-
-  ##############################################
-  # 2. Template Segmentation (seg_only --base)
-  ##############################################
-
-  - name: fastsurfer-template-segmentation-template
-    metadata:
-      labels:
-        cloudpipe.io/phase: anatomical
-        cloudpipe.io/step: template-segmentation
-    inputs:
-      parameters:
-        - name: argstring
-
-    nodeSelector:
-      karpenter.sh/nodepool: gpu-nodepool
-
-    initContainers:
-      - name: clear-is-running
-        image: public.ecr.aws/docker/library/alpine:3.21
-        imagePullPolicy: IfNotPresent
-        resources:
-          requests:
-            ephemeral-storage: 300M
-        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
-        mirrorVolumeMounts: true
-
-    container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-c36b2605dc6f07a55d0f5a491d8b6820413fa0f3"
-      imagePullPolicy: IfNotPresent
-      volumeMounts:
-      - name: "{{=lower(workflow.parameters.subjID)}}"
-        mountPath: /opt/freesurfer/subjects
-        subPath: opt/freesurfer/subjects
-
-      resources:
-        requests:
+          # 4G -> 2G. Measured average working set is ~0.86 GB (ram_efficiency 0.23 against
+          # the old 4G request, 9 pods, 2026-07-31 batch). Kubecost's ram_efficiency is built
+          # from AVERAGE usage, so this keeps >2x headroom over the mean rather than sizing
+          # to it. Deliberately no memory LIMIT: the packing benefit comes entirely from the
+          # request, and adding a ceiling where none existed would turn an underestimate into
+          # an OOM on a step whose failure costs the whole anatomical phase.
           memory: 2G
-          cpu: '2'
+          # 1 CPU to match `--threads 1` in the master template's command string.
+          # Reduced from 2/2: at cpu 2 only ONE GPU pod fit a g4dn.xlarge (3920m
+          # allocatable), stranding the second time-sliced GPU slice. At cpu 1 two
+          # pods (2000m) fit, so time-slicing actually packs 2/node on the cheapest
+          # instance. long_prepare_template.sh forwards --threads to run_prediction.py
+          # (FastSurferCNN brainmask inference) only — mri_robust_template is invoked
+          # with no thread flag and does not consume them. Since inference runs on the
+          # GPU requested below, those threads only cover data loading/view aggregation.
+          # Keep this value and --threads in sync: a thread count above the CPU request
+          # makes PyTorch oversubscribe the cgroup quota and get throttled, which slows
+          # the step while paying for GPU node time.
+          cpu: '1'
+          # Working set: fsaverage (~1 GB unpacked) + per-session T1w + the base
+          # template being built (~1.2 GB at k=6, extrapolated from the 228-418 MiB
+          # long-template tarballs). Sized flat rather than scaled per-subject
+          # because ephemeral-storage is NOT a binding scheduling constraint here:
+          # gpu-nodeclass sets no instanceStorePolicy, so every g4dn/g5/g6 reports
+          # the same ~140Gi allocatable from its 150Gi root volume.
+          # TODO(perf): re-check against observed usage on the first full batch.
+          ephemeral-storage: 20G
         limits:
           nvidia.com/gpu: '1'
 
       command: [bash, -c]
       args:
         - |
-          nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used \
+          nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
             --format=csv -l 5 >&2 &
           MONITOR=$!
-          /fastsurfer/run_fastsurfer.sh {{inputs.parameters.argstring}}
+
+          /fastsurfer/recon_surf/long_prepare_template.sh {{inputs.parameters.fastsurfer-command-string}}
+          PREP_EXIT=$?
+          if [[ $PREP_EXIT -ne 0 ]]; then
+            echo "ERROR: long_prepare_template.sh failed (exit ${PREP_EXIT}); not attempting segmentation." >&2
+            kill $MONITOR 2>/dev/null
+            exit $PREP_EXIT
+          fi
+
+          /fastsurfer/run_fastsurfer.sh {{inputs.parameters.seg-argstring}}
           EXIT=$?; kill $MONITOR 2>/dev/null; exit $EXIT
 
   ##############################################
-  # 3. Template Parcellation (surf_only --base)
+  # B. Template Parcellation (surf_only --base)
   ##############################################
 
   - name: fastsurfer-template-parcellation-template
@@ -240,36 +299,189 @@ spec:
           region: <YOUR_AWS_REGION>
           key: 'config/fslicense'
 
+      # The base template from step A, landed directly at its SUBJECTS_DIR path.
+      - name: template-base
+        path: '/work/subjects/{{workflow.parameters.subjID}}_template'
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/template-base.tar.gz'
+
+    outputs:
+      artifacts:
+      # The parcellated template. Consumed by longitudinal parcellation (D).
+      - name: template-parcellated
+        path: '/work/subjects/{{workflow.parameters.subjID}}_template'
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          bucket: "{{workflow.parameters.bucket}}"
+          region: <YOUR_AWS_REGION>
+          key: 'scratch/{{workflow.name}}/anat/template-parcellated.tar.gz'
+
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
+    volumes:
+      - name: work
+        emptyDir: {}
+
     initContainers:
-      - name: clear-is-running
-        image: public.ecr.aws/docker/library/alpine:3.21
+      # recon-surf.sh registers to fsaverage, which is not in the template tarball.
+      - name: download-fsaverage
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
-            ephemeral-storage: 300M
-        command: ["find", "/opt/freesurfer/subjects", "-name", "*IsRunning*", "-delete"]
+            memory: 256M
+            cpu: '1'
         mirrorVolumeMounts: true
+        env:
+          - name: BUCKET
+            value: "{{workflow.parameters.bucket}}"
+        command: [python]
+        args:
+          - -c
+          - |
+            import boto3, os
+            from pathlib import Path
+
+            dest = Path("/work/subjects/fsaverage")
+            if dest.exists():
+                print("fsaverage already present, skipping download.", flush=True)
+            else:
+                s3 = boto3.client('s3')
+                bucket = os.environ['BUCKET']
+                prefix = 'config/fsaverage/'
+                paginator = s3.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for obj in page.get('Contents', []):
+                        key = obj['Key']
+                        rel = key[len(prefix):]
+                        if not rel:
+                            continue
+                        local = dest / rel
+                        local.parent.mkdir(parents=True, exist_ok=True)
+                        s3.download_file(bucket, key, str(local))
+                print("fsaverage downloaded.", flush=True)
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-c36b2605dc6f07a55d0f5a491d8b6820413fa0f3"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
-      - name: "{{=lower(workflow.parameters.subjID)}}"
-        mountPath: /opt/freesurfer/subjects
-        subPath: opt/freesurfer/subjects
+      - name: work
+        mountPath: /work
 
       env:
       - name: FS_LICENSE
         value: /opt/freesurfer/.license
+      - name: SUBJECTS_DIR
+        value: /work/subjects
 
+      # --threads is derived from this value rather than written in the master
+      # template, so the resources block below is the single source of truth and
+      # the two cannot drift across files. See the args block.
+      - name: CPU_REQUEST
+        valueFrom:
+          resourceFieldRef:
+            containerName: main   # Argo's name for the user container
+            resource: requests.cpu
+            divisor: "1"          # rounds UP to whole cores; keep cpu integral
+
+      # cpu == --threads or the pod loses share under co-tenancy. Note there is no
+      # cpu LIMIT here (nor on any step in this pipeline), so the request sets
+      # cgroup cpu.weight, not a quota — the invariant protects fair share on a
+      # packed node, it is not protection against hard throttling.
+      #
+      # 6 -> 4, from cpu_efficiency 0.577 (10 pods, 2026-07-31 batch). That figure
+      # is trustworthy here: this step stages only 27 s against ~974 s of compute,
+      # 2.7%, so it is not meaningfully diluted by the init container (#123, as
+      # corrected in #128). 0.577 means ~3.6 of 6 cores, so 4 matches observed use.
+      #
+      # DO NOT CUT BELOW 2. recon-surf.sh:319-321 is a cliff, not a gradient:
+      #     threads > 1  -> threads_hemi = threads/2, hemispheres in PARALLEL
+      #     threads == 1 -> threads_hemi = 1,         hemispheres SERIAL
+      # `--parallel` does not change this — run_fastsurfer.sh consumes that flag as
+      # the obsolete legacy_parallel_hemi and never forwards it to recon-surf.sh.
+      # So cpu 1 would not halve the thread count, it would roughly DOUBLE the
+      # surface stage. 4 -> threads_hemi 2 (was 3 at cpu 6); 2 is the floor and
+      # still parcellates both hemispheres concurrently.
       resources:
         requests:
-          memory: 4G
+          # 8G -> 3G. Measured average working set is ~1.05 GB (ram_efficiency 0.14 —
+          # the lowest of any FastSurfer step — against the old 8G request, 10 pods,
+          # 2026-07-31 batch). ram_efficiency is AVERAGE-based, so 3G keeps ~3x headroom
+          # over the mean. No memory LIMIT on purpose: the packing benefit is all in the
+          # request, and a ceiling where none existed would convert an underestimate
+          # into an OOM. Memory is deliberately NOT touched by the CPU cut: ram_efficiency
+          # 0.366 is inside the intended ~3x-headroom band.
+          memory: 3G
           cpu: '4'
+          # cpu-heavy nodes report >=~90Gi allocatable ephemeral storage on every
+          # eligible instance type: Bottlerocket's 100Gi /dev/xvdb data volume when
+          # the type has no instance store, or the RAID0'd NVMe (200-950 GB) when it
+          # does. So this request does not narrow the spot pool — verified against
+          # actual usage, where non-NVMe types (c5.2xlarge, c5.4xlarge, m8i.4xlarge)
+          # dominate the hours while func-preproc already requests 20G here.
+          ephemeral-storage: 20G
 
       command: [bash, -c]
-      args: ["/fastsurfer/run_fastsurfer.sh {{inputs.parameters.argstring}}"]
+      args:
+        - |
+          SD=/work/subjects
+          BASE={{workflow.parameters.subjID}}_template
+
+          # A killed recon-all leaves scripts/IsRunning.* behind, and FastSurfer
+          # refuses to start when it finds one. The emptyDir is fresh, but the
+          # lock can arrive INSIDE the input tarball: run_fastsurfer.sh traps
+          # SIGTERM and exits 0 with its child killed, so an interrupted upstream
+          # step can still "succeed" and publish a tarball carrying the lock.
+          # Scrub inherited state rather than inheriting a wedged SUBJECTS_DIR.
+          find "$SD" -name '*IsRunning*' -delete
+
+          # --threads comes from the cpu request (downward API), not from the master
+          # template's argstring, so the resources block is the only place the two are
+          # written. Floor of 2: at 1, recon-surf.sh drops hemisphere parallelism
+          # entirely (see the resources comment) — clamp loudly rather than silently
+          # doubling the surface stage if someone trims cpu to 1.
+          THREADS="$CPU_REQUEST"
+          if [[ "$THREADS" -lt 2 ]]; then
+            echo "WARNING: cpu request ${CPU_REQUEST} would serialize hemispheres in recon-surf.sh;" >&2
+            echo "         using --threads 2 instead. Raise the cpu request to match." >&2
+            THREADS=2
+          fi
+          echo "cpu request=${CPU_REQUEST} --threads=${THREADS} (threads_hemi=$((THREADS / 2)))" >&2
+
+          /fastsurfer/run_fastsurfer.sh {{inputs.parameters.argstring}} --threads "$THREADS"
+          EXIT=$?
+
+          # run_fastsurfer.sh traps SIGTERM and exits 0 even when its recon-all child
+          # is killed mid-reconstruction (spot reclaim / Karpenter consolidation on
+          # cpu-heavy-nodepool). That leaves a truncated base template — no white
+          # surfaces, no filled.mgz — which is then promoted and only detonates two
+          # steps later at segment-subregions ("base-tps: No such file or directory").
+          # Validate the surface outputs long_compat_segmentHA.py / segment_subregions
+          # depend on, and exit 75 (EX_TEMPFAIL — a retryable code per retryStrategy
+          # above) so the step re-runs on a fresh node instead of shipping a half-built
+          # template.
+          #
+          # This used to exit 137, which collided with a genuine kernel OOMKill and
+          # forced the retry expression to treat both alike. 75 is ours alone; nothing
+          # in the cluster emits it. See issue #115.
+          #
+          # A retry now restarts from a clean emptyDir re-seeded from step A's
+          # artifact rather than resuming over a dirty shared volume, so the
+          # truncated-state hazard is far less likely to arise in the first place —
+          # but the guard stays, since an interrupted run still uploads nothing.
+          for f in surf/lh.white surf/rh.white mri/filled.mgz; do
+            if [[ ! -s "${SD}/${BASE}/${f}" ]]; then
+              echo "ERROR: base template output missing after run_fastsurfer.sh: ${BASE}/${f}" >&2
+              echo "       surface reconstruction was interrupted; forcing retry (exit 75)." >&2
+              exit 75
+            fi
+          done
+          exit $EXIT

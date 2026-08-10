@@ -1,11 +1,14 @@
 """Cancel all active/inactive Globus transfer tasks whose label starts with 'cloudpipe-'."""
+
 import os
 import sys
 
 import globus_sdk
 
 
-def build_transfer_client(native_app_client_id: str, refresh_token: str) -> globus_sdk.TransferClient:
+def build_transfer_client(
+    native_app_client_id: str, refresh_token: str
+) -> globus_sdk.TransferClient:
     native_client = globus_sdk.NativeAppAuthClient(native_app_client_id)
     authorizer = globus_sdk.RefreshTokenAuthorizer(refresh_token, native_client)
     return globus_sdk.TransferClient(authorizer=authorizer)

@@ -9,6 +9,7 @@ def load(path: str) -> list[str]:
     """
     if path.startswith("s3://"):
         import boto3
+
         _, _, rest = path.partition("s3://")
         bucket, _, key = rest.partition("/")
         body = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read().decode()

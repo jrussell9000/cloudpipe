@@ -1,0 +1,969 @@
+"""
+Athena query helpers for cloudpipe metrics.
+
+Requires: boto3, pandas
+Install: pip install boto3 pandas
+
+Usage
+-----
+    from metrics.athena import CloudpipeMetrics
+
+    m = CloudpipeMetrics(bucket="my-cloudpipe-bucket")
+    df = m.func_qc(session="ses-00A")
+    print(df[["subject", "mean_fd", "tsnr_median"]].describe())
+
+    costs = m.costs()
+    runs  = m.workflow_runs(status="Failed")
+
+    # Where the money goes, by pipeline component:
+    print(m.step_costs(date_from="2026-07-01")[
+        ["step", "total_cost_usd", "pct_of_total", "mean_cpu_efficiency"]
+    ])
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+_POLL_INTERVAL = 2.0  # seconds between Athena status polls
+_MAX_WAIT_S = 300  # give up after 5 minutes
+
+# Column lists for the tables that have a metrics/compacted/ counterpart,
+# excluding schema_version (a data column on the raw table, but a partition
+# key — not a data column — on the *_compacted table; see
+# terraform/modules/metrics/main.tf). UNION ALL requires identical column
+# order and count on both sides, so _query(compacted=True) selects these
+# explicit lists rather than SELECT * on either side. Keep in sync with the
+# `columns` blocks of the corresponding raw/*_compacted Glue tables.
+_UNION_COLUMNS = {
+    "func_preproc": [
+        "subject",
+        "session",
+        "task",
+        "run",
+        "n_frames",
+        "n_nss_frames",
+        "tr_seconds",
+        "mean_fd",
+        "median_fd",
+        "max_fd",
+        "n_fd_above_0p2",
+        "n_fd_above_0p5",
+        "pct_fd_above_0p5",
+        "mean_dvars",
+        "dvars_std",
+        "mean_global_signal",
+        "tsnr_median",
+        "gcor",
+        "aor",
+        "aqi",
+        "n_acompcor_wm",
+        "n_acompcor_csf",
+        "n_tcompcor",
+        "n_cosines",
+        "stage_timings_s",
+        "total_runtime_s",
+        "peak_memory_gb",
+        "container_peak_memory_gb",
+        "pipeline",
+        "image_tag",
+        "completed_at",
+    ],
+    "anat_qc": [
+        "subject",
+        "session",
+        "etiv_mm3",
+        "total_brain_vol_mm3",
+        "lh_cortex_vol_mm3",
+        "rh_cortex_vol_mm3",
+        "wm_vol_mm3",
+        "subcort_gm_vol_mm3",
+        "lh_mean_thickness_mm",
+        "rh_mean_thickness_mm",
+        "lh_surface_area_mm2",
+        "rh_surface_area_mm2",
+        "pipeline",
+        "completed_at",
+    ],
+    # Every fsqc column, unlike anat_qc above, which lists a curated subset.
+    # There is no equivalent subset to curate here: the whole table is QC
+    # metrics, and the *_status codes are what tell a NULL metric that was never
+    # computed from one that was computed as absent — dropping them would make
+    # the metrics they qualify uninterpretable.
+    #
+    # Every metric column is nullable, and several are null on every row today
+    # (holes_*, defects_*, topo_*, n_outlier_sample_*). Filter on IS NOT NULL,
+    # never on `> 0` the way `nmi` is filtered: 0.0 is a legitimate measurement
+    # for rot_tal_* and n_outlier_norms. Verified 2026-08-08 that a Parquet file
+    # whose column is entirely null (Arrow infers type `null`, stored as
+    # int32(Null)) still reads as NULL against the `double` declared in Glue —
+    # it does not fail the scan the way a malformed JSON line would.
+    "fsqc_qc": [
+        "subject",
+        "session",
+        "wm_snr_orig",
+        "gm_snr_orig",
+        "wm_snr_norm",
+        "gm_snr_norm",
+        "cc_size",
+        "holes_lh",
+        "holes_rh",
+        "defects_lh",
+        "defects_rh",
+        "topo_lh",
+        "topo_rh",
+        "con_snr_lh",
+        "con_snr_rh",
+        "rot_tal_x",
+        "rot_tal_y",
+        "rot_tal_z",
+        "n_outlier_norms",
+        "n_outlier_sample_nonpar",
+        "n_outlier_sample_param",
+        "hypothalamus_whole_left_mm3",
+        "hypothalamus_whole_right_mm3",
+        "metrics_status",
+        "outlier_status",
+        "hippocampus_status",
+        "hypothalamus_status",
+        "fsqc_version",
+        "pipeline",
+        "completed_at",
+    ],
+    "workflow_runs": [
+        "workflow_name",
+        "subject",
+        "status",
+        "started_at",
+        "finished_at",
+        "total_duration_s",
+        "pending_duration_s",
+        "message",
+        "failed_step",
+        "failure_category",
+        "pipeline",
+        "completed_at",
+    ],
+    # The ONE table whose two Glue declarations are not raw+schema_version.
+    # `registration_compacted` also declares four BBR-era columns the raw
+    # `registration` table never had: dice, bbr_cost, bbr_converged,
+    # bbr_init_used (all retired with BBR in 61ccff7). This list is therefore
+    # the INTERSECTION, not the compacted table's column list — selecting a
+    # compacted-only name here makes the raw half of the UNION fail with
+    # COLUMN_NOT_FOUND, taking the whole query down. Do not "resync" these four
+    # back in to match the compacted table; they are dead fields no emitter
+    # writes, and their historic values are still reachable by querying
+    # registration_compacted directly.
+    "registration": [
+        "subject",
+        "session",
+        "registration_type",
+        "method",
+        "nmi",
+        "mi",
+        "rigid_disp_mean_mm",
+        "rigid_disp_max_mm",
+        "rigid_rot_deg",
+        "mhd_mm",
+        "nmi_identity",
+        "nmi_gain",
+        "seg_bbr_contrast",
+        "seg_bbr_contrast_identity",
+        "ngf",
+        "ngf_identity",
+        "mask_dice",
+        "lncc",
+        "verdict",
+        "jac_det_min",
+        "jac_det_max",
+        "jac_det_mean",
+        "jac_det_std",
+        "jac_det_frac_negative",
+        "log_jac_mean",
+        "log_jac_std",
+        "log_jac_p01",
+        "log_jac_p99",
+        "log_jac_min",
+        "log_jac_max",
+        "log_jac_frac_beyond_1p5",
+        "log_jac_frac_beyond_3",
+        "ice_mean_mm",
+        "ice_p95_mm",
+        "ice_p99_mm",
+        "ice_max_mm",
+        "centroid_displacement_mm",
+        "task",
+        "run",
+        "pipeline",
+        "completed_at",
+    ],
+    "costs": [
+        "date",
+        "workflow_name",
+        "subject",
+        "total_cost_usd",
+        "cpu_cost_usd",
+        "memory_cost_usd",
+        "gpu_cost_usd",
+        "total_adjustment_usd",
+        "scrape_age_days",
+        "pipeline",
+        "completed_at",
+    ],
+    "pod_costs": [
+        "date",
+        "workflow_name",
+        "pod",
+        "step",
+        "phase",
+        "subject",
+        "session",
+        "total_cost_usd",
+        "cpu_cost_usd",
+        "memory_cost_usd",
+        "gpu_cost_usd",
+        "pv_cost_usd",
+        "network_cost_usd",
+        "total_adjustment_usd",
+        "runtime_minutes",
+        "cpu_core_hours",
+        "ram_gb_hours",
+        "gpu_hours",
+        "cpu_efficiency",
+        "ram_efficiency",
+        "node",
+        "node_instance_type",
+        "scrape_age_days",
+        "pipeline",
+        "completed_at",
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Combined anatomical (T1w-derived) QC view
+# ---------------------------------------------------------------------------
+#
+# anat_qc and fsqc_qc are two halves of one thing: both are derived from the
+# same T1w image, both sit at subject×session grain, and neither is complete
+# on its own (WM/GM SNR left anat_qc at schema 1.2 and lives only in fsqc_qc;
+# volumes and thickness live only in anat_qc). anatomical_qc() joins them into
+# the single view an operator actually wants, and these lists are shared with
+# the DuckDB twin so the two engines cannot drift apart.
+#
+# holes_*, defects_*, and topo_* are deliberately NOT carried over: they are
+# null on every row this pipeline writes (FastSurfer emits no surf/[lr]h.orig
+# .nofix), so six always-null columns would be pure noise in a joined view.
+# fsqc_qc() still returns them for the FreeSurfer-based run that would fill
+# them in.
+_ANAT_JOIN_COLUMNS = (
+    "efc",
+    "fber",
+    "cnr",
+    "cjv",
+    "wm2max",
+    "fwhm_x_mm",
+    "fwhm_y_mm",
+    "fwhm_z_mm",
+    "fwhm_avg_mm",
+    "etiv_mm3",
+    "total_brain_vol_mm3",
+    "lh_cortex_vol_mm3",
+    "rh_cortex_vol_mm3",
+    "wm_vol_mm3",
+    "subcort_gm_vol_mm3",
+    "lh_mean_thickness_mm",
+    "rh_mean_thickness_mm",
+    "lh_surface_area_mm2",
+    "rh_surface_area_mm2",
+)
+
+_FSQC_JOIN_COLUMNS = (
+    "wm_snr_orig",
+    "gm_snr_orig",
+    "wm_snr_norm",
+    "gm_snr_norm",
+    "cc_size",
+    "con_snr_lh",
+    "con_snr_rh",
+    "rot_tal_x",
+    "rot_tal_y",
+    "rot_tal_z",
+    "n_outlier_norms",
+    "n_outlier_sample_nonpar",
+    "n_outlier_sample_param",
+    "hypothalamus_whole_left_mm3",
+    "hypothalamus_whole_right_mm3",
+    "metrics_status",
+    "outlier_status",
+    "hippocampus_status",
+    "hypothalamus_status",
+    "fsqc_version",
+)
+
+
+def anatomical_join_sql(
+    anat_source: str,
+    fsqc_source: str,
+    where_both: str = "",
+    where_window: str = "",
+) -> str:
+    """Build the anat_qc ⋈ fsqc_qc SQL, given each side's table expression.
+
+    `anat_source`/`fsqc_source` are whatever the engine reads from — a Glue
+    table name for Athena, a read_json(...) call for DuckDB.
+
+    The query separates two questions that a plain join conflates: WHICH SCANS
+    are in scope, and WHICH RECORD describes each of them.
+
+    `where_both` holds the predicates that identify a scan (subject, session)
+    and applies everywhere. `where_window` holds the dt= bounds and applies
+    ONLY to scan selection — a scan is in scope if EITHER table has a record in
+    the window, and it is then annotated with each table's most recent record
+    for it, whenever that was written.
+
+    That split is measured, not assumed. fsqc-metrics runs on every workflow
+    while anat_qc is written only when FastSurfer actually reprocesses, so a
+    batch reusing existing derivatives writes fsqc rows under today's dt= and
+    leaves its anat rows under the original run's. Filtering both tables by the
+    window therefore returns the fsqc half with the anat half blank — verified
+    against the 2026-08-09 pilot on a dt=2026-08-09 window: 0 of 23 rows paired
+    that way, 23 of 23 paired this way. Filtering neither is equally wrong in
+    the other direction: it drags the whole 271-scan corpus into a batch query.
+
+    Selecting scans from EITHER side (rather than driving off fsqc alone, as
+    the Grafana panel does) is what keeps an anat-only scan visible — the case
+    where FastSurfer ran and fsqc did not record. NULLs on one side of the
+    returned frame are the signal, not a defect.
+
+    Each side is reduced to one row per subject×session (most recent
+    completed_at) before it is attached. Reprocessing writes a second record
+    under a new dt= — the live corpus holds 962 anat_qc rows for 271
+    subject×session, up to 9 per scan — so joining raw would fan rows out by
+    the product of both sides' re-run counts, the multiplicity trap
+    join_subject() documents.
+    """
+    where_scan = " AND ".join(w for w in (where_both.removeprefix("WHERE "), where_window) if w)
+    where_scan = f"WHERE {where_scan}" if where_scan else ""
+    anat_cols = ", ".join(_ANAT_JOIN_COLUMNS)
+    fsqc_cols = ", ".join(_FSQC_JOIN_COLUMNS)
+    select_anat = ", ".join(f"a.{c}" for c in _ANAT_JOIN_COLUMNS)
+    select_fsqc = ", ".join(f"f.{c}" for c in _FSQC_JOIN_COLUMNS)
+    return f"""
+    WITH anat AS (
+        SELECT subject, session, pipeline, completed_at, {anat_cols},
+               ROW_NUMBER() OVER (
+                   PARTITION BY subject, session ORDER BY completed_at DESC
+               ) AS rn
+        FROM {anat_source}
+        {where_both}
+    ),
+    fsqc AS (
+        SELECT subject, session, pipeline, completed_at, {fsqc_cols},
+               ROW_NUMBER() OVER (
+                   PARTITION BY subject, session ORDER BY completed_at DESC
+               ) AS rn
+        FROM {fsqc_source}
+        {where_both}
+    ),
+    scans AS (
+        SELECT subject, session FROM {anat_source} {where_scan}
+        UNION
+        SELECT subject, session FROM {fsqc_source} {where_scan}
+    )
+    SELECT
+        s.subject,
+        s.session,
+        {select_anat},
+        {select_fsqc},
+        COALESCE(a.pipeline, f.pipeline) AS pipeline,
+        a.completed_at AS anat_completed_at,
+        f.completed_at AS fsqc_completed_at
+    FROM scans s
+    LEFT JOIN (SELECT * FROM anat WHERE rn = 1) a
+           ON a.subject = s.subject AND a.session = s.session
+    LEFT JOIN (SELECT * FROM fsqc WHERE rn = 1) f
+           ON f.subject = s.subject AND f.session = s.session
+    ORDER BY 1, 2
+    """
+
+
+def sql_in_list(values: list[str]) -> str:
+    """Render a list of strings as a SQL IN(...) body, quotes escaped."""
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+
+
+def cost_scope_clause(
+    subjects: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    extra: list[str] | None = None,
+) -> str:
+    """Build the WHERE clause that scopes cost records to one batch.
+
+    `metrics/costs/` accumulates across batches and is keyed by workflow, not
+    subject, so both a subject list and a scrape-date window are needed to
+    isolate a single batch's costs.
+
+    CostAllocation.s3_key partitions by `dt=<date>`, and `date` is exactly the
+    partition value, so a `date` bound is also added as a `dt` bound — the
+    `date` predicate alone filters the JSON body but gives Athena nothing to
+    prune the `dt=` partitions on.
+
+    Shared with `metrics/pod-costs/`, which is partitioned and dated the same
+    way and carries the same `subject` column.
+    """
+    where = list(extra or [])
+    if subjects:
+        where.append(f"subject IN ({sql_in_list(subjects)})")
+    if date_from:
+        where.append(f"date >= '{date_from}'")
+        where.append(f"dt >= '{date_from}'")
+    if date_to:
+        where.append(f"date <= '{date_to}'")
+        where.append(f"dt <= '{date_to}'")
+    return ("WHERE " + " AND ".join(where)) if where else ""
+
+
+class CloudpipeMetrics:
+    """Query the cloudpipe_metrics Athena database."""
+
+    def __init__(
+        self,
+        bucket: str,
+        region: str = "<YOUR_AWS_REGION>",
+        workgroup: str = "cloudpipe_metrics_workgroup",
+        output_prefix: str = "grafana-query-results",
+        finops_bucket: str | None = None,
+    ):
+        """
+        Parameters
+        ----------
+        bucket:
+            Main cloudpipe S3 bucket (where metrics/ lives).
+        region:
+            AWS region.
+        workgroup:
+            Athena workgroup for cloudpipe_metrics queries.
+        output_prefix:
+            S3 prefix in finops_bucket for Athena query results.
+        finops_bucket:
+            Bucket for query results; defaults to `bucket` if not set.
+        """
+        import boto3
+
+        self._athena = boto3.client("athena", region_name=region)
+        self._workgroup = workgroup
+        self._results_bucket = finops_bucket or bucket
+        self._results_prefix = output_prefix
+
+    # ------------------------------------------------------------------
+    # Public query methods
+    # ------------------------------------------------------------------
+
+    def func_qc(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return functional QC metrics as a DataFrame.
+
+        Keyword args are appended as WHERE clauses (exact match).
+        Example: func_qc(session="ses-00A", task="task-rest")
+
+        dt_from/dt_to (inclusive, YYYY-MM-DD) scope the query to the `dt=`
+        partition range, which Athena can prune on — pass these whenever the
+        write-date window is known, rather than relying only on a
+        completed_at/recorded_at filter that gives Athena nothing to prune.
+
+        compacted: if True, reads today's raw JSON unioned with all prior
+        compacted Parquet days (see _query's docstring) instead of only the
+        raw table. Off by default so existing callers/dashboards are
+        unaffected until explicitly opted in.
+        """
+        return self._query("func_preproc", filters, dt_from, dt_to, compacted)
+
+    def anat_qc(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return anatomical QC metrics as a DataFrame."""
+        return self._query("anat_qc", filters, dt_from, dt_to, compacted)
+
+    def fsqc_qc(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return fsqc anatomical QC metrics as a DataFrame.
+
+        Same subject+session grain as anat_qc(), and complementary to it rather
+        than overlapping: WM/GM SNR lives here (wm_snr_norm/gm_snr_norm) since
+        anat_qc dropped snr_wm/snr_gm at schema 1.2, while the volume and
+        thickness fields live only there. Join on subject+session.
+
+        Every metric is nullable — filter with IS NOT NULL, not `> 0`, and read
+        the relevant *_status column alongside it (0 = the module ran clean,
+        non-zero = it degraded, NULL = it never reported).
+        """
+        return self._query("fsqc_qc", filters, dt_from, dt_to, compacted)
+
+    def anatomical_qc(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        **filters: Any,
+    ):
+        """Return anat_qc and fsqc_qc as ONE per-subject×session anatomical view.
+
+        Both tables describe the same T1w image at the same grain, and neither
+        is complete alone: WM/GM SNR (wm_snr_norm/gm_snr_norm) left anat_qc at
+        schema 1.2 and lives only in fsqc_qc, while volumes, thickness, and the
+        mriqc-style IQMs live only in anat_qc. This is the accessor to reach
+        for when the question is "how good is this subject's anatomical?";
+        anat_qc()/fsqc_qc() remain for single-table work.
+
+        Row count is the number of distinct subject×session pairs present in
+        EITHER table over the dt window — never a multiple of it, since each
+        side is deduplicated to its most recent record first.
+
+        dt_from/dt_to select WHICH SCANS to return — a scan is in scope if
+        either table wrote a record in the window — but do NOT restrict which
+        record describes them: each scan carries its most recent record from
+        each table, whenever that was written. See anatomical_join_sql for the
+        measurement behind that (filtering both tables by the window left 0 of
+        23 pilot rows paired; this leaves 23 of 23). Keyword filters (subject=,
+        session=) apply to the records themselves, on both sides.
+
+        A NULL anat half is therefore meaningful: it means no anat_qc record
+        exists for that scan at all, not merely that it was written on another
+        day. `anat_completed_at` tells you when the surviving half was computed,
+        and it can legitimately be weeks before `fsqc_completed_at`.
+
+        Every fsqc-side metric is nullable — filter on IS NOT NULL, not `> 0`
+        (0.0 is real for rot_tal_* and n_outlier_norms), and read the relevant
+        *_status column alongside it.
+
+        No `compacted` option, unlike the single-table accessors: anat_qc's
+        _UNION_COLUMNS entry is a curated subset that omits the IQM columns, so
+        a compacted-mode join would quietly return fewer columns than a raw one.
+        """
+        both = [f"{k} = '{v}'" if isinstance(v, str) else f"{k} = {v}" for k, v in filters.items()]
+        window = []
+        if dt_from:
+            window.append(f"dt >= '{dt_from}'")
+        if dt_to:
+            window.append(f"dt <= '{dt_to}'")
+        return self._run_sql(
+            anatomical_join_sql(
+                "cloudpipe_metrics.anat_qc",
+                "cloudpipe_metrics.fsqc_qc",
+                ("WHERE " + " AND ".join(both)) if both else "",
+                " AND ".join(window),
+            )
+        )
+
+    def workflow_runs(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return workflow run summaries as a DataFrame."""
+        return self._query("workflow_runs", filters, dt_from, dt_to, compacted)
+
+    def registration_qc(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return registration QC metrics as a DataFrame.
+
+        Use registration_type= to filter to one step:
+          registration_qc(registration_type="t1w_to_mni")
+          registration_qc(registration_type="bold_to_t1w")
+        """
+        return self._query("registration", filters, dt_from, dt_to, compacted)
+
+    def costs(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return raw cost allocation records as a DataFrame.
+
+        Grain is one row per Argo workflow per scrape date — NOT one row per
+        subject. A subject processed over two UTC days, or reprocessed after a
+        failure, has several rows. For per-subject totals use subject_costs().
+
+        `dt` equals the `date` field for cost records, so dt_from/dt_to and
+        date_from/date_to (in subject_costs) are interchangeable here.
+        """
+        return self._query("costs", filters, dt_from, dt_to, compacted)
+
+    def subject_costs(
+        self,
+        subjects: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ):
+        """Return one row per subject with costs summed over workflow-day records.
+
+        The `metrics/costs/` prefix accumulates across batches, so scope by the
+        batch subject list and the batch's scrape-date window. See the DuckDB
+        twin in metrics/duckdb_query.py for parameter details, including what
+        total_adjustment_usd and max_scrape_age_days (schema 1.2+) mean.
+        """
+        return self._run_sql(f"""
+            SELECT
+                subject,
+                COUNT(*)                       AS n_records,
+                COUNT(DISTINCT workflow_name)  AS n_workflows,
+                SUM(total_cost_usd)            AS total_cost_usd,
+                SUM(cpu_cost_usd)              AS cpu_cost_usd,
+                SUM(memory_cost_usd)           AS memory_cost_usd,
+                SUM(gpu_cost_usd)              AS gpu_cost_usd,
+                SUM(total_adjustment_usd)      AS total_adjustment_usd,
+                MAX(scrape_age_days)           AS max_scrape_age_days,
+                MIN(date)                      AS first_date,
+                MAX(date)                      AS last_date
+            FROM cloudpipe_metrics.costs
+            {cost_scope_clause(subjects, date_from, date_to)}
+            GROUP BY subject
+            ORDER BY total_cost_usd DESC
+        """)
+
+    def pod_costs(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return raw per-pod cost records as a DataFrame.
+
+        Grain is one row per pod per report date — the finest cost grain
+        available, and one grain below costs(). Summing total_cost_usd over a
+        (date, workflow_name) reproduces that workflow's costs() row.
+
+        Filter to one component with step=:
+          pod_costs(step="bold-preprocessing")
+          pod_costs(phase="functional", dt_from="2026-07-01")
+        """
+        return self._query("pod_costs", filters, dt_from, dt_to, compacted)
+
+    def step_costs(
+        self,
+        subjects: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ):
+        """Return the cost distribution across workflow components.
+
+        One row per pipeline step, with cost, share of total, per-pod spread,
+        and request efficiency. This is the answer to "where does the money
+        go" — read total_cost_usd for size, p95 vs median for variance, and
+        cpu/ram efficiency for whether that cost is reducible by right-sizing
+        rather than by faster code.
+
+        n_pods is the pod count, not the subject count: a subject with eight
+        BOLD runs contributes eight bold-to-t1w pods. That is deliberate —
+        mean_cost_usd is then the per-unit-of-work cost, which is what scales
+        when the batch grows.
+
+        Pods whose template sets no `cloudpipe.io/step` label group under ''
+        rather than being dropped, so the step rows always sum to the true
+        total; a large '' row means a template is missing its label, not that
+        cost is unattributable.
+        """
+        return self._run_sql(f"""
+            SELECT
+                step,
+                phase,
+                COUNT(*)                                   AS n_pods,
+                COUNT(DISTINCT subject)                    AS n_subjects,
+                SUM(total_cost_usd)                        AS total_cost_usd,
+                SUM(total_cost_usd) * 100.0
+                    / SUM(SUM(total_cost_usd)) OVER ()     AS pct_of_total,
+                AVG(total_cost_usd)                        AS mean_cost_usd,
+                APPROX_PERCENTILE(total_cost_usd, 0.5)     AS median_cost_usd,
+                APPROX_PERCENTILE(total_cost_usd, 0.95)    AS p95_cost_usd,
+                MAX(total_cost_usd)                        AS max_cost_usd,
+                SUM(cpu_cost_usd)                          AS cpu_cost_usd,
+                SUM(memory_cost_usd)                       AS memory_cost_usd,
+                SUM(gpu_cost_usd)                          AS gpu_cost_usd,
+                SUM(pv_cost_usd)                           AS pv_cost_usd,
+                AVG(runtime_minutes)                       AS mean_runtime_minutes,
+                AVG(cpu_efficiency)                        AS mean_cpu_efficiency,
+                AVG(ram_efficiency)                        AS mean_ram_efficiency
+            FROM cloudpipe_metrics.pod_costs
+            {cost_scope_clause(subjects, date_from, date_to)}
+            GROUP BY step, phase
+            ORDER BY total_cost_usd DESC
+        """)
+
+    def run_costs(
+        self,
+        subjects: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ):
+        """Return an EVEN SPLIT of pod cost across the (task, run)s it processed.
+
+        `bold-to-t1w`, `bold-preprocessing`, and `surface-resample` each run as
+        ONE pod per session, looping over every BOLD run internally — Kubecost
+        bills at pod granularity, so there is no measured cost below session
+        grain. This divides each such pod's cost evenly across the runs its
+        `step_outcomes` rows say it processed. It is a MODELED split, not a
+        measured one: two runs of very different length are charged equally.
+        Do not use this to compare specific runs' cost; use it to compare
+        subjects/sessions once step_costs() has already pointed at one of the
+        three run-scoped steps as the thing worth investigating.
+
+        Subject-scoped steps (e.g. long-segmentation) never appear here —
+        step_outcomes gives them task="na"/run="na", which this excludes.
+
+        Returned `step` values are the `cloudpipe.io/step` pod-cost vocabulary
+        (`bold-to-t1w`, `bold-preprocessing`, `surface-resample`), NOT the
+        step_outcomes canonical vocabulary — the two differ for func-preproc.
+        The `bold-preprocessing` pod writes TWO step_outcomes rows per run
+        (`func-preproc` for its volumetric output, `surface-sample` for its
+        grayordinate output) from one execution, so joining on step_outcomes'
+        own step names would attribute that one pod's cost twice. This maps
+        step_outcomes' `func-preproc` rows to the pod-cost step
+        `bold-preprocessing` and drops `surface-sample` rows entirely — that
+        derivative's cost is the same dollars already counted under
+        `bold-preprocessing`, not an additional cost.
+
+        A step retried within the same workflow can produce more than one pod
+        for the same (workflow_name, step, subject, session); their costs are
+        summed before splitting, so a retry's extra cost is folded into the
+        per-run figure rather than duplicating rows.
+
+        Inherits the same day+1 reconciliation caveat as pod_costs() — the
+        dollar total being split is provisional until scrape_age_days reaches
+        3 (see step_costs()'s docstring and kubecost_drift_probe.py).
+        """
+        pod_scope = cost_scope_clause(subjects, date_from, date_to)
+        sql = f"""
+        WITH pod_cost_by_key AS (
+            SELECT
+                workflow_name, step, subject, session,
+                SUM(total_cost_usd)   AS total_cost_usd,
+                SUM(cpu_cost_usd)     AS cpu_cost_usd,
+                SUM(memory_cost_usd)  AS memory_cost_usd,
+                SUM(gpu_cost_usd)     AS gpu_cost_usd,
+                MAX(date)             AS date,
+                MAX(scrape_age_days)  AS scrape_age_days
+            FROM cloudpipe_metrics.pod_costs
+            {pod_scope}
+            GROUP BY workflow_name, step, subject, session
+        ),
+        run_outcomes AS (
+            -- Map step_outcomes' canonical step names onto the pod_costs
+            -- vocabulary. surface-sample is dropped: it is a second derivative
+            -- of the SAME bold-preprocessing pod as func-preproc, not a
+            -- separately-costed step (see docstring).
+            SELECT
+                workflow_name,
+                CASE step WHEN 'func-preproc' THEN 'bold-preprocessing' ELSE step END AS step,
+                subject, session, task, run
+            FROM cloudpipe_metrics.step_outcomes
+            WHERE task <> 'na' AND run <> 'na' AND step <> 'surface-sample'
+        ),
+        run_counts AS (
+            SELECT workflow_name, step, subject, session, COUNT(*) AS n_runs_in_pod
+            FROM run_outcomes
+            GROUP BY workflow_name, step, subject, session
+        )
+        SELECT
+            so.workflow_name, so.step, so.subject, so.session, so.task, so.run,
+            pc.total_cost_usd  / rc.n_runs_in_pod  AS total_cost_usd,
+            pc.cpu_cost_usd    / rc.n_runs_in_pod  AS cpu_cost_usd,
+            pc.memory_cost_usd / rc.n_runs_in_pod  AS memory_cost_usd,
+            pc.gpu_cost_usd    / rc.n_runs_in_pod  AS gpu_cost_usd,
+            rc.n_runs_in_pod,
+            pc.date, pc.scrape_age_days
+        FROM run_outcomes so
+        JOIN run_counts rc
+          ON so.workflow_name = rc.workflow_name AND so.step = rc.step
+         AND so.subject = rc.subject AND so.session = rc.session
+        JOIN pod_cost_by_key pc
+          ON pc.workflow_name = rc.workflow_name AND pc.step = rc.step
+         AND pc.subject = rc.subject AND pc.session = rc.session
+        ORDER BY so.subject, so.session, so.task, so.run
+        """
+        return self._run_sql(sql)
+
+    def join_subject(self, subject: str):
+        """Return per-BOLD-run QC for one subject, with its run-of-record
+        workflow status, duration, and total cost attached.
+
+        Grain is one row per run (subject, session, task, run) — the row count
+        equals the subject's BOLD-run count, never a multiple of it.
+
+        The three tables sit at three grains: func_preproc is per-run,
+        workflow_runs is per-workflow (a reprocessed subject has several), and
+        costs is per-workflow-per-scrape-date (a midnight-spanning workflow has
+        several). Joining them naively on `subject` / `workflow_name` fans the
+        run rows out by the product of those multiplicities, so any SUM over
+        the result overstates cost and duration. This query avoids that by
+        summing costs to workflow grain first, then reducing workflow_runs to
+        the subject's most recent run (the run of record) before the join, so
+        each run row is annotated exactly once.
+
+        `status`, `total_duration_s`, and `total_cost_usd` are workflow-grain
+        values repeated on every run row for the subject. They describe the
+        whole workflow, not the individual run, so do NOT SUM them across the
+        returned rows — read any single row for the subject-level figure.
+        """
+        sql = f"""
+        WITH cost_by_workflow AS (
+            SELECT workflow_name, SUM(total_cost_usd) AS total_cost_usd
+            FROM cloudpipe_metrics.costs
+            GROUP BY workflow_name
+        ),
+        workflow_of_record AS (
+            SELECT
+                w.subject, w.status, w.total_duration_s, c.total_cost_usd,
+                ROW_NUMBER() OVER (
+                    PARTITION BY w.subject ORDER BY w.completed_at DESC
+                ) AS rn
+            FROM cloudpipe_metrics.workflow_runs w
+            LEFT JOIN cost_by_workflow c ON w.workflow_name = c.workflow_name
+            WHERE w.subject = '{subject}'
+        )
+        SELECT
+            f.session, f.task, f.run,
+            f.mean_fd, f.tsnr_median, f.pct_fd_above_0p5, f.total_runtime_s,
+            a.lh_mean_thickness_mm, a.rh_mean_thickness_mm, a.total_brain_vol_mm3,
+            w.status, w.total_duration_s,
+            w.total_cost_usd
+        FROM cloudpipe_metrics.func_preproc f
+        LEFT JOIN cloudpipe_metrics.anat_qc a
+               ON f.subject = a.subject AND f.session = a.session
+        LEFT JOIN workflow_of_record w
+               ON w.subject = f.subject AND w.rn = 1
+        WHERE f.subject = '{subject}'
+        ORDER BY f.session, f.task, f.run
+        """
+        return self._run_sql(sql)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _query(
+        self,
+        table: str,
+        filters: dict[str, Any],
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+    ):
+        where_clauses = [
+            f"{k} = '{v}'" if isinstance(v, str) else f"{k} = {v}" for k, v in filters.items()
+        ]
+        if dt_from:
+            where_clauses.append(f"dt >= '{dt_from}'")
+        if dt_to:
+            where_clauses.append(f"dt <= '{dt_to}'")
+        extra_where = " AND ".join(where_clauses)
+
+        if not compacted:
+            where = f"WHERE {extra_where}" if extra_where else ""
+            sql = f"SELECT * FROM cloudpipe_metrics.{table} {where} ORDER BY completed_at DESC"
+            return self._run_sql(sql)
+
+        # Today's raw JSON unioned with all prior compacted Parquet days.
+        # Never the same dt on both sides (raw is restricted to dt =
+        # CURRENT_DATE, compacted to dt < CURRENT_DATE — compaction itself
+        # never touches today, see src/metrics/compactor.py), so this never
+        # double-counts a record. Explicit column lists (not SELECT *) are
+        # required: the *_compacted table has one fewer column than the raw
+        # table (schema_version is a partition key there, a data column
+        # here), so positional UNION ALL needs identical column lists on
+        # both sides regardless of each table's own column order.
+        cols = _UNION_COLUMNS.get(table)
+        if cols is None:
+            raise ValueError(f"No compacted counterpart registered for table {table!r}")
+        col_list = ", ".join(cols)
+        # `dt` is declared `string` on every table (all nine), so a bare
+        # `dt = CURRENT_DATE` is varchar = date and Athena rejects the WHOLE
+        # query with TYPE_MISMATCH — this made compacted=True unusable for every
+        # table, not just registration. Same varchar/date class of bug that broke
+        # six Grafana dashboards.
+        #
+        # Format the DATE down to varchar rather than casting `dt` up to DATE
+        # (which is what the Grafana panels do, because there both sides come
+        # from Grafana's macros). Comparing the string partition as a string is
+        # the more direct reading; a measured A/B on the live table showed
+        # identical DataScannedInBytes for both forms, so this is not a
+        # pruning optimisation — do not cite it as one. `<` stays correct
+        # because YYYY-MM-DD sorts lexicographically.
+        today = "date_format(CURRENT_DATE, '%Y-%m-%d')"
+        raw_where = " AND ".join([f"dt = {today}", *where_clauses])
+        compacted_where = " AND ".join([f"dt < {today}", *where_clauses])
+        sql = f"""
+            SELECT {col_list} FROM cloudpipe_metrics.{table} WHERE {raw_where}
+            UNION ALL
+            SELECT {col_list} FROM cloudpipe_metrics.{table}_compacted WHERE {compacted_where}
+            ORDER BY completed_at DESC
+        """
+        return self._run_sql(sql)
+
+    def _run_sql(self, sql: str):
+        import pandas as pd
+
+        output_location = f"s3://{self._results_bucket}/{self._results_prefix}/"
+        resp = self._athena.start_query_execution(
+            QueryString=sql,
+            WorkGroup=self._workgroup,
+            ResultConfiguration={"OutputLocation": output_location},
+        )
+        qid = resp["QueryExecutionId"]
+
+        elapsed = 0.0
+        while elapsed < _MAX_WAIT_S:
+            status = self._athena.get_query_execution(QueryExecutionId=qid)
+            state = status["QueryExecution"]["Status"]["State"]
+            if state == "SUCCEEDED":
+                break
+            if state in {"FAILED", "CANCELLED"}:
+                reason = status["QueryExecution"]["Status"].get("StateChangeReason", "")
+                raise RuntimeError(f"Athena query {qid} {state}: {reason}")
+            time.sleep(_POLL_INTERVAL)
+            elapsed += _POLL_INTERVAL
+        else:
+            raise TimeoutError(f"Athena query {qid} did not complete within {_MAX_WAIT_S}s")
+
+        # Paginate results
+        rows: list[dict] = []
+        paginator = self._athena.get_paginator("get_query_results")
+        columns: list[str] = []
+        for page in paginator.paginate(QueryExecutionId=qid):
+            result = page["ResultSet"]
+            if not columns:
+                columns = [c["Label"] for c in result["ResultSetMetadata"]["ColumnInfo"]]
+            for row in result["Rows"]:
+                values = [d.get("VarCharValue", None) for d in row["Data"]]
+                if values != columns:  # skip header row
+                    # strict=True: Athena returns one Data entry per column. If that
+                    # ever failed, a plain zip would silently drop trailing columns and
+                    # hand back a DataFrame with missing values rather than an error.
+                    rows.append(dict(zip(columns, values, strict=True)))
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=pd.Index(columns))

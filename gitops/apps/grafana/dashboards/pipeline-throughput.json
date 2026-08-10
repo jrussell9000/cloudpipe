@@ -1,105 +1,339 @@
 {
   "uid": "cloudpipe-throughput",
   "title": "CloudPipe — Pipeline Throughput",
-  "description": "Workflow submission counts, success rates, and durations from the workflow_runs metrics table.",
-  "tags": ["cloudpipe", "pipeline"],
+  "description": "How many subjects went through the pipeline, how many finished, how long they took, and how long they waited for a node. One row per Argo workflow.",
+  "tags": [
+    "cloudpipe",
+    "throughput",
+    "operations"
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "CloudPipe dashboards",
+      "tags": [
+        "cloudpipe"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "refresh": "5m",
-  "time": { "from": "now-7d", "to": "now" },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
   "panels": [
+    {
+      "id": 900,
+      "type": "text",
+      "title": "About this dashboard",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 9,
+        "h": 5
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### 🚚 Is work getting through the pipeline?\n\nOne **workflow** = one participant taken through the whole pipeline. A participant reprocessed after a failure has several workflows, and every attempt is counted here — that is deliberate, since throughput is about attempts, not about distinct people.\n\n**Waiting vs. running.** Queue wait is time spent with nowhere to run, before any processing starts: the cluster scales nodes on demand, so a burst of submissions waits for machines to boot.\n\n⚠️ Workflows are dated by when they **finished**, while the QC dashboards date records by when the workflow **started**. A batch running past midnight UTC therefore lands on different days across dashboards."
+      }
+    },
     {
       "id": 1,
       "type": "stat",
-      "title": "Total Runs (selected range)",
-      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Workflows run",
+      "gridPos": {
+        "x": 9,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT COUNT(*) AS total_runs FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo()"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT COUNT(*) AS total_runs FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "blue", "value": null }] } }
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Every attempt in range, including reprocessing. Not a count of distinct participants.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
       }
     },
     {
       "id": 2,
       "type": "stat",
-      "title": "Success Rate",
-      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Finished successfully",
+      "gridPos": {
+        "x": 14,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(100.0 * SUM(CASE WHEN status = 'Succeeded' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_pct FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo()"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT ROUND(100.0 * SUM(CASE WHEN status = 'Succeeded' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_pct FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
-          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 80 }, { "color": "green", "value": 95 }] }
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "green",
+                "value": 95
+              }
+            ]
+          }
         }
+      },
+      "description": "Share of workflows ending in Succeeded. A partial outcome (some sessions processed, others not) does not count as success here.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
       }
     },
     {
       "id": 3,
       "type": "stat",
-      "title": "Mean Duration (hours)",
-      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Mean time to finish",
+      "gridPos": {
+        "x": 19,
+        "y": 0,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT ROUND(AVG(total_duration_s) / 3600.0, 2) AS mean_hours FROM cloudpipe_metrics.workflow_runs WHERE status = 'Succeeded' AND from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo()"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT ROUND(AVG(total_duration_s) / 3600.0, 2) AS mean_hours FROM cloudpipe_metrics.workflow_runs WHERE status = 'Succeeded' AND from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "h" } }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "description": "Averaged over SUCCEEDED workflows only, so a fast failure cannot flatter this number. Runtime is driven mostly by how many BOLD runs a participant has.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "📊 Outcomes & waiting",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Mean wait for a node",
+      "description": "Time between submission and the first pod actually starting — cluster scale-up latency, not processing time. Consistently high values mean the node pools are the bottleneck, not the pipeline.",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 6,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT ROUND(AVG(pending_duration_s) / 60.0, 1) AS mean_queue_min FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) AND pending_duration_s IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
     },
     {
       "id": 4,
       "type": "bargauge",
-      "title": "Runs by Status",
-      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "How workflows ended",
+      "gridPos": {
+        "x": 6,
+        "y": 6,
+        "w": 18,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT status, COUNT(*) AS count FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() GROUP BY status ORDER BY count DESC"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT status, COUNT(*) AS count FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) GROUP BY status ORDER BY count DESC"
         }
       ],
-      "options": { "orientation": "horizontal", "displayMode": "basic" }
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic"
+      },
+      "description": "Count per terminal status. Failed and Error are distinct: Error generally means the pod was lost (evicted, node reclaimed) rather than the code failing.",
+      "fieldConfig": {
+        "defaults": {}
+      }
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "📋 Recent activity",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
     },
     {
       "id": 5,
       "type": "table",
-      "title": "Recent Workflow Runs",
-      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 10 },
-      "datasource": { "uid": "cloudpipe-athena", "type": "grafana-athena-datasource" },
+      "title": "Recent workflows",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
           "format": 1,
-          "connectionArgs": { "catalog": "__default", "database": "__default", "region": "__default" },
-          "rawSQL": "SELECT subject, pipeline, status, started_at, ROUND(total_duration_s / 3600.0, 2) AS duration_h, message FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() ORDER BY started_at DESC LIMIT 50"
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT subject, pipeline, status, started_at, ROUND(total_duration_s / 3600.0, 2) AS duration_h, message FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) ORDER BY started_at DESC LIMIT 50"
         }
       ],
-      "options": { "sortBy": [{ "displayName": "started_at", "desc": true }] }
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "started_at",
+            "desc": true
+          }
+        ]
+      },
+      "description": "Most recent first. `message` carries the failure text when there is one.",
+      "fieldConfig": {
+        "defaults": {}
+      }
     }
   ]
 }

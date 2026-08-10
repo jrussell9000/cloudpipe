@@ -6,3 +6,52 @@ nvidia-device-plugin:
   nodeSelector:
     karpenter.sh/nodepool: gpu-nodepool
   affinity: {}
+  # Explicitly lock to the legacy device plugin API. DRA is not supported with
+  # Karpenter per AWS guidance, and auto-detection in v0.16+ can silently switch
+  # to DRA on EKS 1.26+ clusters, breaking nvidia.com/gpu resource registration.
+  config:
+    map:
+      default: |-
+        version: v1
+        flags:
+          migStrategy: none
+        sharing:
+          # Time-slicing: advertise 3 nvidia.com/gpu per physical GPU so three
+          # GPU pods pack onto one card. The seg working set is ~3.7 GiB
+          # (subject-independent, 256^3 conform), so 3 x 3.7 = 11.1 GiB.
+          #
+          # WHY 3 AND NOT MORE. Two independent ceilings, and the binding one is
+          # NOT the card this was measured on:
+          #
+          #   VRAM. This config is CLUSTER-WIDE, so the count is advertised on
+          #   every family in the gpu-nodepool list — including g4dn, whose T4 has
+          #   15360 MiB (~15109 usable), not the A10G's 23028. At 4 replicas
+          #   4 x 3.7 GiB = 15156 MiB > 15109 and the fourth pod OOMs on any g4dn
+          #   node. That is the same failure mode g6f was dropped for. At 3 the T4
+          #   sits at 11.1/15.0 GiB (74%) and the A10G at 48%.
+          #
+          #   CPU. Every GPU step requests cpu: 1 (enforced by
+          #   tests/argo/test_gpu_step_resources.py), so N slices need N allocatable
+          #   cores for GPU pods alone. A 4-vCPU xlarge (~3920m, minus daemonsets)
+          #   carries 3; it cannot carry 4. Going to 4 would force the instance-size
+          #   floor up to 2xlarge and give back the cost win of capping the pool.
+          #
+          # Duty cycle is what makes extra slices worth anything at all: the GPU
+          # steps compute for ~17% of their wall time while holding a slice for
+          # 100% of it (43 pod logs, 2026-07-31 — see
+          # docs/investigations/2026-07-31-gpu-vram-duty-cycle-handoff.md). At 3
+          # slices that is ~51%, still clear of continuous saturation.
+          #
+          # g6f (a ~5.59 GiB 1/4-L4 slice) stays dropped from the gpu-nodepool
+          # instance-family list — even 2 x 3.7 > 5.59 would OOM there (Option A,
+          # see gpu-nodepool.yaml). Do NOT re-add g6f without moving to per-node
+          # configs first.
+          #
+          # Keep replicas in sync with capacity in Karpenter's
+          # gpu-timeslice-nodeoverlay.yaml (terraform/modules/karpenter).
+          timeSlicing:
+            renameByDefault: false
+            failRequestsGreaterThanOne: false
+            resources:
+              - name: nvidia.com/gpu
+                replicas: 3

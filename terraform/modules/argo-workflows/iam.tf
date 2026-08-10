@@ -20,6 +20,21 @@ data "aws_iam_policy_document" "controller" {
     actions   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
     resources = ["arn:aws:s3:::${var.bucket}/*"]
   }
+
+  # Metrics bucket: no DeleteObject. Metric artifacts are never garbage
+  # collected, and withholding delete is the point of the separate bucket —
+  # versioning makes an overwrite recoverable, this makes a delete impossible.
+  statement {
+    sid       = "ListMetricsBucket"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = ["arn:aws:s3:::${var.metrics_bucket}"]
+  }
+
+  statement {
+    sid       = "S3MetricsReadWrite"
+    actions   = ["s3:PutObject", "s3:GetObject"]
+    resources = ["arn:aws:s3:::${var.metrics_bucket}/*"]
+  }
 }
 
 resource "aws_iam_policy" "controller" {
@@ -76,16 +91,19 @@ data "aws_iam_policy_document" "runner" {
     resources = ["arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/cloudpipe/globus/*"]
   }
 
+  # Metrics bucket. The runner is what actually uploads output artifacts, so
+  # this is the grant that matters for metric emission. No DeleteObject — see
+  # the controller policy above.
   statement {
-    sid       = "AbcdV6S3ReadWrite"
-    actions   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
-    resources = ["arn:aws:s3:::<YOUR_INPUT_S3_BUCKET>/*"]
+    sid       = "S3MetricsReadWrite"
+    actions   = ["s3:PutObject", "s3:GetObject"]
+    resources = ["arn:aws:s3:::${var.metrics_bucket}/*"]
   }
 
   statement {
-    sid       = "AbcdV6S3List"
+    sid       = "S3MetricsListBucket"
     actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
-    resources = ["arn:aws:s3:::<YOUR_INPUT_S3_BUCKET>"]
+    resources = ["arn:aws:s3:::${var.metrics_bucket}"]
   }
 }
 

@@ -89,30 +89,6 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: argo-admin-events
-  namespace: argo-workflows
-rules:
-- apiGroups: ["argoproj.io"]
-  resources: ["sensors", "eventsources", "eventbus"]
-  verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: argo-admin-events
-  namespace: argo-workflows
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: argo-admin-events
-subjects:
-  - kind: ServiceAccount
-    name: argo-admin
-    namespace: argo-workflows
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
   name: argo-admin-pod-ops
   namespace: argo-workflows
 rules:
@@ -130,35 +106,6 @@ roleRef:
   kind: Role
   name: argo-admin-pod-ops
 subjects:
-  - kind: ServiceAccount
-    name: argo-admin
-    namespace: argo-workflows
----
-# Grant argo-workflows-server and argo-admin read access to Argo Events resources
-# in the argo-events namespace, where sensors/eventsources/eventbus actually live.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: argo-server-events-reader
-  namespace: argo-events
-rules:
-- apiGroups: ["argoproj.io"]
-  resources: ["sensors", "eventsources", "eventbus"]
-  verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: argo-server-events-reader
-  namespace: argo-events
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: argo-server-events-reader
-subjects:
-  - kind: ServiceAccount
-    name: argo-workflows-server
-    namespace: argo-workflows
   - kind: ServiceAccount
     name: argo-admin
     namespace: argo-workflows

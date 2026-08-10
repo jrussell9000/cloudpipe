@@ -1,0 +1,1250 @@
+{
+  "uid": "cloudpipe-karpenter",
+  "title": "CloudPipe — Karpenter Autoscaler",
+  "description": "How the cluster grows and shrinks: nodes Karpenter provisions, spot interruptions it absorbs, nodepool capacity headroom, and the nodes it voluntarily removes to save money.",
+  "tags": [
+    "cloudpipe",
+    "karpenter",
+    "infrastructure"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 900,
+      "type": "text",
+      "title": "About this dashboard",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### 📈 How the cluster grows and shrinks\n\nNodes are not kept running for the pipeline. **Karpenter** creates machines when pods need them and deletes them when they go idle, mostly on **spot** capacity, which AWS can reclaim at short notice.\n\nSo three things matter:\n\n- **Provisioning speed** — how fast a pending pod gets a machine\n- **Interruptions** — how often spot capacity is reclaimed, and whether pods survived it\n- **Headroom** — how close each nodepool is to its ceiling\n\n**Blank panels usually mean an idle cluster**, not a fault: between batches there are no Karpenter nodes at all, so anything grouped by nodepool has nothing to show."
+      }
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Karpenter nodes now",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "expr": "count(kube_node_labels{label_karpenter_sh_nodepool!=\"\"})",
+          "legendFormat": "Nodes"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "description": "Nodes Karpenter currently manages. ZERO is the normal resting state — between batches the cluster runs only its static managed nodegroups, which Karpenter does not own and which carry no nodepool label."
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Pods waiting for capacity",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 4,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "expr": "sum(kube_pod_status_phase{namespace=\"argo-workflows\", phase=\"Pending\"})",
+          "legendFormat": "Pending"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        }
+      },
+      "description": "Pipeline pods that cannot be scheduled right now — Pending in the argo-workflows namespace. Scoped to the pipeline deliberately: Karpenter does provision for any unschedulable pod cluster-wide, but system pods pending for their own reasons only add noise to the question this dashboard exists to answer. Matches the equivalent panel on Infrastructure Health, so the two agree."
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Spot reclaims (1 h)",
+      "description": "Spot instances AWS took back in the last hour. Expected and survivable — the pipeline retries interrupted work — but a sustained spike is worth correlating against failures.",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 4,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "expr": "ceil(sum(increase(karpenter_nodeclaims_disrupted_total{reason=\"spot_interrupted\"}[1h])))",
+          "legendFormat": "Interruptions"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Nodes drained (1 h)",
+      "gridPos": {
+        "x": 20,
+        "y": 0,
+        "w": 4,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "expr": "ceil(sum(increase(karpenter_nodes_drained_total[1h])))",
+          "legendFormat": "Drained"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "description": "Nodes Karpenter cordoned and emptied in the last hour, for any reason — spot reclaim, consolidation, or expiry. Draining is orderly: pods are evicted and rescheduled. Compare with the removal panel below to see which cause dominated."
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "⚡ Spot interruptions",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Interruption notices, by type",
+      "description": "SQS message volume, not distinct nodes — AWS redelivers each notice several times. Use this for queue health; use the 'Spot Interruptions' stat for the true node count. 'no_op' dominates by volume and is dimmed.",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (message_type) (rate(karpenter_interruption_received_messages_total[5m])) * 3600",
+          "legendFormat": "{{message_type}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "spot_interrupted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rebalance_recommendation"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "no_op"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "text",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "How long interruption notices sat in the queue",
+      "description": "How long an interruption message sits in SQS before Karpenter processes it. The spot interruption notice gives ~2 minutes of warning, so this is the slice of that budget lost to queueing — elevated values here shorten the window pods have to drain gracefully.",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(karpenter_interruption_message_queue_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(karpenter_interruption_message_queue_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(karpenter_interruption_message_queue_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "🖥️ Nodes & pods",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Nodes per nodepool",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count by (label_karpenter_sh_nodepool) (kube_node_labels{label_karpenter_sh_nodepool!=\"\"})",
+          "legendFormat": "{{label_karpenter_sh_nodepool}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "description": "Empty whenever no Karpenter nodes exist — see the note in the panel above. This series comes from node labels, which only Karpenter-provisioned nodes carry."
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Nodes removed (per hour)",
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(karpenter_nodes_terminated_total[5m])) * 3600",
+          "legendFormat": "Terminated/hr"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(karpenter_nodes_drained_total[5m])) * 3600",
+          "legendFormat": "Drained/hr"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "description": "Two related rates: nodes fully terminated, and nodes drained. Drains lead terminations, so a gap between the lines means nodes are currently emptying. A sustained high rate with no matching workload change suggests consolidation is churning capacity rather than saving money."
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Pods evicted during node removal",
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(karpenter_pods_drained_total[5m])) * 3600",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "description": "Pods evicted because their node was being removed, split by reason. Pipeline work survives this — interrupted steps are retried — but a spike here explains a batch that took longer than expected without anything having actually failed."
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Time to provision a node, by phase",
+      "description": "Where the wait goes between requesting a NodeClaim and having a usable node — instance launch, registration, and readiness.",
+      "gridPos": {
+        "x": 12,
+        "y": 22,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, type) (rate(operator_nodeclaim_status_condition_transition_seconds_bucket{status=\"Unknown\"}[5m])))",
+          "legendFormat": "{{type}} p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le, type) (rate(operator_nodeclaim_status_condition_transition_seconds_bucket{status=\"Unknown\"}[5m])))",
+          "legendFormat": "{{type}} p99"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "AWS API errors (per hour)",
+      "description": "Errors Karpenter hit talking to EC2. A burst here explains slow provisioning better than anything else on this dashboard.",
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 24,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (method) (rate(karpenter_cloudprovider_errors_total[5m])) * 3600",
+          "legendFormat": "{{method}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          }
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "📊 Nodepool headroom",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 13,
+      "type": "bargauge",
+      "title": "CPU headroom by nodepool",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "expr": "100 * karpenter_nodepools_usage{resource_type=\"cpu\"} / karpenter_nodepools_limit{resource_type=\"cpu\"}",
+          "legendFormat": "{{nodepool}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "namePlacement": "auto",
+        "valueMode": "color",
+        "minVizWidth": 8,
+        "minVizHeight": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          }
+        }
+      },
+      "description": "Usage against each nodepool's configured CPU ceiling. Near 100% means the nodepool cap, not the cluster, is what is throttling throughput — the GPU nodepool cap was the single biggest cost lever found in the July 2026 rightsizing."
+    },
+    {
+      "id": 14,
+      "type": "bargauge",
+      "title": "Memory headroom by nodepool",
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "expr": "100 * karpenter_nodepools_usage{resource_type=\"memory\"} / karpenter_nodepools_limit{resource_type=\"memory\"}",
+          "legendFormat": "{{nodepool}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "namePlacement": "auto",
+        "valueMode": "color",
+        "minVizWidth": 8,
+        "minVizHeight": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          }
+        }
+      },
+      "description": "Memory usage against each nodepool's configured ceiling. Near 100% means the nodepool cap is the binding constraint, so more work will queue rather than scale out; the cap is a deliberate cost control, not a bug."
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "CPU cores: used vs ceiling",
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "karpenter_nodepools_usage{resource_type=\"cpu\"}",
+          "legendFormat": "{{nodepool}} used"
+        },
+        {
+          "refId": "B",
+          "expr": "karpenter_nodepools_limit{resource_type=\"cpu\"}",
+          "legendFormat": "{{nodepool}} limit"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*limit"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "description": "CPU actually consumed against the nodepool's ceiling, in cores. The gap is headroom. Reading this alongside pending pods separates 'no capacity allowed' (usage at the ceiling) from 'capacity not yet booted' (usage well below it, pods still pending)."
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Memory: used vs ceiling",
+      "gridPos": {
+        "x": 12,
+        "y": 42,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "karpenter_nodepools_usage{resource_type=\"memory\"} / 1073741824",
+          "legendFormat": "{{nodepool}} used"
+        },
+        {
+          "refId": "B",
+          "expr": "karpenter_nodepools_limit{resource_type=\"memory\"} / 1073741824",
+          "legendFormat": "{{nodepool}} limit"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*limit"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "description": "Memory consumed against the nodepool's ceiling, in GiB. Same reading as the CPU panel beside it. Memory is the binding resource for the cpu-light nodepool, so that is the series to watch there."
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "♻️ Consolidation",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Nodes eligible for removal",
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (method) (karpenter_voluntary_disruption_eligible_nodes)",
+          "legendFormat": "{{method}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "description": "Nodes Karpenter considers underused enough to consolidate away. High numbers alongside pending pods means bin-packing is working against you."
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Consolidation decisions (per hour)",
+      "gridPos": {
+        "x": 8,
+        "y": 50,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (decision, reason) (rate(karpenter_voluntary_disruption_decisions_total[5m])) * 3600",
+          "legendFormat": "{{decision}} / {{reason}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "description": "Consolidation actions per hour, split by decision and reason — Karpenter replacing or deleting underused nodes to cut cost. Activity here during an idle period is expected and healthy; activity during a batch is worth correlating against the pod eviction panel."
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Consolidation problems",
+      "description": "Karpenter v1.x removed karpenter_voluntary_disruption_queue_failures_total; failed disruption launches now surface as cloudprovider errors (see 'Cloud Provider Errors') rather than a dedicated counter.",
+      "gridPos": {
+        "x": 16,
+        "y": 50,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-prometheus",
+        "type": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(karpenter_voluntary_disruption_consolidation_timeouts_total[5m])) * 3600",
+          "legendFormat": "Consolidation Timeouts/hr"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(karpenter_voluntary_disruption_failed_validations_total[5m])) * 3600",
+          "legendFormat": "Validation Failures/hr"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "spanNulls": false,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    }
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "CloudPipe dashboards",
+      "tags": [
+        "cloudpipe"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ]
+}

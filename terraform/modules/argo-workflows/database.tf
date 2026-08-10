@@ -85,8 +85,8 @@ resource "aws_db_instance" "this" {
 #
 # RDS manages the master password natively (manage_master_user_password = true).
 # master_user_secret[0].secret_arn is the RDS-owned Secrets Manager secret.
-# ESO syncs it into a Kubernetes Secret named "argo-db" in var.namespace.
-# The secret contains username, password, dbname, host, port keys.
+# ESO syncs it into a Kubernetes Secret named "argo-db" in var.namespace via
+# ExternalSecret target.template (see below), adding host/port/dbname statically.
 ################################################################################
 
 # ClusterSecretStore — shared by all ExternalSecrets in the cluster.
@@ -114,7 +114,11 @@ resource "kubectl_manifest" "cluster_secretstore" {
 }
 
 # ExternalSecret — syncs the RDS-managed secret into the argo-workflows namespace.
-# Creates a Kubernetes Secret named "argo-db" with username and password keys.
+# Creates a Kubernetes Secret named "argo-db" with username, password, host, port, dbname.
+#
+# The RDS-managed secret (rds!db-...) only stores username and password; host/port/dbname
+# are not included by AWS. target.template injects the static connection fields alongside
+# the dynamic credentials so pgbouncer can read all five keys from one secret.
 resource "kubectl_manifest" "db_external_secret" {
   count     = var.crds_available ? 1 : 0
   yaml_body = <<-YAML
@@ -130,6 +134,46 @@ resource "kubectl_manifest" "db_external_secret" {
         kind: ClusterSecretStore
       target:
         name: argo-db
+        template:
+          data:
+            username: "{{ .username }}"
+            password: "{{ .password }}"
+            host: "${aws_db_instance.this.address}"
+            port: "5432"
+            dbname: "${var.db_name}"
+      dataFrom:
+      - extract:
+          key: ${aws_db_instance.this.master_user_secret[0].secret_arn}
+  YAML
+
+  depends_on = [
+    kubectl_manifest.cluster_secretstore,
+    aws_db_instance.this,
+    data.kubernetes_namespace_v1.this,
+  ]
+}
+
+# ExternalSecret for pgbouncer userlist — formats username+password from the
+# RDS-managed secret into pgbouncer's userlist.txt format ("user" "pass").
+# Mounted at /etc/pgbouncer-auth/ via pgbouncer.extraVolumes in gitops values.
+resource "kubectl_manifest" "pgbouncer_userlist_external_secret" {
+  count     = var.crds_available ? 1 : 0
+  yaml_body = <<-YAML
+    apiVersion: external-secrets.io/v1beta1
+    kind: ExternalSecret
+    metadata:
+      name: pgbouncer-auth-userlist
+      namespace: ${var.namespace}
+    spec:
+      refreshInterval: 1h
+      secretStoreRef:
+        name: external-secrets-clusterstore
+        kind: ClusterSecretStore
+      target:
+        name: pgbouncer-auth-userlist
+        template:
+          data:
+            userlist.txt: '"{{ .username }}" "{{ .password }}"'
       dataFrom:
       - extract:
           key: ${aws_db_instance.this.master_user_secret[0].secret_arn}

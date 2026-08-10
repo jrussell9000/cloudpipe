@@ -17,11 +17,31 @@ argo-workflows:
   controller:
     deploymentAnnotations:
       secret.reloader.stakater.com/reload: "argo-db"
+      configmap.reloader.stakater.com/reload: "argo-workflows-controller-configmap"
 
-    parallelism: 1000
-    resourceRateLimit:
-      limit: 20
-      burst: 35
+    # parallelism / namespaceParallelism / resourceRateLimit are deliberately NOT
+    # set here. The chart's only consumer of them is
+    # templates/controller/workflow-controller-config-map.yaml, and
+    # controller.configMap.create is false below (Terraform owns that ConfigMap),
+    # so anything set here renders nowhere and is silently inert — which is how
+    # this repo shipped a documented pod-creation rate limit that was never in
+    # effect, and no namespace concurrency cap at all, until #206.
+    # They now live in terraform/modules/argo-workflows/main.tf, alongside the
+    # "sso" key, which is there for exactly the same reason.
+
+    # NOT BestEffort: the controller is the single point of failure for every
+    # running workflow, and with `resources: {}` it was first in line for
+    # eviction under node pressure. Requests are sized off observed steady-state
+    # (10m CPU / 237Mi at 100 concurrent workflows, 2026-08-10) with headroom for
+    # the informer cache growth that comes with larger batches. CPU is left
+    # unlimited on purpose — throttling the controller stalls reconciliation of
+    # every workflow at once.
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        memory: 2Gi
 
     rbac:
       create: true
@@ -58,6 +78,7 @@ argo-workflows:
   server:
     deploymentAnnotations:
       secret.reloader.stakater.com/reload: "argo-db"
+      configmap.reloader.stakater.com/reload: "argo-workflows-controller-configmap"
 
     # Pod Identity — SA created by Helm (server needs no AWS permissions)
     serviceAccount:
@@ -68,6 +89,13 @@ argo-workflows:
     - --secure=false
     - --auth-mode=sso
     - --auth-mode=client
+
+    # Suppress the UI first-load "splash" modals for all users
+    extraEnv:
+    - name: FIRST_TIME_USER_MODAL
+      value: "false"
+    - name: FEEDBACK_MODAL
+      value: "false"
 
     sso:
       issuer: https://argocd.<YOUR_DOMAIN>/api/dex
@@ -99,3 +127,73 @@ argo-workflows:
   # artifactRepository is intentionally omitted here — the controller ConfigMap
   # (managed by Terraform) owns the artifactRepository and artifact-repositories
   # keys so the bucket name stays in sync with var.globus_s3_destination_bucket.
+
+pgbouncer:
+  fullnameOverride: pgbouncer
+
+  replicaCount: 1
+
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: argo
+
+  tolerations:
+  - key: "argoproj.io/backend"
+    value: "true"
+    effect: "NoSchedule"
+
+  podAnnotations:
+    secret.reloader.stakater.com/reload: "pgbouncer-auth-userlist"
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+
+  config:
+    adminPassword: "admin"
+    # pgbouncer-auth-userlist is managed by an ExternalSecret (see Terraform
+    # modules/argo-workflows/database.tf) and rotates with the RDS password.
+    # The chart mounts this secret as the userlist volume at /etc/userlist/,
+    # which is exactly the auth_file path its ConfigMap template hardcodes — so
+    # no auth_file override and no extra volume are needed. This replaces the
+    # former last-occurrence-wins auth_file duplicate-key trick, which silently
+    # depended on the override staying textually after the chart's own line.
+    existingUserlistSecret: pgbouncer-auth-userlist
+    # Static connection config rendered into pgbouncer-configmap by the chart.
+    databases:
+      argoworkflows:
+        host: "cloudpipe-argo.c9quuwwes0p8.<YOUR_AWS_REGION>.rds.amazonaws.com"
+        port: 5432
+        dbname: "argoworkflows"
+    pgbouncer:
+      auth_type: md5
+      # Transaction pooling returns a server connection to the pool after every
+      # transaction instead of holding it for a client's whole session, so
+      # default_pool_size is sized by concurrent transactions rather than by
+      # client connection count. Session mode gave no multiplexing at all: it
+      # required default_pool_size >= peak client connections, which does not
+      # scale with the controller's workflowWorkers.
+      pool_mode: transaction
+      # Mandatory for transaction pooling here. Argo's persistence layer
+      # (upper/db over lib/pq) uses protocol-level prepared statements, which
+      # transaction pooling breaks unless pgbouncer tracks them and re-prepares
+      # them on whichever server connection serves the next transaction.
+      # Introduced in pgbouncer 1.21.0; default-on at 200 since 1.24.0. Pinned
+      # explicitly so a future default change cannot silently shrink the cache,
+      # and so the coupling to pool_mode is visible in one place.
+      # NOTE: covers protocol-level statements only, not SQL-level
+      # PREPARE/EXECUTE. Argo does not use those.
+      max_prepared_statements: 200
+      max_client_conn: 200
+      # 25, not the 60 that session mode required: under transaction pooling
+      # this is sized by concurrent transactions, not by peak client count.
+      # maxOpenConns=40 on the controller multiplexes onto these 25.
+      default_pool_size: 25
+      min_pool_size: 2
+      reserve_pool_size: 10
+      reserve_pool_timeout: 3
+      server_tls_sslmode: require
+      ignore_startup_parameters: extra_float_digits
+    userlist: {}

@@ -9,7 +9,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         bc \
         aria2 \
         ca-certificates \
+        tcsh \
+        python3 \
+        python3-numpy \
+        python3-scipy \
+        python3-nibabel \
+        python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# python3-boto3 from apt (Ubuntu 22.04) ships a botocore old enough to predate
+# EKS Pod Identity: it rejects the credentials endpoint host
+# (169.254.170.23) with "Unsupported host", since its allow-list only knows
+# the older ECS-style 169.254.170.2. pip installs a current botocore instead.
+# No --root-user-action: apt's pip here is 22.0.2, older than the 22.1 release
+# that flag requires.
+RUN pip install --disable-pip-version-check --no-cache-dir boto3 botocore
 
 RUN groupadd --gid 1000 nonroot && \
     useradd --uid 1000 --gid 1000 -m nonroot
@@ -85,6 +99,10 @@ RUN aria2c -x 16 -s 16 --file-allocation=none -q -o /tmp/freesurfer.tar.gz "$FS_
 ENV FREESURFER_HOME=/opt/freesurfer
 ENV SUBJECTS_DIR=/opt/freesurfer/subjects
 ENV PATH=$FREESURFER_HOME/bin:$FREESURFER_HOME/python/bin:$PATH
-ENV PYTHONPATH=$FREESURFER_HOME/python/packages
+ENV PYTHONPATH=/app:$FREESURFER_HOME/python/packages
+
+# bold_to_t1w wrapper and shared QC library
+COPY --chown=1000:1000 images/freesurfer/bold_to_t1w.py /app/bold_to_t1w.py
+COPY --chown=1000:1000 images/shared/registration_qc.py /app/registration_qc.py
 
 USER nonroot

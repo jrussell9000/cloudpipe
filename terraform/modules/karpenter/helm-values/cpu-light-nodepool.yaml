@@ -8,11 +8,60 @@ spec:
     consolidateAfter: 10m
     budgets:
     - nodes: "20%"
+  # Sized against a 300-concurrent-workflow burst (issue #62), post recorder
+  # consolidation (#78, #79 — see ADR 016). Outcome-recorder pods no longer
+  # fan out per run: worst case (a full rerun where every step reports
+  # Skipped) is 8 + 5*S recorder pods per subject, not the old 8 + S*(1+4R) —
+  # independent of run count entirely now. The real driver of this pool's
+  # footprint is surface-resample-session-template (2 CPU / 4G per session,
+  # untouched by that consolidation) plus the recorder burst riding with it.
+  #
+  # Derivation: assume up to ~50 sessions across the batch complete within
+  # the same clustering window (anatomical-phase duration is far less
+  # variable than func-preproc's, so early-phase completions can cluster more
+  # than the CLAUDE.md-documented BOLD-driven runtime variance suggests for
+  # later phases) plus ~50 more concurrent workflows in the lighter
+  # globus/inventory/exit-handler phase:
+  #   50 * (2 cpu surface-resample + ~0.5 cpu recorder burst) ~= 125 cpu
+  #   + 50 * ~0.5 cpu background                              ~=  25 cpu
+  #   50 * (4G + ~640M recorder burst)                        ~= 232G
+  #   + 50 * ~0.3G background                                 ~=  15G
+  # -> ~150 cpu / ~250G, rounded up for headroom.
+  #
+  # MEASURED 2026-08-06 (100-subject pilot, #133): the memory figure above was
+  # derived in the wrong unit and bound the pool at 100 concurrent, well short
+  # of the 300 it was sized for.
+  #
+  # Karpenter enforces `limits` against NODE CAPACITY, not against the sum of
+  # pod requests. The ~250G derivation reasons in pod requests (50 * 4G
+  # surface-resample + recorder burst), but every t-family node contributes its
+  # whole ~15.4Gi of capacity toward the limit no matter how little is
+  # requested on it. So the pool filled at **16 nodes = 246.9Gi of 256Gi
+  # (96.5%)** while carrying only ~36 cpu of actual requests — 22% of the cpu
+  # limit. Karpenter then dropped the pool from consideration entirely, and
+  # surface-resample pods pended with monotonically growing waits (532s -> 701s
+  # over three minutes) while nodes were consolidated away beneath them.
+  #
+  # The symptom is badly misleading: the scheduler reports
+  #   FailedScheduling ... incompatible requirements, key karpenter.sh/nodepool
+  # which reads like a nodeSelector bug, not a limits problem.
+  #
+  # The two limits must be expressed in the same unit to stay consistent. In
+  # node-capacity terms `cpu: 160` already permits 40 nodes (4 vCPU each), and
+  # 40 nodes carry 40 * 15.43Gi ~= 617Gi of capacity. 640Gi makes memory
+  # non-binding relative to the cpu limit rather than silently capping the pool
+  # at 40% of it; the cpu limit remains the single intended ceiling.
+  #
+  # Still a ceiling, not a target: 40 nodes is the same footprint the estimate
+  # below intended, just counted correctly. Revisit if
+  # surface-resample-session-template moves off this pool (its 2 CPU request is
+  # a poor fit for a t-series pool otherwise full of 100m pods).
   limits:
-    cpu: 64
-    memory: 128Gi
+    cpu: 160
+    memory: 640Gi
   template:
     spec:
+      expireAfter: 720h
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass

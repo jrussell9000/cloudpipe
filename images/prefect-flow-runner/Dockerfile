@@ -4,8 +4,9 @@ FROM prefecthq/prefect:3-python3.12
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-RUN uv pip install --system --no-cache hera boto3
+RUN uv pip install --system --no-cache hera boto3 pyarrow
 
 WORKDIR /opt/prefect
 COPY prefect/flows/ flows/
-ENV PYTHONPATH=/opt/prefect/flows
+COPY src/metrics/ metrics/
+ENV PYTHONPATH=/opt/prefect/flows:/opt/prefect/metrics

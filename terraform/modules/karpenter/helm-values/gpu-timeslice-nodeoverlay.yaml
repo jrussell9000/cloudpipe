@@ -1,0 +1,42 @@
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  # Renaming from gpu-timeslice-2x forces terraform to replace the object rather
+  # than update it. The brief gap between destroy and create only costs Karpenter
+  # its packing model (it falls back to 1 GPU/node and would over-launch on a burst
+  # in that window) — it cannot strand or evict a running pod, because NodeOverlay
+  # never touches real node capacity. Keep the count in the name: a stale one is
+  # exactly the drift this file's sync requirement exists to prevent.
+  name: gpu-timeslice-3x
+spec:
+  # Makes Karpenter model 3 nvidia.com/gpu per node for the full-GPU families,
+  # matching the device-plugin time-slicing replicas (gitops/apps/
+  # nvidia-device-plugin/values.yaml, sharing.timeSlicing.resources[].replicas).
+  # That file carries the reasoning for why the count is 3 — the binding ceiling is
+  # the T4's 15 GiB on g4dn, not the A10G this was measured on, and separately the
+  # cpu: 1 x N budget on a 4-vCPU xlarge.
+  #
+  # Without this, Karpenter's instance-type model still shows 1 GPU per node, so a
+  # burst of K GPU pods launches K nodes (one per pending pod) even though each
+  # node can now hold 3. This overlay injects capacity: nvidia.com/gpu: 3 into the
+  # SCHEDULING SIMULATION so Karpenter packs 3 pods per node and launches ~K/3.
+  # NodeOverlay cannot change real node capacity — the device plugin advertises the
+  # 2 slices kubelet actually allocates against; this only fixes what Karpenter
+  # *believes* when sizing the fleet. Keep the count == the device-plugin replicas.
+  #
+  # EXCLUDES g6f: its ~5.59 GiB 1/4-L4 slice fits only one ~3.7 GiB FastSurfer pod
+  # (even 2 x 3.7 = 7.4 GiB > 5.59 → OOM). g6f is also dropped from the gpu-nodepool
+  # family list (Option A), so this exclusion is belt-and-suspenders; keep it so the
+  # overlay stays correct even if g6f is re-added. The existing g6f overlay
+  # (gpu-nodeoverlay.yaml) keeps g6f at capacity: 1.
+  #
+  # Requires the NodeOverlay feature gate on the controller
+  # (settings.featureGates.nodeOverlay: true in values-karpenter.yaml) — the g6f
+  # overlay depends on it too. Alpha API (karpenter.sh/v1alpha1) — see
+  # https://karpenter.sh/docs/concepts/nodeoverlays/
+  requirements:
+    - key: karpenter.k8s.aws/instance-family
+      operator: In
+      values: ["g4dn", "g5", "g6", "g6e"]
+  capacity:
+    nvidia.com/gpu: "3"

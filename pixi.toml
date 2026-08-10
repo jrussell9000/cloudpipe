@@ -1,21 +1,104 @@
 [workspace]
-authors = ["Justin Russell <jrussell9000@gmail.com>"]
+authors = ["Justin Russell <<YOUR_MAINTAINER_EMAIL>>"]
 channels = ["conda-forge"]
+license = "MIT"
+license-file = "LICENSE"
 name = "cloudpipe"
 platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
+test = "pytest"
+
+# --- Code-health / lint tooling (dev-only) ---
+# Lives in the `lint` feature/environment so runtime image builds don't pull it.
+# See docs/code-health-plan.md. All tasks are read-only / report-only by default;
+# `format` and `lint-fix` are the only ones that modify files.
+[feature.lint.dependencies]
+ruff = ">=0.14,<0.15"
+vulture = ">=2.14,<3"
+deptry = ">=0.23,<0.24"
+pre-commit = ">=4,<5"
+mypy = ">=1.14,<2"
+
+[feature.lint.tasks]
+# Report-only (safe): no file changes
+lint = "ruff check ."
+fmt-check = "ruff format --check ."
+# Whitelist documents framework entrypoints (Prefect @flow) and public API that
+# vulture can't see are used. Exclude nested pixi envs (e.g. images/workbench/.pixi).
+deadcode = "vulture src images scripts prefect tests .vulture-whitelist.py --exclude '*/.pixi/*' --min-confidence 60 --ignore-names 'side_effect,Bucket,kw,self_inner'"
+# NOTE: deptry cannot read pixi.toml deps — it needs a pyproject.toml [project] or
+# requirements.txt. Blocked pending a decision on adding one (see code-health-plan.md).
+# Until then, stale-dep detection uses the manual import audit in the plan doc.
+deps = "deptry ."
+complexity = "ruff check --select C901 --statistics ."
+# Type-check images/afni/preproc.py (scope + options in mypy.ini). Report-only:
+# a first-pass baseline to make preproc.py's implicit numpy/Path/subprocess
+# contracts explicit before the density refactor. Deliberately NOT in `health`
+# yet — the baseline has findings; gating comes after they're triaged.
+typecheck = "mypy"
+health = { depends-on = ["lint", "fmt-check", "deadcode"] }
+# Mutating (explicit): only these two change files
+format = "ruff format ."
+lint-fix = "ruff check --fix ."
+
+# --- Imaging test stack (dev-only) ---
+# Exists solely so `tests/images/fireants` can be collected. That module imports
+# `fst1w_to_mni`, which imports SimpleITK and torch at module level — so both are
+# needed even by the five `finalize_outputs` tests, which touch neither and only
+# exercise staging promotion and exit codes.
+#
+# No torch here, deliberately. Every test in that directory is CPU-bound: the
+# ITK tests resample 96^3 synthetic volumes, and the finalize_outputs tests
+# assert only staging promotion and exit codes. The GPU path (fireants SyN) is
+# inside main() and has no test, so a torch stack would add ~1.1 GB to the solve
+# to satisfy an import no test exercises. `import torch` in fst1w_to_mni.py is
+# deferred into its two call sites instead — matching the lazy fireants /
+# torch.nn.functional imports already in main().
+[feature.imaging.dependencies]
+simpleitk = ">=2.5.5,<3"
+
+[feature.imaging.tasks]
+# pytest.ini's addopts globally ignores tests/images/fireants so the default env
+# does not fail collection; clear addopts to run exactly what that ignore hides.
+test-imaging = "pytest -o addopts= tests/images/fireants"
+
+# --- Public documentation site (docs-only; not needed by any image) ---
+# Builds docs/ into the public MkDocs Material site. Config, including the
+# curated nav and the exclude list, lives in mkdocs.yml at the repo root.
+[feature.docs.dependencies]
+mkdocs = ">=1.6,<2"
+mkdocs-material = ">=9.5,<10"
+
+[feature.docs.tasks]
+# --strict promotes MkDocs warnings to errors. Combined with the `validation:`
+# block in mkdocs.yml (unrecognized_links: warn), this is what makes a typo'd
+# relative link fail the build instead of shipping a dead link. CI runs this.
+docs-build = "mkdocs build --strict"
+docs-serve = "mkdocs serve"
+
+[environments]
+lint = { features = ["lint"], solve-group = "default" }
+imaging = { features = ["imaging"], solve-group = "default" }
+docs = { features = ["docs"], solve-group = "default" }
 
 [dependencies]
-numpy = ">=2.3.3,<3"
-pandas = ">=2.3.3,<3"
-boto3 = ">=1.40.48,<2"
-tqdm = ">=4.67.1,<5"
+numpy = ">=2.5.1,<3"
+pandas = ">=3.0.3,<4"
+boto3 = ">=1.43.49,<2"
+tqdm = ">=4.68.4,<5"
 hera = ">=5.18.0,<6"
 hera-workflows = ">=4.4.1,<5"
-pipreqs = ">=0.4.13,<0.5"
-botocore = ">=1.40.76,<2"
-prefect = ">=3.6.24,<4"
-globus-sdk = ">=4.5.0,<5"
-pip = ">=25.1,<26"
+pipreqs = ">=0.5.0,<0.6"
+botocore = ">=1.43.49,<2"
+prefect = ">=3.7.8,<4"
+globus-sdk = ">=4.8.1,<5"
+pip = ">=26.1.2,<27"
+pytest = ">=9.1.1,<10"
+requests = ">=2.34.2,<3"
+nibabel = ">=5.4.2,<6"
+scipy = ">=1.18.0,<2"
+matplotlib = ">=3.11.0,<4"
+duckdb = ">=1.5.4,<2"
+pyarrow = ">=21,<22"

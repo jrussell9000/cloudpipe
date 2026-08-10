@@ -6,12 +6,24 @@ metadata:
 
 spec:
   retryStrategy:
-    limit: "3"
+    # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
+    # design, so consecutive reclaims on one long step are routine (2 back-to-back
+    # observed 2026-08-03). At limit 3, four in a row lose the subject outright.
+    # See issue #115.
+    limit: "8"
     retryPolicy: Always
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in [64, 137, 143]'
+    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
+    # never emitted by our scripts. 75 = EX_TEMPFAIL, our own "a reclaim truncated
+    # my output, re-run me" hatch. 137 is deliberately absent: a real OOMKill here
+    # is deterministic (#120, #129, #134 each needed a config change, not a retry),
+    # so retrying it only burns the enlarged budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
     backoff:
       duration: "1m"
       factor: "2"
+      # cap bounds each individual delay (maxDuration would abort the retries
+      # instead): 1+2+4+5+5+5+5+5 = 32m worst case, vs 7m at the old limit of 3.
+      cap: "5m"
 
   templates:
 
@@ -20,7 +32,8 @@ spec:
   #
   # t1w-to-mni and bold-to-t1w run in parallel.
   # t1w-to-mni is skipped when t1w-to-mni-exists == "true" (set by inventory).
-  # bold-to-t1w is fanned out via withParam over runs — b2t_exists skips done runs.
+  # bold-to-t1w runs as ONE pod for the whole session, looping over runs
+  # internally (b2t_exists skips done runs). See bold-to-t1w-session-template.
   ###########################################################################
 
   - name: registration-dag-template
@@ -41,20 +54,88 @@ spec:
               value: '{{inputs.parameters.session}}'
         when: "'{{inputs.parameters.t1w-to-mni-exists}}' != 'true'"
 
+      # Single pod per session — the per-run loop lives inside the container.
+      # The whole task is skipped when inventory found an _itk.txt for every
+      # run, so a fully-complete session never provisions a node.
       - name: bold-to-t1w-step
-        template: bold-to-t1w-template
+        template: bold-to-t1w-session-template
         arguments:
           parameters:
             - name: session
               value: '{{inputs.parameters.session}}'
-            - name: task
-              value: '{{item.task}}'
-            - name: run
-              value: '{{item.run}}'
+            - name: runs
+              value: '{{inputs.parameters.runs}}'
             - name: nss-frames
               value: '{{inputs.parameters.nss-frames}}'
-        withParam: '{{inputs.parameters.runs}}'
-        when: "'{{item.b2t_exists}}' != 'true'"
+        when: '{{= len(filter(jsonpath(inputs.parameters.runs, "$[*]"), {#.b2t_exists == false})) }} > 0'
+
+      # Record T1w→MNI outcome (per session, non-critical).
+      - name: record-outcome-t1w-to-mni-step
+        depends: >-
+          t1w-to-mni-step ||
+          t1w-to-mni-step.Failed ||
+          t1w-to-mni-step.Skipped
+        templateRef:
+          name: outcome-recorder
+          template: record-step-outcome
+        arguments:
+          parameters:
+            - name: step
+              value: t1w-to-mni
+            - name: status
+              value: '{{tasks.t1w-to-mni-step.status}}'
+            - name: subject
+              value: '{{workflow.parameters.subjID}}'
+            - name: session
+              value: '{{inputs.parameters.session}}'
+            - name: bucket
+              value: '{{workflow.parameters.bucket}}'
+            - name: metrics-bucket
+              value: '{{workflow.parameters.metrics-bucket}}'
+
+      # Fallback aggregate record — bold-to-t1w-session-template now records
+      # its own per-run outcomes directly before it exits (see ADR 016), so
+      # this only fires when there is no worker pod to have recorded anything:
+      # the step was skipped (rerun, already registered) or the pod died
+      # before it could write its own records (e.g. OOMKilled, mid-loop
+      # crash). Never on bare success — only Failed || Skipped, so a healthy
+      # session no longer pays for a recorder pod at all.
+      #
+      # status only — no exit-code or output-parameter reference. See ADR 016:
+      # a record task that references {{tasks.bold-to-t1w-step.outputs.*}} is
+      # never instantiated when bold-to-t1w-step is Skipped (a skipped task
+      # has no outputs), deadlocking the parent DAG.
+      - name: record-outcome-bold-to-t1w-step
+        depends: bold-to-t1w-step.Failed || bold-to-t1w-step.Skipped
+        templateRef:
+          name: outcome-recorder
+          template: record-step-outcome
+        arguments:
+          parameters:
+            - name: step
+              value: bold-to-t1w
+            - name: status
+              value: '{{tasks.bold-to-t1w-step.status}}'
+            - name: subject
+              value: '{{workflow.parameters.subjID}}'
+            - name: session
+              value: '{{inputs.parameters.session}}'
+            - name: bucket
+              value: '{{workflow.parameters.bucket}}'
+            - name: metrics-bucket
+              value: '{{workflow.parameters.metrics-bucket}}'
+
+    outputs:
+      parameters:
+        # Exposed so the master DAG can gate functional-preprocessing on the
+        # real t1w-to-mni-step outcome. registration-dagtask itself reports
+        # Succeeded even when t1w-to-mni-step fails, because
+        # record-outcome-t1w-to-mni-step's `depends: ... || t1w-to-mni-step.Failed`
+        # absorbs the failure — so the aggregate status alone can't be used
+        # to gate on this per-session, shared-across-all-runs prerequisite.
+        - name: t1w-to-mni-status
+          valueFrom:
+            expression: "tasks['t1w-to-mni-step'].status"
 
   ###########################################################################
   # T1w → MNI152NLin2009cAsym
@@ -67,12 +148,14 @@ spec:
   # rather than the BIDS T1w.nii.gz.  brainmask.mgz is already in the same
   # conformed space as orig.mgz, so both are converted directly (no --like).
   #
-  # Outputs (uploaded to S3 for cross-session reuse):
-  #   <prefix>_T1w_brain.nii.gz        skull-stripped orig-space T1w (QC)
-  #   <prefix>_affine.mat
-  #   <prefix>_warp.nii.gz
-  #   <prefix>_invwarp.nii.gz
-  #   <prefix>_warped.nii.gz           (QC)
+  # Outputs uploaded individually to S3 (no tar — no symlinks):
+  #   derivatives/registration/{subj}/{ses}/t1w_to_mni/
+  #     <prefix>_T1w_brain.nii.gz      skull-stripped orig-space T1w (QC)
+  #     <prefix>_T1w_orig.nii.gz       orig-space T1w (QC)
+  #     <prefix>_affine.mat
+  #     <prefix>_warp.nii.gz
+  #     <prefix>_warped.nii.gz         (QC)
+  #     <prefix>_qc.json
   ###########################################################################
 
   - name: t1w-to-mni-template
@@ -95,23 +178,93 @@ spec:
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
 
         - name: mni-template
-          path: /data/MNI152NLin2009cAsym_T1w_brain.nii
+          # Register T1w against the 1mm template (matched to the 1mm ABCD moving
+          # data → sharper metrics). Final BOLD output stays 2mm — func-preproc
+          # uses its own 2mm --mni-template as the output grid.
+          path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: config/MNI152NLin2009cAsym_T1w_brain.nii
+            key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
 
     outputs:
       artifacts:
-        # Upload to S3 so downstream sessions / re-runs can skip this step
-        - name: t1w-to-mni-transforms
-          path: '/work/registration/{{inputs.parameters.session}}/t1w_to_mni'
+        # Upload individual files to S3 so downstream sessions / re-runs can skip this step.
+        # inventory checks for <prefix>_affine.mat to verify completion.
+        #
+        # These files live under out_dir, which fst1w_to_mni.py promotes ONLY on a
+        # pass/warn verdict; on a QC fail the script exits 65 before promoting, so
+        # out_dir is empty. They are therefore optional: Argo must not fail the (already
+        # failing) step trying to save absent files, and — crucially — a QC-failed run
+        # uploads no _affine.mat completion marker, so a resubmit re-registers instead
+        # of skipping onto a bad transform. The /tmp reg-qc metrics artifact below is
+        # written before the exit and stays required (observability retained on fail).
+        - name: t1w-to-mni-affine
+          optional: true
+          path: '/work/registration/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_affine.mat'
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni.tar.gz'
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_affine.mat'
+
+        - name: t1w-to-mni-warp
+          optional: true  # absent on QC fail (see t1w-to-mni-affine)
+          path: '/work/registration/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_warp.nii.gz'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_warp.nii.gz'
+
+        - name: t1w-to-mni-t1w-brain
+          optional: true  # absent on QC fail (see t1w-to-mni-affine)
+          path: '/work/registration/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_T1w_brain.nii.gz'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_T1w_brain.nii.gz'
+
+        - name: t1w-to-mni-t1w-orig
+          optional: true  # absent on QC fail (see t1w-to-mni-affine)
+          path: '/work/registration/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_T1w_orig.nii.gz'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_T1w_orig.nii.gz'
+
+        - name: t1w-to-mni-warped
+          optional: true  # absent on QC fail (see t1w-to-mni-affine)
+          path: '/work/registration/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_warped.nii.gz'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_warped.nii.gz'
+
+        - name: t1w-to-mni-qc-json
+          optional: true  # absent on QC fail (see t1w-to-mni-affine); /tmp reg-qc metrics below carries the verdict on fail
+          path: '/work/registration/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_qc.json'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_qc.json'
 
         - name: t1w-to-mni-reg-qc
           path: '/tmp/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
@@ -119,42 +272,114 @@ spec:
             none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
+            # Metrics artifact → versioned metrics bucket, not the data bucket.
+            bucket: "{{workflow.parameters.metrics-bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'metrics/registration/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
+            key: 'metrics/registration/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
 
     nodeSelector:
       karpenter.sh/nodepool: gpu-nodepool
 
+    # /work is local scratch, NOT the shared EFS volume (see the equivalent note
+    # on bold-to-t1w-session-template). It must be a declared emptyDir: Argo
+    # creates directories for *input* artifact paths — which is why /fastsurfer
+    # needs no volume — but never for *output* artifact paths. Without this,
+    # fst1w_to_mni.py's `staging.mkdir(parents=True)` fails with PermissionError
+    # trying to create /work, since the fireANTs image has no /work and the pod
+    # runs as UID 1000.
+    volumes:
+      - name: work
+        emptyDir: {}
+
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-e6e6cd8d9a99799dbff55bba40fe618fef7cd29f"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
-        - name: '{{=lower(workflow.parameters.subjID)}}'
-          mountPath: /work/registration
-          subPath: registration
-        - name: '{{=lower(workflow.parameters.subjID)}}'
-          mountPath: /fastsurfer
-          subPath: opt/freesurfer/subjects
+        - name: work
+          mountPath: /work
+
+      env:
+        # Same downward-API projection as the FastSurfer GPU steps. fst1w_to_mni.py
+        # runs the registration itself on the GPU, but SimpleITK I/O and torch's
+        # intra-op pool both size themselves from the HOST core count, so on a
+        # 4-vCPU node an uncapped pool would contend with the co-tenant time-sliced
+        # pod. Projecting from requests.cpu keeps the resources block the single
+        # source of truth, so the cap can never drift from the request below.
+        #
+        # Cannot be read from the cgroup instead: this container sets no CPU limit,
+        # so /sys/fs/cgroup/cpu.max reads "max" and says nothing about the request.
+        - name: OMP_NUM_THREADS
+          valueFrom: &t1wToMniCpuRequest
+            resourceFieldRef:
+              containerName: main   # Argo's name for the user container
+              resource: requests.cpu
+              divisor: "1"          # rounds UP to whole cores; keep cpu integral
+        - name: MKL_NUM_THREADS
+          valueFrom: *t1wToMniCpuRequest
+        - name: OPENBLAS_NUM_THREADS
+          valueFrom: *t1wToMniCpuRequest
+        - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+          valueFrom: *t1wToMniCpuRequest
+
+        # FireANTs fused CUDA kernels. The extension IS built into the image, but
+        # this is set explicitly to "False" rather than left to the fireants default
+        # (which is True) so production stays bit-comparable to the pre-fused_ops
+        # runs until an A/B has been done. Flipping this to "True" is the whole
+        # experiment arm — the fused loss follows the same switch inside
+        # fst1w_to_mni.py, so no second image and no pin commit between arms.
+        #
+        # Do not adopt "True" on the strength of a smoke test: fused kernels give
+        # different gradients and therefore a shifted QC distribution, and the
+        # t1w-to-mni fail bounds were narrowed in 45f4726. Baseline to clear is
+        # lncc 0.756-0.832, all pass/warn (n=23, 2026-07-23) — see
+        # handoffs/fireants-fused-ops.md.
+        - name: USE_FFO
+          value: "False"
 
       resources:
         requests:
-          memory: 4G
-          cpu: '2'
+          # 4G -> 2G. Measured average working set is ~1.23 GB (ram_efficiency 0.33
+          # against the old 4G request, 25 pods, 2026-07-31 batch). Kubecost's
+          # ram_efficiency is built from AVERAGE usage, so this keeps ~1.6x headroom
+          # over the mean rather than sizing to it. Deliberately no memory LIMIT: the
+          # packing benefit comes entirely from the request, and adding a ceiling
+          # where none existed would turn an underestimate into an OOM.
+          memory: 2G
+          # cpu 2 -> 1: fit two time-sliced GPU pods per 4-vCPU node. With
+          # gpu-nodepool capped to xlarge/2xlarge, two `cpu: 2` pods need 4000m
+          # against a g5.xlarge's ~3920m allocatable, so only one scheduled and the
+          # second GPU slice advertised by the timeslice NodeOverlay was STRANDED on
+          # every xlarge this step landed on. The step is GPU-bound (cpu_efficiency
+          # 0.156 at the 2-core request), so this is a cap, not a squeeze — and do
+          # NOT raise it back to match burst; see the env block above instead.
+          cpu: '1'
+          # Extracted FastSurfer tree (~1.5 GB) + MNI template + the warp,
+          # warped volume and QC images staged under /work before upload.
+          ephemeral-storage: 10G
         limits:
           nvidia.com/gpu: '1'
 
       command: [bash, -c]
       args:
         - |
-          nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used \
+          # Stream GPU utilization to stderr every 5 s for Argo log visibility.
+          # Kill the monitor before exit to prevent orphaned background processes
+          # from blocking pod termination.
+          #
+          # `name` and `memory.total` make each sample self-describing about headroom.
+          # Karpenter may place this pod on g4dn (T4, 15 GiB), g5 (A10G) or g6 (L4,
+          # 23 GiB), and memory.used alone cannot say what fraction of the card is in
+          # use — which is the quantity the time-slicing invariant is written against
+          # (replicas x peak working set < GPU memory). Note memory.used is WHOLE-CARD,
+          # not per-process: under time-slicing a co-tenant's footprint is included.
+          nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
             --format=csv -l 5 >&2 &
           MONITOR=$!
           python /app/fst1w_to_mni.py \
             --t1w '/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/orig.mgz' \
             --brainmask '/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/brainmask.mgz' \
-            --template /data/MNI152NLin2009cAsym_T1w_brain.nii \
+            --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
             --out-dir '/work/registration/{{inputs.parameters.session}}/t1w_to_mni' \
             --prefix '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni' \
             --subj '{{workflow.parameters.subjID}}' \
@@ -163,23 +388,38 @@ spec:
           EXIT=$?; kill $MONITOR 2>/dev/null; exit $EXIT
 
   ###########################################################################
-  # BOLD reference → T1w
-  # Runs once per run (parallelised over runs by the parent steps template).
+  # BOLD reference → T1w — ONE pod per session, looping over that session's runs.
+  #
   # Uses SynthMorph (contrast-agnostic deep learning affine registration).
-  # GPU-accelerated — single forward pass ~5s vs bbregister ~5-10min.
+  # Single forward pass ~5 s vs bbregister ~5-10 min.
   #
   # The LTA output is converted to an ANTs/ITK .mat in Python (RAS→LPS flip)
   # for use in antsApplyTransforms.
   #
-  # Outputs written to PVC and uploaded to S3:
-  #   <prefix>_desc-bold2t1w_ref.nii.gz      reference volume (QC)
-  #   <prefix>_desc-bold2t1w.lta             SynthMorph LTA transform
-  #   <prefix>_desc-bold2t1w_warped.nii.gz   BOLD ref in T1w space (QC)
-  #   <prefix>_desc-bold2t1w_itk.txt         ANTs/ITK affine transform
-  #   <prefix>_desc-bold2t1w_brainmask.nii.gz brain mask in BOLD space
+  # WHY ONE POD PER SESSION (cost): this step was previously fanned out per
+  # (task, run). Every one of those pods paid node provisioning + a full AFNI/
+  # FreeSurfer image pull, and each independently re-downloaded and decompressed
+  # *the same* per-session FastSurfer tarball for a few seconds of GPU-free
+  # compute. With a dozen runs in a session that tarball was fetched a dozen
+  # times. Looping inside one pod amortises image pull, node spin-up and the
+  # shared downloads across the whole session.
+  # See docs/investigations/2026-07-20-cloudpipe-cost-reduction-deep-dive.md §3.2.
+  #
+  # Per-run inputs arrive as ONE directory artifact (the session's whole func/
+  # prefix) because Argo resolves inputs.artifacts statically when the pod spec
+  # is built — a per-run list cannot be declared when the run count varies.
+  #
+  # Outputs uploaded individually to S3 (no tar — no symlinks):
+  #   derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/
+  #     <prefix>_desc-bold2t1w_itk.txt         ANTs/ITK affine transform
+  #     <prefix>_desc-bold2t1w_brainmask.nii.gz brain mask in BOLD space
+  #     <prefix>_desc-bold2t1w_ref.nii.gz       reference volume (QC)
+  #     <prefix>_desc-bold2t1w.lta              SynthMorph LTA transform
+  #     <prefix>_desc-bold2t1w_warped.nii.gz    BOLD ref in T1w space (QC)
+  # inventory checks for _itk.txt to verify completion.
   ###########################################################################
 
-  - name: bold-to-t1w-template
+  - name: bold-to-t1w-session-template
     metadata:
       labels:
         cloudpipe.io/phase: registration
@@ -188,19 +428,59 @@ spec:
     inputs:
       parameters:
         - name: session
-        - name: task
-        - name: run
+        # JSON array from inventory:
+        #   [{"task": ..., "run": ..., "b2t_exists": bool, "func_exists": bool}, ...]
+        - name: runs
         - name: nss-frames
+        # Runs processed concurrently inside the pod. STAYS 1, and no caller
+        # passes it — the driver divides the thread pools by this value, so
+        # raising it is safe from an over-subscription standpoint but is still a
+        # net loss (measured 2026-08-03, issue #106):
+        #
+        #   Upside: process parallelism beats TensorFlow's intra-op threads
+        #   here. Thread scaling is poor — 2 -> 4 threads buys only 1.33x, ~66%
+        #   efficiency — so 2 runs x 1 thread should beat 1 run x 2 threads by
+        #   ~25-33% on the compute phase.
+        #
+        #   Downside, and it is larger: peak `anon` is ~3.87 G PER RUN (§9.9),
+        #   so jobs=2 needs requests.memory ~8G rather than 3G. On a c-family
+        #   2xlarge (~7.6 cores, ~15.2 G allocatable) that flips the binding
+        #   packing dimension from cpu to memory — 3 pods per node becomes 1.
+        #   Throughput per node: 3/546s = 0.0055 vs 1/459s = 0.0022, i.e.
+        #   jobs=1 wins by ~2.5x. A 25% compute win does not pay for a 3x
+        #   packing loss.
+        #
+        # (Corrected 2026-08-03: an earlier version of this note claimed ~248 s
+        # of the pod is artifact staging and that this was the step's dominant
+        # cost. Measured on a real batch it is 30-43 s, ~12.7% — the 248 s came
+        # from a probe arithmetic bug that folded the cold-node image pull into
+        # staging. Compute IS the dominant cost here, so the jobs trade-off
+        # above stands on its own numbers. See #123.)
+        - name: jobs
+          default: "1"
 
       artifacts:
-        - name: bold
-          path: /data/bold.nii.gz
+        # The session's entire func/ prefix in one shot: every run's
+        # _bold.nii.gz and _bold.json. Argo fetches a prefix key recursively.
+        #
+        # NO TRAILING SLASH — measured, not stylistic. The Globus S3 gateway
+        # leaves a zero-byte "directory marker" object whose key equals the
+        # prefix itself (mmps_mproc/{subj}/{ses}/func/). With a trailing slash
+        # Argo's S3 driver then downloads *nothing* and still exits 0, so the
+        # step fails later with confusing missing-input errors. Without the
+        # slash the same prefix downloads correctly. Output artifacts are the
+        # opposite — they must keep the trailing slash (Argo docs: artifact GC).
+        - name: func-inputs
+          path: /data/func
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold.nii.gz'
+            key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func'
 
+        # Downloaded and decompressed ONCE per session instead of once per run.
         - name: fastsurfer-output
           path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}'
           s3:
@@ -219,66 +499,508 @@ spec:
 
     outputs:
       artifacts:
-        # Upload to S3 so func-preproc can download them directly and
-        # so bold-to-t1w can be skipped on reruns (see b2t_exists check
-        # in discover-bold-runs-template).
-        - name: bold-to-t1w
-          path: '/work/registration/{{inputs.parameters.session}}/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
+        # Per-run StepOutcome JSON records, written directly by the driver
+        # (see ADR 016) instead of a separate outcome-recorder pod per run —
+        # see the equivalent block in functional-preprocessing-workflow-template.yaml.
+        - name: step-outcomes
+          optional: true
+          path: /tmp/step_outcomes
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
+            bucket: "{{workflow.parameters.metrics-bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/bold_to_t1w_{{inputs.parameters.task}}_{{inputs.parameters.run}}.tar.gz'
-
-        - name: bold-to-t1w-reg-qc
-          path: '/tmp/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold_to_t1w_reg_qc.json'
+            key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
+        # One directory upload replaces the five per-run file artifacts. The
+        # driver names each run's directory bold_to_t1w_{task}_{run}, so files
+        # land at exactly the keys inventory and func-preproc already expect.
+        # optional: every run may have been skipped, leaving the dir empty.
+        - name: bold-to-t1w-outputs
+          optional: true
+          path: /tmp/registration_out
           archive:
             none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'metrics/registration/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}_bold_to_t1w_reg_qc.json'
+            key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/'
+
+        # Per-run QC JSONs, collected flat by the driver. Filenames are
+        # unchanged; only the destination prefix gained a dt= partition segment.
+        - name: bold-to-t1w-reg-qc
+          optional: true
+          path: /tmp/reg_qc
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            # Metrics artifact → versioned metrics bucket, not the data bucket.
+            bucket: "{{workflow.parameters.metrics-bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'metrics/registration/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
-    container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/synthmorph:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-c2ba15155f39af001ca6bd2f0045f759234ab879"
       imagePullPolicy: IfNotPresent
 
-      volumeMounts:
-        - name: '{{=lower(workflow.parameters.subjID)}}'
-          mountPath: /work/registration
-          subPath: registration
+      # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the
+      # artifact above. Nothing reads bold-to-t1w results off the shared volume
+      # (func-preproc pulls them from S3 by design), so writing a session's worth
+      # of NIfTIs to EFS was pure latency and cost.
 
       resources:
         requests:
-          memory: 8G
+          # Was 16G request == 16G limit, on a stale rationale ("BBR can spike to
+          # ~12 GB") — the step has been SynthMorph, not BBR, for some time and
+          # never came close. Measured down in issue #95/#97: across 25
+          # bold-to-t1w pods in the 2026-07-30/31 ten-subject batch,
+          # ram_efficiency averaged 0.083 — ~1.3 GB against 16 GB, a 12x
+          # over-request. Each 4-minute pod was reserving a 16 GB slot.
+          #
+          # Request is ~2.3x observed peak; the limit is left well above it
+          # (rather than pinned equal, as before) so an underestimate degrades
+          # to burst rather than OOM-killing the registration. Sized for a
+          # single run: runs execute sequentially (jobs=1).
+          memory: 3G
+          # Was '2', which this step was quietly exceeding: cpu_efficiency
+          # averaged 1.659, i.e. ~3.3 cores against a 2-core request. CPU
+          # requests are not caps, so it got away with it on idle nodes — but
+          # the scheduler was packing on the assumption of 2, and under node
+          # pressure it would be throttled to its 2-core share.
+          #
+          # That 3.3 was never a workload requirement: mri_synthmorph is
+          # TensorFlow-based and, unconstrained, sizes its intra-op pool from
+          # the *host* core count, not the cgroup. It read 16 on the 4xlarge
+          # nodes the old 16G request forced. Dropping memory to 3G moves these
+          # pods onto smaller nodes, which would have changed that number again.
+          # So the thread pool is now pinned explicitly via the env block below
+          # and this request is kept equal to it — the same cpu == threads rule
+          # the fastsurfer templates document. Change one, change both.
+          #
+          # 4 -> 2 is MEASURED (issue #106). A/B on one pinned c6i.4xlarge, same
+          # 6-run session, oneDNN off on both arms, differing only in this value:
+          #
+          #                    cpu: 4      cpu: 2
+          #   per-run compute   37.5 s      49.7 s   (+32.5%)
+          #
+          # THAT is the number that decides it. Halving the threads costs only
+          # 32.5% more compute time — the 2->4 thread speedup is 1.33x against
+          # an ideal 2x, ~66% parallel efficiency — so the second pair of cores
+          # was buying very little. Two cores at 49.7 s/run is 99 core-seconds
+          # of compute per run against four cores at 37.5 s = 150. `cpu: 3`
+          # sits between the two and cannot win.
+          #
+          # Confirmed on the 2026-08-03 10-subject batch: per-run compute
+          # 44.6-50.4 s at cpu: 2 across 11 pods, i.e. the pinned-probe number
+          # reproduces under real batch concurrency.
+          #
+          # CORRECTED 2026-08-03 — an earlier version of this comment reported
+          # "staging (init) 233 s" and concluded the pod was ~half artifact
+          # download, which made cpuEff 0.484 look like an artefact of the phase
+          # split. That was wrong. It derived staging as `pod duration - compute`,
+          # which also swallows the MAIN CONTAINER IMAGE PULL — and the probe
+          # pins an instance with do-not-disrupt, so it provisions a fresh node
+          # and pays a cold multi-GB pull on every single run. Measured properly
+          # on the batch (init and main timestamps read separately): staging is
+          # 30-43 s, ~12.7% of the pod, and the init-end -> main-start gap is
+          # 1-22 s on a warm node but 84-152 s on a cold one.
+          #
+          # So #106's original reading was closer to correct than that rebuttal:
+          # at ~12.7% overhead a saturated compute phase would give cpuEff ~0.87,
+          # and the observed 0.484 means compute really was using only ~2.2 of
+          # its 4 cores. cpu: 2 therefore MATCHES observed usage rather than
+          # trading throughput for packing. Do not expect any particular cpuEff
+          # figure from this change; measure the phases instead, with
+          # scripts/collect_pod_phase_split.py, which reads the timestamps
+          # separately and does not have the subtraction bug.
           cpu: '2'
-          ephemeral-storage: 4G
+          # Was 5G for one run. Now holds the session's entire func/ prefix
+          # (every run's BOLD, ~0.3-0.5 GB each) plus the extracted FastSurfer
+          # tree (~2 GB) plus all runs' outputs until upload.
+          ephemeral-storage: 20G
+        limits:
+          # 12G is MEASURED, not guessed. `8c28db6` cut this to 6G from a
+          # `ram_efficiency` lifetime average of 0.083 — an average cannot see
+          # the peak that OOMs, and 27 pods were exit-137 killed in one batch.
+          #
+          # Peak is a property of the HOST, not the workload. Same session, same
+          # image, 6 runs each, measured 2026-08-03 by pinning instance type:
+          #
+          #   c6i.4xlarge (Xeon 8375C, Ice Lake)   peak anon 8.67 G  <- sizes this
+          #   c5.4xlarge  (Xeon 8275CL, no VNNI)   peak anon 4.25 G
+          #   c6a.4xlarge / c5.2xlarge / m5.2xlarge     2.90-4.57 G
+          #
+          # `cpu-heavy-nodepool` pins no instance family, so any pod can land on
+          # Ice Lake and must fit 8.67 G. 12G is that peak plus ~38%.
+          #
+          # Do NOT re-derive this from `ram_efficiency` (still ~0.4 and healthy
+          # looking), and do NOT size it from `memory.current` — current
+          # includes reclaimable page cache and reads up to 7.10 G on hosts that
+          # never OOM. Size from `anon`.
+          #
+          # The REQUEST is deliberately left at 3G: requests drive bin-packing,
+          # limits do not, so this costs nothing in scheduling or node size.
+          # KNOWN GAP: on Ice Lake the step really uses 8.67 G against that 3G
+          # request, so the scheduler under-counts it ~2.9x — a co-tenant
+          # eviction risk, tracked in §9.8.1 of the investigation.
+          #
+          # See docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.8.
+          memory: 12G
+          ephemeral-storage: 30G
 
-      command: [python, /app/bold_to_t1w.py]
-      args:
-        - --bold
-        - /data/bold.nii.gz
-        - --nss-frames
-        - '{{inputs.parameters.nss-frames}}'
-        - --subjects-dir
-        - /tmp/fastsurfer
-        - --subject
-        - '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}'
-        - --out-dir
-        - '/work/registration/{{inputs.parameters.session}}/bold_to_t1w/{{inputs.parameters.task}}_{{inputs.parameters.run}}'
-        - --prefix
-        - '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_{{inputs.parameters.task}}_{{inputs.parameters.run}}'
-        - --subj
-        - '{{workflow.parameters.subjID}}'
-        - --ses
-        - '{{inputs.parameters.session}}'
-        - --task
-        - '{{inputs.parameters.task}}'
-        - --run
-        - '{{inputs.parameters.run}}'
-        - --pipeline
-        - cloudpipe_minproc
+      # Pin every thread pool mri_synthmorph might consult to this container's
+      # own CPU request (issue #97). Previously nothing here was set, so
+      # TensorFlow sized its intra-op pool from the host's core count and the
+      # step consumed ~3.3 cores against a 2-core request — real over-use, and
+      # a number that drifted with whatever instance Karpenter happened to
+      # pick. Env vars rather than a CLI flag because mri_synthmorph's thread
+      # option is not present across all FreeSurfer 7.4.x builds, whereas these
+      # are honoured by the underlying runtimes regardless.
+      #
+      # All four are projected from requests.cpu via the downward API, so the
+      # resources block above stays the single source of truth and the pod
+      # cannot be left requesting fewer cores than it spawns threads for.
+      # containerName must be `main` — what Argo names a script template's
+      # user container.
+      env:
+        # Read by the driver to divide the thread pools across concurrent runs
+        # (see THREADS_PER_JOB). The four *_NUM_THREADS vars below size the
+        # whole container; this is what lets the driver size each child process.
+        - name: CPU_REQUEST
+          valueFrom:
+            resourceFieldRef:
+              containerName: main
+              resource: requests.cpu
+              divisor: "1"
+        # THE FIX for this step's OOMs. Measured 2026-08-03, A/B on one pinned
+        # c6i.4xlarge, same session, differing only in this variable:
+        #
+        #            peak anon   wall clock (6 runs)   NMI / NGF
+        #   oneDNN on   8.69 G          8m02s          1.0192 / 0.6847
+        #   oneDNN off  3.87 G          8m28s          1.0192 / 0.6847
+        #
+        # oneDNN's blocked layouts pad channels to the AVX512 register width and
+        # allocate reorder scratchpads. SynthMorph is 3D convs with FEW
+        # channels, so that padding dominates: it bought ~5% speed for ~4.8 GB.
+        # It only fires on Ice Lake and newer, which is why the OOM tracked the
+        # instance type (c6i 31/31, everything else 0/40) and looked like a
+        # scheduling mystery — the decision is made inside a library dispatching
+        # on CPUID, invisible to Kubernetes.
+        #
+        # OFF is now the LOWEST peak of any host (3.87 G, under c5.4xlarge's
+        # 4.25 G), and registration output is unchanged: NMI and NGF match to
+        # four decimals on all 6 runs and every QC verdict still passes. So this
+        # changes how the convolutions are computed, not what they produce.
+        #
+        # NOTE this contradicts an earlier draft of the investigation (§8.4
+        # item 4), which argued oneDNN's fusion REDUCES peak so disabling it
+        # might make things worse. Sound reasoning, wrong here — hence the A/B.
+        # See docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.9.
+        #
+        # Read by TensorFlow at import, so this is env-only: no image rebuild
+        # and no `ci: pin workflow images to sha-...` commit.
+        - name: TF_ENABLE_ONEDNN_OPTS
+          value: "0"
+        - name: OMP_NUM_THREADS
+          valueFrom:
+            resourceFieldRef:
+              containerName: main
+              resource: requests.cpu
+              divisor: "1"
+        - name: TF_NUM_INTRAOP_THREADS
+          valueFrom:
+            resourceFieldRef:
+              containerName: main
+              resource: requests.cpu
+              divisor: "1"
+        - name: TF_NUM_INTEROP_THREADS
+          valueFrom:
+            resourceFieldRef:
+              containerName: main
+              resource: requests.cpu
+              divisor: "1"
+        - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+          valueFrom:
+            resourceFieldRef:
+              containerName: main
+              resource: requests.cpu
+              divisor: "1"
+
+      # Pinned to the system interpreter, not bare `python3` — FreeSurfer's
+      # Dockerfile puts $FREESURFER_HOME/python/bin (its own bundled Python
+      # 3.8) ahead of the system PATH, so bare `python3` silently resolves to
+      # 3.8 here. The _TAXONOMY block below uses PEP 585 generics (3.9+) and
+      # crashes immediately on 3.8 with "'type' object is not subscriptable" —
+      # see issue #84.
+      command: [/usr/bin/python3, -u]
+      source: |
+        """Run bold_to_t1w.py for every pending run in one session.
+
+        A failing run is logged and skipped rather than aborting the session:
+        the runs are independent, and one bad BOLD should not discard the
+        registrations already computed for its siblings.
+        """
+        import json
+        import os
+        import re
+        import shutil
+        import subprocess
+        import sys
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        SUBJ = "{{workflow.parameters.subjID}}"
+        SES = "{{inputs.parameters.session}}"
+        NSS = "{{inputs.parameters.nss-frames}}"
+        JOBS_REQUESTED = max(1, int("{{inputs.parameters.jobs}}"))
+        RUNS = json.loads(r"""{{inputs.parameters.runs}}""")
+        WORKFLOW_NAME = "{{workflow.name}}"
+
+        # The four thread-pool vars are projected from requests.cpu by the
+        # downward API, so they are sized for the WHOLE container. Each run is a
+        # separate bold_to_t1w.py process that inherits this environment, so at
+        # JOBS > 1 every one of them would read the full core count and the pod
+        # would spawn JOBS x cpu threads against a cpu-core request.
+        #
+        # That is precisely the over-subscription `8c28db6` fixed (the step was
+        # burning ~3.3 cores against a 2-core request because TensorFlow sized
+        # its pool from the host), reachable again through a parameter that
+        # looks harmless to turn up. So divide here rather than trusting the
+        # caller: threads-per-job x JOBS <= cpu, always.
+        #
+        # At JOBS == 1 this is exactly a no-op — THREADS_PER_JOB == CPU_REQUEST
+        # and the child env matches the container env — so the measured
+        # behaviour in issue #106 is unchanged.
+        _THREAD_VARS = (
+            "OMP_NUM_THREADS",
+            "TF_NUM_INTRAOP_THREADS",
+            "TF_NUM_INTEROP_THREADS",
+            "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS",
+        )
+        # resourceFieldRef with divisor "1" rounds requests.cpu UP to whole
+        # cores, so this is an integer even if the request is ever fractional.
+        CPU_REQUEST = max(1, int(os.environ.get("CPU_REQUEST") or 1))
+        # Clamp so the invariant actually holds. Without this, JOBS > CPU_REQUEST
+        # hits the max(1, ...) floor and every job still gets a whole thread —
+        # JOBS threads against CPU_REQUEST cores, i.e. the over-subscription this
+        # guard exists to prevent, just with more processes. More concurrent runs
+        # than cores has no upside anyway: they would only contend.
+        JOBS = max(1, min(JOBS_REQUESTED, CPU_REQUEST))
+        THREADS_PER_JOB = max(1, CPU_REQUEST // JOBS)
+        RUN_ENV = {**os.environ, **{v: str(THREADS_PER_JOB) for v in _THREAD_VARS}}
+
+        # Echoed once so the cpu == threads invariant is observable at runtime
+        # instead of surfacing as an unexplained slowdown. Also carries the
+        # oneDNN switch, which decides ~5 GB of peak memory (§9.9).
+        print(
+            "[driver] cpu={} jobs={}{} threads/job={} (container OMP={}) onednn={}".format(
+                CPU_REQUEST,
+                JOBS,
+                f" (clamped from {JOBS_REQUESTED})" if JOBS != JOBS_REQUESTED else "",
+                THREADS_PER_JOB,
+                os.environ.get("OMP_NUM_THREADS", "<unset>"),
+                os.environ.get("TF_ENABLE_ONEDNN_OPTS", "<unset>"),
+            )
+        )
+        if JOBS > 1:
+            # Peak `anon` is ~3.87 G PER RUN with oneDNN off (§9.9), and the
+            # memory request is deliberately sized for one. Concurrency multiplies
+            # it, so raising JOBS without raising requests.memory to ~3.9 G x JOBS
+            # is a systematic under-request, not an occasional burst — the
+            # co-tenant eviction risk §9.8.1 raised. Measured 2026-08-03: doing
+            # that flips the binding packing dimension from cpu to memory and
+            # costs ~2.5x throughput per node, which is why the default is 1.
+            print(
+                f"[driver] WARNING: jobs={JOBS} needs requests.memory >= "
+                f"{3.9 * JOBS:.1f}G; verify the resources block was raised too"
+            )
+
+        # See ADR 016 (docs/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
+        # this pod records its own StepOutcome facts instead of exposing them
+        # as a DAG output parameter for a sibling recorder task to read.
+        STEP_OUTCOMES_DIR = Path("/tmp/step_outcomes")
+        STEP_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Mirrors src/metrics/outcome_recorder.py's _TAXONOMY exactly — kept in
+        # sync by tests/images/afni/test_driver_gating.py::
+        # test_driver_taxonomy_matches_canonical. Duplicated inline rather than
+        # imported because this container has no access to src/metrics (see
+        # ADR 016 and issue #67).
+        _TAXONOMY: list[tuple[str, list[str]]] = [
+            (
+                "infrastructure",
+                [
+                    r"OOMKilled",
+                    r"exit\s+code\s+137",
+                    r"evicted",
+                    r"node\s+cordoned",
+                    r"deadline\s+exceeded",
+                    r"pod\s+unschedul",
+                    r"Unschedulable",
+                    r"insufficient\s+memory",
+                ],
+            ),
+            (
+                "data",
+                [
+                    r"NoSuchKey",
+                    r"NoSuchBucket",
+                    r"nss_volumes",
+                    r"missing\s+input",
+                    r"corrupt",
+                    r"Unable\s+to\s+open",
+                    r"Input\s+file\s+not\s+found",
+                ],
+            ),
+            (
+                "algorithm",
+                [
+                    r"AssertionError",
+                    r"ValueError",
+                    r"segmentation\s+fault",
+                    r"Segmentation\s+fault",
+                    r"SIGSEGV",
+                    r"RuntimeError",
+                    r"CalledProcessError",
+                    r"non-zero\s+exit\s+code",
+                    r"ERROR:",
+                ],
+            ),
+            (
+                "dependency",
+                [
+                    r"depended\s+on\s+task",
+                    r"upstream\s+task\s+failed",
+                    r"Skipped",
+                ],
+            ),
+        ]
+
+        def classify_failure(message):
+            msg = message or ""
+            for category, patterns in _TAXONOMY:
+                for pat in patterns:
+                    if re.search(pat, msg, re.IGNORECASE):
+                        return category
+            return "unknown"
+
+        def write_outcome(step, task, run, status, failure_reason=""):
+            record = {
+                "workflow_name": WORKFLOW_NAME,
+                "step": step,
+                "subject": SUBJ,
+                "session": SES,
+                "task": task,
+                "run": run,
+                "status": status,
+                "failure_category": "" if status == "succeeded" else classify_failure(failure_reason),
+                "failure_reason": failure_reason,
+                "upstream_failed_step": "",
+                "outputs_verified": [],
+                "pipeline": "cloudpipe_minproc",
+                "schema_version": "1.0",
+                "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            key = f"{WORKFLOW_NAME}__{step}__{SUBJ}__{SES}__{task}__{run}_outcome.json"
+            (STEP_OUTCOMES_DIR / key).write_text(json.dumps(record))
+
+        FUNC_DIR = Path("/data/func")
+        OUT_ROOT = Path("/tmp/registration_out")
+        QC_DIR = Path("/tmp/reg_qc")
+        for d in (OUT_ROOT, QC_DIR):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # inventory sets b2t_exists per run by heading the _itk.txt marker.
+        pending = [r for r in RUNS if not r.get("b2t_exists")]
+        print(f"[driver] {SES}: {len(pending)} of {len(RUNS)} runs need bold-to-t1w")
+
+        def process(run):
+            task, rid = run["task"], run["run"]
+            prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+            out_dir = OUT_ROOT / f"bold_to_t1w_{task}_{rid}"
+            print(f"[driver] === {prefix} ===")
+            t0 = time.monotonic()
+            rc = subprocess.run([
+                "python3", "/app/bold_to_t1w.py",
+                "--bold", str(FUNC_DIR / f"{prefix}_bold.nii.gz"),
+                "--json", str(FUNC_DIR / f"{prefix}_bold.json"),
+                "--nss-frames", NSS,
+                "--subjects-dir", "/tmp/fastsurfer",
+                "--subject", f"{SUBJ}_{SES}",
+                "--out-dir", str(out_dir),
+                "--prefix", prefix,
+                "--subj", SUBJ,
+                "--ses", SES,
+                "--task", task,
+                "--run", rid,
+                "--pipeline", "cloudpipe_minproc",
+            ], env=RUN_ENV).returncode
+            elapsed = time.monotonic() - t0
+
+            # Per-run compute time, logged separately from the pod's wall clock.
+            # The pod also downloads the session's whole func/ prefix and a ~2 GB
+            # FastSurfer tarball and uploads every run's output, all of which is
+            # near-serial — so pod duration (and the lifetime `cpu_efficiency`
+            # derived from it) understates how well the parallel phase uses its
+            # cores. Sizing requests.cpu from that average is how issue #106's
+            # premise went wrong; this line is what it should be sized from.
+            print(f"[driver] {prefix} took {elapsed:.1f}s (exit {rc})")
+
+            # bold_to_t1w.py writes QC to a flat /tmp path, including on its
+            # early-exit failure path (nmi=0.0) — collect it before handling rc
+            # so failures stay visible in the metrics prefix.
+            qc = Path(f"/tmp/{prefix}_bold_to_t1w_reg_qc.json")
+            if qc.exists():
+                shutil.move(str(qc), str(QC_DIR / qc.name))
+
+            if rc != 0:
+                # Discard partial output so a half-written run directory is not
+                # uploaded next to the good ones. Idempotency keys on _itk.txt,
+                # which a failed run never reaches, so this only saves transfer.
+                shutil.rmtree(out_dir, ignore_errors=True)
+                print(f"[driver] FAILED {prefix} (exit {rc})")
+            return prefix, rc
+
+        results = []
+        pending_prefixes = {f"{SUBJ}_{SES}_{r['task']}_{r['run']}" for r in pending}
+        try:
+            with ThreadPoolExecutor(max_workers=JOBS) as pool:
+                results = list(pool.map(process, pending))
+        finally:
+            # Record every run's outcome directly (see ADR 016). Written in a
+            # `finally` so a run that finished before an unrelated sibling
+            # crashes the pool still gets its record.
+            result_by_prefix = dict(results)
+            for r in RUNS:
+                task, rid = r["task"], r["run"]
+                prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+                if prefix in result_by_prefix:
+                    rc = result_by_prefix[prefix]
+                    status = "succeeded" if rc == 0 else "failed"
+                    reason = "" if rc == 0 else f"bold_to_t1w.py exited {rc}"
+                elif prefix in pending_prefixes:
+                    status = "failed"
+                    reason = "pod terminated before this run's result was recorded"
+                else:
+                    status = "succeeded"
+                    reason = ""
+                write_outcome("bold-to-t1w", task, rid, status, reason)
+            failed = [p for p, rc in results if rc != 0]
+
+        print(f"[driver] {len(results) - len(failed)} succeeded, {len(failed)} failed")
+        if failed:
+            print(f"[driver] failed runs: {' '.join(failed)}")
+
+        # Fail the step only when the session produced nothing. Note the
+        # rationale once given here — that Argo discards a failed pod's output
+        # artifacts — was measured false on 2026-07-22; see
+        # functional-preprocessing-workflow-template.yaml for what it does cost.
+        if results and len(failed) == len(results):
+            sys.exit(1)

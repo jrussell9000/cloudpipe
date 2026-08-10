@@ -17,6 +17,11 @@ variable "vpc_cidr" {
   type        = string
 }
 
+variable "nat_gateway_ip" {
+  description = "Public Elastic IP of the VPC's NAT gateway. Full-tunnel Client VPN traffic to this ALB's public IP hairpins out through the NAT gateway and back in over the internet, so the ALB security group must trust it as a source."
+  type        = string
+}
+
 variable "private_subnets" {
   description = "List of private subnet IDs for the RDS subnet group."
   type        = list(string)
@@ -58,6 +63,11 @@ variable "namespace" {
 
 variable "bucket" {
   description = "Name of the S3 bucket used for workflow artifact storage."
+  type        = string
+}
+
+variable "metrics_bucket" {
+  description = "Name of the dedicated, versioned S3 bucket that pipeline QC metrics are written to. Separate from `bucket` so metrics survive derivative flushes — see terraform/metrics_bucket.tf."
   type        = string
 }
 
@@ -107,25 +117,25 @@ variable "db_username" {
 variable "db_engine_version" {
   description = "PostgreSQL engine version. Update deliberately — changing the major version triggers an instance replacement."
   type        = string
-  default     = "16.6"
+  default     = "16.13"
 }
 
 variable "db_instance_class" {
-  description = "RDS instance class. db.t4g.micro is sufficient for Argo Workflows archive metadata."
+  description = "RDS instance class. Upsized from db.t4g.micro: burst-credit exhaustion plus a ~112 max_connections ceiling caused SQLSTATE 53300 under bulk workflow operations."
   type        = string
-  default     = "db.t4g.micro"
+  default     = "db.m7g.large"
 }
 
 variable "db_allocated_storage" {
   description = "Initial allocated storage in GiB. gp3 minimum is 20 GiB."
   type        = number
-  default     = 20
+  default     = 100
 }
 
 variable "db_max_allocated_storage" {
   description = "Upper bound for RDS storage autoscaling in GiB. Set to 0 to disable autoscaling."
   type        = number
-  default     = 100
+  default     = 500
 }
 
 variable "db_backup_retention_days" {

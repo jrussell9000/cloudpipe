@@ -85,8 +85,9 @@ resource "kubernetes_network_policy_v1" "argo_workflows_egress_https" {
   depends_on = [data.kubernetes_namespace_v1.this]
 }
 
-# Allow egress to RDS PostgreSQL (5432) within the VPC.
-# The workflow-controller uses this for workflow persistence.
+# Allow egress on port 5432 within the VPC:
+#   - Argo controller/server → pgbouncer Service (pod IP in VPC CIDR via kube-proxy DNAT)
+#   - pgbouncer → RDS (VPC CIDR)
 resource "kubernetes_network_policy_v1" "argo_workflows_egress_rds" {
   metadata {
     name      = "allow-egress-rds"
@@ -103,6 +104,37 @@ resource "kubernetes_network_policy_v1" "argo_workflows_egress_rds" {
       to {
         ip_block {
           cidr = var.vpc_cidr
+        }
+      }
+    }
+  }
+
+  depends_on = [data.kubernetes_namespace_v1.this]
+}
+
+# Allow ingress to PgBouncer on port 6432 from Argo components in the same namespace.
+resource "kubernetes_network_policy_v1" "argo_workflows_ingress_pgbouncer" {
+  metadata {
+    name      = "allow-ingress-pgbouncer"
+    namespace = var.namespace
+  }
+  spec {
+    pod_selector {
+      match_labels = {
+        app = "pgbouncer"
+      }
+    }
+    policy_types = ["Ingress"]
+    ingress {
+      ports {
+        port     = "6432"
+        protocol = "TCP"
+      }
+      from {
+        namespace_selector {
+          match_labels = {
+            "kubernetes.io/metadata.name" = var.namespace
+          }
         }
       }
     }

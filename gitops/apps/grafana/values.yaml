@@ -21,6 +21,15 @@ grafana:
     datasources.yaml:
       apiVersion: 1
       datasources:
+        - name: Prometheus
+          type: prometheus
+          uid: cloudpipe-prometheus
+          access: proxy
+          isDefault: false
+          url: http://prometheus-kube-prometheus-prometheus.prometheus.svc:9090
+          jsonData:
+            timeInterval: 30s
+
         - name: Athena - CloudPipe Metrics
           type: grafana-athena-datasource
           uid: cloudpipe-athena
@@ -62,6 +71,15 @@ grafana:
       alb.ingress.kubernetes.io/target-type: ip
       alb.ingress.kubernetes.io/healthcheck-path: /api/health
       alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+      # Restrict inbound access to UW Madison IPs via a dedicated security group
+      # (terraform/grafana.tf, aws_security_group.grafana_lb). Referenced by its
+      # Name tag rather than ID since this ingress is GitOps-managed, not a
+      # Terraform resource that could reference the SG output directly.
+      alb.ingress.kubernetes.io/security-groups: grafana-alb-sg
+      alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+      # idle_timeout raised to the ALB maximum (4000s) so live-updating panels and Explore
+      # streams survive quiet periods; the 60s default tears them down mid-session.
+      alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=4000
     hosts:
       - grafana.<YOUR_DOMAIN>
     path: /
@@ -91,13 +109,53 @@ grafana:
     size: 5Gi
 
   # ---------------------------------------------------------------------------
+  # SSO env bridge — values injected from Terraform-managed objects so the
+  # domain/admin email are single-sourced from var.domain / var.admin_netid
+  # (see terraform/grafana.tf) rather than hardcoded here. Grafana expands
+  # these with $__env{...} inside grafana.ini below.
+  # ---------------------------------------------------------------------------
+  envValueFrom:
+    GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET:
+      secretKeyRef:
+        name: grafana-sso
+        key: clientSecret
+    DOMAIN:
+      configMapKeyRef:
+        name: grafana-oidc-config
+        key: domain
+    ADMIN_EMAIL:
+      configMapKeyRef:
+        name: grafana-oidc-config
+        key: admin_email
+
+  # ---------------------------------------------------------------------------
   # Grafana configuration
   # ---------------------------------------------------------------------------
   grafana.ini:
     server:
-      root_url: https://grafana.<YOUR_DOMAIN>
+      root_url: https://grafana.$__env{DOMAIN}
     analytics:
       reporting_enabled: false
       check_for_updates: false
     auth.anonymous:
       enabled: false
+    # Local login form is intentionally left enabled as an admin escape hatch
+    # until SSO is verified end-to-end; flip disable_login_form to true after.
+    auth:
+      disable_login_form: false
+    # SSO via the ArgoCD-bundled Dex (UW-Madison NetID upstream). Endpoints are
+    # Dex's OIDC routes under the argocd host; the admin NetID gets the Admin
+    # role, everyone else in <YOUR_INSTITUTION_DOMAIN> gets Viewer.
+    auth.generic_oauth:
+      enabled: true
+      name: UW-Madison NetID
+      client_id: grafana
+      client_secret: $__env{GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET}
+      scopes: openid profile email
+      auth_url: https://argocd.$__env{DOMAIN}/api/dex/auth
+      token_url: https://argocd.$__env{DOMAIN}/api/dex/token
+      api_url: https://argocd.$__env{DOMAIN}/api/dex/userinfo
+      allowed_domains: <YOUR_INSTITUTION_DOMAIN>
+      allow_sign_up: true
+      email_attribute_path: email
+      role_attribute_path: "email == '$__env{ADMIN_EMAIL}' && 'Admin' || 'Viewer'"
