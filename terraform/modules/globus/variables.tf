@@ -90,3 +90,13 @@ variable "globus_source_base_path" {
   type        = string
 }
 
+variable "globus_owner_email" {
+  description = "Globus identity (email) that owns the endpoint — typically an institutional Globus admin. Used as the endpoint --owner during setup."
+  type        = string
+}
+
+variable "globus_identity_domain" {
+  description = "Identity domain permitted to authenticate to the storage gateway (e.g. your institution's domain, 'example.edu'). Passed as --domain during gateway creation."
+  type        = string
+}
+

@@ -1,0 +1,224 @@
+# t1w-to-mni run-to-run repeatability probe — the NOISE FLOOR for any A/B
+#
+# QUESTION
+# --------
+# How much does `lncc` move between two runs that differ in NOTHING? Same session,
+# same image, same instance type, same env, same arm. Whatever spread this probe
+# finds is the resolution limit of every A/B on this step: an arm effect smaller
+# than the noise floor cannot be attributed to the arm, no matter how many sessions
+# are added.
+#
+# WHY IT WAS NEEDED
+# -----------------
+# The first control arm of the fused_ops timing probe scored lncc 0.7517 on
+# sub-VKPJ803Y/ses-02A against 0.80071 for the same session in the production batch
+# of 2026-08-04 (dt=2026-08-04). It was running the production CONFIGURATION —
+# USE_FFO=False restores both the torch interpolator and the non-fused 'cc' loss —
+# and the code path was identical: the previously pinned image (f384607) IS the #138
+# NONE-sampling commit, and afb52d5 sits directly on top of it with nothing else
+# touching fst1w_to_mni.py or registration_qc.py in between. mask_dice, centroid
+# displacement and jac_det_frac_negative all moved too, so this is a genuinely
+# different warp, not a rounding artefact.
+#
+# Two candidates remain: the GPU MODEL (production lets Karpenter pick among g4dn,
+# g5, g6, g6e; the probes pin g4dn) and run-to-run NONDETERMINISM on identical
+# hardware. SyN is a ~300-iteration non-convex optimization and GPU reductions use
+# atomics, so reduction order — and therefore the trajectory, and which local optimum
+# it reaches — need not be reproducible even on the same card.
+#
+# #138 established that the SimpleITK affine is thread-invariant under NONE sampling
+# (lncc spread 5e-5 across 1/4/8 threads). That result covers the CPU affine stage
+# ONLY. Nothing has ever measured the GPU SyN stage's run-to-run spread.
+#
+# DESIGN
+# ------
+#   arms 1-4   USE_FFO=False, four times, pinned g4dn.2xlarge -> spread on ONE card model
+#   arms 5-6   USE_FFO=False, twice, pinned g5.2xlarge        -> is the card model the cause
+#
+# Sequential, so no arm ever shares a card with another (and so the g5 arms cannot be
+# confounded by co-tenancy). Every arm is byte-identical in configuration; the only
+# thing that varies is which physical node it landed on, and for arms 1-4 not even
+# the instance type.
+#
+# HOW TO READ IT
+# --------------
+#   spread(1-4) ~ 0            SyN is deterministic per card model. The production
+#                              delta is then explained by GPU model, and a paired A/B
+#                              on a pinned instance type is sound as designed.
+#   spread(1-4) ~ 0.05         SyN is nondeterministic at the scale of the effect
+#                              being hunted. A 1-run-per-arm A/B cannot resolve it;
+#                              it needs replicates per session, and the QC gate's
+#                              own reproducibility becomes the more urgent question.
+#   spread(1-4) ~ 0 but 5-6 differ from 1-4
+#                              GPU model changes the answer. That has implications
+#                              well beyond fused_ops: gpu-nodepool spans four
+#                              families, so production QC carries an uncontrolled
+#                              hardware term.
+#
+# SAFETY: writes nothing to derivatives/ or the metrics corpus — reg-qc is redirected
+# to scratch/. Same reasoning as t1w-to-mni-fused-ops-ab.yaml.
+#
+# USAGE
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-repeatability-probe.yaml --watch
+#
+#   aws s3 sync s3://<YOUR_S3_BUCKET>/scratch/repeatability/run1/ /tmp/repeat/
+#   for f in /tmp/repeat/*.json; do
+#     echo "$(basename "$f") $(jq -r '"lncc=\(.lncc) dice=\(.mask_dice) jacneg=\(.jac_det_frac_negative) verdict=\(.verdict)"' "$f")"
+#   done
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: t1w-mni-repeat-
+  namespace: argo-workflows
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+
+  activeDeadlineSeconds: 7200
+
+  entrypoint: repeat
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      - name: fireants-tag
+        value: sha-afb52d5048608a6d7cf1c20345ad2a97a622f76d
+      # The session whose production/control discrepancy prompted this probe, so the
+      # noise floor is measured on the very run that raised the question.
+      - name: subject
+        value: sub-VKPJ803Y
+      - name: session
+        value: ses-02A
+      - name: run-label
+        value: run1
+
+  templates:
+    - name: repeat
+      steps:
+        # Four identical runs on the pinned T4. `rep` only names the output key —
+        # nothing in the container reads it, so these arms are byte-identical.
+        - - {name: t4-rep1, template: arm, arguments: {parameters: [{name: rep, value: "t4-rep1"}, {name: instance-type, value: g4dn.2xlarge}]}}
+        - - {name: t4-rep2, template: arm, arguments: {parameters: [{name: rep, value: "t4-rep2"}, {name: instance-type, value: g4dn.2xlarge}]}}
+        - - {name: t4-rep3, template: arm, arguments: {parameters: [{name: rep, value: "t4-rep3"}, {name: instance-type, value: g4dn.2xlarge}]}}
+        - - {name: t4-rep4, template: arm, arguments: {parameters: [{name: rep, value: "t4-rep4"}, {name: instance-type, value: g4dn.2xlarge}]}}
+        # Same configuration on a different card model (A10G), to separate "SyN is
+        # nondeterministic" from "the GPU model changes the answer".
+        - - {name: a10g-rep1, template: arm, arguments: {parameters: [{name: rep, value: "a10g-rep1"}, {name: instance-type, value: g5.2xlarge}]}}
+        - - {name: a10g-rep2, template: arm, arguments: {parameters: [{name: rep, value: "a10g-rep2"}, {name: instance-type, value: g5.2xlarge}]}}
+
+    - name: arm
+      inputs:
+        parameters:
+          - name: rep
+          - name: instance-type
+        artifacts:
+          - name: fastsurfer-output
+            path: /fastsurfer/{{workflow.parameters.subject}}_{{workflow.parameters.session}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{workflow.parameters.subject}}/{{workflow.parameters.subject}}_{{workflow.parameters.session}}_templated.tar.gz'
+
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
+      outputs:
+        artifacts:
+          - name: reg-qc
+            path: '/tmp/{{workflow.parameters.subject}}_{{workflow.parameters.session}}_t1w_to_mni_reg_qc.json'
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/repeatability/{{workflow.parameters.run-label}}/{{inputs.parameters.rep}}_reg_qc.json'
+
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-nodepool
+        node.kubernetes.io/instance-type: "{{inputs.parameters.instance-type}}"
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:{{workflow.parameters.fireants-tag}}"
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: work
+            mountPath: /work
+
+        env:
+          # The control configuration on EVERY arm — this probe measures noise, not
+          # an effect, so nothing here may vary between arms.
+          - name: USE_FFO
+            value: "False"
+          - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: MKL_NUM_THREADS
+            value: "1"
+          - name: OPENBLAS_NUM_THREADS
+            value: "1"
+
+        resources:
+          requests:
+            memory: 2G
+            cpu: '2'
+            ephemeral-storage: 10G
+          limits:
+            nvidia.com/gpu: '1'
+
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+
+            # The card identity is the whole point of the g5 arms, so record it.
+            echo "=== REP={{inputs.parameters.rep}} instance={{inputs.parameters.instance-type}} host=$(hostname) ===" >&2
+            nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv >&2
+
+            python /app/fst1w_to_mni.py \
+              --t1w '/fastsurfer/{{workflow.parameters.subject}}_{{workflow.parameters.session}}/mri/orig.mgz' \
+              --brainmask '/fastsurfer/{{workflow.parameters.subject}}_{{workflow.parameters.session}}/mri/brainmask.mgz' \
+              --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+              --out-dir '/work/registration/{{workflow.parameters.session}}/t1w_to_mni' \
+              --prefix '{{workflow.parameters.subject}}_{{workflow.parameters.session}}_desc-t1w2mni' \
+              --subj '{{workflow.parameters.subject}}' \
+              --ses '{{workflow.parameters.session}}' \
+              --pipeline cloudpipe_minproc
+            EXIT=$?
+
+            echo "=== REP={{inputs.parameters.rep}} exit=$EXIT (65 = QC fail) ===" >&2
+
+            QC="/tmp/{{workflow.parameters.subject}}_{{workflow.parameters.session}}_t1w_to_mni_reg_qc.json"
+            if [ ! -f "$QC" ]; then
+              echo "FATAL: no QC record written — arm produced no measurement" >&2
+              exit 1
+            fi
+            exit 0

@@ -28,7 +28,9 @@ SCAN_TYPE_MAP = {
 VALID_SCAN_TYPES = set(SCAN_TYPE_MAP)
 
 
-def build_transfer_client(native_app_client_id: str, refresh_token: str) -> globus_sdk.TransferClient:
+def build_transfer_client(
+    native_app_client_id: str, refresh_token: str
+) -> globus_sdk.TransferClient:
     native_client = globus_sdk.NativeAppAuthClient(native_app_client_id)
     authorizer = globus_sdk.RefreshTokenAuthorizer(refresh_token, native_client)
 
@@ -54,7 +56,9 @@ def verify_dest_collection(
     except globus_sdk.TransferAPIError as e:
         if e.http_status == 404 or (e.code or "").startswith("ClientError.NotFound"):
             # Path doesn't exist yet — collection is reachable and credentials are fine.
-            print("Destination collection pre-flight check passed (path not yet created).", flush=True)
+            print(
+                "Destination collection pre-flight check passed (path not yet created).", flush=True
+            )
             return
         raise RuntimeError(
             f"Destination collection pre-flight failed — {e.code}: {e.message}. "
@@ -104,7 +108,9 @@ def discover_files(
     except globus_sdk.TransferAPIError as e:
         raise RuntimeError(f"Failed to list {base}: {e}") from e
 
-    sessions = [e["name"] for e in top_entries if e["type"] == "dir" and e["name"].startswith("ses-")]
+    sessions = [
+        e["name"] for e in top_entries if e["type"] == "dir" and e["name"].startswith("ses-")
+    ]
     if not sessions:
         raise RuntimeError(f"No session directories found under {base}. Check source-base-path.")
     print(f"Found {len(sessions)} session(s): {sessions}", flush=True)
@@ -115,7 +121,9 @@ def discover_files(
             try:
                 entries = ls(transfer_client, source_collection_id, dir_path)
             except globus_sdk.TransferAPIError as e:
-                if e.code == "ClientError.NotFound" or e.http_status == 404:  # Directory may not exist for this session/type combination — skip silently
+                if (
+                    e.code == "ClientError.NotFound" or e.http_status == 404
+                ):  # Directory may not exist for this session/type combination — skip silently
                     continue
                 else:
                     raise e
@@ -195,7 +203,9 @@ def submit_transfer(
                 wait = min(wait * 2, 600)
             else:
                 raise
-    raise RuntimeError(f"Gave up submitting transfer after {SUBMIT_RETRY_LIMIT} attempts") from last_exc
+    raise RuntimeError(
+        f"Gave up submitting transfer after {SUBMIT_RETRY_LIMIT} attempts"
+    ) from last_exc
 
 
 def wait_for_transfer(transfer_client: globus_sdk.TransferClient, task_id: str) -> None:
@@ -255,14 +265,16 @@ def main() -> None:
     scan_types = json.loads(args.scan_types)
     invalid = set(scan_types) - VALID_SCAN_TYPES
     if invalid:
-        print(f"Unknown scan type(s): {invalid}. Valid: {sorted(VALID_SCAN_TYPES)}", file=sys.stderr)
+        print(
+            f"Unknown scan type(s): {invalid}. Valid: {sorted(VALID_SCAN_TYPES)}", file=sys.stderr
+        )
         sys.exit(1)
 
     transfer_client = build_transfer_client(native_app_client_id, refresh_token)
     verify_dest_collection(transfer_client, args.dest_collection_id, args.dest_base_path)
 
     source_subject_root = f"{args.source_base_path.rstrip('/')}/{args.subject_id}"
-    dest_subject_root   = f"{args.dest_base_path.rstrip('/')}/{args.subject_id}"
+    dest_subject_root = f"{args.dest_base_path.rstrip('/')}/{args.subject_id}"
 
     print(f"Discovering files for subject {args.subject_id}, scan types: {scan_types}", flush=True)
     rel_paths = discover_files(
@@ -273,7 +285,11 @@ def main() -> None:
     )
 
     if not rel_paths:
-        print("No matching files found for any requested scan type — check source-base-path and that subject data exists on the source collection.", file=sys.stderr, flush=True)
+        print(
+            "No matching files found for any requested scan type — check source-base-path and that subject data exists on the source collection.",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(1)
 
     print(f"Discovered {len(rel_paths)} file(s) across all sessions.", flush=True)

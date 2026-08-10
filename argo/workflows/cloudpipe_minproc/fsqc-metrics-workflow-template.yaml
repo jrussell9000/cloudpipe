@@ -1,0 +1,237 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: fsqc-metrics
+  namespace: argo-workflows
+
+spec:
+
+  entrypoint: fsqc-metrics-entrypoint
+
+  # Pod-level fields do NOT inherit through templateRef — only `templates` do.
+  # serviceAccountName and securityContext are set on the master workflow's spec
+  # for its own pods, but a templateRef'd template gets neither, so both must be
+  # declared here or the pod runs as default/root and cannot reach S3 via IRSA.
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  retryStrategy:
+    # cpu-light-nodepool is t-family spot, so reclaims happen. This step is ~3
+    # minutes of work with no checkpointing, so a retry replays it whole — cheap.
+    limit: "8"
+    retryPolicy: Always
+    # Infrastructure codes only, matching every other template in this pipeline.
+    # 64/143 = executor / SIGTERM on node teardown; 75 = EX_TEMPFAIL. 137 is
+    # deliberately absent: a real OOMKill here would be deterministic (peak
+    # memory is a flat function of the largest single session, not of anything
+    # stochastic), so retrying would burn the budget on an identical failure.
+    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    backoff:
+      duration: "1m"
+      factor: "2"
+      cap: "5m"
+
+  # Standalone submissions use these defaults; production submissions inherit
+  # them from the cloudpipe master workflow (where configmap defaults are set).
+  arguments:
+    parameters:
+      - name: subjID
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  templates:
+
+  ###########################################################################
+  # Standalone entrypoint — lets this be submitted directly for testing or
+  # reprocessing a single subject. Not used when called via templateRef from
+  # the master DAG.
+  ###########################################################################
+
+  - name: fsqc-metrics-entrypoint
+    steps:
+    - - name: fsqc-metrics
+        template: fsqc-metrics-template
+
+  ###########################################################################
+  # fsqc anatomical QC — ONE pod per SUBJECT, covering all of its sessions.
+  #
+  # Runs Deep-MI/fsqc against the FastSurfer + subregion derivatives already in
+  # S3 and writes one FsqcQC record per session to the metrics bucket. See the
+  # openspec change `add-fsqc-anatomical-qc`.
+  #
+  # WHY ONE POD FOR THE WHOLE SUBJECT, not one per session: fsqc's outlier
+  # module compares each session against the others in the same invocation, so
+  # a per-session fan-out would lose the sample-based outlier fields entirely.
+  # The cost of bundling is only wall-clock — the pod is sequential over
+  # sessions — and that is ~50 s each.
+  #
+  # NOTE fsqc's "subject" is our SESSION. The driver merges the derivatives into
+  # one $SUBJECTS_DIR with one directory per session, so `--subjects ses-00A ...`
+  # is not a typo, and the records it writes are keyed subject+session.
+  #
+  # NO ARGO ARTIFACTS, in or out. stage_and_run.py does all of its own S3 I/O
+  # through boto3: it must LIST derivatives/fastsurfer/{subj}/ to discover which
+  # sessions exist (the long-template's `base-tps` file is empty for at least
+  # some subjects, so it cannot be trusted), and a declarative input-artifact
+  # list would have to enumerate every possible session key as optional: true —
+  # the pattern subregion-seg uses, which silently caps the pipeline at the seven
+  # session IDs hardcoded there. Consequently the Argo dir-artifact
+  # trailing-slash rule does not apply anywhere in this file.
+  #
+  # Reads from S3 (per subject):
+  #   derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz   (all sessions)
+  #   derivatives/subregions/{subj}/{subj}_hippoamyg.tar.gz
+  #   derivatives/subregions/{subj}/{subj}_hypothalamic.tar.gz
+  # Deliberately NOT read: the long-template tarball (~480 MB, nothing enabled
+  # reads it) nor thalamus/brainstem/sclimbic. See the driver's module docstring.
+  #
+  # Writes to the METRICS bucket (never the derivatives bucket — this step
+  # produces QC records, not derivatives):
+  #   metrics/fsqc-qc/dt={date}/{subj}_{ses}_fsqc_qc.json
+  #   fsqc/{subj}/{ses}/*.png      (hippocampus + hypothalamus overlays, plus a
+  #                                 whole-brain screenshots-{ses}.png)
+  #   fsqc/{subj}/fsqc-results.html (browsable summary over all the subject's
+  #                                 sessions; links rewritten to the above layout)
+  #
+  # There is NO skip gate. Recomputation IS the idempotency mechanism: each run
+  # overwrites the record for that subject+session, so the stored metrics always
+  # describe the derivatives currently in S3. Do not add a `metrics-exist`
+  # check modelled on `subregions-exist` — that check reads a deterministic flat
+  # key, whereas an FsqcQC record lives under dt={date} and a checker cannot
+  # know which partition a prior run used. See the change's design.md.
+  ###########################################################################
+
+  - name: fsqc-metrics-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: anatomical
+        cloudpipe.io/step: fsqc-metrics
+
+    # cpu-light, not cpu-heavy: at 5G/2cpu this pod is almost exactly the shape
+    # of surface-resample-session-template (4G/2cpu), which this pool's own
+    # sizing comment names as its footprint driver — so the precedent is direct.
+    # cpu-heavy is c/m-family 2xlarge/4xlarge, badly oversized for ~1.5 cpu of
+    # real work.
+    #
+    # The constraint to respect (project memory `test-batch-2026-08-05-pilot`):
+    # Karpenter enforces this pool's `limits` against NODE CAPACITY, not against
+    # the sum of pod requests, and the 2026-08-06 pilot filled it at 16 nodes /
+    # 96.5% of the memory limit while carrying only ~22% of the cpu limit. The
+    # limits have since been rebalanced so cpu is the single binding ceiling
+    # (cpu: 160 / memory: 640Gi — see the nodepool's helm values), and a 5G
+    # request packs 3 pods onto a ~15.4Gi t-family node, so this adds node
+    # capacity roughly in proportion to the cpu it consumes rather than
+    # stranding it. Re-check that balance if this request grows.
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    # The container runs as uid 1000 and cannot mkdir at the image root, so the
+    # driver's --workdir must be a writable volume. /tmp in the image is used by
+    # MPLCONFIGDIR/XDG_CACHE_HOME (see images/fsqc/Dockerfile) and is not sized
+    # for ~900 MB of extracted derivatives; give the work tree its own emptyDir.
+    volumes:
+      - name: work
+        emptyDir: {}
+
+    container:
+      # :latest is the deliberate bootstrap value for a brand-new image, not an
+      # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
+      # rewrites this to sha-<commit> once the first build lands, and only after
+      # confirming that tag actually reached the registry.
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fsqc:sha-d51990e89319d1fcb46e0971be23ce00a43a74cf"
+      imagePullPolicy: IfNotPresent
+
+      volumeMounts:
+        - name: work
+          mountPath: /work
+
+      resources:
+        # MEASURED 2026-08-07 in this exact image against live derivatives,
+        # reading cgroup v2 memory.peak — an exact high-water mark, not a
+        # sampled RSS:
+        #
+        #                        sessions   memory.peak   wall    /work disk
+        #   sub-086U18RD            3          3.93 G     172 s     863 M
+        #   sub-AU979320            4          3.97 G     225 s    1070 M
+        #
+        # The two axes behave DIFFERENTLY, which is the whole basis for the
+        # numbers below: +33% sessions moved peak memory by +1% but disk by
+        # +24%. Memory is flat because fsqc loops sessions and frees between
+        # them, so peak is set by the largest SINGLE session; disk is cumulative
+        # because every session's extracted tree is kept for the outlier
+        # module's cross-session comparison. Sized for the 6-session maximum of
+        # the ABCD longitudinal design (ses-00A..ses-10A): memory unchanged,
+        # disk ~1.6 G extrapolated at ~270 M/session, wall ~340 s.
+        #
+        # Do NOT re-derive memory from the ~2.7 GB figure in section 1.2 of the
+        # change's validation notes: that was `/usr/bin/time` maximum RSS for a
+        # single-session run outside a container. memory.peak additionally
+        # accounts the page cache from writing ~1 GB of extracted derivatives,
+        # and it is what the kernel charges against a cgroup — so it, not RSS,
+        # is the number a request has to clear.
+        requests:
+          # 3.97 G measured peak + ~1 G headroom, and flat in session count.
+          memory: 5G
+          # ~142% CPU measured: fsqc is only incidentally parallel (numpy BLAS
+          # inside otherwise serial per-session loops), so more than 2 buys
+          # nothing. Deliberately NOT the 4 the subregion pods request — those
+          # pass an explicit --threads 4, whereas fsqc has no threads flag that
+          # could drift out of sync with this number.
+          cpu: '2'
+          # The extracted tree, not the transfer: the driver holds each tarball
+          # in a BytesIO and extracts from memory, so the tarballs themselves
+          # never land on disk. 4G covers the 6-session extrapolation (~1.6 G)
+          # with room for fsqc's own output (overlay PNGs, CSV, status files).
+          ephemeral-storage: 4G
+        limits:
+          # Limits are safe to set here precisely BECAUSE peak memory is flat in
+          # session count — unlike the subregion pods, where the limit was
+          # omitted deliberately and the request is the only scheduling
+          # guarantee. If a future fsqc version or a newly-enabled module breaks
+          # that flatness, re-measure rather than raising these.
+          memory: 6G
+          ephemeral-storage: 6G
+
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+
+      command: [python, -u, /app/stage_and_run.py]
+      args:
+        - --subject
+        - '{{workflow.parameters.subjID}}'
+        - --bucket
+        - '{{workflow.parameters.bucket}}'
+        - --metrics-bucket
+        - '{{workflow.parameters.metrics-bucket}}'
+        - --workdir
+        - /work
+        # Partition the record by the WORKFLOW's creation date, not the pod's
+        # "today". A workflow that starts at 23:58Z lands its QC record in the
+        # same dt= partition as the workflow_runs row that describes it;
+        # defaulting to the driver's own clock would split them across two days.
+        # (Project memory `metrics-export-dt-mismatch` is the inverse of this
+        # hazard, for the partitions that genuinely cannot be aligned.)
+        - --dt
+        - '{{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}'

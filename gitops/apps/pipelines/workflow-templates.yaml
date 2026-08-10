@@ -13,6 +13,11 @@ spec:
     targetRevision: main
     directory:
       recurse: true
+      # cloudpipe_fullproc is a planned pipeline (raw DICOM input) — no such directory
+      # exists in argo/workflows/ yet. Placeholder exclusion so a future
+      # cloudpipe_fullproc/ directory doesn't get auto-synced mid-development;
+      # drop this once the pipeline is ready to deploy. See docs/architecture.md.
+      exclude: 'cloudpipe_fullproc/**'
   destination:
     server: https://kubernetes.default.svc
     namespace: argo-workflows

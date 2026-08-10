@@ -1,0 +1,281 @@
+# t1w-to-mni fused_ops timing + VRAM probe
+#
+# QUESTION
+# --------
+# The prize, as opposed to the risk. Upstream claims up to 80% training-time and 20%
+# memory reduction from the fused kernels, but that figure is for deep-learning
+# TRAINING loops, not a single-pair optimizer — treat it as an upper bound that will
+# not be reached. What is measurable here: SyN wall time and peak VRAM, per arm, on
+# identical hardware.
+#
+# The companion QC A/B (t1w-to-mni-fused-ops-ab.yaml) cannot answer this. Its pods
+# run at parallelism 10, so up to 3 arms time-slice one card and every arm pays a
+# cold multi-GB image pull — both of which swamp a ~40 s SyN stage. This probe exists
+# solely to hold the host constant.
+#
+# WHY SEQUENTIAL, AND WHY THAT IS THE POINT
+# -----------------------------------------
+# Each arm requests `nvidia.com/gpu: 1`, and the device plugin advertises multiple
+# time-slices per card, so parallel arms could co-tenant and contend. Steps run in
+# series, which guarantees each arm owns its card outright. That matters twice over:
+#   * timings are comparable arm-to-arm, and
+#   * `memory.used` from nvidia-smi is WHOLE-CARD, so peak VRAM is only attributable
+#     to this pod when nothing else is on the card. Under time-slicing it is not, and
+#     no DCGM field fixes that (all DCGM_FI_DEV_* fields are device-scoped) — see
+#     Part 2a of handoffs/fireants-fused-ops.md.
+#
+# Arms rotate off/on WITHIN a session so that any slow drift in the cluster
+# (spot pool, throttling) hits every arm of a triple roughly equally.
+#
+# THREE ARMS, NOT TWO (#165)
+# --------------------------
+# `fusedcc` defaults to `use_ants_gradient=True`, an approximate backward pass that
+# drops neighbouring-voxel coupling; that is the measured cause of the warp folding
+# in #163, and fst1w_to_mni.py's `resolve_syn_loss` now turns it OFF by default. The
+# arms are therefore:
+#
+#   off     USE_FFO=False                            -> 'cc', exact autograd gradient
+#   exact   USE_FFO=True                             -> 'fusedcc', exact gradient
+#   approx  USE_FFO=True FFO_ANTS_GRADIENT=True      -> 'fusedcc', library default
+#
+# `approx` reproduces #163's fused arm (lncc 0.831/0.862/0.879, jac_det_frac_negative
+# 0.0129/0.0191/0.0156, fail x3) from THIS image, so all three arms are one workflow
+# on one card model and no cross-image comparison is needed.
+#
+# READ THE RESULT ON jac_det_frac_negative, NEVER lncc. lncc rises monotonically as
+# the warp degrades — it was +0.078 in the arm that failed — so a sweep steered by it
+# goes in exactly the wrong direction. The `exact` arm succeeds iff it lands back in
+# the control's 0.0004-0.0017 band (bound: fail > 0.005).
+#
+# THEN read SyN wall time. The exact path adds a convolution back per backward pass
+# ("maybe slightly slower" per fusedcc.py), so the open question is how much of the
+# -50% survives correctness. If the speed win is gone, the answer is no and the
+# extension stays dark.
+#
+# PINNED TO g4dn.2xlarge (T4)
+# ---------------------------
+# One card model for every arm, and the T4 is both the cheapest and the oldest arch
+# (sm_75) in gpu-nodepool. It is also the tightest on memory at 15 GiB, which is the
+# card the time-slicing invariant (replicas x peak < GPU memory) is written against.
+# 2xlarge rather than xlarge so the pod is not CPU-starved during the SimpleITK
+# affine while measuring the GPU stage.
+#
+# The nvidia-smi monitor line is copied VERBATIM from the production template so the
+# emitted CSV keeps the same 6 columns (`name` and `memory.total` were added in
+# 951f234) and stays parseable by the preserved analysis script.
+#
+# SAFETY: writes nothing to derivatives/ or the metrics corpus — see the same
+# section in t1w-to-mni-fused-ops-ab.yaml.
+#
+# USAGE
+#   # fireants-tag MUST be a build that contains fst1w_to_mni.py's resolve_syn_loss
+#   # (#165) — i.e. the `ci: pin workflow images to sha-...` commit AFTER that merged.
+#   # On an older image FFO_ANTS_GRADIENT is simply ignored, and the `exact` and
+#   # `approx` arms silently become the same (approximate) run.
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-fused-ops-timing.yaml \
+#     -p fireants-tag=sha-<build with resolve_syn_loss> --watch
+#
+#   # then pull this workflow's archived pod logs and parse them. The parser reports
+#   # per-arm SyN wall time, peak VRAM, in-SyN GPU utilization and jac_det_frac_negative:
+#   WF=<workflow-name>
+#   mkdir -p /tmp/ffo-timing
+#   aws s3api list-objects-v2 --bucket <YOUR_S3_BUCKET> --prefix "logs/$WF" \
+#     --query 'Contents[].Key' --output text | tr '\t' '\n' \
+#     | while read -r k; do aws s3 cp "s3://<YOUR_S3_BUCKET>/$k" "/tmp/ffo-timing/$(echo "$k" | tr / _)" --quiet; done
+#   python handoffs/fireants-fused-ops/parse_gpu_logs.py /tmp/ffo-timing/
+#
+#   # and the full paired QC diff from the uploaded RegistrationQC records:
+#   aws s3 sync s3://<YOUR_S3_BUCKET>/scratch/fused-ops-timing/run1/ /tmp/ffo-timing-qc/
+#   python scripts/investigations/fused_ops_ab/compare_arms.py /tmp/ffo-timing-qc/ \
+#     --control arm-off --treatment arm-exact
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: t1w-mni-ffo-timing-
+  namespace: argo-workflows
+spec:
+  # See t1w-to-mni-fused-ops-ab.yaml — a standalone Workflow inherits neither the
+  # service account nor the pod securityContext from the cloudpipe WorkflowTemplate.
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    annotations:
+      # Non-negotiable here: a consolidation mid-arm both loses the arm and, worse,
+      # would put a second workload on the card whose whole-card VRAM we are reading.
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+
+  # 9 arms, strictly sequential, each a cold image pull plus ~90 s of registration.
+  activeDeadlineSeconds: 10800
+
+  # NO retryStrategy — same reason as the QC A/B: exit 65 is a result, not an error.
+  entrypoint: timing
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      - name: instance-type
+        value: g4dn.2xlarge
+      # MUST be a fireants image built with the fused_ops extension — see the same
+      # parameter in t1w-to-mni-fused-ops-ab.yaml — AND containing resolve_syn_loss
+      # (#165), or the exact/approx arms collapse into one. This default is the
+      # pre-#165 build and is deliberately left stale: override it, do not trust it.
+      - name: fireants-tag
+        value: sha-afb52d5048608a6d7cf1c20345ad2a97a622f76d
+      - name: run-label
+        value: run1
+
+  templates:
+    - name: timing
+      # Three mid-distribution sessions from the QC A/B sample (production lncc
+      # 0.801 / 0.804 / 0.822). Deliberately NOT the fail sessions: a bad-basin run
+      # is a timing outlier as well as a QC one, and this probe measures the normal
+      # case. Three, not one, so a single anomalous pod cannot carry the result.
+      steps:
+        - - {name: s1-off,    template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: use-ffo, value: "False"}, {name: ants-gradient, value: "False"}, {name: arm-label, value: "off"}]}}
+        - - {name: s1-exact,  template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: use-ffo, value: "True"},  {name: ants-gradient, value: "False"}, {name: arm-label, value: exact}]}}
+        - - {name: s1-approx, template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: use-ffo, value: "True"},  {name: ants-gradient, value: "True"},  {name: arm-label, value: approx}]}}
+        - - {name: s2-off,    template: arm, arguments: {parameters: [{name: subject, value: sub-VMT7W436}, {name: session, value: ses-00A}, {name: use-ffo, value: "False"}, {name: ants-gradient, value: "False"}, {name: arm-label, value: "off"}]}}
+        - - {name: s2-exact,  template: arm, arguments: {parameters: [{name: subject, value: sub-VMT7W436}, {name: session, value: ses-00A}, {name: use-ffo, value: "True"},  {name: ants-gradient, value: "False"}, {name: arm-label, value: exact}]}}
+        - - {name: s2-approx, template: arm, arguments: {parameters: [{name: subject, value: sub-VMT7W436}, {name: session, value: ses-00A}, {name: use-ffo, value: "True"},  {name: ants-gradient, value: "True"},  {name: arm-label, value: approx}]}}
+        - - {name: s3-off,    template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: use-ffo, value: "False"}, {name: ants-gradient, value: "False"}, {name: arm-label, value: "off"}]}}
+        - - {name: s3-exact,  template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: use-ffo, value: "True"},  {name: ants-gradient, value: "False"}, {name: arm-label, value: exact}]}}
+        - - {name: s3-approx, template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: use-ffo, value: "True"},  {name: ants-gradient, value: "True"},  {name: arm-label, value: approx}]}}
+
+    - name: arm
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: use-ffo
+          - name: ants-gradient
+          - name: arm-label
+        artifacts:
+          - name: fastsurfer-output
+            path: /fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{inputs.parameters.subject}}/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_templated.tar.gz'
+
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
+      outputs:
+        artifacts:
+          # Secondary here — the primary result of this probe is in the pod LOG (the
+          # nvidia-smi stream plus the stage markers), which Argo archives to
+          # s3://<YOUR_S3_BUCKET>/logs/{workflow}/{pod}/main.log. Kept anyway so the QC of a
+          # timing arm can be checked against its paired QC-A/B counterpart.
+          - name: reg-qc
+            path: '/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/fused-ops-timing/{{workflow.parameters.run-label}}/arm-{{inputs.parameters.arm-label}}/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_reg_qc.json'
+
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-nodepool
+        node.kubernetes.io/instance-type: "{{workflow.parameters.instance-type}}"
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:{{workflow.parameters.fireants-tag}}"
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: work
+            mountPath: /work
+
+        env:
+          - name: USE_FFO
+            value: "{{inputs.parameters.use-ffo}}"
+          # Ignored on the USE_FFO=False arm (resolve_syn_loss returns plain 'cc'
+          # with no loss_params), so it is safe to set unconditionally.
+          - name: FFO_ANTS_GRADIENT
+            value: "{{inputs.parameters.ants-gradient}}"
+          # Held at production's value on both arms. Fixed, not projected from
+          # requests.cpu, so the CPU request below cannot drag the thread count with
+          # it — thread count changes where the affine lands (#138).
+          - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: MKL_NUM_THREADS
+            value: "1"
+          - name: OPENBLAS_NUM_THREADS
+            value: "1"
+
+        resources:
+          requests:
+            memory: 2G
+            # 2, not production's 1. This probe runs one pod on a dedicated 8-vCPU
+            # node and sets no CPU limit, so the request does not bound real compute
+            # either way; it is held identical across arms, which is what matters.
+            cpu: '2'
+            ephemeral-storage: 10G
+          limits:
+            nvidia.com/gpu: '1'
+
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+
+            # VERBATIM from the production template so the CSV keeps its 6 columns
+            # and parse_gpu_logs.py's SMI_WIDE pattern matches. memory.used is
+            # WHOLE-CARD; it is attributable to this pod only because arms run
+            # sequentially and this pod owns the card.
+            nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
+              --format=csv -l 5 >&2 &
+            MONITOR=$!
+
+            echo "=== arm={{inputs.parameters.arm-label}} USE_FFO={{inputs.parameters.use-ffo}} FFO_ANTS_GRADIENT={{inputs.parameters.ants-gradient}} subj={{inputs.parameters.subject}} ses={{inputs.parameters.session}} host=$(hostname) nproc=$(nproc) ===" >&2
+
+            python /app/fst1w_to_mni.py \
+              --t1w '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/orig.mgz' \
+              --brainmask '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/brainmask.mgz' \
+              --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+              --out-dir '/work/registration/{{inputs.parameters.session}}/t1w_to_mni' \
+              --prefix '{{inputs.parameters.subject}}_{{inputs.parameters.session}}_desc-t1w2mni' \
+              --subj '{{inputs.parameters.subject}}' \
+              --ses '{{inputs.parameters.session}}' \
+              --pipeline cloudpipe_minproc
+            EXIT=$?
+
+            kill $MONITOR 2>/dev/null
+            echo "=== arm={{inputs.parameters.arm-label}} exit=$EXIT (65 = QC fail, 1 = FFO asserted unavailable) ===" >&2
+
+            # Exit 0 on a QC fail so the remaining arms still run; exit 1 only when
+            # the arm produced no measurement at all.
+            QC="/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json"
+            if [ ! -f "$QC" ]; then
+              echo "FATAL: no QC record written — arm produced no measurement" >&2
+              exit 1
+            fi
+            exit 0

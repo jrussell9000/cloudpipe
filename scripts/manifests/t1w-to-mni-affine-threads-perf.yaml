@@ -1,0 +1,284 @@
+# t1w-to-mni affine thread scaling — PHASE A (upper bound, dedicated node)
+#
+# Issue #164.
+#
+# QUESTION
+# --------
+# The SimpleITK affine is now 53.6% of this step (production, n=25/25 complete,
+# dt=2026-08-04) and it runs on ONE thread. How much wall time does raising the
+# thread count actually buy, and does the result still not move?
+#
+# #138 switched the affine's metric sampling to NONE, which evaluates every voxel
+# centre instead of a sampled subset. That is what made the affine dominant (from
+# ~4s to ~75s) and it is also what makes this experiment safe to contemplate: under
+# NONE the affine is thread-INVARIANT (lncc 0.77511 / 0.77507 / 0.77506 at 1/4/8
+# threads, a 5e-5 spread, versus 0.49 under RANDOM). Its own code comment concludes
+# "thread count is now purely a performance knob". This probe measures that knob and
+# re-confirms the invariance at the current commit rather than trusting it.
+#
+# WHAT THIS PROBE IS NOT
+# ----------------------
+# It is an UPPER BOUND, not a production estimate. Every arm runs alone on a
+# dedicated 8-vCPU node, so it measures thread scaling with no competition. In
+# production three of these pods time-slice one GPU (#102 raised replicas to 3) and
+# each requests cpu: 1, so the realistic figure comes from the co-packed Phase B
+# probe (t1w-to-mni-affine-threads-packing.yaml). Do not quote Phase A numbers as
+# what production would get.
+#
+# WHY ITK IS VARIED ALONE
+# -----------------------
+# The production template projects FOUR variables from requests.cpu at once —
+# OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS and
+# ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS. Moving all four together would confound the
+# affine's ITK pool with torch's intra-op pool in the SyN stage, so arms 1-8 raise
+# ITK ONLY and hold the other three at production's value of 1. That attributes any
+# change to the affine.
+#
+# The `all8` arm then raises all four together, because that is what actually
+# happens if requests.cpu is raised — it captures whatever the BLAS/torch side adds
+# or costs on top of the isolated ITK effect. Comparing `itk8` with `all8` is the
+# whole reason that arm exists.
+#
+# Threads are exported from bash, not projected through the downward API, because
+# the API cannot express a value that differs from requests.cpu — and holding the
+# CPU REQUEST fixed at 2 on every arm is what removes scheduling as a confound.
+# No CPU limit is set, so on a dedicated 8-vCPU node the request does not bound real
+# compute; only the thread variables do.
+#
+# ARM ORDER IS DELIBERATELY NOT MONOTONIC
+# ---------------------------------------
+# Levels run 1, 8, 2, 4, all8. If the cluster drifts during the run (thermal, noisy
+# neighbour on the hypervisor), a monotonic 1->2->4->8 order would let that drift
+# masquerade as a thread effect. Shuffling the levels means drift cannot align with
+# the independent variable.
+#
+# Two sessions per level, both mid-distribution. Two rather than one because affine
+# wall time depends on how quickly the optimizer converges (500 iterations max),
+# which is subject-specific.
+#
+# NOTE ON THE lncc REFERENCE: the 2026-08-05 repeatability figures for these sessions
+# (sub-VKPJ803Y/ses-02A 0.7517, sub-FA0DV854/ses-02A 0.8020) were measured on a T4.
+# These arms run on an A10G, which carries a measured +0.0156 lncc / 1.63x jac_neg
+# hardware term. So do NOT read a shift from those numbers as a thread effect. The
+# invariance test is FLATNESS ACROSS THIS PROBE'S OWN ARMS, all of which share one
+# instance type and one AZ.
+#
+# SAFETY: writes nothing to derivatives/ or the metrics corpus — reg-qc goes to
+# scratch/. Same reasoning as scripts/manifests/t1w-to-mni-fused-ops-ab.yaml.
+#
+# USAGE
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-affine-threads-perf.yaml
+#
+#   # timings come from the pod LOGS (Stage 1 -> Stage 2 delta), not the QC JSON:
+#   WF=<workflow-name>
+#   mkdir -p /tmp/affine-threads
+#   aws s3api list-objects-v2 --bucket <YOUR_S3_BUCKET> --prefix "logs/$WF" \
+#     --query 'Contents[].Key' --output text | tr '\t' '\n' \
+#     | while read -r k; do aws s3 cp "s3://<YOUR_S3_BUCKET>/$k" "/tmp/affine-threads/$(echo "$k" | tr / _)" --quiet; done
+#   python handoffs/fireants-fused-ops/parse_gpu_logs.py /tmp/affine-threads/
+#
+#   # invariance check (should be flat to ~1e-3, the fixed-hardware noise floor):
+#   aws s3 sync s3://<YOUR_S3_BUCKET>/scratch/affine-threads/run1/ /tmp/at/
+#   for f in /tmp/at/*.json; do echo "$(basename "$f") $(jq -r .lncc "$f")"; done
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: t1w-mni-affine-threads-
+  namespace: argo-workflows
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    annotations:
+      # A consolidation mid-arm would surface as a timing outlier indistinguishable
+      # from a thread effect.
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+
+  # 10 arms, strictly sequential, each a registration plus (for the first) a cold
+  # multi-GB image pull.
+  activeDeadlineSeconds: 10800
+
+  # No retryStrategy: a QC fail is a result, and a retry would either hide an arm or
+  # re-run a deterministic outcome for nothing.
+  entrypoint: sweep
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      # 2xlarge = 8 vCPU, so the 8-thread arms have 8 real cores. The nodepool only
+      # allows xlarge/2xlarge, so 8 is the highest testable thread count.
+      #
+      # g5, not g4dn: on 2026-08-05 `get-spot-placement-scores` returned 1 (the floor)
+      # for every g4dn and g6 size in all three AZs, and Karpenter churned two
+      # NodeClaims before giving up. g5.2xlarge scored 3 in <YOUR_AWS_REGION>c. The family
+      # only has to be HELD CONSTANT across arms — the scaling curve is what is being
+      # measured, not the absolute affine time — so substituting is safe. Re-check
+      # before a re-run; capacity moves:
+      #   aws ec2 get-spot-placement-scores --instance-types g5.2xlarge \
+      #     --target-capacity 1 --target-capacity-unit-type units \
+      #     --region-names <YOUR_AWS_REGION> --single-availability-zone
+      - name: instance-type
+        value: g5.2xlarge
+      # Pinned, and not only to find capacity: holding the AZ fixed removes another
+      # confound, since different AZs can back the same instance type with different
+      # host generations. <YOUR_AWS_REGION>c is where the capacity was.
+      - name: zone
+        value: <YOUR_AWS_REGION>c
+      - name: fireants-tag
+        value: sha-24a26a89159e0b61336b57ee4cbc496028a36266
+      - name: run-label
+        value: run1
+
+  templates:
+    - name: sweep
+      steps:
+        - - {name: itk1-s1,  template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "1"}, {name: scope, value: itk}]}}
+        - - {name: itk1-s2,  template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: itk, value: "1"}, {name: scope, value: itk}]}}
+        - - {name: itk8-s1,  template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "8"}, {name: scope, value: itk}]}}
+        - - {name: itk8-s2,  template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: itk, value: "8"}, {name: scope, value: itk}]}}
+        - - {name: itk2-s1,  template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "2"}, {name: scope, value: itk}]}}
+        - - {name: itk2-s2,  template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: itk, value: "2"}, {name: scope, value: itk}]}}
+        - - {name: itk4-s1,  template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "4"}, {name: scope, value: itk}]}}
+        - - {name: itk4-s2,  template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: itk, value: "4"}, {name: scope, value: itk}]}}
+        # All four thread vars at 8 — what raising requests.cpu would actually do.
+        - - {name: all8-s1,  template: arm, arguments: {parameters: [{name: subject, value: sub-VKPJ803Y}, {name: session, value: ses-02A}, {name: itk, value: "8"}, {name: scope, value: all}]}}
+        - - {name: all8-s2,  template: arm, arguments: {parameters: [{name: subject, value: sub-FA0DV854}, {name: session, value: ses-02A}, {name: itk, value: "8"}, {name: scope, value: all}]}}
+
+    - name: arm
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: itk
+          # "itk" = raise ITK only, hold OMP/MKL/OPENBLAS at 1.
+          # "all" = raise all four together.
+          - name: scope
+        artifacts:
+          - name: fastsurfer-output
+            path: /fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{inputs.parameters.subject}}/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_templated.tar.gz'
+
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
+      outputs:
+        artifacts:
+          # Secondary: the primary result is the Stage 1 -> Stage 2 delta in the pod
+          # log. This carries the invariance check (lncc must stay flat).
+          - name: reg-qc
+            path: '/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/affine-threads/{{workflow.parameters.run-label}}/{{inputs.parameters.scope}}{{inputs.parameters.itk}}_{{inputs.parameters.subject}}_{{inputs.parameters.session}}_reg_qc.json'
+
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-nodepool
+        node.kubernetes.io/instance-type: "{{workflow.parameters.instance-type}}"
+        topology.kubernetes.io/zone: "{{workflow.parameters.zone}}"
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:{{workflow.parameters.fireants-tag}}"
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: work
+            mountPath: /work
+
+        # NO env block: every thread variable is exported from bash below, because
+        # the downward API cannot express a thread count that differs from
+        # requests.cpu — which is the entire point of this experiment. USE_FFO is
+        # exported there too, pinned to the production value.
+
+        resources:
+          requests:
+            memory: 2G
+            # Held at 2 on EVERY arm. No CPU limit is set, so on a dedicated 8-vCPU
+            # node this does not bound real compute; fixing it removes scheduling
+            # and node choice as confounds so only the thread variables move.
+            cpu: '2'
+            ephemeral-storage: 10G
+          limits:
+            nvidia.com/gpu: '1'
+
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+            ITK='{{inputs.parameters.itk}}'
+            SCOPE='{{inputs.parameters.scope}}'
+
+            # Production value on every arm — this probe is about threads, and the
+            # fused kernels fold the warp (#163), so they stay off.
+            export USE_FFO=False
+
+            export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS="$ITK"
+            if [ "$SCOPE" = "all" ]; then
+              export OMP_NUM_THREADS="$ITK"
+              export MKL_NUM_THREADS="$ITK"
+              export OPENBLAS_NUM_THREADS="$ITK"
+            else
+              # Held at production's value so the affine's ITK pool is the only
+              # thing that changed.
+              export OMP_NUM_THREADS=1
+              export MKL_NUM_THREADS=1
+              export OPENBLAS_NUM_THREADS=1
+            fi
+
+            # Machine-readable marker for parse_gpu_logs.py, plus the host facts
+            # needed to read a timing against what it ran on. `nproc --all` and not
+            # plain `nproc`: coreutils applies the OMP_NUM_THREADS override only to
+            # the default (available-processors) mode, so on "itk" arms plain nproc
+            # would report 1 while 8 real cores are in fact available.
+            echo "=== ITK_THREADS=$ITK SCOPE=$SCOPE subj={{inputs.parameters.subject}} ses={{inputs.parameters.session}} host=$(hostname) cores=$(nproc --all) ===" >&2
+            echo "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=${ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS} OMP_NUM_THREADS=${OMP_NUM_THREADS}" >&2
+            nvidia-smi --query-gpu=name,memory.total --format=csv >&2
+
+            python /app/fst1w_to_mni.py \
+              --t1w '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/orig.mgz' \
+              --brainmask '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/brainmask.mgz' \
+              --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+              --out-dir '/work/registration/{{inputs.parameters.session}}/t1w_to_mni' \
+              --prefix '{{inputs.parameters.subject}}_{{inputs.parameters.session}}_desc-t1w2mni' \
+              --subj '{{inputs.parameters.subject}}' \
+              --ses '{{inputs.parameters.session}}' \
+              --pipeline cloudpipe_minproc
+            EXIT=$?
+
+            echo "=== ITK_THREADS=$ITK SCOPE=$SCOPE exit=$EXIT (65 = QC fail) ===" >&2
+
+            QC="/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json"
+            if [ ! -f "$QC" ]; then
+              echo "FATAL: no QC record written — arm produced no measurement" >&2
+              exit 1
+            fi
+            exit 0

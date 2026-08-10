@@ -36,9 +36,9 @@ module "kubecost_agent_pod_identity" {
       ]
     },
     {
-      sid     = "SpotPricingFeed"
-      actions = ["ec2:DescribeSpotPriceHistory"]
-      effect  = "Allow"
+      sid       = "SpotPricingFeed"
+      actions   = ["ec2:DescribeSpotPriceHistory"]
+      effect    = "Allow"
       resources = ["*"]
     }
   ]
@@ -93,7 +93,7 @@ resource "helm_release" "kubecost" {
   name             = "kubecost"
   chart            = "kubecost"
   repository       = "oci://public.ecr.aws/kubecost"
-  version          = "3.1.5"
+  version          = "3.2.1"
   namespace        = "kubecost"
   create_namespace = false
   wait             = false
@@ -171,10 +171,63 @@ resource "aws_security_group" "kubecost_lb" {
 
 resource "aws_vpc_security_group_ingress_rule" "kubecost_lb_https" {
   security_group_id = aws_security_group.kubecost_lb.id
-  description       = "HTTPS from operator workstation"
+  description       = "HTTPS from UW Madison prefix list"
   prefix_list_id    = var.inbound_prefix_list_id
   from_port         = 443
   to_port           = 443
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "kubecost_lb_http" {
+  security_group_id = aws_security_group.kubecost_lb.id
+  description       = "HTTP from UW Madison prefix list (redirected to HTTPS)"
+  prefix_list_id    = var.inbound_prefix_list_id
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+}
+
+# Allow access via the AWS Client VPN too (source-NATs to the VPC CIDR, same
+# as the EKS API server rule) — lets a single VPN connection reach both the
+# cluster API and this ALB, without also requiring the UW-Madison VPN.
+resource "aws_vpc_security_group_ingress_rule" "kubecost_lb_https_client_vpn" {
+  security_group_id = aws_security_group.kubecost_lb.id
+  description       = "HTTPS from AWS Client VPN (source-NATs to VPC CIDR)"
+  cidr_ipv4         = var.vpc_cidr
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "kubecost_lb_http_client_vpn" {
+  security_group_id = aws_security_group.kubecost_lb.id
+  description       = "HTTP from AWS Client VPN (redirected to HTTPS)"
+  cidr_ipv4         = var.vpc_cidr
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+}
+
+# The Client VPN CIDR rule above only covers traffic to VPC-internal
+# destinations. Traffic from a full-tunnel VPN client to this ALB's *public*
+# IP instead hairpins out through the VPC's NAT gateway and back in over the
+# internet, presenting the NAT gateway's EIP as the source — so that EIP
+# needs its own trust rule too.
+resource "aws_vpc_security_group_ingress_rule" "kubecost_lb_https_nat" {
+  security_group_id = aws_security_group.kubecost_lb.id
+  description       = "HTTPS from VPC NAT gateway (full-tunnel VPN clients hairpin through here)"
+  cidr_ipv4         = "${var.nat_gateway_ip}/32"
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "kubecost_lb_http_nat" {
+  security_group_id = aws_security_group.kubecost_lb.id
+  description       = "HTTP from VPC NAT gateway (redirected to HTTPS)"
+  cidr_ipv4         = "${var.nat_gateway_ip}/32"
+  from_port         = 80
+  to_port           = 80
   ip_protocol       = "tcp"
 }
 

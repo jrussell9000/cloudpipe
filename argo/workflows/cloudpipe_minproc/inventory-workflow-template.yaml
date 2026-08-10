@@ -26,9 +26,12 @@ spec:
         - name: fastsurfer-exists
           valueFrom:
             path: /tmp/fastsurfer_exists.txt
+        - name: subregions-exist
+          valueFrom:
+            path: /tmp/subregions_exists.txt
 
-    script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-5c9f627400e80dafdf1494b054da7d0b2540f1d3"
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -37,144 +40,15 @@ spec:
           ephemeral-storage: 500M
         limits:
           ephemeral-storage: 500M
-
       env:
-        - name: SUBJECT_ID
-          value: "{{workflow.parameters.subjID}}"
-        - name: BUCKET_NAME
-          value: "{{workflow.parameters.bucket}}"
-
-      command: ["sh", "-c"]
-
-      source: |
-
-        #!/bin/sh
-        set -e
-
-        python - <<EOF
-        import boto3
-        import csv
-        import io
-        import json
-        import os
-        import re
-        import sys
-        from botocore.exceptions import ClientError
-
-        s3 = boto3.client('s3')
-        paginator = s3.get_paginator('list_objects_v2')
-        subject_id = os.environ['SUBJECT_ID']
-        bucket = os.environ['BUCKET_NAME']
-        target_tasks = {"rest", "nback"}
-        MIN_ARTIFACT_BYTES = 1024
-
-        # Discover sessions under mmps_mproc/{subj}/
-        sessions = []
-        prefix = f"mmps_mproc/{subject_id}/"
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/'):
-            for cp in page.get('CommonPrefixes', []):
-                session = cp['Prefix'][len(prefix):].strip('/')
-                sessions.append(session)
-
-        # For each session, discover BOLD runs under func/
-        result = []
-        for ses in sessions:
-            func_prefix = f"mmps_mproc/{subject_id}/{ses}/func/"
-            runs = []
-            seen = set()
-            for page in paginator.paginate(Bucket=bucket, Prefix=func_prefix):
-                for obj in page.get('Contents', []):
-                    key = obj['Key']
-                    if not key.endswith(('.nii', '.nii.gz')):
-                        continue
-                    fname = key.split('/')[-1]
-                    task_m = re.search(r'task-([a-zA-Z0-9]+)', fname)
-                    run_m  = re.search(r'run-(\d+)', fname)
-                    if not task_m or not run_m:
-                        continue
-                    task = task_m.group(1)
-                    if task not in target_tasks:
-                        continue
-                    entry = {"task": f"task-{task}", "run": f"run-{run_m.group(1)}"}
-                    key_tuple = (entry['task'], entry['run'])
-                    if key_tuple not in seen:
-                        seen.add(key_tuple)
-                        runs.append(entry)
-
-            # Check registration and func-preproc existence for each run.
-            # Require a minimum size so that empty tarballs left by crashed
-            # steps (Argo uploads the artifact dir even on failure) are treated
-            # as missing rather than valid.
-            for run in runs:
-                task, run_id = run['task'], run['run']
-                b2t_key = (f"derivatives/registration/{subject_id}/{ses}/"
-                           f"bold_to_t1w_{task}_{run_id}.tar.gz")
-                func_key = (f"derivatives/func/{subject_id}/{ses}/"
-                            f"{subject_id}_{ses}_{task}_{run_id}"
-                            f"_space-MNI152NLin2009cAsym_bold.tar.gz")
-                for field, s3_key in (('b2t_exists', b2t_key), ('func_exists', func_key)):
-                    try:
-                        resp = s3.head_object(Bucket=bucket, Key=s3_key)
-                        run[field] = resp['ContentLength'] > MIN_ARTIFACT_BYTES
-                    except ClientError as e:
-                        if e.response['Error']['Code'] == '404':
-                            run[field] = False
-                        else:
-                            raise
-
-            # Check t1w-to-mni existence for this session.
-            t1w_key = f"derivatives/registration/{subject_id}/{ses}/t1w_to_mni.tar.gz"
-            try:
-                resp = s3.head_object(Bucket=bucket, Key=t1w_key)
-                t1w_exists = resp['ContentLength'] > MIN_ARTIFACT_BYTES
-            except ClientError as e:
-                if e.response['Error']['Code'] == '404':
-                    t1w_exists = False
-                else:
-                    raise
-
-            result.append({"session": ses, "runs": runs, "t1w_to_mni_exists": t1w_exists})
-
-        # Download nss_volumes.csv once and attach nss_frames to each session.
-        try:
-            obj = s3.get_object(Bucket=bucket, Key='config/nss_volumes.csv')
-        except ClientError as e:
-            if e.response['Error']['Code'] in ('NoSuchKey', 'NoSuchBucket'):
-                print(f"ERROR: s3://{bucket}/config/nss_volumes.csv not found", file=sys.stderr)
-                sys.exit(1)
-            raise
-        content = obj['Body'].read().decode('utf-8')
-        nss_map = {row['session']: row['nss_frames']
-                   for row in csv.DictReader(io.StringIO(content))
-                   if row['subject_id'] == subject_id}
-        for item in result:
-            ses = item['session']
-            if ses not in nss_map:
-                print(f"ERROR: no nss_frames entry for {subject_id}/{ses} in nss_volumes.csv",
-                      file=sys.stderr)
-                sys.exit(1)
-            nss_val = nss_map[ses]
-            if not nss_val:
-                print(f"WARNING: empty nss_frames for {subject_id}/{ses} in nss_volumes.csv; "
-                      f"bold_to_t1w will fall back to BIDS sidecar JSON", file=sys.stderr)
-            item['nss_frames'] = nss_val
-
-        # Check FastSurfer derivatives existence for all sessions.
-        fastsurfer_missing = []
-        for item in result:
-            ses = item['session']
-            fs_key = f"derivatives/fastsurfer/{subject_id}/{subject_id}_{ses}_templated.tar.gz"
-            try:
-                s3.head_object(Bucket=bucket, Key=fs_key)
-            except ClientError as e:
-                if e.response['Error']['Code'] == '404':
-                    fastsurfer_missing.append(ses)
-                else:
-                    raise
-
-        if fastsurfer_missing:
-            print(f"Missing templated derivatives for sessions: {fastsurfer_missing}", file=sys.stderr)
-        open('/tmp/fastsurfer_exists.txt', 'w').write('False' if fastsurfer_missing else 'True')
-
-        print(json.dumps(result))
-        EOF
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+      command: [python, /app/inventory.py]
+      args:
+        - --subject
+        - '{{workflow.parameters.subjID}}'
+        - --bucket
+        - '{{workflow.parameters.bucket}}'

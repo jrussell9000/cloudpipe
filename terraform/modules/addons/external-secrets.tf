@@ -2,14 +2,14 @@
 # Helm release is managed by ArgoCD (gitops/apps/external-secrets/)
 # Pod Identity Association keeps the IAM binding in Terraform; SA is created by Helm
 module "external_secrets_pod_identity" {
-  source  = "terraform-aws-modules/eks-pod-identity/aws"
+  source = "terraform-aws-modules/eks-pod-identity/aws"
 
-  name                                               = "external-secrets"
-  attach_external_secrets_policy                     = true
-  external_secrets_create_permission                 = true
-  external_secrets_ssm_parameter_arns                = ["arn:aws:ssm:*:*:parameter/*"]
-  external_secrets_secrets_manager_arns              = ["arn:aws:secretsmanager:*:*:secret:*"]
-  external_secrets_kms_key_arns                      = ["arn:aws:kms:*:*:key/*"]
+  name                                  = "external-secrets"
+  attach_external_secrets_policy        = true
+  external_secrets_create_permission    = true
+  external_secrets_ssm_parameter_arns   = ["arn:aws:ssm:*:*:parameter/*"]
+  external_secrets_secrets_manager_arns = ["arn:aws:secretsmanager:*:*:secret:*"]
+  external_secrets_kms_key_arns         = ["arn:aws:kms:*:*:key/*"]
 
   associations = {
     cloudpipe = {
@@ -48,6 +48,15 @@ resource "kubernetes_cluster_role_v1" "external_secrets_cert_controller_patch" {
     resources  = ["leases"]
     verbs      = ["get", "create", "update", "patch"]
   }
+
+  # Also defined in gitops/apps/cluster-config (ArgoCD manages the live state
+  # post-bootstrap; this copy exists so the patch is in place before ArgoCD is
+  # up). Without this, every plan wants to strip ArgoCD's tracking-id annotation.
+  lifecycle {
+    ignore_changes = [
+      metadata[0].annotations["argocd.argoproj.io/tracking-id"],
+    ]
+  }
 }
 
 resource "kubernetes_cluster_role_binding_v1" "external_secrets_cert_controller_patch_binding" {
@@ -65,5 +74,13 @@ resource "kubernetes_cluster_role_binding_v1" "external_secrets_cert_controller_
     kind      = "ServiceAccount"
     name      = "external-secrets-cert-controller"
     namespace = "external-secrets"
+  }
+
+  # See lifecycle note on the ClusterRole above — same dual-ownership with
+  # gitops/apps/cluster-config.
+  lifecycle {
+    ignore_changes = [
+      metadata[0].annotations["argocd.argoproj.io/tracking-id"],
+    ]
   }
 }

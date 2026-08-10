@@ -23,8 +23,29 @@ Derivative S3 keys match the structure consumed by downstream pipelines, so a ke
 ## Consequences
 
 - Any step can be skipped or retried independently: the inventory checks S3 for each derivative and skips steps whose outputs already exist (with a `size > 1 KB` guard against zero-byte failure artifacts)
-- `functional-preprocessing-template` can be submitted standalone without running the full pipeline — all its inputs (BOLD, registration outputs, FastSurfer tarball, MNI template) are declared as S3 artifact inputs
+- `functional-preprocessing-session-template` can be submitted standalone without running the full pipeline — all its inputs (BOLD, registration outputs, FastSurfer tarball, MNI template) are declared as S3 artifact inputs
 - S3 Transfer Acceleration (`s3-accelerate.amazonaws.com`) is used as the artifact endpoint to reduce per-pod download latency for large files
 - Each pod incurs S3 GET costs for its input artifacts and PUT costs for its output artifact uploads; for large BOLD NIfTIs this is non-trivial at scale (offset by the elimination of EFS data transfer costs for large files)
 - If an upstream step fails after writing a partial artifact, the partial tarball may be present in S3. The `size > 1 KB` guard prevents this from being treated as a valid completed output, but a manually deleted key may be needed if the partial artifact is larger than the guard threshold
-- The EFS PVC is still required for FastSurfer because FastSurfer's longitudinal pipeline writes to a shared subjects directory across all five steps, and the intermediate data (surface models, parcellations) is too large and transient to upload to S3 between steps
+
+## Update (2026-07): the FastSurfer exception is retired
+
+This ADR originally carved out an exception — "the EFS PVC is still required for FastSurfer because FastSurfer's longitudinal pipeline writes to a shared subjects directory across all five steps, and the intermediate data is too large and transient to upload to S3 between steps." That is no longer true, and the sizing premise behind it did not hold up:
+
+- The intermediate `SUBJECTS_DIR` is ~1.2 GB for the base template and ~0.5 GB per session, extrapolated from the 228–418 MiB `_long-template.tar.gz` and ~180 MiB `_{ses}_templated.tar.gz` artifacts the phase already uploads. In-region S3 transfer is free, so the round-trips cost wall-clock, not dollars.
+- The anatomical chain is now four pods passing state through `scratch/{workflow.name}/anat/`, reaped by a 7-day lifecycle rule. Template creation and segmentation were merged (both `gpu-nodepool`, strictly sequential), which removed one boundary and one GPU node provision.
+- The PVC never delivered the spot-resume property it was credited with. `clear-is-running` deleted FreeSurfer lock files so a retry could *restart over a dirty directory*; `recon-surf.sh` has no skip-completed-stages logic. That dirty-restart behaviour is what produced the truncated-template failures the exit-137 guards were added to catch. A clean `emptyDir` re-seeded from S3 is strictly safer, and S3 state also survives workflow deletion, which `volumeClaimGC: OnWorkflowCompletion` does not.
+
+The remaining PVC consumer is `subregion-segmentation`, whose per-region resume guard reads completed outputs off the retry-persistent volume. Converting it to S3 checkpointing is tracked in **#77**; the EFS filesystem, CSI driver and StorageClass come out once that lands.
+
+## Update (2026-08): the PVC exception is fully retired
+
+`subregion-segmentation`'s `segment-subregions-gems-template` and `segment-subregions-dl-template` now stage the FastSurfer tarballs onto their own private `emptyDir`s (the `hydrate-fastsurfer-template` pod is gone — each segmentation pod declares those inputs directly) and checkpoint each region to its final `derivatives/subregions/{subj}/{subj}_{region}.tar.gz` key immediately after that region completes, rather than relying on a retry-persistent volume. `cloudpipe-long-master-workflow-template.yaml` no longer declares `volumeClaimTemplates`. The "Decision" section above (the FastSurfer/registration EFS exception) is now historical only — no template in this pipeline mounts a PVC. The EFS filesystem, CSI driver, and StorageClass have been removed from the cluster and Terraform entirely.
+
+> **Two EFS references outlived the removal and will break a fresh cluster bootstrap.**
+> `terraform/install.sh:45` still runs `apply_target "module.aws_efs_csi_pod_identity"` and
+> `terraform/cleanup.sh:52` still runs `destroy_target` on the same module — but that module is
+> declared in no `.tf` file, so `install.sh` fails at that line when building a cluster from
+> scratch. This is latent rather than active: the running cluster predates the removal and never
+> re-executes the bootstrap. There is also an orphaned `efs.csi.aws.com` `CSIDriver` object in the
+> cluster with no owning ArgoCD Application, so nothing prunes it.

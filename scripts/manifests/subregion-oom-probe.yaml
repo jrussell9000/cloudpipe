@@ -1,0 +1,364 @@
+# segment-subregions OOM probe (GitHub #129) — isolate the TensorFlow step and
+# measure its exact peak, with oneDNN as the single variable.
+#
+# WHAT #129 GOT WRONG, and what the 2026-08-03 batch actually shows:
+#
+#   The issue hypothesised two co-tenant segment pods exhausting a node. Checked:
+#   both surviving OOMKilled pods were the ONLY workload pod on their node. The
+#   real split is by node SIZE, and it is total:
+#
+#     c8i-flex.2xlarge (16 GiB)  7 attempts  7 OOMKilled
+#     c8i-flex.4xlarge (32 GiB)  7 attempts  0 OOMKilled
+#     c5d.4xlarge      (32 GiB)  3 attempts  0 OOMKilled  (1 SIGTERM, spot)
+#
+#   Both OOMKilled logs end at the IDENTICAL point — all three GEMS regions
+#   complete, then `mri_segment_hypothalamic_subunits` prints its first
+#   `predicting 1/1` and the pod dies. Container Insights, per minute:
+#
+#     time    failing pod   succeeding pod   failing node mem%
+#     14:16      3.66 G         3.49 G            48.0
+#     14:17     12.88 G         3.62 G            94.5   <- TF step starts
+#     14:18     12.88 G          —                94.3   <- kernel OOM kill
+#
+#   So #95's 3.38 GB is correct for the three GEMS regions — they hold ~3.5 G for
+#   ~50 min on every host. The TF step then adds ~9 G in under a minute.
+#   `ram_efficiency` is a lifetime average and is structurally blind to that.
+#
+# WHY oneDNN IS THE SUSPECT: this is the #120 shape exactly — TensorFlow, AVX512
+# host, multi-GB peak that tracks instance type and is invisible to Kubernetes
+# because the decision happens inside a library dispatching on CPUID. That A/B
+# measured 8.69 G -> 3.87 G with identical output (registration-workflow-template
+# .yaml:653, docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.9).
+#
+# THE ONE DATUM THAT DOES NOT YET FIT: c8i-flex.2xlarge and .4xlarge are the SAME
+# CPU, so oneDNN should fire on both — yet the 4xlarge peaked at 3.62 G. Most
+# likely the 4xlarge spikes too and a 60-second Maximum missed a ~20-second
+# transient. THAT IS AN ASSUMPTION, and it is the first thing this probe settles:
+# cgroup v2 `memory.peak` is an exact high-water mark, not a sample, so a
+# transient cannot hide from it.
+#
+#   READ THE RESULT AS:
+#     onednn=1 peaks ~13 G, onednn=0 peaks ~4 G
+#         -> cause confirmed. Fix = TF_ENABLE_ONEDNN_OPTS=0, env-only.
+#     both arms peak ~13 G
+#         -> not oneDNN; the spike is real and unconditional, and the 4xlarge
+#            successes were sampling luck. Fix = raise the request past 13 G.
+#     both arms peak ~4 G on this instance type
+#         -> the spike is node-size dependent, not host-CPU dependent.
+#            Re-run with -p instance-type=c8i-flex.2xlarge (see below).
+#
+# SUBMIT — two arms, differing in exactly one character:
+#   argo -n argo-workflows submit scripts/manifests/subregion-oom-probe.yaml -p onednn=1
+#   argo -n argo-workflows submit scripts/manifests/subregion-oom-probe.yaml -p onednn=0
+#
+# DEFAULT INSTANCE IS THE 32 GiB TYPE, ON PURPOSE. Pinning the 16 GiB type that
+# fails would OOM-kill the pod before it can print its own peak — the measurement
+# would destroy itself. A 32 GiB host has headroom above the observed 12.88 G, so
+# BOTH arms complete and both report a real number. Only after that is worth
+# re-running on `-p instance-type=c8i-flex.2xlarge` to confirm the fix survives
+# the host that actually fails.
+#
+# DELIBERATE DEVIATION FROM b2t-oom-instance-probe.yaml, which uses templateRef
+# so it cannot drift from the step under test. This one COPIES steps 4 and 5.
+# Two reasons, both load-bearing:
+#   1. templateRef would re-run the three GEMS regions first — ~50 minutes of
+#      compute per arm to reach the 60 seconds being measured.
+#   2. The real step has no memory sampler. Catching a sub-minute transient needs
+#      cgroup instrumentation the production template does not carry.
+# The drift risk is bounded because the copy is two command lines. KEEP THEM
+# BYTE-IDENTICAL to subregion-segmentation-workflow-template.yaml (the
+# `mri_segment_hypothalamic_subunits` / `mri_sclimbic_seg` calls, and the image
+# tag below) or this measures a different program than the one that OOMs.
+#
+# PREREQUISITES (verified present 2026-08-03; re-check, the batch flush reaps these):
+#   s3://<YOUR_S3_BUCKET>/derivatives/fastsurfer/sub-086U18RD/  long-template + ses-00A/02A/06A
+# Three timepoints was not an arbitrary pick: the 2026-08-03 OOM whose log is
+# quoted above was a 3-timepoint subject, and steps 4/5 process every timepoint
+# in ONE invocation, so timepoint count is the one input that could plausibly
+# scale peak. If this subject has been reaped, pick another 3-timepoint one:
+#   aws s3 ls s3://<YOUR_S3_BUCKET>/derivatives/fastsurfer/
+#
+# SIDE EFFECTS: none. This writes only into a per-pod emptyDir and uploads no
+# artifacts — unlike the b2t probe it does not overwrite any derivative or emit
+# any metrics. Safe to run against a subject you care about.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: subreg-oom-probe-
+  namespace: argo-workflows
+spec:
+  # REQUIRED — carries the IRSA role with S3 access, so the artifact init
+  # container can read derivatives/fastsurfer/. It is set on the `cloudpipe`
+  # WorkflowTemplate's spec, and a standalone Workflow inherits nothing, so it
+  # must be named here. Getting it wrong fails as `init: Error (exit code 64):
+  # artifact ... failed to load: ... Access Denied`.
+  serviceAccountName: argo-workflows-runner
+
+  # Copied from the `subregion-seg` WorkflowTemplate's spec. Without it the init
+  # container stages the FastSurfer tarballs as root into the emptyDir and the
+  # main container (UID 1000) cannot read them.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  # Karpenter must not consolidate the node out from under a probe: a mid-run
+  # disruption surfaces as a failure that looks like — but is not — the OOM being
+  # measured. This is the same trap as the SIGTERM (143) that one 2026-08-03
+  # attempt hit on c5d.4xlarge and that reads as a failure in the Argo table.
+  podMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+
+  # Steps 4+5 are ~10 s and <1 min per session respectively; the artifact
+  # download of ~1.1 GiB dominates. 45 min is generous and stops a hung probe
+  # from holding a pinned node.
+  activeDeadlineSeconds: 2700
+
+  # NO retryStrategy, on purpose: the probe must FAIL FAST. The production
+  # template's `expression: ... exitCode in ["64","137","143"]` is precisely what
+  # retried this OOM into invisible success for weeks (#129), and it would just
+  # as happily hide a serviceAccount or securityContext bug here.
+  entrypoint: probe
+
+  # `cpu` CANNOT be templated inside `resources` — the API parses that field as a
+  # Quantity at submit time, before parameter substitution, and rejects
+  # `{{workflow.parameters.threads}}` with "quantities must match the regular
+  # expression ...". podSpecPatch is applied after substitution, which is why the
+  # b2t probe drives its cpu arm the same way. Doing it here rather than
+  # hardcoding keeps the request and the `--threads` flag from silently drifting
+  # apart, which would throttle the pod and quietly corrupt the timings.
+  #
+  # `resources.requests` is a plain map, so this overrides ONLY cpu and leaves
+  # the template's memory / ephemeral-storage requests intact. Verify rather than
+  # trust:
+  #   kubectl -n argo-workflows get pod <p> \
+  #     -o jsonpath='{.spec.containers[?(@.name=="main")].resources.requests}'
+  podSpecPatch: |
+    containers:
+      - name: main
+        resources:
+          requests:
+            cpu: "{{workflow.parameters.threads}}"
+
+  arguments:
+    parameters:
+      # THE SINGLE VARIABLE. Set EXPLICITLY on both arms rather than leaving the
+      # control unset, so the two submissions differ in one character.
+      #   "1" = TensorFlow default (oneDNN on)
+      #   "0" = oneDNN off
+      - name: onednn
+        value: "1"
+
+      # Held FIXED across arms. Kept equal to the production template's
+      # `--threads 4` / `cpu: '4'` so the probe measures the deployed
+      # configuration. Do not vary this in the same run as `onednn`.
+      - name: threads
+        value: "4"
+
+      # 32 GiB default — see the header. Override to c8i-flex.2xlarge only to
+      # confirm a fix, never to take the first measurement.
+      - name: instance-type
+        value: c8i-flex.4xlarge
+
+      - name: subjID
+        value: sub-086U18RD
+
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  templates:
+    - name: probe
+      nodeSelector:
+        karpenter.sh/nodepool: cpu-heavy-nodepool
+        node.kubernetes.io/instance-type: "{{workflow.parameters.instance-type}}"
+
+      inputs:
+        artifacts:
+          - name: fslicense
+            path: /opt/freesurfer/.license
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: config/fslicense
+
+          # Staged into the emptyDir below, not a PVC. The production step reads
+          # these from shared EFS; for steps 4/5 the storage backend is
+          # irrelevant (they read the timepoint mri/ dirs and write beside them),
+          # and an emptyDir keeps the probe from provisioning EFS or EBS.
+          - name: long-template
+            path: /opt/freesurfer/subjects/{{workflow.parameters.subjID}}_template
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz
+
+          # Every session optional, same as hydrate-fastsurfer-template: not
+          # every subject has every visit, and the probe reads the actual
+          # timepoint list from base-tps rather than assuming these three.
+          - name: ses-00A-templated
+            path: /opt/freesurfer/subjects/ses-00A
+            optional: true
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz
+          - name: ses-02A-templated
+            path: /opt/freesurfer/subjects/ses-02A
+            optional: true
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-02A_templated.tar.gz
+          - name: ses-04A-templated
+            path: /opt/freesurfer/subjects/ses-04A
+            optional: true
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-04A_templated.tar.gz
+          - name: ses-06A-templated
+            path: /opt/freesurfer/subjects/ses-06A
+            optional: true
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-06A_templated.tar.gz
+          - name: ses-08A-templated
+            path: /opt/freesurfer/subjects/ses-08A
+            optional: true
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-08A_templated.tar.gz
+          - name: ses-10A-templated
+            path: /opt/freesurfer/subjects/ses-10A
+            optional: true
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-10A_templated.tar.gz
+
+      volumes:
+        - name: subjects
+          emptyDir: {}
+
+      container:
+        # MUST match subregion-segmentation-workflow-template.yaml's segment
+        # step. A different tag is a different TensorFlow build and a different
+        # answer.
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-47f3e20fc7dd28bb163804d098f3e984474c0c96"
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: subjects
+            mountPath: /opt/freesurfer/subjects
+
+        resources:
+          requests:
+            # Matches production. NO memory limit, also matching production — and
+            # on a 32 GiB host that is safe, because the worst observed peak
+            # (12.88 G) fits with room. A limit here would convert the
+            # measurement into a kill at an arbitrary threshold.
+            memory: 5G
+            # Overridden by the podSpecPatch above to match `threads`. The value
+            # here is only a placeholder the API can parse at submit time.
+            cpu: '4'
+            # ~1.1 GiB of tarballs expanding into the emptyDir, plus the tools'
+            # /tmp scratch on the container writable layer.
+            ephemeral-storage: 20G
+
+        env:
+          - name: SUBJECTS_DIR
+            value: /opt/freesurfer/subjects
+          - name: FS_LICENSE
+            value: /opt/freesurfer/.license
+          # THE VARIABLE UNDER TEST. Read by TensorFlow at import, so it is
+          # env-only: no image rebuild and no `ci: pin workflow images` commit if
+          # this turns out to be the fix.
+          - name: TF_ENABLE_ONEDNN_OPTS
+            value: "{{workflow.parameters.onednn}}"
+
+        command: [bash, -c]
+        args:
+          - |
+            set -euo pipefail
+            SD=/opt/freesurfer/subjects
+            BASE={{workflow.parameters.subjID}}_template
+            THREADS={{workflow.parameters.threads}}
+
+            # SetUpFreeSurfer.sh is not `set -u`-safe and returns non-zero — same
+            # dance as the production template, for the same reason.
+            set +eu
+            source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" >/dev/null 2>&1 || true
+            set -eu
+
+            mapfile -t SESSIONS < <(grep -v '^$' "${SD}/${BASE}/base-tps")
+            echo "[probe] onednn=${TF_ENABLE_ONEDNN_OPTS} threads=${THREADS} timepoints=${#SESSIONS[@]}: ${SESSIONS[*]}"
+            echo "[probe] host=$(uname -n) cgroup_max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
+
+            # cgroup v2 `memory.peak` is an exact high-water mark maintained by
+            # the kernel, NOT a sample — which is the whole point. The 60-second
+            # CloudWatch Maximum that produced the 3.62 G figure for a succeeding
+            # pod cannot see a 20-second transient; this can. Writing "0" resets
+            # it (kernel 6.x), so each stage gets an independent peak.
+            PEAK=/sys/fs/cgroup/memory.peak
+            reset_peak() { echo 0 > "$PEAK" 2>/dev/null || true; }
+            read_peak()  { awk '{printf "%.2f", $1/1e9}' "$PEAK" 2>/dev/null || echo "n/a"; }
+
+            # 1 Hz shape trace alongside the exact peak. The peak says how bad;
+            # the trace says whether it is a step, a ramp, or a spike — which is
+            # what distinguishes an allocation event from a leak.
+            ( while :; do
+                echo "[mem] $(date -u +%H:%M:%S) $(awk '{printf "%.2f", $1/1e9}' /sys/fs/cgroup/memory.current)"
+                sleep 1
+              done ) &
+            SAMPLER=$!
+            trap 'kill $SAMPLER 2>/dev/null || true' EXIT
+
+            SESSION_ARGS=()
+            for tp in "${SESSIONS[@]}"; do SESSION_ARGS+=(--s "$tp"); done
+
+            reset_peak
+            echo "[probe] === step 4: mri_segment_hypothalamic_subunits ==="
+            t0=$SECONDS
+            mri_segment_hypothalamic_subunits "${SESSION_ARGS[@]}" --sd "$SD" --threads "$THREADS"
+            echo "[probe] step4 wall=$((SECONDS-t0))s peak_GB=$(read_peak)"
+
+            reset_peak
+            echo "[probe] === step 5: mri_sclimbic_seg ==="
+            t0=$SECONDS
+            mri_sclimbic_seg "${SESSION_ARGS[@]}" --sd "$SD" --threads "$THREADS"
+            echo "[probe] step5 wall=$((SECONDS-t0))s peak_GB=$(read_peak)"
+
+            # Output equivalence, the other half of the b2t A/B: a memory fix
+            # that changes the segmentation is not a fix. Compare these hashes
+            # and volume tables across the two arms.
+            echo "[probe] === output checksums ==="
+            for tp in "${SESSIONS[@]}"; do
+              md5sum "${SD}/${tp}/mri/hypothalamic_subunits_seg"*.mgz \
+                     "${SD}/${tp}/mri/sclimbic.mgz" 2>/dev/null || true
+              echo "--- ${tp} sclimbic.stats ---"
+              cat "${SD}/${tp}/stats/sclimbic.stats" 2>/dev/null | tail -20 || true
+            done

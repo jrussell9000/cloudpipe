@@ -1,0 +1,321 @@
+# t1w-to-mni fused_ops A/B — paired QC equivalence test
+#
+# QUESTION
+# --------
+# Installing `fireants_fused_ops` flips the ENTIRE SyN inner loop to fused CUDA
+# kernels (grid sampling, warp composition) plus the loss ('cc' -> 'fusedcc'). Same
+# metric, different implementation, therefore different gradients — so the question
+# is not "is it faster" (measured: 84% of wall time is the fusable SyN loop, see
+# handoffs/fireants-fused-ops.md) but "does the QC distribution move".
+#
+# It matters because the t1w-to-mni gate was recalibrated in 45f4726 to fail-only
+# bounds, and #138 then made bad-basin failures DETERMINISTIC rather than
+# self-healing on retry. A shift that pushes boundary sessions across the gate turns
+# into permanent failures, not flakes.
+#
+# WHY PAIRED, AND WHY NOT AGAINST THE HANDOFF BASELINE
+# ----------------------------------------------------
+# The handoff's baseline (lncc 0.756-0.832, n=23, 2026-07-23) is NO LONGER A VALID
+# CONTROL: it predates #138, which replaced the SimpleITK affine's RANDOM metric
+# sampling with NONE. That moved where the affine lands, so a fused-vs-2026-07-23
+# comparison would confound two changes.
+#
+# Instead both arms run here, now, from ONE image, on the SAME sessions, with
+# USE_FFO as the only variable. That controls the affine, the GPU model, and the ITK
+# thread count simultaneously. USE_FFO=False is the true pre-adoption control: it
+# restores both the torch interpolator AND the non-fused loss (fst1w_to_mni.py
+# derives loss_type from USE_FFO for exactly this reason).
+#
+# The two arms of a session run SEQUENTIALLY in one `pair` template, so a session's
+# control and treatment are adjacent in time and land on the same instance type.
+#
+# SAMPLE — 30 sessions, stratified, from scripts/investigations/select_ffo_ab_sample.py
+# against metrics/registration/dt=2026-08-04 (271 sessions / 100 subjects, lncc
+# median 0.8034, 5 fails). `prod_lncc` below is that production value, carried
+# inline so results read against it without a second lookup. It is context, NOT the
+# control — the control is this workflow's own USE_FFO=False arm.
+#
+#   5 fails         the sharpest test: does a bad basin stay the same bad basin
+#   5 lowest passes the only region where a shift can change a verdict
+#   20 spread       rank-spaced over the rest of the pass distribution
+#
+# INSTANCE TYPE IS PINNED
+# -----------------------
+# Every pod runs on g4dn.2xlarge. Holding the card constant removes GPU model as a
+# confound, and the T4 (sm_75) is the OLDEST arch in gpu-nodepool — the one most
+# likely to expose a fused-kernel arch problem. Note this makes the pod timings here
+# unusable as absolute numbers (every arm pays a cold multi-GB image pull, and up to
+# 3 arms time-slice one card); speed and VRAM come from the sequential solo probe in
+# t1w-to-mni-fused-ops-timing.yaml, not from this workflow.
+#
+# SAFETY
+# ------
+# Writes NOTHING to derivatives/ or to the metrics corpus. The reg-qc artifact is
+# redirected to scratch/fused-ops-ab/, because 60 synthetic records landing in
+# metrics/registration/dt=... would double-count these subjects in every QC
+# dashboard and in the Athena partition. On a QC fail fst1w_to_mni.py exits 65
+# BEFORE promoting outputs, so no derivative is written on those arms regardless.
+#
+# NO retryStrategy, deliberately: exit 65 is the measurement. A lost pod (spot
+# reclaim) is a missing datapoint, not a corrupt one — re-run the workflow for the
+# missing pairs; the analysis script reports pair coverage explicitly.
+#
+# USAGE
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-fused-ops-ab.yaml
+#   argo -n argo-workflows watch @latest
+#
+#   # then compare the arms:
+#   aws s3 sync s3://<YOUR_S3_BUCKET>/scratch/fused-ops-ab/ /tmp/ffo-ab/
+#   python scripts/investigations/compare_ffo_ab.py /tmp/ffo-ab/
+#
+# IMPORTANT: the `image` below must be a tag whose build INCLUDES the fused_ops
+# extension. With an older fireants image the USE_FFO=True arm exits 1 by design
+# (fst1w_to_mni.py asserts FFO_AVAILABLE rather than running silently unfused).
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: t1w-mni-ffo-ab-
+  namespace: argo-workflows
+spec:
+  # REQUIRED — carries the IRSA role the artifact init container needs for S3. A
+  # standalone Workflow inherits nothing from the cloudpipe WorkflowTemplate, so
+  # omitting this fails as `exit code 64 ... Access Denied`.
+  serviceAccountName: argo-workflows-runner
+
+  # The fireANTs image runs as UID 1000 and fst1w_to_mni.py mkdir's under /work.
+  # Without this the init container stages artifacts as root and main cannot read
+  # them. Pod-level fields are NOT inherited via templateRef, hence repeated here.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    annotations:
+      # A consolidation mid-arm surfaces as a failure that looks like, but is not,
+      # the effect being measured.
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+
+  # Bounds concurrent pods, and therefore nodes. At cpu:1 and 3 GPU time-slices per
+  # card this is ~4 g4dn.2xlarge nodes in flight.
+  parallelism: 10
+
+  # 30 pairs x 2 arms x (cold image pull + ~90 s registration), at parallelism 10.
+  activeDeadlineSeconds: 14400
+
+  entrypoint: ab
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      - name: instance-type
+        value: g4dn.2xlarge
+      # MUST be a fireants image built with the fused_ops extension — the first such
+      # build is the one below (PR #160, pin commit a3563df). An older tag makes the
+      # USE_FFO=True arm exit 1 by design, since fst1w_to_mni.py asserts
+      # FFO_AVAILABLE rather than running silently unfused.
+      - name: fireants-tag
+        value: sha-afb52d5048608a6d7cf1c20345ad2a97a622f76d
+      # Prefix under scratch/ — bump to keep a re-run's results separate.
+      - name: run-label
+        value: run1
+
+  templates:
+    - name: ab
+      steps:
+        - - name: pair
+            template: pair
+            arguments:
+              parameters:
+                - name: subject
+                  value: "{{item.subject}}"
+                - name: session
+                  value: "{{item.session}}"
+                - name: prod-lncc
+                  value: "{{item.prod_lncc}}"
+            withItems:
+              # Generated — see SAMPLE above. Regenerate with:
+              #   python scripts/investigations/select_ffo_ab_sample.py <records-dir> -o sample.json
+              - {subject: sub-UNZ46TB8, session: ses-04A, prod_lncc: "0.31074", prod_verdict: fail}
+              - {subject: sub-TGZMNV19, session: ses-02A, prod_lncc: "0.37108", prod_verdict: fail}
+              - {subject: sub-CXKTLU8R, session: ses-06A, prod_lncc: "0.40227", prod_verdict: fail}
+              - {subject: sub-UNZ46TB8, session: ses-02A, prod_lncc: "0.48596", prod_verdict: fail}
+              - {subject: sub-7YGY6CKP, session: ses-00A, prod_lncc: "0.62582", prod_verdict: fail}
+              - {subject: sub-NY9E48W0, session: ses-00A, prod_lncc: "0.68252", prod_verdict: pass}
+              - {subject: sub-BZBW11DL, session: ses-00A, prod_lncc: "0.71334", prod_verdict: pass}
+              - {subject: sub-623BMY8N, session: ses-04A, prod_lncc: "0.73812", prod_verdict: pass}
+              - {subject: sub-PKEKZ5AE, session: ses-00A, prod_lncc: "0.74144", prod_verdict: pass}
+              - {subject: sub-VKPJ803Y, session: ses-06A, prod_lncc: "0.74259", prod_verdict: pass}
+              - {subject: sub-2J50AKJP, session: ses-06A, prod_lncc: "0.75028", prod_verdict: pass}
+              - {subject: sub-VKPJ803Y, session: ses-00A, prod_lncc: "0.76844", prod_verdict: pass}
+              - {subject: sub-15M33G49, session: ses-00A, prod_lncc: "0.78489", prod_verdict: pass}
+              - {subject: sub-K1DE6JAR, session: ses-00A, prod_lncc: "0.78861", prod_verdict: pass}
+              - {subject: sub-GJB4RF9G, session: ses-02A, prod_lncc: "0.79206", prod_verdict: pass}
+              - {subject: sub-BKN88GVE, session: ses-06A, prod_lncc: "0.79402", prod_verdict: pass}
+              - {subject: sub-ZG3E0W8V, session: ses-02A, prod_lncc: "0.79696", prod_verdict: pass}
+              - {subject: sub-086U18RD, session: ses-02A, prod_lncc: "0.79856", prod_verdict: pass}
+              - {subject: sub-VKPJ803Y, session: ses-02A, prod_lncc: "0.80071", prod_verdict: pass}
+              - {subject: sub-V25NXUTA, session: ses-02A, prod_lncc: "0.80189", prod_verdict: pass}
+              - {subject: sub-VMT7W436, session: ses-00A, prod_lncc: "0.80401", prod_verdict: pass}
+              - {subject: sub-KWZ5L3B4, session: ses-02A, prod_lncc: "0.80635", prod_verdict: pass}
+              - {subject: sub-XALFHN4F, session: ses-00A, prod_lncc: "0.80882", prod_verdict: pass}
+              - {subject: sub-FA0DV854, session: ses-00A, prod_lncc: "0.81080", prod_verdict: pass}
+              - {subject: sub-HLRR37FK, session: ses-06A, prod_lncc: "0.81246", prod_verdict: pass}
+              - {subject: sub-LDH3YU2R, session: ses-04A, prod_lncc: "0.81384", prod_verdict: pass}
+              - {subject: sub-WH0P4JHC, session: ses-00A, prod_lncc: "0.81613", prod_verdict: pass}
+              - {subject: sub-TGZMNV19, session: ses-06A, prod_lncc: "0.81902", prod_verdict: pass}
+              - {subject: sub-FA0DV854, session: ses-02A, prod_lncc: "0.82223", prod_verdict: pass}
+              - {subject: sub-FA0DV854, session: ses-06A, prod_lncc: "0.82758", prod_verdict: pass}
+
+    # Both arms of one session, back to back. Sequential rather than parallel so the
+    # control and the treatment for a session are adjacent in time and cannot
+    # time-slice the same card as each other.
+    - name: pair
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: prod-lncc
+      steps:
+        - - name: ffo-off
+            template: arm
+            arguments:
+              parameters:
+                - {name: subject, value: "{{inputs.parameters.subject}}"}
+                - {name: session, value: "{{inputs.parameters.session}}"}
+                - {name: prod-lncc, value: "{{inputs.parameters.prod-lncc}}"}
+                - {name: use-ffo, value: "False"}
+        - - name: ffo-on
+            template: arm
+            arguments:
+              parameters:
+                - {name: subject, value: "{{inputs.parameters.subject}}"}
+                - {name: session, value: "{{inputs.parameters.session}}"}
+                - {name: prod-lncc, value: "{{inputs.parameters.prod-lncc}}"}
+                - {name: use-ffo, value: "True"}
+
+    - name: arm
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: prod-lncc
+          - name: use-ffo
+        artifacts:
+          - name: fastsurfer-output
+            path: /fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{inputs.parameters.subject}}/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_templated.tar.gz'
+
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
+      outputs:
+        artifacts:
+          # The ONLY output, and it exists on pass and fail alike — fst1w_to_mni.py
+          # writes it before its exit-65. Keyed by arm, into scratch/, NEVER into
+          # metrics/registration/.
+          - name: reg-qc
+            path: '/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/fused-ops-ab/{{workflow.parameters.run-label}}/ffo-{{inputs.parameters.use-ffo}}/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_reg_qc.json'
+
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-nodepool
+        node.kubernetes.io/instance-type: "{{workflow.parameters.instance-type}}"
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:{{workflow.parameters.fireants-tag}}"
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: work
+            mountPath: /work
+
+        env:
+          # THE variable under test. Read by fireants.interpolator at import time
+          # (dispatcher construction) and by fst1w_to_mni.py to select the loss.
+          - name: USE_FFO
+            value: "{{inputs.parameters.use-ffo}}"
+          # Held at 1 on both arms — production's value, projected there from
+          # requests.cpu. Hardcoded rather than projected so the two arms cannot
+          # differ if the request below is ever edited.
+          - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: MKL_NUM_THREADS
+            value: "1"
+          - name: OPENBLAS_NUM_THREADS
+            value: "1"
+
+        resources:
+          requests:
+            # Production values, unchanged — this experiment must reproduce the
+            # production configuration in every respect except USE_FFO.
+            memory: 2G
+            cpu: '1'
+            ephemeral-storage: 10G
+          limits:
+            nvidia.com/gpu: '1'
+
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+            ARM='{{inputs.parameters.use-ffo}}'
+
+            # Host and card facts, so a result can be read against what it ran on.
+            echo "=== USE_FFO=$ARM subj={{inputs.parameters.subject}} ses={{inputs.parameters.session}} prod_lncc={{inputs.parameters.prod-lncc}} host=$(hostname) nproc=$(nproc) ===" >&2
+            nvidia-smi --query-gpu=name,memory.total --format=csv >&2
+
+            python /app/fst1w_to_mni.py \
+              --t1w '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/orig.mgz' \
+              --brainmask '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/brainmask.mgz' \
+              --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+              --out-dir '/work/registration/{{inputs.parameters.session}}/t1w_to_mni' \
+              --prefix '{{inputs.parameters.subject}}_{{inputs.parameters.session}}_desc-t1w2mni' \
+              --subj '{{inputs.parameters.subject}}' \
+              --ses '{{inputs.parameters.session}}' \
+              --pipeline cloudpipe_minproc
+            EXIT=$?
+
+            echo "=== USE_FFO=$ARM exit=$EXIT (65 = QC fail, 1 = FFO asserted unavailable) ===" >&2
+            QC="/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json"
+            [ -f "$QC" ] && cat "$QC" >&2
+
+            # Exit 1 ONLY when the arm produced no measurement at all. Exit 65 is a
+            # RESULT (QC fail) and must not abort the paired sibling or the rest of
+            # the sample; an FFO-unavailable exit 1 leaves no QC file and SHOULD
+            # fail loudly, because it means the image is wrong for this experiment.
+            if [ ! -f "$QC" ]; then
+              echo "FATAL: no QC record written — arm produced no measurement" >&2
+              exit 1
+            fi
+            exit 0

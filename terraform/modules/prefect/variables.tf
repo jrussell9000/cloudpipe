@@ -32,6 +32,11 @@ variable "inbound_prefix_list_id" {
   type        = string
 }
 
+variable "nat_gateway_ip" {
+  description = "Public Elastic IP of the VPC's NAT gateway. Full-tunnel Client VPN traffic to this ALB's public IP hairpins out through the NAT gateway and back in over the internet, so the ALB security group must trust it as a source."
+  type        = string
+}
+
 ################################################################################
 # DNS / TLS
 ################################################################################
@@ -58,6 +63,11 @@ variable "namespace" {
 
 variable "bucket" {
   description = "Name of the S3 bucket used for workflow artifact storage (read by Prefect worker flows)."
+  type        = string
+}
+
+variable "metrics_bucket" {
+  description = "Name of the dedicated, versioned S3 bucket that pipeline QC and cost metrics are written to. The kubecost-cost-scraper flow writes CostAllocation records here. Separate from `bucket` so metrics survive derivative flushes — see terraform/metrics_bucket.tf."
   type        = string
 }
 
@@ -102,7 +112,7 @@ variable "db_username" {
 variable "db_engine_version" {
   description = "PostgreSQL engine version. Update deliberately — changing the major version triggers an instance replacement."
   type        = string
-  default     = "16.6"
+  default     = "16.13"
 }
 
 variable "db_instance_class" {

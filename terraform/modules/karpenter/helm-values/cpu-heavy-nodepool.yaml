@@ -9,18 +9,15 @@ spec:
     budgets:
     - nodes: "20%"
   limits:
-    cpu: 256
+    cpu: 2560
+    memory: "10240Gi"
   template:
     spec:
+      expireAfter: 720h
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: nodeclass
-      # Avoid possible race between the scheduler and the CSINode
-      # see https://karpenter.sh/docs/troubleshooting/#pods-were-scheduled-due-to-a-race-condition-in-kubernetes
-      startupTaints:
-      - key: efs.csi.aws.com/agent-not-ready
-        effect: NoExecute
       requirements:
       # see: https://karpenter.sh/docs/concepts/scheduling/#well-known-labels
       # AMD64

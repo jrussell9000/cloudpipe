@@ -235,7 +235,7 @@ analyses:
 # available_sessions   — pool of possible session codes to probe on S3
 s3:
   enabled: true
-  bucket: "<YOUR_INPUT_S3_BUCKET>"
+  bucket: "<YOUR_S3_BUCKET>"
   fmriprep_s3_prefix: "derivatives/fmriprep"
   mmps_mproc_s3_prefix: "mmps_mproc_noimages"
   upload_prefix: "derivatives/first_levels"

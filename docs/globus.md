@@ -2,7 +2,7 @@
 
 CloudPipe uses Globus Connect Server (GCS) v5 to transfer ABCD minimally-preprocessed data from the DAIRC MMPS endpoint to the cloudpipe S3 bucket. This document covers the architecture, credentials model, operational procedures, and recovery steps.
 
-For the initial setup walkthrough (endpoint creation, storage gateway, IAM credentials, refresh token), see [globus-s3-gateway-config.md](globus-s3-gateway-config.md).
+For the initial setup walkthrough (endpoint creation, storage gateway, IAM credentials, refresh token), see [globus-setup.md](globus-setup.md).
 
 ---
 
@@ -10,7 +10,7 @@ For the initial setup walkthrough (endpoint creation, storage gateway, IAM crede
 
 ```
 DAIRC MMPS Globus endpoint
-  (source collection: 43583c7d-29c9-4d36-9cb5-c8a1641923cb)
+  (source collection: <YOUR_GLOBUS_SOURCE_COLLECTION_ID>)
         │
         │  GridFTP data channel (port 50000–51000)
         ▼
@@ -19,7 +19,7 @@ GCS v5 endpoint — EC2 c5n.xlarge, Elastic IP, Ubuntu 22.04
         │
         │  S3 multipart PUT (no FUSE, no EBS staging)
         ▼
-s3://abcd-v7/mmps_mproc/{subject}/{session}/...
+s3://<YOUR_S3_BUCKET>/mmps_mproc/{subject}/{session}/...
 ```
 
 The S3 storage gateway writes GridFTP data directly to S3 via multipart upload. No local staging volume or EFS is involved. The alternative POSIX+EBS staging approach is implemented but disabled (`globus-use-s3-gateway = true` in Terraform).
@@ -35,13 +35,13 @@ AWS Mountpoint for S3 only supports sequential writes from byte 0. Globus GridFT
 | Resource | Value |
 |---|---|
 | EC2 instance type | `c5n.xlarge` |
-| Endpoint ID | `8e6a5497-c260-4613-8698-e4fecd6365eb` |
-| S3 storage gateway ID | `3cdb1567-f3fe-416c-a52b-ffaf46f9a2c9` |
-| Destination collection ID | `00666689-6b52-444d-b6a8-57a3ce6ee97c` |
+| Endpoint ID | `<YOUR_GLOBUS_ENDPOINT_ID>` |
+| S3 storage gateway ID | `<YOUR_GLOBUS_S3_GATEWAY_ID>` |
+| Destination collection ID | `<YOUR_GLOBUS_DEST_COLLECTION_ID>` |
 | Collection name | `cloudpipe-s3` |
-| Source collection (DAIRC MMPS) | `43583c7d-29c9-4d36-9cb5-c8a1641923cb` |
+| Source collection (DAIRC MMPS) | `<YOUR_GLOBUS_SOURCE_COLLECTION_ID>` |
 | Source base path | `/abcd/derivatives/mmps_mproc` |
-| Native app client ID | `e8f5215c-8d92-4899-b920-48ec9a412d28` |
+| Native app client ID | `<YOUR_GLOBUS_NATIVE_APP_CLIENT_ID>` |
 | IAM credential identity | `<YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>` |
 | UW-Madison HA subscription ID | `<YOUR_GLOBUS_SUBSCRIPTION_UUID>` |
 
@@ -82,7 +82,7 @@ All workflow-accessible Globus config lives in SSM. Terraform creates these para
 
 | Role | Used by | Permissions |
 |---|---|---|
-| `cloudpipe-globus-*` (instance profile) | GCS EC2 instance | S3 read/write on `abcd-v7`, SSM core, SSM write to collection-id + deployment-key + endpoint-id; SSM read for gcs-client-id + gcs-client-secret |
+| `cloudpipe-globus-*` (instance profile) | GCS EC2 instance | S3 read/write on `<YOUR_S3_BUCKET>`, SSM core, SSM write to collection-id + deployment-key + endpoint-id; SSM read for gcs-client-id + gcs-client-secret |
 | `cloudpipe-argo-runner` | `argo-workflows-runner` SA | EC2 `StartInstances` (scoped to Globus instance ID), `DescribeInstanceStatus` + `DescribeInstances` (not resource-scoped), SSM `GetParameter` for instance-id + collection-id |
 
 The runner role gets EC2 and SSM permissions from `terraform/modules/globus/main.tf` (`runner_globus_ec2` inline policy), not from the base runner IAM module.
@@ -161,13 +161,13 @@ The IAM user key registered with the S3 gateway is a long-lived credential store
 3. Update the credential in Globus (enter the new key at the prompts):
    ```bash
    globus-connect-server user-credentials s3-create \
-     3cdb1567-f3fe-416c-a52b-ffaf46f9a2c9 \
+     <YOUR_GLOBUS_S3_GATEWAY_ID> \
      --globus-identity <YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN> \
      --replace-existing
    ```
 4. Verify S3 access is working (service credentials show an empty list — use `globus ls` instead):
    ```bash
-   globus ls 00666689-6b52-444d-b6a8-57a3ce6ee97c:/
+   globus ls <YOUR_GLOBUS_DEST_COLLECTION_ID>:/
    ```
 5. Delete the old IAM access key in the AWS console once the new key is confirmed working.
 
@@ -176,7 +176,7 @@ The IAM user key registered with the S3 gateway is a long-lived credential store
 HA collections require periodic reauthentication (token expires after up to 30 days). When expired, `transfer.py` fails with an auth error.
 
 ```bash
-export GLOBUS_NATIVE_APP_CLIENT_ID=e8f5215c-8d92-4899-b920-48ec9a412d28
+export GLOBUS_NATIVE_APP_CLIENT_ID=<YOUR_GLOBUS_NATIVE_APP_CLIENT_ID>
 python images/globus/setup_auth.py
 ```
 
@@ -296,7 +296,7 @@ To raise the limit, edit `argo/workflows/cloudpipe_minproc/cloudpipe-semaphores-
 
 **Symptom**: Globus transfer fails with `550-Globus-S3-Error: Bucket not allowed`.
 
-**Cause**: The S3 gateway was created with `s3_allow_multi_keys: true` (the default). In multi-key mode, the first component of every path is treated as a bucket name — so a path like `/mmps_mproc/sub-xxx` tells Globus to write to a bucket named `mmps_mproc`, not `abcd-v7`. The fix is `--no-allow-multiple-keys` at gateway creation time.
+**Cause**: The S3 gateway was created with `s3_allow_multi_keys: true` (the default). In multi-key mode, the first component of every path is treated as a bucket name — so a path like `/mmps_mproc/sub-xxx` tells Globus to write to a bucket named `mmps_mproc`, not `<YOUR_S3_BUCKET>`. The fix is `--no-allow-multiple-keys` at gateway creation time.
 
 **Verify the flag**:
 ```bash
@@ -312,16 +312,16 @@ If `s3_allow_multi_keys: True`, recreate the gateway (see below). An in-place up
 
 **Symptom**: Transfer fails with `530-GridFTP-Message: Your credential requires some initial setup. code=invalid_credential`.
 
-**Cause**: The IAM access key registered with the gateway is invalid — wrong key, rotated key, or key without S3 access to `abcd-v7`.
+**Cause**: The IAM access key registered with the gateway is invalid — wrong key, rotated key, or key without S3 access to `<YOUR_S3_BUCKET>`.
 
 **Fix**:
 ```bash
 # On GCS instance
 globus-connect-server user-credentials list
 globus-connect-server user-credentials delete <credential-id>
-globus-connect-server user-credentials s3-create 3cdb1567-f3fe-416c-a52b-ffaf46f9a2c9 \
+globus-connect-server user-credentials s3-create <YOUR_GLOBUS_S3_GATEWAY_ID> \
   --globus-identity <YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>
-# Enter a valid IAM access key with permissions to s3://abcd-v7
+# Enter a valid IAM access key with permissions to s3://<YOUR_S3_BUCKET>
 ```
 
 ### Gateway and collection recreation
@@ -336,13 +336,13 @@ ENDPOINT_ID=$(cat /etc/globus-connect-server/info.json | python3 -c "import sys,
 globus-connect-server login "$ENDPOINT_ID" --no-local-server
 
 # 2. Delete user credentials (required before gateway deletion)
-GATEWAY_ID="3cdb1567-f3fe-416c-a52b-ffaf46f9a2c9"
+GATEWAY_ID="<YOUR_GLOBUS_S3_GATEWAY_ID>"
 globus-connect-server user-credentials list
 # For each credential ID in the output:
 globus-connect-server user-credentials delete <credential-id>
 
 # 3. Remove delete protection from collection, then delete it
-COLLECTION_ID="562c9c0a-8e76-457b-9fdf-18a07ce55f80"
+COLLECTION_ID="<YOUR_GLOBUS_COLLECTION_ID>"
 globus-connect-server collection update "$COLLECTION_ID" --no-delete-protected
 globus-connect-server collection delete "$COLLECTION_ID"
 
@@ -351,7 +351,7 @@ globus-connect-server storage-gateway delete "$GATEWAY_ID"
 
 # 5. Recreate gateway with --no-allow-multiple-keys
 GATEWAY_ID=$(globus-connect-server storage-gateway create s3 "cloudpipe-s3" \
-  --bucket abcd-v7 \
+  --bucket <YOUR_S3_BUCKET> \
   --s3-endpoint https://s3.<YOUR_AWS_REGION>.amazonaws.com \
   --domain <YOUR_INSTITUTION_DOMAIN> \
   --high-assurance \
@@ -362,10 +362,10 @@ GATEWAY_ID=$(globus-connect-server storage-gateway create s3 "cloudpipe-s3" \
   --format json | python3 -c "import sys,json; d=json.load(sys.stdin); r=d[0] if isinstance(d,list) else d; print(r.get('id') or r.get('data',[{}])[0].get('id'))")
 echo "New gateway: $GATEWAY_ID"
 
-# 6. Create collection (rooted at /abcd-v7 — bucket name is always the first path component)
+# 6. Create collection (rooted at /<YOUR_S3_BUCKET> — bucket name is always the first path component)
 # Note: collection create returns the object directly; gateway create wraps in {"data":[...]}
 COLLECTION_ID=$(globus-connect-server collection create \
-  "$GATEWAY_ID" "/abcd-v7" "cloudpipe-s3" \
+  "$GATEWAY_ID" "/<YOUR_S3_BUCKET>" "cloudpipe-s3" \
   --allow-guest-collections \
   --enable-https \
   --format json | python3 -c "import sys,json; d=json.load(sys.stdin); r=d[0] if isinstance(d,list) else d; print(r.get('id') or r.get('data',[{}])[0].get('id'))")
@@ -374,7 +374,7 @@ echo "New collection: $COLLECTION_ID"
 # 7. Register IAM credentials
 globus-connect-server user-credentials s3-create "$GATEWAY_ID" \
   --globus-identity <YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>
-# Enter IAM access key with s3://abcd-v7 permissions at the prompts
+# Enter IAM access key with s3://<YOUR_S3_BUCKET> permissions at the prompts
 
 # 8. Update SSM
 aws ssm put-parameter --region <YOUR_AWS_REGION> \
@@ -391,6 +391,143 @@ systemctl status globus-gridftp-server
 journalctl -u gcs-auto-reregister --no-pager -n 50
 ```
 
+### "A transfer with identical paths has not yet completed" (409 Conflict)
+
+**Symptom**: resubmitting a workflow before Globus clears the prior task:
+
+```
+409 Conflict: A transfer with identical paths has not yet completed
+```
+
+`transfer.py` deduplicates by label (`cloudpipe-{subject-id}`) — reusing `ACTIVE` tasks
+and cancelling `INACTIVE` ones — but a manual resubmit outside that flow can still
+collide. Clear the stale tasks before retrying (or from the
+[Globus web app](https://app.globus.org) → Activity).
+
+Terminating an Argo workflow does **not** cancel the Globus task it submitted, and a
+surviving `ACTIVE` task with a matching label gets *adopted* by the next run — so a
+resubmit can re-surface the original failure even after the underlying cause is fixed.
+Check for stale tasks after any terminated batch.
+
+List first — this reaches every task the token owns, not just the colliding one:
+
+```python
+pixi run python - <<'EOF'
+import boto3, json, globus_sdk
+secret = json.loads(
+    boto3.client("secretsmanager", region_name="<YOUR_AWS_REGION>")
+    .get_secret_value(SecretId="globus/refresh-token")["SecretString"]
+)
+client = globus_sdk.NativeAppAuthClient(secret["native-app-client-id"])
+authorizer = globus_sdk.RefreshTokenAuthorizer(secret["refresh-token"], client)
+tc = globus_sdk.TransferClient(authorizer=authorizer)
+# globus-sdk 4.x: filter= clause dict. The pre-4.x `filter_status="ACTIVE,INACTIVE"`
+# raises TypeError on the pinned SDK (4.8.1).
+for task in tc.task_list(filter={"status": ["ACTIVE", "INACTIVE"]}):
+    print(f"{task['task_id']}  {task['status']}  {task['label']}  {task['request_time']}")
+    # To cancel, uncomment — verify the labels above are yours to cancel first:
+    # print(tc.cancel_task(task["task_id"])["code"])
+EOF
+```
+
+Run it from the repo root: `globus-sdk` is a pixi dependency, so bare `python3` will
+fail on the import.
+
+### Endpoint recovery (after accidental deletion)
+
+If the GCS endpoint is deleted from the Globus web UI, transfers fail with:
+
+```
+530-Login incorrect. : GlobusError: v=1 c=ENDPOINT_ERROR
+530-Failure while contacting GCS Manager API.
+```
+
+`gcs-auto-reregister` cannot fix this — it only re-registers a node against an *existing*
+endpoint. A full endpoint re-creation is required.
+
+**Diagnosis** (SSM in, `sudo -i`):
+
+```bash
+systemctl status globus-gridftp-server        # running but unable to validate logins
+systemctl status apache2                       # running but proxying to a dead backend
+curl -k -s --max-time 5 https://localhost/api/v1/endpoint  # hangs = GCS Manager down
+globus-connect-server endpoint show            # "You must log in" = endpoint gone
+```
+
+If curl hangs and `endpoint show` returns "You must log in", the endpoint has been deleted.
+
+**Recovery:**
+
+1. Stop services and clear stale GCS state:
+   ```bash
+   systemctl stop globus-gridftp-server apache2
+   rm /var/lib/globus-connect-server/info.json
+   rm /var/lib/globus-connect-server/gcs-manager/gcs54.db
+   rm /var/lib/globus-connect-server/gcs-manager/gridftp-key
+   rm /var/lib/globus-connect-server/gcs-manager/gridftp-key.old
+   ```
+
+2. Recreate the endpoint — run the command **directly**, not via `gcs-finalize-setup`,
+   which captures stdout via command substitution and swallows the interactive auth URL
+   on a headless terminal (the script hangs silently):
+   ```bash
+   GCS_CLIENT_ID="<your-globus-client-id>"   # from terraform.tfvars
+
+   globus-connect-server endpoint setup cloudpipe \
+     --organization "BRAVE Research Collaborative" \
+     --contact-email "<YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>" \
+     --owner "<YOUR_GLOBUS_SUBSCRIPTION_ADMIN_EMAIL>" \
+     --client-id "$GCS_CLIENT_ID" \
+     --public \
+     --agree-to-letsencrypt-tos
+   ```
+   Open the printed URL, authenticate, paste the auth code. Note the new endpoint UUID.
+
+3. A new endpoint UUID requires **re-subscribing** to the UW-Madison HA subscription.
+   Email `<YOUR_GLOBUS_SUBSCRIPTION_ADMIN_EMAIL>` with the new UUID (or subscribe directly in the
+   [Globus web UI](https://app.globus.org) if you have group Admin/Manager role). The HA
+   subscription is tied to the endpoint UUID.
+
+4. Save the new deployment key to SSM and the canonical path:
+   ```bash
+   cp ~/deployment-key.json /etc/globus-connect-server/deployment-key.json
+   aws ssm put-parameter --region <YOUR_AWS_REGION> \
+     --name /cloudpipe/globus/deployment-key \
+     --type SecureString \
+     --value "$(cat /etc/globus-connect-server/deployment-key.json)" --overwrite
+   ```
+
+5. Run node setup. The GCS tooling drops to the `gcsweb` user to write `info.json`; since
+   it was deleted and the directory is root-owned, pre-create it with the right ownership:
+   ```bash
+   touch /var/lib/globus-connect-server/info.json
+   chown gcsweb:gcsweb /var/lib/globus-connect-server/info.json
+   globus-connect-server node setup \
+     -d /etc/globus-connect-server/deployment-key.json \
+     --ip-address "$(curl -s https://checkip.amazonaws.com)"
+   ```
+
+6. Start services and log in to the new endpoint (second browser flow):
+   ```bash
+   systemctl start apache2 globus-gridftp-server
+   globus-connect-server login <new-endpoint-uuid>
+   ```
+
+7. Recreate the S3 storage gateway, collection, and IAM credential — follow steps 5–8 of
+   [Gateway and collection recreation](#gateway-and-collection-recreation) above.
+
+8. Re-scope the refresh token to the new collection and pick up the new collection ID in
+   Terraform state (from your local machine — the existing token is scoped to the old
+   collection UUID):
+   ```bash
+   cd terraform && terraform apply     # picks up the new collection ID from SSM
+   export GLOBUS_NATIVE_APP_CLIENT_ID=<YOUR_GLOBUS_NATIVE_APP_CLIENT_ID>
+   python images/globus/setup_auth.py
+   ```
+
+> **Cleanup**: orphaned `cloudpipe-s3` collections from the deleted endpoint that appear
+> in the Globus web UI can be safely deleted.
+
 ---
 
 ## POSIX staging alternative (disabled)
@@ -399,4 +536,4 @@ The POSIX staging approach (`globus_use_s3_gateway = false` in Terraform) uses a
 
 The POSIX path is fully implemented in the WorkflowTemplate (the `globus-s3-sync-template` step) and is activated by setting `globus-use-s3-gateway = "false"` at workflow submission time. The Terraform EBS volume resource (`aws_ebs_volume.globus_staging`) is only provisioned when `globus_use_s3_gateway = false`.
 
-See [globus-two-stage-transfer.md](globus-two-stage-transfer.md) for the POSIX setup guide.
+See [globus-setup.md → Appendix: POSIX+EBS staging](globus-setup.md#appendix-posixebs-staging-historical) for the (historical) POSIX setup details.
