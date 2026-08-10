@@ -1,0 +1,70 @@
+# Deploys the documentation site to GitHub Pages.
+#
+# Maintained in the INTERNAL repo at scripts/public-pages-workflow.yaml and
+# installed here by hand. It is not auto-synced: sync-public.sh does not sync
+# .github/, and its PAT cannot push to .github/workflows/ without the
+# `workflow` scope. Edit the template upstream, then re-copy.
+#
+# mkdocs.yml IS synced, so nav/theme/exclude_docs changes arrive automatically
+# and need no change here.
+
+name: Deploy docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "pixi.toml"
+      - "pixi.lock"
+      - ".github/workflows/pages.yaml"
+  workflow_dispatch:
+
+# Least privilege: read the tree, write the Pages artifact, mint the OIDC token
+# the deploy step exchanges for a Pages deployment. No `contents: write`.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race for the live site. `cancel-in-progress: false`
+# because a half-finished Pages deploy is worse than a slightly stale one — let
+# the running deploy finish, then supersede it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Build through pixi, using the same `docs` environment and the same
+      # `docs-build` task the internal CI runs, so the published site cannot be
+      # produced by a different toolchain than the one that gated it.
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          environments: docs
+          cache: true
+
+      - name: mkdocs build --strict
+        run: pixi run -e docs docs-build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
