@@ -59,7 +59,6 @@ import SimpleITK as sitk
 from registration_qc import (
     centroid_displacement_mm,
     dice,
-    inverse_consistency_error,
     jacobian_stats,
     lncc,
     verdict,
@@ -431,25 +430,27 @@ def main():
     warped_path = str(pfx_staging) + '_warped.nii.gz'
     syn_reg.save_as_ants_transforms([warp_path])
 
-    # Inverse warp, for the inverse-consistency QC check below. SyN optimises to a
-    # midpoint space (phi = phi1 o phi2^-1), so the inverse is a first-class product
-    # of the fit rather than something we numerically invert — inverting it here
-    # would make the QC metric partly a measure of our own inversion error.
+    # NO INVERSE WARP IS SAVED, so the inverse-consistency (ice_*) metrics are not
+    # computed and are absent from the QC record.
     #
-    # QC-only, so it must never take the registration down with it: `fireants` is
-    # installed unpinned, and if a future version drops or renames save_inverse we
-    # want a logged warning and a missing metric, not a failed subject. verdict()
-    # ignores threshold keys that are absent, so ICE simply does not gate when this
-    # fails — deliberately fail-open, hence the loud log.
-    inv_warp_path = str(pfx_staging) + '_inverse_warp.nii.gz'
-    try:
-        syn_reg.save_as_ants_transforms([inv_warp_path], save_inverse=True)
-    except Exception as exc:  # noqa: BLE001 — any failure here must stay non-fatal
-        log.warning(
-            f'Could not save inverse warp ({exc!r}); inverse-consistency QC will be '
-            'skipped and its threshold will not be evaluated for this session.'
-        )
-        inv_warp_path = None
+    # SyN optimises to a midpoint space (phi = phi1 o phi2^-1), so its inverse is a
+    # first-class product of the fit — but `fireants` 1.5.0 does not expose it:
+    # save_as_ants_transforms(save_inverse=True) raises
+    #   NotImplementedError('Inverse warp not implemented for SyN registration')
+    # That call used to live here wrapped in a try/except, which meant every run
+    # spent the attempt, logged a warning, and moved on. It was removed on
+    # 2026-08-11 along with the ice_mean_mm gate entry, because the warning
+    # described a threshold that had never once been evaluated and so read as a
+    # transient problem rather than a permanent gap.
+    #
+    # Numerically inverting the forward field is the obvious substitute and is
+    # deliberately NOT done: it would make the round-trip residual partly a measure
+    # of our own inversion error, which is what the metric exists to rule out.
+    #
+    # To restore: obtain the true inverse from fireants, write it beside the
+    # forward warp, and re-add both the qc.update(inverse_consistency_error(...))
+    # call and the 'ice_mean_mm' entry in _T1W_MNI_THRESHOLDS. The metric function
+    # in images/shared/registration_qc.py is intact and still unit-tested.
 
     # Apply the warp via get_warped_coordinates (the moved-image save helper is a
     # no-op for the SyN warp — it returns the input unchanged). Sample the
@@ -518,18 +519,6 @@ def main():
         'run': '',
         'completed_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
     }
-    # Inverse consistency: forward∘inverse round-trip residual, in mm. Masked to
-    # the template brain for the same reason the Jacobian stats are. Non-fatal for
-    # the same reason the inverse save is — see the note there.
-    if inv_warp_path is not None:
-        try:
-            qc.update(inverse_consistency_error(warp_path, inv_warp_path, mask_path=args.template))
-        except Exception as exc:  # noqa: BLE001 — QC must not fail the registration
-            log.warning(
-                f'Inverse-consistency QC failed ({exc!r}); its threshold will not be '
-                'evaluated for this session.'
-            )
-
     if args.brainmask is not None:
         warped_mask = sitk.GetArrayFromImage(sitk.ReadImage(warped_mask_path)) > 0.5
         qc['mask_dice'] = dice(brain_mask.astype(np.float32), warped_mask.astype(np.float32))
@@ -540,14 +529,12 @@ def main():
     with open(qc_path, 'w') as fh:
         json.dump(qc, fh)
     mask_dice_str = f'{qc["mask_dice"]:.4f}' if 'mask_dice' in qc else 'n/a'
-    ice_str = f'{qc["ice_mean_mm"]:.3f}/{qc["ice_p95_mm"]:.3f}mm' if 'ice_mean_mm' in qc else 'n/a'
     log.info(
         f'QC: mask_dice={mask_dice_str}  lncc={qc["lncc"]:.4f}  '
         f'jac_frac_neg={qc["jac_det_frac_negative"]:.6f}  '
         f'log_jac=[{qc["log_jac_p01"]:.2f},{qc["log_jac_p99"]:.2f}]p1-99 '
         f'beyond1.5={qc["log_jac_frac_beyond_1p5"]:.4f} '
         f'beyond3={qc["log_jac_frac_beyond_3"]:.6f}  '
-        f'ice(mean/p95)={ice_str}  '
         f'centroid={qc["centroid_displacement_mm"]:.2f}mm  verdict={qc["verdict"]}'
     )
 

@@ -5,7 +5,7 @@ This is the thing to check before trusting a column name — in a query, in
 `scripts/export_batch_metrics.py` output, or in a Grafana panel.
 
 **Source of truth is the emitter, not the dataclass.** `src/metrics/schemas.py` defines a
-`@dataclass` per table, but three of the nine tables are built as raw Python dicts in the
+`@dataclass` per table, but five of the ten tables are built as raw Python dicts in the
 image scripts rather than constructed through the dataclass, so they can (and do) drift from
 it silently — nothing enforces that the dict a script writes matches the dataclass shape. This
 file was built by reading the actual `qc = {...}` / `qc[...] = ...` construction in each
@@ -18,6 +18,7 @@ Every table also includes `pipeline` (str, always `"cloudpipe_minproc"` today) a
 | Table | S3 prefix | Grain | Written by | Constructed via | `export_batch_metrics.py` CSV |
 |---|---|---|---|---|---|
 | [FuncQC](#funcqc--per-bold-run) | `metrics/func-preproc/` | 1 row per BOLD run | `images/afni/preproc.py` | raw dict — **drifts** | `func_qc.csv` |
+| [SurfaceSampleQC](#surfacesampleqc--per-bold-run) | `metrics/surface-sample/` | 1 row per BOLD run | `images/afni/preproc.py` | raw dict — matches dataclass | `surface_qc.csv` |
 | [AnatQC](#anatqc--per-subjectsession) | `metrics/anat-qc/` | 1 row per subject×session | `images/fastsurfer/extract_qc.py` | raw dict — matches dataclass | `anat_qc.csv` |
 | [FsqcQC](#fsqcqc--per-subjectsession) | `metrics/fsqc-qc/` | 1 row per subject×session | `images/fsqc/stage_and_run.py` | raw dict — matches dataclass | `fsqc_qc.csv` |
 | [RegistrationQC](#registrationqc--per-registration-step) | `metrics/registration/` | 1 row per registration | `images/fireANTs/scripts/fst1w_to_mni.py`, `images/freesurfer/bold_to_t1w.py` | raw dict — **drifts heavily** | `registration_qc.csv` |
@@ -27,13 +28,13 @@ Every table also includes `pipeline` (str, always `"cloudpipe_minproc"` today) a
 | [StepOutcome](#stepoutcome--per-step-per-scan-unit) | `metrics/step-outcomes/` | 1 row per (workflow, step, subject, session, task, run) | `src/metrics/outcome_recorder.py` | dataclass — no drift possible | *not exported* |
 | [SubjectManifest](#subjectmanifest--per-workflow-per-subject) | `metrics/subject-manifests/` | 1 row per (workflow, subject) | `src/metrics/exit_handler.py` | dataclass — no drift possible | *not exported* |
 
-All nine are partitioned `dt=YYYY-MM-DD/` (the write date, except `CostAllocation`/`PodCost`
+All ten are partitioned `dt=YYYY-MM-DD/` (the write date, except `CostAllocation`/`PodCost`
 where `dt` equals the cost *report* date — see those tables' notes) and queryable via
 `metrics.athena.CloudpipeMetrics` / `metrics.duckdb_query.CloudpipeMetrics`
-(`func_qc`/`anat_qc`/`fsqc_qc`/`registration_qc`/`workflow_runs`/`costs`/`pod_costs`), or in bulk via
+(`func_qc`/`surface_qc`/`anat_qc`/`fsqc_qc`/`registration_qc`/`workflow_runs`/`costs`/`pod_costs`), or in bulk via
 `scripts/export_batch_metrics.py`. `StepOutcome` and `SubjectManifest` are queryable but have no
-CSV export today — `export_batch_metrics.py` only pulls the five tables in the rightmost column
-above. Three more S3 prefixes exist under `metrics/` that are **not** part of this queryable set
+CSV export today — `export_batch_metrics.py` only pulls the six tables in the rightmost column
+above. Two more S3 prefixes exist under `metrics/` that are **not** part of this queryable set
 — see [Non-schema objects](#non-schema-s3-objects) at the bottom.
 
 > **Row counts and cohort statistics in this document are historical, not reproducible.** The
@@ -112,7 +113,8 @@ requested for that run) — merged in via `qc.update(surf_metrics)` in `preproc.
 
 These same fields, plus a provenance envelope (`emit`, `stage_timings_s`, `total_runtime_s`,
 `peak_memory_gb`, `container_peak_memory_gb`), are *also* written standalone to
-`metrics/surface-sample/` — see [Non-schema objects](#non-schema-s3-objects).
+`metrics/surface-sample/` — see [SurfaceSampleQC](#surfacesampleqc--per-bold-run). That copy is
+the durable one; the copy folded in here is the one that is sometimes absent and sometimes stale.
 
 **`pending_duration_s` was removed from this schema in [#147]**: it was always `0.0` — the
 `POD_CREATION_TIMESTAMP` env var its docstring described was never set, and *couldn't* be, since
@@ -126,6 +128,69 @@ back. Argo's own `workflow.outputs.parameters` can't be used for this: `argo lin
 cannot statically resolve it from an `onExit` template even though it works at runtime.
 
 [#147]: https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/147
+
+---
+
+## `SurfaceSampleQC` — per BOLD run
+
+`metrics/surface-sample/dt={dt}/{subject}_{session}_{task}_{run}_surf_qc.json`, written by
+`_surface_qc_envelope()` in `images/afni/preproc.py` and uploaded as the `surf-qc` output artifact
+of `functional-preprocessing-workflow-template.yaml`.
+
+**Why this exists when `FuncQC` already carries the same eleven measurements.** `preproc.py` has
+two paths that produce grayordinates. The full path (`--emit both`) computes volumetric and surface
+QC together and writes the surface fields to *both* places — genuinely redundant in that case. The
+grayordinate-only short path (`--emit grayordinate`), used when a run's volumetric output already
+exists and this pass only adds surface data on top, writes **only** here, deliberately leaving
+`FuncQC` untouched rather than overwriting a real volumetric record with a partial one (see
+`_finish_grayordinate_only`). So this prefix is the always-current surface QC record regardless of
+which path produced it, and for short-path runs it is the *sole* copy. Read `emit` to know which
+case a row is.
+
+Prefer `surface_qc()` over `func_qc()` for any surface question: it answers for both paths, whereas
+`func_qc` answers only for `--emit both` runs. Expect **fewer** rows than `func_qc` — only runs that
+produced surfaces appear at all.
+
+| Field | Type | Description |
+|---|---|---|
+| `subject`, `session`, `task`, `run` | str | Grain, same as `FuncQC` |
+| `pipeline` | str | Always `"cloudpipe_minproc"` today |
+| `image_tag` | str | The `sha-…` tag of the AFNI image that produced the record |
+| `emit` | str | `both` (full path — these fields are also in that run's `FuncQC`) \| `grayordinate` (short path — this record is the only copy) |
+| `stage_timings_s` | struct | Same `timed_stage()` dict as `FuncQC`, so the same seven keys are declared; the short path populates only `boldref` and `grayordinates` |
+| `total_runtime_s` | float | Wall-clock for the pass that wrote this record — **not** comparable across `emit` values |
+| `peak_memory_gb` | float | Peak RSS for *this run* — `max(RUSAGE_SELF, RUSAGE_CHILDREN)`, deliberately rusage rather than the cgroup, which never resets across a session's runs |
+| `container_peak_memory_gb` | float | cgroup `memory.peak` — container-lifetime, so it covers every run so far; the figure to size `limits.memory` against, not the per-run reading |
+| `surf_L_n_vertices`, `surf_R_n_vertices` | int | Vertex count per hemisphere's surface mesh |
+| `surf_L_coverage_frac`, `surf_R_coverage_frac` | float | Fraction of vertices whose timeseries is not identically zero — the direct measure of how much cortex the acquisition covered |
+| `surf_L_nan_frac`, `surf_R_nan_frac` | float | Fraction of NaN samples in the surface timeseries |
+| `surf_L_tsnr_median`, `surf_R_tsnr_median` | float | Median tSNR over *covered* vertices only |
+| `subcort_n_voxels` | int | Voxel count across all sampled subcortical structures |
+| `subcort_n_structures` | int | Distinct subcortical structure labels sampled |
+| `subcort_space` | str | Always `"MNI152NLin2009cAsym"` today |
+
+**Missing values are `null`, never `0.0`.** Unlike `FuncQC`'s `gcor`/`aor`/`aqi`, `0` is a
+legitimate measurement for every count and fraction on this table — a `coverage_frac` of `0.0`
+means the surface sampled no BOLD at all, which is a real and important result. `SurfaceSampleQC`
+therefore defaults these to `None`.
+
+**Nothing on this table is gated.** No threshold is calibrated for any surface field yet; the
+`surface-sample` step's pass/fail comes from `outputs_verified`, not from these numbers.
+
+**`schema_version` is `"1.0"`, and records written before 2026-08-11 have none at all.** Until
+[#241] the artifact key had no `dt=` component and the emitter stamped neither `schema_version` nor
+`completed_at`. Both were fixed together, because the compactor maps a missing `schema_version` to
+the literal `"unknown"` and that value is a *projected partition key* on
+`surface_sample_compacted` — a value outside the enum returns zero rows with a **successful** query
+status. `"unknown"` is declared in that enum so the 3,031 pre-fix records (re-keyed into
+`dt=2026-08-10/` and `dt=2026-08-11/` by their `LastModified`) stay readable; do not drop it until
+those partitions are gone.
+
+Adding a field here is the same **five-place change** as `FuncQC` — the dataclass,
+`_UNION_COLUMNS["surface_sample"]`, both Terraform `columns` blocks, and the raw table's SerDe
+`paths` — all pinned by `tests/metrics/test_surface_sample_schema_sync.py`.
+
+[#241]: https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/241
 
 ---
 
@@ -320,9 +385,9 @@ S3 key: `metrics/registration/dt={dt}/{subject}_{session}_t1w_to_mni_reg_qc.json
 | `log_jac_p01`, `log_jac_p99` | float | 1st/99th percentile of log-Jacobian — robust lower/upper edge |
 | `log_jac_min`, `log_jac_max` | float | Worst single compressing / expanding voxel |
 | `log_jac_frac_beyond_1p5`, `log_jac_frac_beyond_3` | float | Fraction of (non-folded) brain voxels with \|log det J\| beyond 1.5 / 3 — healthy T1w→MNI152 keeps the vast majority within ±1.5; mass near ±3 means tissue is being squashed/ballooned to force an intensity match. **Recorded but not gated** — no threshold calibrated yet |
-| `ice_mean_mm`, `ice_p95_mm`, `ice_p99_mm`, `ice_max_mm` | float | Inverse consistency error (mm): displace a voxel by the forward warp then the inverse warp sampled there — the residual from the start point. Reads no image intensities, so it catches a warp that matches intensities well but isn't globally invertible. **All four absent (not zero) if the inverse warp couldn't be computed/saved** — `verdict()` skips absent keys, so this gate fails *open*. Only `ice_mean_mm` is gated (fails **above** 0.5 mm, sub-half-voxel on 1 mm MNI152) |
-| `centroid_displacement_mm` | float | Brain-mask centroid displacement after alignment (mm) — one of three `verdict` inputs |
-| `verdict` | str | `"pass"` / `"fail"` against `registration_qc._T1W_MNI_THRESHOLDS`, which declares **three** fail bounds: `lncc < 0.65`, `jac_det_frac_negative > 0.005`, `ice_mean_mm > 0.5`. `mask_dice` and `centroid_displacement_mm` are recorded but **not** gated. **There is no warn band** — both threshold tables dropped theirs on 2026-07-30 and `verdict()` can no longer emit one, because a warn exited 0 and promoted outputs exactly as a pass did. Records written before then still carry `"warn"`, so queries spanning historical partitions must handle the value |
+| `ice_mean_mm`, `ice_p95_mm`, `ice_p99_mm`, `ice_max_mm` | float | Inverse consistency error (mm): displace a voxel by the forward warp then the inverse warp sampled there — the residual from the start point. Reads no image intensities, so it would catch a warp that matches intensities well but isn't globally invertible. **NEVER POPULATED — all four are absent (not zero).** Computing them needs the inverse of the SyN fit, and `fireants` 1.5.0 raises `NotImplementedError('Inverse warp not implemented for SyN registration')`, so the emitter no longer attempts it. Measured 2026-08-11: 0 of 582 records at schema 2.1 carry any `ice_*` value, and of 12 archived `t1w-to-mni` pod logs sampled across 2026-07-23..2026-08-11, 11 log that error and none emit a value. `ice_mean_mm` was gated (fail **above** 0.5 mm) from 2026-07-23 to 2026-08-11 and was evaluated on **zero** sessions in that window, because `verdict()` skips absent keys; the entry is withdrawn. Columns remain declared so no schema bump is needed if the inverse lands upstream. Treat any value here as missing data, never as a measurement |
+| `centroid_displacement_mm` | float | Brain-mask centroid displacement after alignment (mm) — recorded, **not** gated |
+| `verdict` | str | `"pass"` / `"fail"` against `registration_qc._T1W_MNI_THRESHOLDS`, which declares **two** fail bounds: `lncc < 0.65` and `jac_det_frac_negative > 0.005`. `mask_dice`, `centroid_displacement_mm` and the `ice_*` family are recorded but **not** gated (`ice_*` is not even measurable — see above). **There is no warn band** — both threshold tables dropped theirs on 2026-07-30 and `verdict()` can no longer emit one, because a warn exited 0 and promoted outputs exactly as a pass did. Records written before then still carry `"warn"`, so queries spanning historical partitions must handle the value |
 | `completed_at`, `schema_version` | str | `schema_version` is `"2.1"` |
 
 ### `bold_to_t1w` (schema 2.6) — from `images/freesurfer/bold_to_t1w.py` (SynthMorph, rigid)
@@ -643,10 +708,10 @@ S3 key: `metrics/step-outcomes/dt={dt}/{workflow_name}__{step}__{subject}__{sess
 | `step` | str | Canonical step name — one of `anatomical-phase`, `session-phase`, `fastsurfer-template`, `fastsurfer-template-parc`, `fastsurfer-long-seg`, `fastsurfer-long-parc`, `t1w-to-mni`, `bold-to-t1w`, `func-preproc`, `surface-sample` |
 | `subject` | str | Subject ID |
 | `session`, `task`, `run` | str | Scan-unit identity, or `"na"` if the step is scoped above that level |
-| `status` | str | `succeeded` \| `failed` \| `skipped` |
+| `status` | str | `succeeded` \| `failed` \| `skipped`. A per-run `func-preproc`/`surface-sample` row is `skipped` when `bold-to-t1w` rejected that run on its QC floor and discarded the transform, so the step never computed anything (issue #222); the same event reads `failed` in records written before it |
 | `failure_category` | str | `infrastructure` \| `algorithm` \| `data` \| `dependency` \| `unknown` \| `""` (see classifier below) |
 | `failure_reason` | str | Raw Argo failure message, when available |
-| `upstream_failed_step` | str | The step whose failure caused this one to be skipped, if `status="skipped"` |
+| `upstream_failed_step` | str | The step whose failure caused this one to be skipped, if `status="skipped"` — `bold-to-t1w` for a QC-gated run, or `registration` when `preproc.py`'s own pre-flight check found the missing input (exit 66) |
 | `outputs_verified` | list[str] | S3 keys the recorder confirmed actually exist, not just that the step reported success |
 | `schema_version` | str | `"1.0"` |
 | `recorded_at` | str | ISO 8601 UTC — note this field is named `recorded_at`, not `completed_at`, on this one table |
@@ -696,9 +761,19 @@ wrong in a way that's hard to notice (the dataclass silently accepts and default
 doesn't recognize via `from_dict`'s `known` filter — a stale reader doesn't error, it just
 drops columns):
 
-1. **`FuncQC`** — the dataclass has no `surf_*`/`subcort_*` fields at all; the live emitter adds
-   eleven of them whenever a run also produces grayordinates. A query or export that assumes
-   the dataclass's field list is complete will simply never see them.
+[#236]: https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/236
+
+1. **`FuncQC`** — *resolved 2026-08-11 ([#236])*, kept here as the worked example. The dataclass
+   had no `surf_*`/`subcort_*` fields at all while the live emitter added eleven of them on every
+   run that also produced grayordinates. Nothing failed: the eleven were written to S3 correctly
+   the whole time, and the drift lived entirely in the readers. `export_batch_metrics.py`
+   returned them through DuckDB, which infers columns from the JSON, and silently dropped them
+   through Athena, which reads only what Glue declares — the two engines disagreed on eleven
+   columns with no error on either side. Adding a `FuncQC` field is a **five-place change**: this
+   dataclass, `_UNION_COLUMNS["func_preproc"]`, *both* the `func_preproc` and
+   `func_preproc_compacted` `columns` blocks in Terraform, and the raw table's SerDe `paths`
+   parameter (a name in `columns` but absent from `paths` reads NULL). All five are now pinned
+   against each other by `tests/metrics/test_func_qc_schema_sync.py`.
 2. **`RegistrationQC` / `bold_to_t1w`** — dataclass default `schema_version` is `"1.2"`; live
    emitted records are `"2.6"`. 2.4 added `nmi_identity`/`nmi_gain` (the fields the current
    pass/fail gate actually reads), 2.5 added the boundary-sensitive
@@ -717,7 +792,11 @@ drops columns):
    resource's `projection.schema_version.values` enum.
 3. **`RegistrationQC` / `t1w_to_mni`** — live schema is `"2.1"`, matching the dataclass's
    documented 2.1 comments reasonably closely (this one drifted the least).
-4. Every other table (`AnatQC`, `WorkflowRun`, `CostAllocation`, `StepOutcome`,
+4. **`SurfaceSampleQC`** — the dataclass was written *from* the live emitter dict on 2026-08-11
+   ([#241]) and agrees with it today, but the emitter is still a raw dict, so it can drift the same
+   way `FuncQC` did. Two of its fields exist only because the dataclass forced the question:
+   `schema_version` and `completed_at` were absent from every record written before that date.
+5. Every other table (`AnatQC`, `WorkflowRun`, `CostAllocation`, `StepOutcome`,
    `SubjectManifest`) is constructed by calling the dataclass constructor directly in its
    writer, so it cannot drift the way the two above can — the dataclass *is* the schema for
    these five.
@@ -726,24 +805,17 @@ drops columns):
 
 ## Non-schema S3 objects
 
-Three more prefixes exist under `s3://cloudpipe-metrics/metrics/` with no dataclass, no entry
-in `duckdb_query.py`'s `_PREFIXES`, and (as far as could be confirmed without Glue console
-access) no Athena table. `scripts/export_batch_metrics.py` and the `CloudpipeMetrics` query
-classes do not read any of these.
+Two more prefixes exist under `s3://cloudpipe-metrics/metrics/` with no dataclass, no entry
+in `duckdb_query.py`'s `_PREFIXES`, and no Athena table. `scripts/export_batch_metrics.py` and
+the `CloudpipeMetrics` query classes do not read either of these.
 
-- **`metrics/surface-sample/`** — `{subject}_{session}_{task}_{run}_surf_qc.json`, not
-  `dt=`-partitioned. The `surf_*`/`subcort_*` fields plus a small provenance envelope (`emit`,
-  `stage_timings_s`, `total_runtime_s`, `peak_memory_gb`, `container_peak_memory_gb`). Live
-  writer, actively used — **not a deletion candidate** like
-  `registration-summary/` was. `preproc.py` has two paths that produce grayordinates: a full
-  path that computes volumetric + surface QC together (writes the surface fields to *both*
-  here and into that run's `FuncQC` record — genuinely redundant in this case), and a
-  grayordinate-only short path used when a run's volumetric output already exists and this
-  pass only adds surface data on top (writes *only* here, deliberately leaving `FuncQC`
-  untouched rather than overwriting the real volumetric record with a partial one — see the
-  comment in `_finish_grayordinate_only`). So this prefix is the durable, always-current
-  surface QC record regardless of which path produced it; the copy folded into `FuncQC` is the
-  one that's sometimes absent and sometimes stale.
+`metrics/surface-sample/` was the third until 2026-08-11 — it is now a first-class table, see
+[SurfaceSampleQC](#surfacesampleqc--per-bold-run). Its unreadability was not merely a missing
+Glue declaration but a missing `dt=` component in the artifact key itself ([#241]), which put it
+out of reach of *both* engines at once: partition projection is the only thing publishing
+partitions since the crawlers were removed, and `duckdb_query._s3_glob` restricts to `dt=*/`
+deliberately. 3,031 records were written that neither engine could read.
+
 - **`metrics/cost-drift-probe/`** — `{run_ts}.json`, not `dt=`-partitioned. Written by
   `src/metrics/kubecost_drift_probe.py` (invoked from `prefect/flows/cost_scraper.py`). Each
   run snapshots how Kubecost's cost estimate for recent report-dates has moved since the last

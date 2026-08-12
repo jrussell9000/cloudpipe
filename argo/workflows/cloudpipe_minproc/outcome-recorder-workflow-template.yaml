@@ -31,6 +31,12 @@ spec:
     inputs:
       parameters:
         - name: step           # canonical step name (e.g. t1w-to-mni)
+        # Optional second step recorded by the same pod. Only for steps that
+        # share a producer task and gate and differ solely by step name —
+        # func-preproc + surface-sample, both produced inside the
+        # func-preproc pod. Empty means "record `step` only".
+        - name: step2
+          default: ""
         - name: status         # Argo task status: Succeeded | Failed | Skipped | Error
         - name: message        # Argo task message (may be empty); not available as a DAG task variable
           default: ""
@@ -54,7 +60,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -75,6 +81,11 @@ spec:
         - '{{workflow.name}}'
         - --step
         - '{{inputs.parameters.step}}'
+        # Always passed — Argo cannot conditionally omit an arg, so the empty
+        # default arrives as an empty --step value and outcome_recorder.py
+        # filters it out.
+        - --step
+        - '{{inputs.parameters.step2}}'
         - --subject
         - '{{inputs.parameters.subject}}'
         - --session

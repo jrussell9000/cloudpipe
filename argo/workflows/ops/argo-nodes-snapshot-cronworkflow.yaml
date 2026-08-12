@@ -1,0 +1,291 @@
+####################################################################
+# Scheduled snapshot of Argo `status.nodes` (#237).
+#
+# WHY THIS EXISTS. Per-attempt pod data lives in exactly one place — the
+# Workflow CRD's `status.nodes` — for 24h (`ttlStrategy.secondsAfterCompletion:
+# 86400`). `podGC: OnPodSuccess` reaps the pods themselves within seconds, and
+# none of it ever reaches Athena. Everything the readiness epic knows about
+# retries, spot exposure and exit codes came from hand-taken snapshots
+# (`~/cloudpipe-batch-snapshots/`). For a 100-subject pilot a missed capture
+# costs ~$22 to redo; for an 11-14 day full-cohort run a lost day of failure
+# telemetry is gone permanently.
+#
+# WHY IN-CLUSTER RATHER THAN A LAPTOP LOOP. This is the failure that motivated
+# the issue: during the 2026-08-05 pilot the workstation running a live pod
+# watch suspended twice (22:26-23:10Z, 23:49-01:08Z) and only 5 of 33 k=4 pods
+# survived in the capture. Argo's server-side record had all 33. A client-side
+# watch is a cross-check, never the source of record.
+#
+# WHY `list` AND NOT A LOOP OF `get`. `status.nodes` is stored inline here (no
+# `offloadNodeStatusVersion`, no `compressedNodes`), so one paged LIST captures
+# a whole batch in seconds; `argo get` per workflow takes minutes over 300.
+#
+# WHY A REDUCED PROJECTION. A raw dump of 300 workflows with inline node status
+# is hundreds of MB per snapshot, six times a day. Everything #234 (Error-phase
+# workflow loss) and #239 (per-step spot-reclaim rate) need is per-pod-attempt:
+# template, phase, exit code, message, timing, host node. Those are kept in
+# full; the DAG/Steps scaffolding nodes are not.
+#
+# WHERE IT WRITES. `s3://{metrics-bucket}/snapshots/argo-nodes/` — deliberately
+# OUTSIDE `metrics/`, because `scripts/prep_test_batch.py` flushes every
+# `metrics/` prefix before each test batch and `--flush-qc` additionally wipes
+# all of `metrics/compacted/`. A snapshot that a batch prep can delete is not a
+# snapshot. See #238 for the derived-numbers half of the same argument.
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: argo-nodes-snapshot
+  namespace: argo-workflows
+
+spec:
+  # Every 4h. The TTL is 24h, so this tolerates five consecutive missed runs
+  # before data is actually lost — #237 asks for "comfortably inside the 24h
+  # TTL", and the issue also notes reaping is NOT reliably on schedule in
+  # either direction, so neither "it will still be there" nor "it will be
+  # gone" is a safe assumption to schedule against.
+  schedules:
+    - "0 */4 * * *"
+  timezone: UTC
+
+  # A snapshot is a point-in-time read; two overlapping runs would write two
+  # near-identical objects and double the API load for nothing.
+  concurrencyPolicy: Forbid
+
+  # If the controller was down at the scheduled minute, run late rather than
+  # skipping — a late snapshot still beats a missing one.
+  startingDeadlineSeconds: 3600
+
+  # Keep failures around longer than successes: silent absence is the failure
+  # mode this whole job guards against, so a failed run must stay visible in
+  # `argo list` long enough to be noticed.
+  successfulJobsHistoryLimit: 4
+  failedJobsHistoryLimit: 16
+
+  workflowSpec:
+    serviceAccountName: argo-workflows-runner
+    entrypoint: snapshot
+    activeDeadlineSeconds: 1800
+    podGC:
+      strategy: OnPodSuccess
+    ttlStrategy:
+      secondsAfterCompletion: 172800
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+
+    arguments:
+      parameters:
+        - name: metrics-bucket
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: metrics_bucket
+        - name: ecr-registry
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: ecr_registry
+
+    templates:
+      - name: snapshot
+        metadata:
+          labels:
+            cloudpipe.io/phase: observability
+            cloudpipe.io/step: argo-nodes-snapshot
+
+        nodeSelector:
+          karpenter.sh/nodepool: cpu-light-nodepool
+
+        script:
+          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+          imagePullPolicy: IfNotPresent
+          command: [python]
+
+          env:
+            - name: METRICS_BUCKET
+              value: "{{workflow.parameters.metrics-bucket}}"
+
+          # Paging keeps peak memory bounded by one page of workflows, not by
+          # the whole namespace: a k=4 workflow's inline node status is large,
+          # and this pod is sized for a batch of 300+.
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512M
+
+          source: |
+            """Snapshot Argo per-attempt pod telemetry to S3 (#237).
+
+            Reads the Workflow CRDs straight from the Kubernetes API with the
+            pod's own ServiceAccount token — no kubernetes client library, so
+            this runs on the stock cloudpipe/python image and needs no rebuild
+            (and therefore no image pin commit) to deploy or change.
+            """
+
+            import gzip
+            import io
+            import json
+            import os
+            import ssl
+            import time
+            import urllib.parse
+            import urllib.request
+            from datetime import datetime, timezone
+
+            import boto3
+
+            NAMESPACE = "argo-workflows"
+            API = "https://kubernetes.default.svc"
+            SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+            PREFIX = "snapshots/argo-nodes"
+            PAGE_SIZE = 25
+
+            bucket = os.environ["METRICS_BUCKET"]
+            now = datetime.now(timezone.utc)
+            stamp = now.strftime("%Y%m%dT%H%M%SZ")
+
+            with open(SA_DIR + "/token") as fh:
+                token = fh.read().strip()
+            ctx = ssl.create_default_context(cafile=SA_DIR + "/ca.crt")
+
+
+            def list_page(cont):
+                """One page of workflows. Retries: a transient API error must not
+                cost a whole snapshot, since the data it covers expires."""
+                url = (
+                    API
+                    + "/apis/argoproj.io/v1alpha1/namespaces/"
+                    + NAMESPACE
+                    + "/workflows?limit="
+                    + str(PAGE_SIZE)
+                )
+                if cont:
+                    url = url + "&continue=" + urllib.parse.quote(cont)
+                req = urllib.request.Request(
+                    url, headers={"Authorization": "Bearer " + token}
+                )
+                for attempt in range(5):
+                    try:
+                        with urllib.request.urlopen(req, context=ctx, timeout=180) as resp:
+                            return json.load(resp)
+                    except Exception as exc:
+                        if attempt == 4:
+                            raise
+                        print(
+                            "LIST failed (" + repr(exc) + "); retry "
+                            + str(attempt + 1) + "/4",
+                            flush=True,
+                        )
+                        time.sleep(5 * (attempt + 1))
+
+
+            def pod_nodes(status):
+                """Per-attempt pod rows.
+
+                Only `type == Pod` nodes are kept — DAG and StepGroup nodes carry
+                no attempt data. The template name is read as
+                `templateName // templateRef.template`: most steps here are
+                invoked ACROSS WorkflowTemplates, and in the 2026-08-01 batch
+                filtering on `templateName` alone silently dropped 25 of 31 pods.
+                """
+                rows = []
+                for node in (status.get("nodes") or {}).values():
+                    if node.get("type") != "Pod":
+                        continue
+                    ref = node.get("templateRef") or {}
+                    outputs = node.get("outputs") or {}
+                    rows.append(
+                        {
+                            "node_id": node.get("id"),
+                            "display_name": node.get("displayName"),
+                            "template": node.get("templateName") or ref.get("template"),
+                            "phase": node.get("phase"),
+                            "message": node.get("message"),
+                            "exit_code": outputs.get("exitCode"),
+                            "started_at": node.get("startedAt"),
+                            "finished_at": node.get("finishedAt"),
+                            "host_node": node.get("hostNodeName"),
+                            "resources_duration": node.get("resourcesDuration"),
+                        }
+                    )
+                return rows
+
+
+            buf = io.BytesIO()
+            n_wf = 0
+            n_pods = 0
+            phases = {}
+            cont = None
+
+            with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+                while True:
+                    page = list_page(cont)
+                    for wf in page.get("items", []):
+                        meta = wf.get("metadata") or {}
+                        status = wf.get("status") or {}
+                        labels = meta.get("labels") or {}
+                        rows = pod_nodes(status)
+                        phase = status.get("phase")
+                        phases[phase] = phases.get(phase, 0) + 1
+                        n_wf += 1
+                        n_pods += len(rows)
+                        record = {
+                            "snapshot_at": now.isoformat(),
+                            "workflow": meta.get("name"),
+                            "created_at": meta.get("creationTimestamp"),
+                            "subject": labels.get("subjectid"),
+                            "pipeline": labels.get("pipeline"),
+                            "phase": phase,
+                            "workflow_message": status.get("message"),
+                            "started_at": status.get("startedAt"),
+                            "finished_at": status.get("finishedAt"),
+                            "progress": status.get("progress"),
+                            "resources_duration": status.get("resourcesDuration"),
+                            "pods": rows,
+                        }
+                        gz.write((json.dumps(record) + "\n").encode())
+                    cont = (page.get("metadata") or {}).get("continue")
+                    if not cont:
+                        break
+
+            body = buf.getvalue()
+            key = (
+                PREFIX
+                + "/dt="
+                + now.strftime("%Y-%m-%d")
+                + "/argo-nodes-"
+                + stamp
+                + ".jsonl.gz"
+            )
+            s3 = boto3.client("s3")
+            s3.put_object(Bucket=bucket, Key=key, Body=body)
+
+            # Heartbeat at a FIXED key. A missing/stale snapshot is invisible by
+            # construction — you cannot see an object that was never written — so
+            # the freshness of this one object is what an alert or a human checks.
+            s3.put_object(
+                Bucket=bucket,
+                Key=PREFIX + "/_last_success.json",
+                Body=json.dumps(
+                    {
+                        "snapshot_at": now.isoformat(),
+                        "key": key,
+                        "workflows": n_wf,
+                        "pod_attempts": n_pods,
+                        "bytes_gz": len(body),
+                        "phases": phases,
+                    },
+                    indent=2,
+                ).encode(),
+                ContentType="application/json",
+            )
+
+            print(
+                "wrote s3://" + bucket + "/" + key
+                + " (" + str(n_wf) + " workflows, " + str(n_pods)
+                + " pod attempts, " + str(len(body)) + " bytes gz)",
+                flush=True,
+            )
+            print("phases: " + json.dumps(phases), flush=True)

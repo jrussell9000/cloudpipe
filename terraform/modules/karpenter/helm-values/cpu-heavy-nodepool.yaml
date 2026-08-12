@@ -4,12 +4,57 @@ metadata:
   name: cpu-heavy-nodepool
 spec:
   disruption:
+    # WhenEmpty (not WhenEmptyOrUnderutilized) is forced by the workload: 264 of
+    # 267 workflow pods carry `karpenter.sh/do-not-disrupt: true`, so Karpenter
+    # cannot repack a partially-filled node no matter the policy. What it CAN do
+    # is reclaim nodes that have gone empty, and that is what consolidateAfter
+    # gates.
+    #
+    # 30m was measurably too long. Measured mid-batch at 200 concurrent
+    # (2026-08-11, 148 cpu-heavy nodes / 179 workflow pods): 25 nodes were
+    # holding ZERO workflow pods, ~17% of the pool, billed while waiting out the
+    # timer. Steps here are 10-40m, so a 30m window is long enough for a node to
+    # sit idle for most of a step's duration before reclamation.
+    #
+    # 10m matches cpu-light and gpu. It does not risk churning nodes out from
+    # under running work (do-not-disrupt still protects that); it only shortens
+    # the empty-node tail.
     consolidationPolicy: WhenEmpty
-    consolidateAfter: 30m
+    consolidateAfter: 10m
     budgets:
     - nodes: "20%"
+  # RAISED 2026-08-11 ahead of the 300-concurrent batch. Measured peak from the
+  # 200-concurrent batch (`karpenter_nodepools_usage`, which counts provisioned
+  # NODE CAPACITY and is therefore the unit these limits are denominated in —
+  # summed pod requests is the wrong comparison, see cpu-light-nodepool.yaml):
+  #
+  #   cpu     1960 / 2560   = 77%      memory  4040Gi / 10240Gi = 39%
+  #
+  # Scaled linearly to 300, cpu projects to ~2940 — 115% of 2560, so the cpu
+  # limit binds and pods would sit Pending. With `activeDeadlineSeconds: 43200`
+  # on the master template a long enough Pending queue stops merely slowing the
+  # batch and starts failing workflows, which would confound the capacity test
+  # it is meant to measure.
+  #
+  # That linear scale is pessimistic: #217's right-sizing was NOT in effect for
+  # the batch it was measured on. #217 merged mid-run and in-flight workflows
+  # freeze their spec, so those 183 nodes were packing the old GEMS `cpu: 4` and
+  # func-preproc `cpu: 3`. Against 7.21 usable cpu per c*.2xlarge, 4 was the
+  # worst possible request (2x4 > 7.21, one pod per node); 3.5 fits two and 2
+  # fits three. Expect ~30-40% less node demand, i.e. ~1900-2100 cpu at 300.
+  #
+  # 4096 covers both: 1.39x the pessimistic 2940, and ~2x the packing-corrected
+  # figure. A NodePool limit is a runaway backstop, not a budget — spend is
+  # governed by what the workload actually requests, so headroom here is free
+  # while a binding limit is not.
+  #
+  # Memory needs no change and is deliberately left alone. The observed mix runs
+  # 2.06Gi per cpu of node capacity (4040/1960), so 4096 cpu implies ~8437Gi,
+  # still inside 10240Gi. Memory stays the slack dimension on this pool — the
+  # inverse of cpu-light, which is memory-capped. There is no global rule; the
+  # binding dimension is per-pool.
   limits:
-    cpu: 2560
+    cpu: 4096
     memory: "10240Gi"
   template:
     spec:

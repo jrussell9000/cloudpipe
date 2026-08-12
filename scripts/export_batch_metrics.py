@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Export all metrics for a batch of subjects to CSV files.
 
-Pulls func-preproc QC, anatomical QC (both halves — FastSurfer's anat_qc and
-fsqc's fsqc_qc), registration QC, workflow-run summaries, and cost data for a
+Pulls func-preproc QC, grayordinate (surface) QC, anatomical QC (both halves —
+FastSurfer's anat_qc and fsqc's fsqc_qc), registration QC, workflow-run
+summaries, and cost data for a
 given subject list and date window, and writes each to its own CSV. One CSV
 per table, not one merged file — the tables sit at different grains (func_qc
-is per-BOLD-run, anat_qc and fsqc_qc are per-session,
+and surface_qc are per-BOLD-run, anat_qc and fsqc_qc are per-session,
 workflow_runs is per-workflow, costs is per-workflow-per-scrape-date), and
 join_subject()'s own docstring explains why naively joining grains inflates
 SUMs. Keeping them separate leaves aggregation to the analysis step, where
@@ -81,11 +82,32 @@ def scope_to_subjects(df, subjects: list[str]):
 
 # Grains scoped by --dt-from/--dt-to. They do not all derive dt from the same
 # event, which is what grain_asymmetry_warning() exists to catch.
+#
+# surface_qc is dt-scoped too but deliberately NOT listed. It takes dt from the
+# same {{workflow.creationTimestamp}} as func_qc, so it adds no detection power
+# to the midnight-split check — while adding a false-positive mode this list has
+# no way to express: a batch whose surface-resample step failed broadly is a
+# real coverage gap, not a partition split, and the warning only knows how to
+# report the latter.
 DT_SCOPED_GRAINS = ("func_qc", "anat_qc", "fsqc_qc", "registration_qc", "workflow_runs")
 
 
-def grain_asymmetry_warning(counts: dict[str, int]) -> str | None:
-    """Warn when some dt-scoped grains are empty while others are populated.
+# A grain covering fewer than this fraction of the best-covered grain's
+# subjects is reported as a partition split rather than as real absence.
+#
+# 0.9 tolerates the legitimate reasons one grain covers fewer subjects than
+# another — a subject with no BOLD in the requested scan types is missing from
+# func_qc, one whose FastSurfer was reused is missing from anat_qc — while still
+# catching a split. It is deliberately far from the observed failures: the
+# 2026-08-10 200-subject batch put 15 of 200 workflows (7.5%) on the earlier dt,
+# and the 2026-08-05 pilot put 0 of 100 (0%) there.
+PARTIAL_SPLIT_COVERAGE_RATIO = 0.9
+
+
+def grain_asymmetry_warning(
+    counts: dict[str, int], subject_counts: dict[str, int] | None = None
+) -> str | None:
+    """Warn when dt-scoped grains disagree about which subjects the batch had.
 
     The QC grains take dt from {{workflow.creationTimestamp}}, templated into
     the artifact key in the WorkflowTemplate YAML — workflow *start*.
@@ -95,22 +117,58 @@ def grain_asymmetry_warning(counts: dict[str, int]) -> str | None:
     returns one or the other with no error. That asymmetry is always this
     bug; every-grain-empty is a different problem (wrong subjects or window),
     so it is deliberately not flagged here.
+
+    Row counts alone catch this only when the split is total. They missed the
+    2026-08-10 200-subject batch entirely: 15 of its 200 workflows finished
+    before UTC midnight, so a single-day window returned workflow_runs at 15
+    rows — not 0, and therefore not "empty" — losing 92.5% of the grain in
+    silence. Subject coverage is what makes a partial split visible, since
+    every dt-scoped grain should see very nearly the same subject list.
     """
     present = {name: counts[name] for name in DT_SCOPED_GRAINS if name in counts}
-    empty = sorted(name for name, n in present.items() if n == 0)
-    if not empty or len(empty) == len(present):
+    if not present or not any(present.values()):
         return None
-    populated = ", ".join(
-        f"{name} {n}" for name, n in sorted(present.items(), key=lambda kv: -kv[1]) if n
+    coverage = {name: n for name, n in (subject_counts or {}).items() if name in present}
+    best = max(coverage.values(), default=0)
+
+    empty = sorted(name for name, n in present.items() if n == 0)
+    partial = sorted(
+        name
+        for name, n in present.items()
+        if n and best and coverage.get(name, best) < best * PARTIAL_SPLIT_COVERAGE_RATIO
     )
+    if not empty and not partial:
+        return None
+    short = set(empty) | set(partial)
+    populated = ", ".join(
+        f"{name} {n}"
+        for name, n in sorted(present.items(), key=lambda kv: -kv[1])
+        if n and name not in short
+    )
+    if not populated:  # nothing left to contrast against; not a diagnosable split
+        return None
+
+    clauses = []
+    if empty:
+        clauses.append(f"{', '.join(empty)} returned 0 rows")
+    if partial:
+        clauses.append(
+            ", ".join(
+                f"{name} covered only {coverage[name]} of {best} subjects" for name in partial
+            )
+        )
     return (
-        f"WARNING: dt partition asymmetry — {', '.join(empty)} returned 0 rows while "
+        f"WARNING: dt partition asymmetry — {' and '.join(clauses)} while "
         f"{populated} returned data.\n"
         "  QC grains partition dt on workflow START; workflow_runs partitions on "
         "workflow FINISH.\n"
         "  A batch crossing UTC midnight splits across two dt= partitions. Widen "
         "--dt-from/--dt-to\n"
-        "  to span the batch's start day through its finish day."
+        "  to span the batch's start day through its finish day.\n"
+        "  costs_raw and costs_by_subject are scoped to the workflows workflow_runs "
+        "returned, so\n"
+        "  a short workflow_runs silently truncates them too — do not read the cost "
+        "totals below."
     )
 
 
@@ -338,6 +396,12 @@ def main() -> None:
     # returns, so workflow_runs must be fetched first.
     tables = {
         "func_qc": lambda: m.func_qc(dt_from=args.dt_from, dt_to=args.dt_to),
+        # Grayordinate QC, same per-BOLD-run grain as func_qc and overlapping it
+        # in field names — exported separately because it is the only copy for
+        # runs processed by preproc.py's `--emit grayordinate` short path, which
+        # leaves func_qc untouched. Read `emit` to tell those rows apart. Expect
+        # FEWER rows than func_qc: only runs that produced surfaces appear.
+        "surface_qc": lambda: m.surface_qc(dt_from=args.dt_from, dt_to=args.dt_to),
         # anat_qc and fsqc_qc are the two halves of the T1w-derived QC, at the
         # same subject×session grain. Exported as two CSVs rather than one
         # joined file for the reason in the module docstring — but unlike the
@@ -351,6 +415,7 @@ def main() -> None:
     }
 
     counts: dict[str, int] = {}
+    subject_counts: dict[str, int] = {}
     batch_workflows: set[str] = set()
     cost = CostScope(None, set(), [], set(), 0, 0.0)
 
@@ -371,6 +436,8 @@ def main() -> None:
         covered = df["subject"].nunique() if "subject" in df.columns else "n/a"
         print(f"  {name:<18} {len(df):>5} rows, {covered} subjects -> {out_path}")
         counts[name] = len(df)
+        if isinstance(covered, int):
+            subject_counts[name] = covered
 
     # Per-subject totals, derived from the scoped frame above so the two cost
     # CSVs cannot disagree; subject_costs() is the fallback when costs_raw
@@ -391,7 +458,7 @@ def main() -> None:
     warnings = [
         w
         for w in (
-            grain_asymmetry_warning(counts),
+            grain_asymmetry_warning(counts, subject_counts),
             anatomical_pairing_warning(counts),
             cost_coverage_warning(cost.dates, args.window_start, args.window_end),
             stale_cost_warning(cost.scrape_ages),

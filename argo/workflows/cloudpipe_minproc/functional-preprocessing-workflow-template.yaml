@@ -69,6 +69,15 @@ spec:
           configMapKeyRef:
             name: cloudpipe-config
             key: ecr_registry
+      # Required by the metrics-emission steps. Declared here so a standalone
+      # submission resolves it; under the master this default is ignored (a
+      # templateRef inherits `templates` only) and the master's own
+      # workflow-scope value wins. See issue #212.
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
 
   entrypoint: functional-preprocessing-entrypoint
 
@@ -171,9 +180,9 @@ spec:
         # Runs processed concurrently inside the pod. Left at 1 (sequential) so
         # each run gets the whole CPU request. Raising it splits --threads
         # across jobs and multiplies peak memory — re-check the memory limit
-        # and the QC JSONs' peak_memory_gb before going above 1. Note the
-        # request is now 3 CPU (issue #96), so jobs=3 would leave one thread
-        # per run and jobs>3 would floor at 1 while still tripling peak memory.
+        # and the QC JSONs' peak_memory_gb before going above 1. The request is
+        # now 2 CPU, so jobs=2 would already leave one thread per run and
+        # anything above 2 floors at 1 while still multiplying peak memory.
         - name: jobs
           default: "1"
 
@@ -336,9 +345,10 @@ spec:
             region: <YOUR_AWS_REGION>
             key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/anat/'
 
-        # Grayordinate QC from the short path. The full path folds its surface
-        # metrics into the func-preproc QC JSON instead, so this only carries
-        # runs that skipped the warp chain.
+        # Grayordinate QC — the durable surface QC record, written by BOTH
+        # preproc.py paths. The full path also folds these fields into the
+        # func-preproc QC JSON; the grayordinate-only short path writes only
+        # here, so for those runs this is the sole copy.
         - name: surf-qc
           optional: true
           path: /tmp/surf_qc
@@ -349,13 +359,13 @@ spec:
             # Metrics artifact → versioned metrics bucket, not the data bucket.
             bucket: "{{workflow.parameters.metrics-bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'metrics/surface-sample/'
+            key: 'metrics/surface-sample/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-91a27beb1e3c6a2f588b43e0ee234fd5be02de73"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -366,19 +376,30 @@ spec:
         # Memory is still sized for ONE run: runs execute sequentially at jobs=1.
         requests:
           memory: 4G
-          # Was '6', measured down to '3' (issue #96): across 26
-          # bold-preprocessing pods in the 2026-07-30/31 ten-subject batch,
-          # cpu_efficiency averaged 0.347 — ~2.1 of 6 cores, the largest single
-          # CPU over-request in the batch. This step runs on the most contended
-          # nodepool and is the documented pipeline bottleneck, so the 3.9
-          # idle cores each pod held for ~19 min were also costing throughput:
-          # fewer pods fit per node than needed to.
+          # Was '6', measured down to '3' (issue #96), now '2' — same method,
+          # more data. Across 26 bold-preprocessing pods in the 2026-07-30/31
+          # ten-subject batch cpu_efficiency averaged 0.347 (~2.1 of 6 cores),
+          # which set the 3. Re-measured 2026-08-11 mid-batch at 200 concurrent
+          # over 65 live pods: median 1.15 cpu, p90 3.19 — 38% of the 3 it was
+          # requesting, and the median pod idles at about one core because this
+          # step spends much of its life on S3 I/O rather than compute.
           #
-          # The driver does NOT hardcode this number — it reads it back out of
-          # the pod spec via the CPU_REQUEST env var below and derives
-          # --threads from it. Change this value alone and the thread count
-          # follows automatically.
-          cpu: '3'
+          # 2 is chosen over 1 because the p90 is genuinely bursty (the ANTs
+          # warp and the pigz tail do use several threads) and because THREADS
+          # is derived from this number: at 1 the warp loop below drops to a
+          # single thread and the burst phases get materially slower. 2 keeps
+          # two threads for the parallel sections while letting three pods share
+          # a c*.2xlarge (3x2 = 6 <= 7.21 usable after the DaemonSet tax) where
+          # only two fit at 3.
+          #
+          # MUST STAY AN INTEGER. The driver reads this back out of the pod spec
+          # via the CPU_REQUEST env var below (downward API, divisor "1") and
+          # derives --threads from it; resourceFieldRef rounds a fractional cpu
+          # request UP, so a '2.5' here would silently project as 3 and the
+          # thread count would not match the reservation. Fractional values are
+          # fine for pods whose thread count is hardcoded (see the GEMS pod's
+          # 3.5 in subregion-segmentation-workflow-template.yaml) — not here.
+          cpu: '2'
           # Was 4G for one run. Now holds the session's entire func/ prefix
           # (every run's BOLD, ~0.3-0.5 GB each), the extracted FastSurfer tree
           # (~2 GB), the registration prefix, plus the current run's
@@ -402,7 +423,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-91a27beb1e3c6a2f588b43e0ee234fd5be02de73"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather
@@ -531,7 +552,19 @@ spec:
                         return category
             return "unknown"
 
-        def write_outcome(step, task, run, status, failure_reason=""):
+        def write_outcome(step, task, run, status, failure_reason="", upstream_failed_step=""):
+            # A "skipped" run is dependency by definition, matching
+            # outcome_recorder.classify_failure: its reason describes an absent
+            # upstream artifact, not anything this step did. Left to the pattern
+            # match it would classify as "data" (the reason names a missing
+            # input), which reads as bad subject data rather than an upstream
+            # QC rejection. Issue #222.
+            if status == "succeeded":
+                category = ""
+            elif status == "skipped":
+                category = "dependency"
+            else:
+                category = classify_failure(failure_reason)
             record = {
                 "workflow_name": WORKFLOW_NAME,
                 "step": step,
@@ -540,9 +573,9 @@ spec:
                 "task": task,
                 "run": run,
                 "status": status,
-                "failure_category": "" if status == "succeeded" else classify_failure(failure_reason),
+                "failure_category": category,
                 "failure_reason": failure_reason,
-                "upstream_failed_step": "",
+                "upstream_failed_step": upstream_failed_step,
                 "outputs_verified": [],
                 "pipeline": "cloudpipe_minproc",
                 "schema_version": "1.0",
@@ -558,7 +591,7 @@ spec:
         # cgroup share and throttling the step. The fallback only applies if
         # the env var is missing entirely, which would mean the template and
         # this script have been separated.
-        CPU_REQUEST = max(1, int(os.environ.get("CPU_REQUEST") or 3))
+        CPU_REQUEST = max(1, int(os.environ.get("CPU_REQUEST") or 2))
         THREADS = max(1, CPU_REQUEST // JOBS)
 
         # Tag half of the container's own image ref, for QC provenance. Empty
@@ -589,6 +622,35 @@ spec:
         # cortical GIFTIs and the subcortical volume block together.
         def surf_tarball(prefix):
             return SURF_OUT / f"{prefix}_desc-grayordcomponents_bold.tar.gz"
+
+        # Mirrors preproc.py's EXIT_MISSING_INPUT — kept in sync by
+        # tests/images/afni/test_missing_upstream_transform.py::
+        # test_driver_missing_input_exit_code_matches_preproc. NOT in this
+        # template's retryStrategy expression, deliberately: a missing upstream
+        # artifact is not transient. Issue #222.
+        EXIT_MISSING_INPUT = 66
+
+        # Every registration output this run needs that bold-to-t1w did not
+        # leave behind. When bold_to_t1w.py rejects a run on its relative-NMI
+        # floor it exits 65 and its own driver deletes the run's output
+        # directory, so these files are *supposed* to be absent — the run was
+        # gated upstream, not broken here. Checked before launching preproc.py
+        # so the outcome is one greppable SKIPPED line instead of an
+        # antsApplyTransforms CalledProcessError traceback at Stage 2, which is
+        # indistinguishable at a glance from an OOM or an ANTs crash (issue
+        # #222: 4 of 6 runs in one session, twice, in the 2026-08-10 batch).
+        #
+        # Only the per-run bold_to_t1w_{task}_{run}/ outputs are checked here,
+        # because those are the ones attributable to bold-to-t1w. preproc.py
+        # runs the full, --emit-aware input check itself and exits
+        # EXIT_MISSING_INPUT, which is handled below.
+        def missing_registration_inputs(b2t, prefix, emit):
+            needed = [b2t / f"{prefix}_desc-bold2t1w_itk.txt"]
+            # The brain mask is read only by Stage 4 and Stage 6, both of which
+            # the grayordinate short path skips.
+            if emit in ("volumetric", "both"):
+                needed.append(b2t / f"{prefix}_desc-bold2t1w_brainmask.nii.gz")
+            return [p for p in needed if not p.exists()]
 
         # func_exists and surf_exists gate independently, so a run needs work if
         # EITHER is missing. --emit picks the cheapest path that produces what
@@ -657,18 +719,25 @@ spec:
             raising here would abort list(pool.map(...)) and lose every
             sibling's tarball. The wrapper turns that into an ordinary failure.
 
-            Returns (prefix, func_failed, surf_failed, produced, message): the
-            two derivatives fail independently (a run can emit a valid
-            volumetric tarball while its surface sampling failed — see
-            preproc.py Stage 5b), so they are tracked and recorded separately.
-            `produced` is True when the run wrote at least one new tarball,
-            which is what the exit rule checks. `message` is this run's real
-            failure detail (empty on success) — recorded as this run's
+            Returns (prefix, func_failed, surf_failed, produced, message,
+            skipped_upstream): the two derivatives fail independently (a run can
+            emit a valid volumetric tarball while its surface sampling failed —
+            see preproc.py Stage 5b), so they are tracked and recorded
+            separately. `produced` is True when the run wrote at least one new
+            tarball, which is what the exit rule checks. `message` is this run's
+            real failure detail (empty on success) — recorded as this run's
             StepOutcome.failure_reason (see write_outcome / ADR 016), which is
             the whole point of recording in-pod rather than via a DAG task
             that never sees more than Argo's aggregate pod status. An
             unexpected error fails exactly the derivatives this run was asked
             to emit.
+
+            `skipped_upstream` is the name of the step whose absent output made
+            this run unrunnable, or "" when the run was actually attempted. Non-
+            empty turns the two records into `skipped` rather than `failed` and
+            populates StepOutcome.upstream_failed_step — a run whose transform
+            was discarded by the upstream QC gate never reached this pod's
+            compute and must not read as a func-preproc defect (issue #222).
             """
             prefix = f"{SUBJ}_{SES}_{run['task']}_{run['run']}"
             emit = emit_for(run)
@@ -681,7 +750,8 @@ spec:
                         emit in ("volumetric", "both"),
                         emit in ("grayordinate", "both"),
                         False,
-                        f"{type(exc).__name__}: {exc}")
+                        f"{type(exc).__name__}: {exc}",
+                        "")
 
         def _process(run):
             task, rid = run["task"], run["run"]
@@ -692,6 +762,21 @@ spec:
             b2t = REG_DIR / f"bold_to_t1w_{task}_{rid}"
             work_dir = WORK_ROOT / SES / f"{task}_{rid}"
             print(f"[driver] === {prefix} (--emit {emit}) ===")
+
+            absent = missing_registration_inputs(b2t, prefix, emit)
+            if absent:
+                names = ' '.join(p.name for p in absent)
+                # The transform is the file a QC rejection takes with it; name it
+                # explicitly when it is the one missing, so the log line states
+                # the cause rather than only the symptom.
+                what = ("no bold_to_t1w transform (QC-rejected upstream)"
+                        if any(p.name.endswith("_desc-bold2t1w_itk.txt") for p in absent)
+                        else "incomplete bold_to_t1w output")
+                print(f"[driver] SKIPPED {prefix} — {what}: {names}")
+                return (prefix, func_needed, surf_needed, False,
+                        f"bold-to-t1w left no usable output for this run "
+                        f"(absent: {names})",
+                        "bold-to-t1w")
 
             env = dict(os.environ)
             # Without this ITK defaults to every core on the node and
@@ -735,7 +820,7 @@ spec:
                 # in S3, untouched.
                 print(f"[driver] FAILED {prefix}: {type(exc).__name__}: {exc}")
                 shutil.rmtree(work_dir, ignore_errors=True)
-                return prefix, False, True, False, f"{type(exc).__name__}: {exc}"
+                return prefix, False, True, False, f"{type(exc).__name__}: {exc}", ""
 
             rc = subprocess.run(cmd, env=env).returncode
 
@@ -747,6 +832,22 @@ spec:
                 if Path(src).exists():
                     shutil.move(src, str(dest / Path(src).name))
 
+            if rc == EXIT_MISSING_INPUT:
+                # preproc.py's own pre-flight check refused the run: an input
+                # this driver does not pre-check is absent (the session-shared
+                # t1w_to_mni pair, the aseg, the BOLD itself). Same event class
+                # as the skip above — nothing was computed and nothing is lost
+                # here — so it records as `skipped`, not as a compute failure.
+                # The upstream step is named generically because the missing
+                # file could belong to either registration step; preproc.py
+                # logged which one on its MISSING INPUT lines.
+                print(f"[driver] SKIPPED {prefix} — preproc.py found a required "
+                      f"input absent (exit {rc}); see its MISSING INPUT lines above")
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return (prefix, func_needed, surf_needed, False,
+                        f"preproc.py exited {rc} (required input absent)",
+                        "registration")
+
             if rc != 0:
                 # preproc.py exits 0 when it downgrades a Stage 5b failure to
                 # volumetric-only, so a non-zero exit means the volumetric
@@ -754,7 +855,7 @@ spec:
                 # for is lost.
                 print(f"[driver] FAILED {prefix} (exit {rc})")
                 shutil.rmtree(work_dir, ignore_errors=True)
-                return prefix, func_needed, surf_needed, False, f"preproc.py exited {rc}"
+                return prefix, func_needed, surf_needed, False, f"preproc.py exited {rc}", ""
 
             # Argo's archiver used to build these tarballs from the artifact
             # path; one static declaration cannot emit N per-run tarballs, so
@@ -816,7 +917,7 @@ spec:
             # (--emit grayordinate, which re-raises rather than downgrades), so
             # this is True whenever func was emitted or the surface survived.
             produced = func_needed or not surf_failed
-            return prefix, False, surf_failed, produced, surf_message
+            return prefix, False, surf_failed, produced, surf_message, ""
 
         results = []
         pending_prefixes = {f"{SUBJ}_{SES}_{r['task']}_{r['run']}" for r in pending}
@@ -842,40 +943,69 @@ spec:
                 func_needed = emit in ("volumetric", "both")
                 surf_needed = emit in ("grayordinate", "both")
                 if prefix in result_by_prefix:
-                    func_failed, surf_failed, _prod, message = result_by_prefix[prefix]
+                    func_failed, surf_failed, _prod, message, upstream = result_by_prefix[prefix]
                 elif prefix in pending_prefixes:
                     # Pool started this run but the pod died before process()
                     # returned (e.g. OOMKilled) — no result to trust.
                     func_failed, surf_failed = func_needed, surf_needed
                     message = "pod terminated before this run's result was recorded"
+                    upstream = ""
                 else:
                     # Not pending: both derivatives already existed coming in.
                     func_failed = surf_failed = False
                     message = ""
+                    upstream = ""
+                # An unrunnable run records `skipped`, not `failed` (issue #222):
+                # `failed` claims this step tried and lost the derivative, which
+                # sends triage looking for a defect that is not here. `skipped`
+                # is an existing StepOutcome status carrying
+                # upstream_failed_step, and exit_handler folds both into the same
+                # `partial` subject manifest, so nothing downstream changes
+                # grade. validate_test_batch keys the explanation off the
+                # bold-to-t1w row's exit 65 (issue #221) and treats any
+                # non-`succeeded` func-preproc status the same way, so it still
+                # reports these under `runs gated by bold-to-t1w QC`.
+                bad_status = "skipped" if upstream else "failed"
                 write_outcome(
                     "func-preproc", task, rid,
-                    "failed" if (func_needed and func_failed) else "succeeded",
+                    bad_status if (func_needed and func_failed) else "succeeded",
                     message if (func_needed and func_failed) else "",
+                    upstream if (func_needed and func_failed) else "",
                 )
                 write_outcome(
                     "surface-sample", task, rid,
-                    "failed" if (surf_needed and surf_failed) else "succeeded",
+                    bad_status if (surf_needed and surf_failed) else "succeeded",
                     message if (surf_needed and surf_failed) else "",
+                    upstream if (surf_needed and surf_failed) else "",
                 )
-            failed_func = [p for p, ff, sf, prod, msg in results if ff]
-            failed_surf = [p for p, ff, sf, prod, msg in results if sf]
-        produced = [p for p, ff, sf, prod, msg in results if prod]
+            # Skipped runs are counted separately: folding them into the failure
+            # lists is what made a QC rejection read as a func-preproc defect.
+            failed_func = [p for p, ff, sf, prod, msg, up in results if ff and not up]
+            failed_surf = [p for p, ff, sf, prod, msg, up in results if sf and not up]
+        skipped = [p for p, ff, sf, prod, msg, up in results if up]
+        produced = [p for p, ff, sf, prod, msg, up in results if prod]
         print(f"[driver] {len(produced)}/{len(results)} runs produced output; "
-              f"func failed={len(failed_func)}, surface failed={len(failed_surf)}")
+              f"func failed={len(failed_func)}, surface failed={len(failed_surf)}, "
+              f"skipped={len(skipped)}")
         if failed_func:
             print(f"[driver] volumetric failed: {' '.join(failed_func)}")
         if failed_surf:
             print(f"[driver] surface failed: {' '.join(failed_surf)}")
+        if skipped:
+            print(f"[driver] skipped (no upstream transform): {' '.join(skipped)}")
 
         # Fail the step only when the session produced nothing at all — no run
         # wrote any new tarball. A partial failure (some runs, or some
         # derivatives, succeeded) exits 0 so their artifacts and per-run records
         # survive.
+        #
+        # Runs skipped for a missing upstream transform are excluded from the
+        # denominator (issue #222): a session whose every run was QC-rejected by
+        # bold-to-t1w has nothing for this step to produce, and exiting non-zero
+        # would mark the whole session failed, fire the DAG's fallback recorder
+        # over the per-run `skipped` records this pod just wrote, and put a
+        # func-preproc failure in the batch report for a correct outcome. If any
+        # run was actually attempted and none produced, that is still a failure.
         #
         # The original rationale was that Argo does not save output artifacts
         # from a failed pod. Measured 2026-07-22 (dagval-330e63gh-tarerr), it
@@ -883,5 +1013,6 @@ spec:
         # exit actually costs is the output *parameters* (skipped when their
         # file is missing) and the session's status, which the outcome fan-out
         # stamps onto every sibling run. Those are the reasons to keep this.
-        if results and not produced:
+        attempted = [p for p, ff, sf, prod, msg, up in results if not up]
+        if attempted and not produced:
             sys.exit(1)

@@ -97,21 +97,22 @@ argo-workflows:
     - name: FEEDBACK_MODAL
       value: "false"
 
-    sso:
-      issuer: https://argocd.<YOUR_DOMAIN>/api/dex
-      clientId:
-        name: argo-workflows-sso
-        key: clientID
-      clientSecret:
-        name: argo-workflows-sso
-        key: clientSecret
-      redirectUrl: https://argo.<YOUR_DOMAIN>/oauth2/callback
-      scopes:
-      - openid
-      - profile
-      - email
-      rbac:
-        enabled: true
+    # server.sso is deliberately NOT set here, for the same reason as the
+    # controller settings above: it would render nowhere. The chart has exactly
+    # two consumers of `.Values.server.sso` —
+    #   templates/controller/workflow-controller-config-map.yaml, which is not
+    #     rendered at all because controller.configMap.create is false, and
+    #   templates/server/server-cluster-roles.yaml, gated on
+    #     server.sso.enabled, which defaults to false and was never set here.
+    # So the issuer/redirectUrl/clientId that used to live here were inert, and
+    # editing their domain had no effect on the running server. The live "sso"
+    # key is in terraform/modules/argo-workflows/main.tf, which derives both
+    # URLs from var.route53_zone_name. The SSO RBAC the chart would have created
+    # is supplied instead by the ClusterRole argo-workflows-server-sso-rbac in
+    # gitops/apps/cluster-config/templates/argo-server-rbac.yaml (serviceaccount
+    # reads) plus kubernetes_role_v1.server_sso_secrets in that same Terraform
+    # module (SSO session secrets). See GitHub #17.
+    # --auth-mode=sso above stays here — that IS a server extraArg.
 
     clusterWorkflowTemplates:
       enabled: true

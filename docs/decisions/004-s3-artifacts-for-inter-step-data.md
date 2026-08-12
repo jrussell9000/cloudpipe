@@ -42,10 +42,20 @@ The remaining PVC consumer is `subregion-segmentation`, whose per-region resume 
 
 `subregion-segmentation`'s `segment-subregions-gems-template` and `segment-subregions-dl-template` now stage the FastSurfer tarballs onto their own private `emptyDir`s (the `hydrate-fastsurfer-template` pod is gone — each segmentation pod declares those inputs directly) and checkpoint each region to its final `derivatives/subregions/{subj}/{subj}_{region}.tar.gz` key immediately after that region completes, rather than relying on a retry-persistent volume. `cloudpipe-long-master-workflow-template.yaml` no longer declares `volumeClaimTemplates`. The "Decision" section above (the FastSurfer/registration EFS exception) is now historical only — no template in this pipeline mounts a PVC. The EFS filesystem, CSI driver, and StorageClass have been removed from the cluster and Terraform entirely.
 
-> **Two EFS references outlived the removal and will break a fresh cluster bootstrap.**
-> `terraform/install.sh:45` still runs `apply_target "module.aws_efs_csi_pod_identity"` and
-> `terraform/cleanup.sh:52` still runs `destroy_target` on the same module — but that module is
-> declared in no `.tf` file, so `install.sh` fails at that line when building a cluster from
-> scratch. This is latent rather than active: the running cluster predates the removal and never
-> re-executes the bootstrap. There is also an orphaned `efs.csi.aws.com` `CSIDriver` object in the
-> cluster with no owning ArgoCD Application, so nothing prunes it.
+Three pieces of EFS residue outlived that removal by roughly three months, all now cleaned up:
+
+- `terraform/install.sh` and `cleanup.sh` still targeted `module.aws_efs_csi_pod_identity`, which
+  was declared in no `.tf` file — enough to break a fresh bootstrap, latent only because the
+  running cluster predates the removal and never re-executes it
+  ([#211](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/211)). Both scripts now share
+  a validated target list (`terraform/targets.sh`).
+- An `efs.csi.aws.com` CSIDriver object and an empty `aws-efs-csi-driver` namespace survived
+  in-cluster with no owning ArgoCD Application
+  ([#213](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/213)), deleted by hand.
+
+> **The removal-residue lesson generalizes past EFS.** A capability retired from this stack has
+> three surfaces to clean, and they fail differently: Terraform *config* (a dangling `-target`
+> errors loudly, but only on a code path nobody exercises), ArgoCD *Applications* (removal can
+> leave `helm.sh/resource-policy: keep` objects behind by design), and *live cluster state* (a
+> CSIDriver with no controller silently accepts PVCs that can never bind). Nothing sweeps the
+> second and third automatically.

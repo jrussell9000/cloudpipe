@@ -109,7 +109,7 @@ spec:
 
     initContainers:
       - name: download-t1w-inputs
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -150,7 +150,7 @@ spec:
       # runs surface registration. It is not included in per-subject tarballs, so it
       # is fetched per pod from config/fsaverage/ in S3 (~480 MiB, 312 objects).
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -332,7 +332,7 @@ spec:
     initContainers:
       # recon-surf.sh registers to fsaverage, which is not in the template tarball.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
         imagePullPolicy: IfNotPresent
         resources:
           requests:

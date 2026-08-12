@@ -49,11 +49,76 @@ This replaced a local-only backend (no remote state at all) after a 2026-07 inci
 | Resource | Value |
 |---|---|
 | Primary CIDR | `10.0.0.0/16` — the only CIDR in use. `var.secondary_cidr_blocks` is declared, and the VPN has routes/auth rules that iterate over it, but `vpc.tf` never associates it, so it is empty in practice. |
-| Private subnets | Three AZs (<YOUR_AWS_REGION>a/b/c), `/20` each — EKS nodes |
+| Private subnets | Three AZs (<YOUR_AWS_REGION>a/b/c), `/20` each — EKS nodes. Upper 3/4 of each is a `prefix` CIDR reservation for pod prefix delegation, see [pod IP address space](#pod-ip-address-space) |
 | Public subnets | Three AZs, `/24` each — ALBs, Globus EC2 |
 | NAT gateway | Single (cost optimisation) — private subnets route through it |
 | S3 VPC Gateway endpoint | All route tables — S3 traffic stays on AWS backbone |
 | VPC flow logs | → `cloudpipe-logging` S3 bucket under `vpc-flow-logs/`, 60s aggregation |
+
+### Pod IP address space
+
+Every pod gets a real VPC IP from the private subnet its node sits in, so the `/20`
+per AZ (4,091 usable) is a hard ceiling on concurrency — and the binding constraint
+is **fragmentation, not depletion**.
+
+With `ENABLE_PREFIX_DELEGATION=true` the CNI allocates a **`/28` — 16 contiguous,
+16-aligned addresses — at a time**. A node can therefore fail to place one more pod
+while hundreds of addresses are free, because none of them form an aligned block of
+16. Two things consume blocks:
+
+1. **Per-node warm capacity.** `WARM_PREFIX_TARGET=1` alone makes each node hold one
+   whole *spare* `/28` beyond current need. Measured during the 2026-08-10
+   200-subject batch (GitHub #218): <YOUR_AWS_REGION>c had 113 nodes running just 268 pods
+   but held 204 prefixes = **3,264 addresses reserved**, a 12× overprovision, with 99
+   nodes holding 2 prefixes apiece and only **one** fully-free aligned `/28` left in
+   the whole `/20`. Pods stalled in `Init:0/1` for up to 93 min on `failed to assign
+   an IP address` (42,843 `FailedCreatePodSandBox` events). Adding
+   `MINIMUM_IP_TARGET=10` / `WARM_IP_TARGET=2` — which **override**
+   `WARM_PREFIX_TARGET` — cut this to 98 prefixes / 1,568 reserved and raised free
+   IPs in 2c from 698 to 2,413, verified live on the running batch.
+2. **Node primary ENI addresses**, which AWS assigns singly and scatters through the
+   same `/20`. These sterilised 52 further `/28` slots (~700 addresses) that no
+   amount of CNI tuning can recover, and the count grows with every node added.
+   Fixed outside the CNI by **`prefix`-type subnet CIDR reservations** (GitHub
+   #220, `aws_ec2_subnet_cidr_reservation.pod_prefixes` in `vpc.tf`), which stop
+   AWS assigning single addresses out of the reserved range. Each private `/20` is
+   split into a **lower `/22` left unreserved** for single addresses (node primary
+   ENIs, secondary-ENI primaries, VPC endpoint / RDS / Client VPN ENIs, the CNI's
+   single-IP fallback) and the **remaining 3/4 reserved** for delegation — 3,072
+   addresses = **192 `/28` slots per AZ**, against the 113 nodes the 300-concurrent
+   batch peaked at in one AZ.
+
+   Verified live on 2026-08-11: a fresh Karpenter node in <YOUR_AWS_REGION>c took primary
+   IP `10.0.32.34` (unreserved `10.0.32.0/22`) and exactly one delegated prefix,
+   `10.0.45.0/28` (reserved `10.0.40.0/21`) — the two patterns no longer interleave.
+
+   Two things to know about reservations before touching this:
+
+   - They **decrement `AvailableIpAddressCount` immediately** (documented for
+     `prefix`, unlike `explicit`), so that field now reports *free single
+     addresses* — ~1,014, not ~4,070. Read `aws ec2
+     get-subnet-cidr-reservations --subnet-id <id>` alongside it or pod headroom
+     looks like it collapsed by 75%.
+   - They are **not retroactive** and may legally span addresses already in use
+     (`10.0.4.0/22` was created over an in-use endpoint ENI at `10.0.4.222`). So
+     apply on a drained cluster, and note the long-lived non-node ENIs scattered
+     across each `/20` keep ~3 slots per AZ blocked until they are recreated —
+     ~1.6%, versus the 20% above.
+
+   This is why a secondary VPC CIDR + CNI custom networking (the original proposal
+   in #220) was **not** needed: reservations retrofit onto the existing private
+   subnets, so pod IPs stay inside `10.0.0.0/16` and every `cidr_ipv4 =
+   var.vpc_cidr` security-group rule and NetworkPolicy `ipBlock` in the repo keeps
+   matching pod traffic. Custom networking remains the option if *total* pod
+   address space — not fragmentation — ever becomes the binding constraint; the
+   primary CIDR still has three unused `/18`s (`10.0.64.0/18`, `10.0.128.0/18`,
+   `10.0.192.0/18`) for pod subnets, so even then no secondary CIDR is required.
+
+AZ skew compounds it: Karpenter's `price-capacity-optimized` spot strategy has no
+awareness of subnet IP headroom, and both `EC2NodeClass`es select all three private
+subnets via `tags: {karpenter.sh/discovery: cloudpipe}`, so node placement follows
+spot price and routinely piles ~70% of nodes into one AZ. Sizing headroom against an
+even three-way split will under-provision.
 
 ### Client VPN
 
@@ -84,12 +149,12 @@ A replacement (Cloudflare Tunnel + Access, reusing the UW-Madison OIDC identity 
 
 | Add-on | Notes |
 |---|---|
-| `vpc-cni` | Prefix delegation enabled (`ENABLE_PREFIX_DELEGATION=true`). Strict network policy mode (`NETWORK_POLICY_ENFORCING_MODE=strict`) enabled after Phase 3 of `install.sh`. |
+| `vpc-cni` | Prefix delegation enabled (`ENABLE_PREFIX_DELEGATION=true`), with `MINIMUM_IP_TARGET=10` / `WARM_IP_TARGET=2` — these **override** `WARM_PREFIX_TARGET`, which is retained only as a fallback. See [pod IP address space](#pod-ip-address-space) for why. Strict network policy mode (`NETWORK_POLICY_ENFORCING_MODE=strict`) enabled after Phase 3 of `install.sh`. |
 | `coredns` | Runs on `backend` node group; forwards to VPC DNS resolver |
 | `kube-proxy` | Standard |
 | `metrics-server` | Runs on `backend` node group |
 | `eks-pod-identity-agent` | Installed `before_compute` so Pod Identity works from first node join |
-| `amazon-cloudwatch-observability` | Basic Container Insights mode (per-metric billing, not per-observation). Application Signals disabled. Runs on `backend` node group. |
+| `amazon-cloudwatch-observability` | Basic Container Insights **metrics** only (per-metric billing, not per-observation). Application Signals disabled. Container **logs** disabled (`containerLogs.enabled = false`), so no fluent-bit DaemonSet — pod logs go to S3 via Argo's log archive instead. Runs on `backend` node group. |
 
 ### Managed node groups (always-on, fixed size)
 
@@ -262,12 +327,15 @@ External DNS (running in `external-dns` namespace, managed by ArgoCD) automatica
 | Log stream | Destination | Retention |
 |---|---|---|
 | EKS control plane (api, audit, authenticator) | CloudWatch log group `/aws/eks/cloudpipe/cluster` | 365 days, KMS encrypted |
-| Container Insights (basic mode) | CloudWatch | Default (15 months) |
+| Container Insights **metrics** (basic mode) | CloudWatch | Default (15 months) |
+| Container **logs** (pod stdout/stderr) | S3 `<YOUR_S3_BUCKET>/logs/{workflow}/{pod}/main.log` — *not* CloudWatch | Bucket lifecycle |
 | VPC flow logs | `cloudpipe-logging/vpc-flow-logs/` | 90d → Glacier → 3y expiry |
 | CloudTrail (all regions, all mgmt events + S3 data events on `<YOUR_S3_BUCKET>`) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
 | ALB access logs | `cloudpipe-logging/*/AWSLogs/` | 90d → Glacier → 3y expiry |
 
 Pipeline pod logs are **not** forwarded to CloudWatch. Use the Argo UI or `argo logs` to access them while the workflow is running, or the Argo server's S3-backed log archive for completed workflows.
+
+Until 2026-08-11 the addon's fluent-bit DaemonSet *did* also ship every pod's stdout to `/aws/containerinsights/cloudpipe/{application,argo-workflows}`, a second copy of the same bytes that nothing in this repo read. Measured over a 200-subject batch window it ingested ~234 GB/month, ≈$139/month all-in, so `containerLogs.enabled = false` turned it off. If searchable workflow logs are wanted, build them over the S3 archive (Athena or an OpenSearch ingest) — do not re-enable the addon's log path. Note this is unrelated to the control-plane `audit`/`authenticator` streams above, which are a NIST 800-171 control and stay.
 
 Container Insights runs in basic mode (`kubernetes: {}` config only — per-metric billing). Enhanced mode and Application Signals are explicitly disabled to avoid ~$80/month in unnecessary APM charges for batch workloads.
 
@@ -336,14 +404,19 @@ A fresh cluster install follows the phased sequence in `install.sh`. Do not run 
 
 After Phase 6 the EKS API is private-only — connect via VPN for all subsequent `kubectl`/`terraform` operations.
 
-> **Known bug — a fresh install fails in Phase 2.** `install.sh:45` still runs
-> `apply_target "module.aws_efs_csi_pod_identity"`, and `cleanup.sh:52` still
-> destroys it, but that module was deleted along with EFS (GitHub #77) and exists
-> in no `.tf` file. Both scripts will error on a targeted apply/destroy of a
-> nonexistent module. This has gone unnoticed because no fresh cluster has been
-> bootstrapped since the EFS removal. Delete both lines before relying on either
-> script. An orphaned `efs.csi.aws.com` CSIDriver object also survives in-cluster
-> with no owning ArgoCD Application; it is inert but can be deleted by hand.
+Both scripts share their `-target` lists via `terraform/targets.sh`, which also validates every
+address against the `.tf` sources before Terraform is invoked. `terraform apply -target=` on an
+address declared nowhere is a hard error, not a no-op, so one stale entry used to abort the
+bootstrap partway through — which is what a deleted-but-still-referenced
+`module.aws_efs_csi_pod_identity` did for three months ([#211](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/211)),
+unnoticed because the running cluster predates the removal and never re-runs the bootstrap. The
+preflight reports *every* bad address at once instead of failing at the first; cleanup.sh derives
+its teardown order by reversing the same list rather than keeping a second copy.
+
+> **The check is a grep of the `.tf` files, not `terraform plan -target=`.** Plan would be
+> authoritative, but it instantiates the kubernetes/helm providers, which at bootstrap time must
+> reach a cluster that does not exist yet — the reason these applies are phased at all. So the
+> preflight catches an undeclared address, not every way a target can be wrong.
 
 ### Key Terraform variables
 

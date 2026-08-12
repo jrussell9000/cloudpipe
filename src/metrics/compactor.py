@@ -53,6 +53,7 @@ log = logging.getLogger(__name__)
 # match their eventual Glue table names one-for-one.
 RAW_PREFIXES = {
     "func_preproc": "metrics/func-preproc/",
+    "surface_sample": "metrics/surface-sample/",
     "anat_qc": "metrics/anat-qc/",
     "fsqc_qc": "metrics/fsqc-qc/",
     "workflow_runs": "metrics/workflow-runs/",

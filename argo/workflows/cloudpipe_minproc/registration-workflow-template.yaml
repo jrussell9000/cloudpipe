@@ -98,15 +98,24 @@ spec:
       # this only fires when there is no worker pod to have recorded anything:
       # the step was skipped (rerun, already registered) or the pod died
       # before it could write its own records (e.g. OOMKilled, mid-loop
-      # crash). Never on bare success — only Failed || Skipped, so a healthy
-      # session no longer pays for a recorder pod at all.
+      # crash). Never on bare success — only Failed || Errored || Skipped, so a
+      # healthy session no longer pays for a recorder pod at all.
+      #
+      # `.Errored` matters as much as `.Failed` here: a spot-preempted or
+      # deleted pod reports phase Error, and the in-pod records are written to
+      # /tmp/step_outcomes and only reach S3 via an output artifact uploaded
+      # after the main container exits — so a hard kill loses every record for
+      # that session. Gating on Failed alone left that case unrecorded.
       #
       # status only — no exit-code or output-parameter reference. See ADR 016:
       # a record task that references {{tasks.bold-to-t1w-step.outputs.*}} is
       # never instantiated when bold-to-t1w-step is Skipped (a skipped task
       # has no outputs), deadlocking the parent DAG.
       - name: record-outcome-bold-to-t1w-step
-        depends: bold-to-t1w-step.Failed || bold-to-t1w-step.Skipped
+        depends: >-
+          bold-to-t1w-step.Failed ||
+          bold-to-t1w-step.Errored ||
+          bold-to-t1w-step.Skipped
         templateRef:
           name: outcome-recorder
           template: record-step-outcome
@@ -292,7 +301,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-e6e6cd8d9a99799dbff55bba40fe618fef7cd29f"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-34fd35825a707887639dd303103b80d978a04ae9"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -545,7 +554,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-c2ba15155f39af001ca6bd2f0045f759234ab879"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-34fd35825a707887639dd303103b80d978a04ae9"
       imagePullPolicy: IfNotPresent
 
       # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the
