@@ -2,7 +2,7 @@
 
 Structured metrics emitted by every pipeline step, stored in S3, queryable via Athena SQL or DuckDB, and visualized in Grafana.
 
-**Why this exists as a first-class layer rather than log scraping.** On ephemeral infrastructure the pod that knew how a step went is gone minutes later, and its node with it. So each step *emits* what it knows — alignment scores, motion summaries, resource peaks, exit status — as a structured record at the moment it still knows it. The result is that "how well did this run register?" and "what did this run cost?" are both SQL queries over a durable corpus, not archaeology across logs. Nine tables, all schemas hand-declared in Terraform ([ADR 011](decisions/011-s3-athena-for-metrics.md)).
+**Why this exists as a first-class layer rather than log scraping.** On ephemeral infrastructure the pod that knew how a step went is gone minutes later, and its node with it. So each step *emits* what it knows — alignment scores, motion summaries, resource peaks, exit status — as a structured record at the moment it still knows it. The result is that "how well did this run register?" and "what did this run cost?" are both SQL queries over a durable corpus, not archaeology across logs. Ten tables, all schemas hand-declared in Terraform ([ADR 011](decisions/011-s3-athena-for-metrics.md)).
 
 Three things about this corpus are load-bearing and non-obvious; skipping them leads to confidently wrong numbers:
 
@@ -60,6 +60,7 @@ duplicate table — how the historical `anat`/`anat_qc` and
 | Prefix | Athena table | Grain | Key format |
 |--------|-------------|-------|-----------|
 | `metrics/func-preproc/` | `func_preproc` | Per BOLD run | `dt={date}/{subj}_{ses}_{task}_{run}_qc.json` |
+| `metrics/surface-sample/` | `surface_sample` | Per BOLD run | `dt={date}/{subj}_{ses}_{task}_{run}_surf_qc.json` |
 | `metrics/anat-qc/` | `anat_qc` | Per subject × session | `dt={date}/{subj}_{ses}_anat_qc.json` |
 | `metrics/fsqc-qc/` | `fsqc_qc` | Per subject × session | `dt={date}/{subj}_{ses}_fsqc_qc.json` |
 | `metrics/registration/` | `registration` | Per registration step | `dt={date}/{subj}_{ses}_t1w_to_mni_reg_qc.json` / `dt={date}/{subj}_{ses}_{task}_{run}_bold_to_t1w_reg_qc.json` |
@@ -69,7 +70,7 @@ duplicate table — how the historical `anat`/`anat_qc` and
 | `metrics/step-outcomes/` | `step_outcomes` | Per step × scan unit | `dt={date}/{workflow-name}__{step}__{subj}__{ses}__{task}__{run}_outcome.json` |
 | `metrics/subject-manifests/` | `subject_manifests` | Per Argo workflow | `dt={date}/{workflow-name}__{subj}_manifest.json` |
 
-Each of the nine prefixes above also has a compacted Parquet counterpart at
+Each of the ten prefixes above also has a compacted Parquet counterpart at
 `metrics/compacted/{table}/dt={date}/schema_version={version}/part-0000.parquet`,
 written by the nightly `metrics-compactor` flow — see
 [How compaction works](#how-compaction-works). Raw JSON is retained
@@ -141,11 +142,13 @@ the live emitted JSON has drifted from the `src/metrics/schemas.py` dataclasses 
 dedicated **[Metrics Data Dictionary](metrics_data_dictionary.md)**. Check it before trusting
 any column name in a query or export.
 
-Quick index: `FuncQC` (per BOLD run), `AnatQC` (per subject×session), `RegistrationQC` (per
+Quick index: `FuncQC` (per BOLD run), `SurfaceSampleQC` (per BOLD run — grayordinate QC; the
+durable copy, and the *only* copy for runs preprocessed by the `--emit grayordinate` short path),
+`AnatQC` (per subject×session), `RegistrationQC` (per
 registration — `t1w_to_mni` and `bold_to_t1w` emit different field sets, query them
 separately), `WorkflowRun` (per Argo workflow), `CostAllocation` (per workflow per scrape
 date), `StepOutcome` (per step per scan unit), `SubjectManifest` (per workflow per subject).
-Two more S3 prefixes (`surface-sample/`, `cost-drift-probe/`) exist
+Two more S3 prefixes (`cost-drift-probe/`, `workflow-starts/`) exist
 outside this queryable set — see the dictionary's [Non-schema
 objects](metrics_data_dictionary.md#non-schema-s3-objects) section.
 
@@ -160,9 +163,9 @@ Grafana is at **https://grafana.<YOUR_DOMAIN>**, deployed via ArgoCD (`gitops/ap
 | Pipeline Throughput | `cloudpipe-throughput` | Total runs, success rate, mean duration, mean queue wait; runs-by-status bargauge; recent workflow run table |
 | Functional QC | `cloudpipe-funcqc` | Header: runs QC'd, mean FD, % high-motion runs, median tSNR. Rows: **Head motion** (max FD, % frames > 0.2 mm, mean DVARS; FD + DVARS histograms), **Signal quality** (GCOR, AOR, AQI; tSNR + global-signal histograms), **Processing cost** (runtime, per-run and per-pod peak memory p95; stage-timing + confound-regressor bargauges), **Needs review** (high-motion run table) |
 | Anatomical QC | `cloudpipe-anatqc` | Mean eTIV, brain/eTIV % (ICV-normalized), cortical thickness (LH/RH); brain volume + thickness histograms; full session table |
-| Registration QC | `cloudpipe-regqc` | Mean Dice + NCC (T1w→MNI), % sessions low Dice + warp folding; mean Dice (BOLD→T1w), % runs low Dice; Dice/NCC/Jacobian histograms; T1w→MNI and BOLD→T1w failure tables |
-| Cost Overview | `cloudpipe-costs` | Total cost, mean per subject (thresholded), subjects processed; daily spend timeseries; cost by component (GPU ≈ anatomy/FastSurfer, CPU, memory); cost-by-subject table |
-| Failure Triage | `cloudpipe-failure-triage` | Participants affected, failed/skipped step counts, most common cause; a "what failed" breakdown and a table of every failed & skipped step |
+| Registration QC | `cloudpipe-regqc` | Header: anatomicals + BOLD runs registered, and the rejection rate of each gate. Organised gate-first, twice — for each registration step, what the calibrated gate decided, then the recorded-only metrics behind it. Rows: **T1w→MNI gate** (mean LNCC, % failing LNCC, % over the folding budget — the two gated families; LNCC + folding histograms), **T1w→MNI recorded-only** (mask Dice, mean Jacobian, centroid shift, extreme local volume change; Dice + log-Jacobian histograms; per-metric coverage/distribution table covering all 20 declared `t1w_to_mni` columns), **BOLD→T1w gate** (median `nmi_gain`, % failing, absolute NMI beside its identity baseline; NMI-gain histogram; rejections split by task × run), **BOLD→T1w recorded-only** (`seg_bbr_contrast`, `ngf`, `mhd_mm`, `rigid_disp_max_mm`; contrast + NGF histograms; coverage/distribution table over all 12 declared `bold_to_t1w` columns), **Needs review** (per-step rejection tables naming the bound each record crossed; within-session boundary-contrast outlier table as a descriptive triage aid), **Provenance** (collapsed: records by `registration_type` × `schema_version`). A `schema_version` template variable pins one definition, since `jac_*`/`log_jac_*` changed meaning at 2.1 and `seg_*`/`ngf` only exist from 2.5. Colour bands are set from the measured passing distribution; metrics with no calibrated bound are left uncoloured rather than banded. |
+| Cost Overview | `cloudpipe-costs` | Header: cost per run, total spend, runs/participants, settled share of spend, reconciliation applied. Rows: **Spend over time** (daily spend stacked by component; cost-per-run trend), **Where the money goes** (cost per run by component, by pipeline phase, and by step — the last two from `pod_costs`), **Right-sizing signal** (step economics table with cost beside CPU/RAM request efficiency and resource-hours; spend by node instance type), **Per-run and per-participant detail** (cost-per-run distribution, spend by run outcome, spend-by-participant table), **Settlement and data quality** (collapsed: per-report-date scrape age, adjustment, and component residual) |
+| Failure Triage | `cloudpipe-failure-triage` | Header: participants with incomplete output (from `subject_manifests`, not workflow status), root-cause vs downstream-casualty failure counts, QC rejections. Rows: **Root causes** (failures by step split root/casualty, normalized `failure_reason` families, hourly failures by step), **QC-gate rejections** (joined to `registration.verdict='fail'` — names the gated metric and the bound it crossed), **Hard failures** (crashed/killed/output-missing detail, QC rejections excluded), **Skipped steps** (per participant × session, with any failure in the same session), **Blast radius** (per-participant `subject_manifests` table) |
 | Infrastructure Health | `cloudpipe-infra-health` | Argo workflow phases + queue depth/latency; API server latency; Karpenter node provisioning + disruption summary |
 | Karpenter Autoscaler | `cloudpipe-karpenter` | Per-nodepool resource usage vs limits; node claim lifecycle latency; disruption counts; interruption messages |
 
@@ -245,7 +248,22 @@ pixi run python scripts/export_batch_metrics.py \
 ```
 
 Defaults to the DuckDB backend; pass `--engine athena` for large date ranges
-over the full cohort, where partition pruning matters.
+over the full cohort, where partition pruning matters. That distinction is not a
+preference — measured 2026-08-11, a 0-row DuckDB query for a two-day window took
+**16.8 s** against **23.7 s** for the same query unscoped over the same 3,047
+files, because `sample_size=-1` forces schema inference across the whole glob.
+Read cost tracks total corpus size, not window size, so DuckDB cannot be the
+full-cohort path (projected ~476k files across the six exported grains at 11,876
+subjects).
+
+**Span the batch's start day *through its finish day*.** The QC grains take `dt`
+from workflow *start*; `workflow_runs` takes it from workflow *finish*. A batch
+crossing UTC midnight therefore splits across two `dt=` partitions, and a
+single-day window silently returns a fraction of `workflow_runs` — 15 of 200 on
+the 2026-08-10 batch. Because both cost CSVs are scoped to the workflow names
+`workflow_runs` returned, a short `workflow_runs` truncates the cost totals too.
+`grain_asymmetry_warning()` now catches this by comparing each grain's *subject*
+coverage rather than its row count, which only ever saw a total split.
 
 ### Athena SQL
 
@@ -475,7 +493,7 @@ SELECT <cols> FROM cloudpipe_metrics.func_preproc_compacted WHERE dt < date_form
 ```
 
 `dt` is compared against a **formatted string**, not a bare `CURRENT_DATE`. `dt`
-is declared `string` on all nine tables, so `dt = CURRENT_DATE` is
+is declared `string` on all ten tables, so `dt = CURRENT_DATE` is
 varchar = date and Athena rejects the entire query with `TYPE_MISMATCH`. (`<`
 still orders correctly because `YYYY-MM-DD` sorts lexicographically.) The
 Grafana panels solve the same mismatch the other way round, with
@@ -597,5 +615,5 @@ kubectl exec -n grafana deployment/grafana -c grafana-sc-dashboard -- \
 | [`src/metrics/compactor.py`](https://github.com/jrussell9000/cloudpipe/blob/main/src/metrics/compactor.py) | Compacts raw JSON into per-`schema_version` Parquet under `metrics/compacted/` |
 | [`prefect/flows/metrics_compactor_flow.py`](https://github.com/jrussell9000/cloudpipe/blob/main/prefect/flows/metrics_compactor_flow.py) | Nightly Prefect flow wrapping `compactor.py` |
 | [`images/fastsurfer/extract_qc.py`](https://github.com/jrussell9000/cloudpipe/blob/main/images/fastsurfer/extract_qc.py) | FreeSurfer stats parser — writes `AnatQC` |
-| [`gitops/apps/grafana/`](https://github.com/jrussell9000/cloudpipe/tree/main/gitops/apps/grafana/) | Grafana Helm chart wrapper + 7 dashboard JSONs (Pipeline Throughput, Functional QC, Anatomical QC, Registration QC, Cost Overview, Infrastructure Health, Karpenter) |
+| [`gitops/apps/grafana/`](https://github.com/jrussell9000/cloudpipe/tree/main/gitops/apps/grafana/) | Grafana Helm chart wrapper + 8 dashboard JSONs (Pipeline Throughput, Functional QC, Anatomical QC, Registration QC, Cost Overview, Failure Triage, Infrastructure Health, Karpenter) |
 | [`terraform/modules/metrics/`](https://github.com/jrussell9000/cloudpipe/tree/main/terraform/modules/metrics/) | Glue database + hand-declared catalog tables, Athena workgroup, IAM |

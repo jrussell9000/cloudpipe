@@ -93,8 +93,9 @@ def rigid_transform_metrics(matrix: np.ndarray, points_ras: np.ndarray) -> dict:
 
     Gate the mean displacement if you gate anything: it already folds in the
     rotation's effect on the brain, so rigid_rot_deg is diagnostic rather than a
-    second independent gate (cf. how ice_mean_mm is gated and its percentiles are
-    not). All three are recorded ungated pending batch calibration.
+    second independent gate (one bound per failure family, as in
+    _T1W_MNI_THRESHOLDS). All three are recorded ungated pending batch
+    calibration.
     """
     r = np.asarray(matrix, dtype=np.float64)[:3, :3]
     t = np.asarray(matrix, dtype=np.float64)[:3, 3]
@@ -460,17 +461,34 @@ def centroid_displacement_mm(
 
 # T1w-to-MNI QC gate. One bound per failure family, fail-only — no warn bands.
 #
-# Narrowed from five gated metrics to three (2026-07-25). Every added gate
-# multiplies the FALSE-fail rate, and a false fail costs a GPU re-registration
-# plus operator time; it buys nothing unless it detects a failure mode the other
-# gates miss. These three are each the only cheap detector of their family:
+# Narrowed from five gated metrics to three (2026-07-25), then to two (2026-08-11)
+# when the third turned out never to have run. Every added gate multiplies the
+# FALSE-fail rate, and a false fail costs a GPU re-registration plus operator
+# time; it buys nothing unless it detects a failure mode the other gates miss.
+# These two are each the only cheap detector of their family:
 #
 #   lncc                   intensity agreement with the template
 #   jac_det_frac_negative  local folding (the transform is not a diffeomorphism)
-#   ice_mean_mm            global invertibility (a property of the TRANSFORM
-#                          alone — no intensity, no template — so it catches a
-#                          warp that matches intensities well while being
-#                          globally non-invertible)
+#
+# ice_mean_mm was the third, covering global invertibility — a property of the
+# TRANSFORM alone, so it would catch a warp that matches intensities well while
+# being globally non-invertible. It is WITHDRAWN because the measurement is not
+# obtainable: computing it needs the inverse warp, and `fireants` 1.5.0 raises
+# NotImplementedError('Inverse warp not implemented for SyN registration') from
+# save_as_ants_transforms(save_inverse=True). Every archived t1w-to-mni pod log
+# from the metric's introduction (2026-07-23) through the 2026-08-10 batch
+# carries that warning, and `ice_mean_mm` is absent from 582/582 records of that
+# batch — so the entry gated nothing from the day it was added.
+#
+# It was invisible because it fails open at three layers: the inverse save is
+# non-fatal, the metric is computed only `if inv_warp_path is not None`, and
+# verdict() skips absent keys. Each layer is defensible alone; composed, they
+# turn "a third of the gate never ran" into `verdict=pass` plus a WARNING line in
+# a pod log. A declared-but-inert bound is worse than an absent one, because
+# every consumer (this table, the specs, two dashboards) asserted a
+# three-family gate that did not exist. inverse_consistency_error() is kept and
+# still tested: if upstream implements the SyN inverse, restore the emitter call
+# and this entry together.
 #
 # Warn bands are gone. Warn exited 0, promoted outputs, and had no consumer — but
 # all three recorded recalibrations (lncc 2026-07-03, jac_det_frac_negative,
@@ -494,13 +512,12 @@ _T1W_MNI_THRESHOLDS = {
     # ~17% of the time — it was measuring the population mean, not detecting
     # anomalies.
     'jac_det_frac_negative': {'fail': 0.005, 'direction': 'above'},
-    # Forward∘inverse round-trip residual. Sub-half-voxel on 1 mm MNI152. Gated
-    # on the mean; p95/p99/max are recorded for diagnosis but not gated. Absent
-    # when the inverse warp could not be saved — verdict() skips absent keys, so
-    # this gate fails open rather than failing a session on a missing measurement.
-    'ice_mean_mm': {'fail': 0.5, 'direction': 'above'},
     # DELIBERATELY NOT GATED, recorded only:
     #
+    #   ice_* — the forward∘inverse round-trip residual, and the withdrawn third
+    #     gate. Not currently obtainable at all; see the note above. The fields
+    #     stay declared in RegistrationQC so the columns exist if the inverse
+    #     lands upstream.
     #   mask_dice — near-inert by construction. Whole-brain overlap saturates for
     #     affine+SyN to a template (10-subject batch: mean 0.9818, sd 0.0019,
     #     range 0.9759-0.9843), so a bound that can fire at all has to sit far
@@ -768,6 +785,14 @@ def inverse_consistency_error(
     mask_path: str | None = None,
 ) -> dict:
     """Round-trip error of composing the forward and inverse warps, in mm.
+
+    CURRENTLY UNREACHABLE FROM THE PIPELINE, and kept deliberately. `fireants`
+    1.5.0 cannot produce the inverse of a SyN fit — save_as_ants_transforms(
+    save_inverse=True) raises NotImplementedError — so fst1w_to_mni.py has no
+    inverse field to pass here and the ice_* metrics are never emitted. The
+    matching gate entry was withdrawn from _T1W_MNI_THRESHOLDS on 2026-08-11 for
+    that reason. This function is correct and tested; restoring the metric is a
+    matter of obtaining the inverse, not of rewriting this.
 
     Displace each voxel by the forward field, then displace the result by the
     inverse field sampled at that (off-grid) location. A true inverse pair

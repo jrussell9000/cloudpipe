@@ -15,7 +15,7 @@ Four Karpenter NodePools provision pipeline nodes on demand, each constrained to
 | NodePool | Arch | Instances | Capacity | Consolidation | Use |
 |---|---|---|---|---|---|
 | `cpu-light-nodepool` | amd64 | t-family (burstable) | spot only | `WhenEmptyOrUnderutilized` after 10m | Globus, inventory, lightweight scripting |
-| `cpu-heavy-nodepool` | amd64 | c/m, 2xlarge or 4xlarge | spot only | `WhenEmpty` after 30m | SynthMorph, AFNI func-preproc |
+| `cpu-heavy-nodepool` | amd64 | c/m, 2xlarge or 4xlarge | spot only | `WhenEmpty` after 10m | SynthMorph, AFNI func-preproc |
 | `gpu-nodepool` | amd64 | g4dn, g5, g6, g6e (single-GPU NVIDIA) | spot only | `WhenEmpty` after 10m | FastSurfer, FireANTs |
 | `first-level-nodepool` | arm64 | {m,r,c}{6g,7g}d (Graviton, NVMe), xlarge–4xlarge | spot only | `WhenEmpty` after 10m | fmri-first-level-proc |
 
@@ -31,5 +31,5 @@ Karpenter provisions a new node within ~30 seconds of an unschedulable pod appea
 - Cluster cost scales with actual pipeline throughput; idle periods between subject batches incur only the cost of the three fixed managed node groups
 - **All four pools are spot-only, by design, for cost.** There is no on-demand fallback anywhere — not on `cpu-light`, not on `gpu-nodepool`. The pipeline absorbs interruption through retries instead: the retry strategy keys on exit codes 137/143 and the `imminent node shutdown` message to handle the ~2-minute spot interruption notice. Reintroducing on-demand as insurance would be a real decision to revisit, not a description of the current state
 - Spot scarcity is handled by **widening the pool rather than falling back**. `gpu-nodepool` was extended from `["g4dn","g5"]` to `["g4dn","g5","g6","g6e"]` — T4, A10G, L4, L40S, all single-GPU amd64 — so `price-capacity-optimized` has more families to reach for. `g6f` is deliberately excluded: its ~5.59 GiB fractional-L4 slice cannot honour the cluster-wide 3-slice time-slicing config
-- The `WhenEmptyOrUnderutilized` policy on `cpu-light` reclaims partially-empty nodes; the `WhenEmpty` policy on other pools avoids consolidation mid-step since those pods hold long-running workloads that must not be disrupted. `cpu-heavy` additionally waits 30m rather than 10m
+- The `WhenEmptyOrUnderutilized` policy on `cpu-light` reclaims partially-empty nodes; the `WhenEmpty` policy on other pools avoids consolidation mid-step since those pods hold long-running workloads that must not be disrupted. All pools now use `consolidateAfter: 10m`; `cpu-heavy` waited 30m until 2026-08-11, when a mid-batch measurement at 200 concurrent found 25 of 148 nodes (~17%) holding zero workflow pods while they waited out the timer. Note that on `cpu-heavy` the policy choice is forced regardless: 264 of 267 workflow pods carry `karpenter.sh/do-not-disrupt: true`, so `WhenEmptyOrUnderutilized` could not repack them anyway — `consolidateAfter` only governs the empty-node tail
 - g5g/g6g (Graviton GPU) instances are excluded from `gpu-nodepool` via the amd64 architecture constraint — pipeline GPU images are built for linux/amd64 only. `g7` is omitted separately, pending driver validation against the baked AMI

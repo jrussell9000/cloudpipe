@@ -1,14 +1,19 @@
 """
-outcome_recorder.py — Record a StepOutcome for one cloudpipe pipeline step.
+outcome_recorder.py — Record StepOutcome records for cloudpipe pipeline steps.
 
 Invoked as an Argo DAG sibling task immediately after each substantive step.
 Classifies the Argo failure message into a taxonomy category, verifies which
 expected output S3 paths exist, and writes a StepOutcome JSON to S3.
 
+--step is repeatable. Steps that share a producer task and a gate, differing
+only by step name, are recorded by a single pod: each gets its own
+expected-output verification, per-run status and record, and one step's failure
+never suppresses another's.
+
 Usage:
   python outcome_recorder.py \
     --workflow-name cloudpipe-abc123 \
-    --step t1w-to-mni \
+    --step t1w-to-mni [--step surface-sample] \
     --subject sub-NDABC123 \
     --session ses-baselineYear1Arm1 \
     --status Succeeded \
@@ -309,7 +314,12 @@ def verify_outputs(expected: list[str], bucket: str, region: str, step: str = ""
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Record a StepOutcome to S3")
     p.add_argument("--workflow-name", required=True)
-    p.add_argument("--step", required=True)
+    # Repeatable: one pod can record several steps that share a producer task
+    # and a gate, differing only by step name. func-preproc and surface-sample
+    # both hang off functional-preprocessing-dagtask, so recording them together
+    # halves the fallback recorder pods. Each step still gets its own
+    # expected-output check, per-run status and S3 record.
+    p.add_argument("--step", required=True, action="append")
     p.add_argument("--subject", required=True)
     p.add_argument("--session", default="na")
     p.add_argument("--task", default="na")
@@ -336,19 +346,18 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-
+def record_one_step(args: argparse.Namespace, step: str) -> None:
+    """Verify outputs for one step and write its StepOutcome record."""
     # Verify this run's own output first — its presence is what defines this
     # run's success once the step has run (see resolve_run_status).
     expected_keys = default_expected_keys(
-        step=args.step,
+        step=step,
         subject=args.subject,
         session=args.session,
         task=args.task,
         run=args.run,
     )
-    outputs_verified = verify_outputs(expected_keys, args.bucket, args.region, step=args.step)
+    outputs_verified = verify_outputs(expected_keys, args.bucket, args.region, step=step)
 
     # The pod-level status is only a starting point — resolve this run's own.
     run_status = resolve_run_status(args.status, expected_keys, outputs_verified)
@@ -374,7 +383,7 @@ def main() -> None:
 
     outcome = StepOutcome(
         workflow_name=args.workflow_name,
-        step=args.step,
+        step=step,
         subject=args.subject,
         session=args.session,
         task=args.task,
@@ -389,7 +398,7 @@ def main() -> None:
 
     s3_key = StepOutcome.s3_key(
         workflow_name=args.workflow_name,
-        step=args.step,
+        step=step,
         subject=args.subject,
         session=args.session,
         task=args.task,
@@ -398,7 +407,7 @@ def main() -> None:
     )
 
     print(f"  Recording step outcome: {s3_key}", flush=True)
-    print(f"  step={args.step}  status={run_status}  category={failure_category}", flush=True)
+    print(f"  step={step}  status={run_status}  category={failure_category}", flush=True)
     if outputs_verified:
         print(f"  outputs_verified={outputs_verified}", flush=True)
 
@@ -409,6 +418,25 @@ def main() -> None:
         region=args.region,
     )
     print("  Done.", flush=True)
+
+
+def main() -> None:
+    args = parse_args()
+
+    # Argo always passes every declared arg, so an unused optional step arrives
+    # as "" — drop those rather than writing a record with an empty step name.
+    steps = [s for s in (s.strip() for s in args.step) if s]
+    if not steps:
+        print("WARNING: no non-empty --step given; nothing to record", flush=True)
+        return
+
+    # Each step is independent: one step's S3 error must not cost the others
+    # their record, since a merged invocation is the only recorder pod they get.
+    for step in steps:
+        try:
+            record_one_step(args, step)
+        except Exception as exc:
+            print(f"WARNING: recording step={step} failed (non-fatal): {exc}", flush=True)
 
 
 if __name__ == "__main__":

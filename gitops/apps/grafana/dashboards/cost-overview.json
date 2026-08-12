@@ -1,7 +1,7 @@
 {
   "uid": "cloudpipe-costs",
   "title": "CloudPipe — Cost Overview",
-  "description": "Pipeline spend per participant and per component, from Kubecost allocation data. Figures settle over about three days — read the dashboard notes before quoting a number.",
+  "description": "Pipeline spend per participant, per pipeline step, and per component, from Kubecost allocation data. Figures settle over about three days — check the 'Settled share' tile before quoting a number.",
   "tags": [
     "cloudpipe",
     "cost",
@@ -37,100 +37,12 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 10,
-        "h": 6
+        "w": 9,
+        "h": 7
       },
       "options": {
         "mode": "markdown",
-        "content": "### 💰 What the pipeline costs\n\nSpend is attributed per participant by tagging every pod with the subject it is processing, then reading Kubecost's allocation data once a day.\n\n**Unit cost is per _run_, not per person.** One workflow = one participant processed once. Test batches reuse a fixed subject list, so the same people are reprocessed constantly — over the 30 days to 2026-08-09, 317 runs covered just 100 participants. Dividing spend by distinct participants would have reported $0.85 where the real unit cost was $0.27, so these panels divide by distinct workflows instead.\n\n**⚠️ Recent numbers are too high.** Cloud billing reconciles over roughly three days as reserved-capacity and spot discounts are applied. A figure scraped the day after a run has historically overstated the settled cost by a **median of ~51%** — occasionally much more. Numbers older than three days are reconciled and trustworthy; the last two days are provisional.\n\n**Component costs are list price.** The CPU/memory/GPU split is *gross* — it does not carry the discounts that land later, which is why the components can add up to more than the reconciled total.\n\n**Rows without a participant are probe runs** — infrastructure warm-ups, not real work — and are excluded from the per-participant figures."
-      }
-    },
-    {
-      "id": 1,
-      "type": "stat",
-      "title": "Total spend",
-      "gridPos": {
-        "x": 10,
-        "y": 0,
-        "w": 5,
-        "h": 6
-      },
-      "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
-          },
-          "rawSQL": "SELECT ROUND(SUM(total_cost_usd), 2) AS total_cost FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "currencyUSD",
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "green"
-          }
-        }
-      },
-      "description": "Sum over every cost record in range, including probe runs and reprocessing. This is the money actually spent, not a per-participant estimate.",
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "textMode": "value",
-        "justifyMode": "center"
-      }
-    },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "Runs / participants",
-      "gridPos": {
-        "x": 15,
-        "y": 0,
-        "w": 5,
-        "h": 6
-      },
-      "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
-          },
-          "rawSQL": "SELECT COUNT(DISTINCT workflow_name) AS runs, COUNT(DISTINCT subject) AS participants FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> ''"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "blue"
-          }
-        }
-      },
-      "description": "`runs` = distinct workflows with attributed cost in range — one workflow is one participant processed once. `participants` = distinct people behind those runs. The two diverge whenever a subject is reprocessed, which is routine here because test batches reuse a fixed subject list; over a typical month `runs` has been ~3x `participants`. Probe runs (no subject tag) are excluded from both.",
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center"
+        "content": "### 💰 What the pipeline costs\n\nEvery pod is tagged with the subject it is processing and the pipeline step it is running; Kubecost's allocation data is read once a day at two grains — per workflow (`costs`) and per pod (`pod_costs`). The pod grain sums back to the workflow grain exactly, so the drill-downs below reconcile with the headline by construction.\n\n**Unit cost is per _run_, not per person.** One workflow = one participant processed once. Test batches reuse a fixed subject list, so the same people are reprocessed constantly. Dividing spend by distinct participants has reported $0.85 where the real unit cost was $0.27, so these panels divide by distinct workflows.\n\n**⚠️ Check the _Settled share_ tile first.** Cloud billing reconciles over roughly three days. A figure scraped the day after a run has historically overstated the settled cost by a **median of ~51%**. When that tile is below 100%, part of this window is provisional.\n\n**Components are pre-reconciliation.** CPU + memory + GPU exclude the billing adjustment that arrives later; the total includes it. The gap is the _Reconciliation_ tile — plus any storage, network, or load-balancer cost, which the workflow grain does not break out.\n\n**Rows without a participant are probe runs** — infrastructure warm-ups — and are excluded from per-run figures."
       }
     },
     {
@@ -138,10 +50,10 @@
       "type": "stat",
       "title": "Cost per run",
       "gridPos": {
-        "x": 20,
+        "x": 9,
         "y": 0,
-        "w": 4,
-        "h": 6
+        "w": 5,
+        "h": 4
       },
       "datasource": {
         "uid": "cloudpipe-athena",
@@ -163,13 +75,167 @@
       "fieldConfig": {
         "defaults": {
           "unit": "currencyUSD",
+          "decimals": 3,
           "color": {
             "mode": "fixed",
-            "fixedColor": "green"
+            "fixedColor": "text"
           }
         }
       },
-      "description": "Total spend divided by distinct workflows — the cost of processing one participant once. Two traps this avoids: it is NOT an average of per-row costs (rows are per workflow per scrape-date, so a run spanning midnight UTC contributes several rows), and it does NOT divide by distinct participants, which inflates the figure by the reprocessing multiple — with a fixed test-batch subject list that ran ~3.2x over the 30 days to 2026-08-09, turning a true $0.27 into $0.85. The July 2026 rightsizing is often quoted as taking this from $0.74 to $0.36; that pair came from day+1 scrapes, and on the settled re-scrape of the same 2026-07-31 A/B it reads $0.379 -> $0.304 per run. Even that is soft — the two cohorts share only 2 of 10 subjects, and per-POD cost is flat between them ($0.0212 vs $0.0208), so most of the gap is BOLD run count, not rightsizing.",
+      "description": "The headline number: total spend divided by distinct workflows — the cost of processing one participant once. Two traps this avoids. It is NOT an average of per-row costs (rows are per workflow per report date, so a run spanning midnight UTC contributes several rows), and it does NOT divide by distinct participants, which inflates the figure by the reprocessing multiple — with a fixed test-batch subject list that ran ~3.2x over the 30 days to 2026-08-09, turning a true $0.27 into $0.85. The July 2026 rightsizing is often quoted as taking this from $0.74 to $0.36; that pair came from day+1 scrapes, and on the settled re-scrape of the same 2026-07-31 A/B it reads $0.379 -> $0.304 per run. Even that is soft — the two cohorts share only 2 of 10 subjects, and per-POD cost is flat between them ($0.0212 vs $0.0208), so most of the gap is BOLD run count, not rightsizing.",
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total spend",
+      "gridPos": {
+        "x": 14,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT ROUND(SUM(total_cost_usd), 2) AS total_cost FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        }
+      },
+      "description": "Sum over every cost record in range, including probe runs and reprocessing. This is the money actually spent, not a per-participant estimate.",
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Runs / participants",
+      "gridPos": {
+        "x": 19,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT COUNT(DISTINCT workflow_name) AS runs, COUNT(DISTINCT subject) AS participants FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> ''"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        }
+      },
+      "description": "`runs` = distinct workflows with attributed cost in range — one workflow is one participant processed once. `participants` = distinct people behind those runs. The two diverge whenever a subject is reprocessed, which is routine here because test batches reuse a fixed subject list; over a typical month `runs` has been ~3x `participants`. Probe runs (no subject tag) are excluded from both.",
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Settled share of spend",
+      "gridPos": {
+        "x": 9,
+        "y": 4,
+        "w": 7,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT ROUND(100.0 * SUM(CASE WHEN scrape_age_days >= 3 THEN total_cost_usd ELSE 0 END) / NULLIF(SUM(total_cost_usd), 0), 0) AS pct_settled FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 99
+              }
+            ]
+          }
+        }
+      },
+      "description": "Share of the spend in this window that has been re-scraped at scrape_age_days >= 3, where Kubecost's reconciliation against cloud billing has converged. 100% (green) means every dollar shown is settled and quotable. Anything less means part of the window is a day+1 read, which has historically overstated settled cost by a median ~51%. A window that stays below 100% for dates older than three days is a signal the settled re-scrape never landed, not that billing is still moving.",
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -178,13 +244,58 @@
       }
     },
     {
+      "id": 11,
+      "type": "stat",
+      "title": "Reconciliation applied so far",
+      "gridPos": {
+        "x": 16,
+        "y": 4,
+        "w": 8,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT ROUND(100.0 * SUM(total_adjustment_usd) / NULLIF(SUM(total_cost_usd), 0), 1) AS pct_of_total FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        }
+      },
+      "description": "`total_adjustment_usd` as a share of total spend — the portion of the total that reconciliation against cloud billing has already contributed. This is also exactly the gap between the total and the CPU+memory+GPU components: Kubecost's component costs exclude adjustments while its total includes them, so total - (cpu+memory+gpu) = adjustment whenever storage, network, and load-balancer cost are ~0 (as they are today). That is why the component panel below does not sum to Total spend, and it replaces the old gross/net double-bar, which only ever rescaled every component by this one shared factor.",
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
       "id": 100,
       "type": "row",
-      "title": "📈 Over time",
+      "title": "📈 Spend over time",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 6,
+        "y": 7,
         "w": 24,
         "h": 1
       },
@@ -193,11 +304,609 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Daily spend",
+      "title": "Daily spend by component",
       "gridPos": {
         "x": 0,
-        "y": 7,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT CAST(date AS TIMESTAMP) AS time, ROUND(SUM(cpu_cost_usd), 4) AS \"CPU\", ROUND(SUM(memory_cost_usd), 4) AS \"Memory\", ROUND(SUM(gpu_cost_usd), 4) AS \"GPU\" FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY 1 ORDER BY 1 ASC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 85,
+            "lineWidth": 0,
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisSoftMin": 0,
+            "gradientMode": "none"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CPU"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Memory"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "GPU"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Stacked because the three components are parts of one whole. The stack height is pre-reconciliation spend, so it sits slightly below Total spend by the Reconciliation share above. Colors are pinned per component, so they do not move when the ordering does. Expect the most recent one or two bars to fall as billing reconciles."
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Cost per run over time",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT CAST(date AS TIMESTAMP) AS time, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_run FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' GROUP BY 1 ORDER BY 1 ASC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 3,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "always",
+            "pointSize": 8,
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "gradientMode": "none"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "description": "The unit-cost trend — the number a right-sizing change should move. One series, so no legend: the title names it. Read a single point with care: cost is bucketed by report date, so a run that spanned midnight UTC lands partly on each of two days and pushes both points below the true per-run cost. Only compare dates whose whole batch ran inside one UTC day, and only once the Settled share tile reads 100%."
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "🧾 Where the money goes",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 16,
         "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "barchart",
+      "title": "Cost per run, by component",
+      "description": "Which resource the money buys, per workflow run. Three bars, one hue: the job here is comparing magnitudes, not telling identities apart. These are Kubecost's pre-reconciliation component costs, so they sum to slightly less than Cost per run — the difference is the Reconciliation tile above, and it is the same scalar for all three components, which is why showing a second 'net' bar per component (the old design) added no information.",
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT 'CPU' AS component, ROUND(SUM(cpu_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_run FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' UNION ALL SELECT 'GPU', ROUND(SUM(gpu_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' UNION ALL SELECT 'Memory', ROUND(SUM(memory_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' ORDER BY cost_per_run DESC"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "always",
+        "stacking": "none",
+        "barWidth": 0.6,
+        "groupWidth": 0.7,
+        "xTickLabelRotation": 0,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 85,
+            "gradientMode": "none",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "barchart",
+      "title": "Cost per run, by pipeline phase",
+      "description": "From `pod_costs`, rolled up by the `cloudpipe.io/phase` pod label — the coarse answer to 'which part of the pipeline costs the money'. Anatomical segmentation dominates by design. Phases past the top five fold into `other` rather than earning their own bar; pods with no phase label (Argo helper pods) appear as `unlabelled`. Every pod is counted, so this sums to the full workflow cost and reconciles with Cost per run.",
+      "gridPos": {
+        "x": 6,
+        "y": 17,
+        "w": 9,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH scoped AS (SELECT CASE WHEN phase = '' THEN 'unlabelled' ELSE phase END AS phase, workflow_name, total_cost_usd FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())), runs AS (SELECT COUNT(DISTINCT workflow_name) AS n FROM scoped), per_phase AS (SELECT phase, SUM(total_cost_usd) AS c FROM scoped GROUP BY 1), ranked AS (SELECT phase, c, ROW_NUMBER() OVER (ORDER BY c DESC) AS rn FROM per_phase) SELECT CASE WHEN rn <= 5 THEN phase ELSE 'other' END AS phase, ROUND(SUM(c) / NULLIF((SELECT n FROM runs), 0), 4) AS cost_per_run FROM ranked GROUP BY 1 ORDER BY cost_per_run DESC"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "always",
+        "stacking": "none",
+        "barWidth": 0.7,
+        "groupWidth": 0.7,
+        "xTickLabelRotation": 0,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 85,
+            "gradientMode": "none",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "type": "barchart",
+      "title": "Cost per run, by step (top 12)",
+      "description": "The same `pod_costs` data one level finer, by the `cloudpipe.io/step` pod label. This is the actionable ranking: the step at the top is where a runtime or request change buys the most. The divisor is distinct workflows in the whole window, not just the workflows that ran this step, so a step that is skipped when derivatives already exist reads lower here than in Step economics below — that table's `runs` column tells you which case you are in.",
+      "gridPos": {
+        "x": 15,
+        "y": 17,
+        "w": 9,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH scoped AS (SELECT step, workflow_name, total_cost_usd FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND step <> ''), runs AS (SELECT COUNT(DISTINCT workflow_name) AS n FROM scoped) SELECT step, ROUND(SUM(total_cost_usd) / NULLIF((SELECT n FROM runs), 0), 4) AS cost_per_run FROM scoped GROUP BY step ORDER BY cost_per_run DESC LIMIT 12"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "always",
+        "stacking": "none",
+        "barWidth": 0.8,
+        "groupWidth": 0.7,
+        "xTickLabelRotation": 0,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 85,
+            "gradientMode": "none",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "🔧 Right-sizing signal",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "table",
+      "title": "Step economics",
+      "description": "Cost next to the efficiency that produced it — this is what makes the pod grain actionable rather than merely descriptive. `cpu_eff` / `ram_eff` are Kubecost's usage-over-request ratios: an expensive step with low efficiency is over-requested, and that is where per-pod cost is reducible. Values above 1.0 mean the pod burst past its request (routine for the GPU steps, which set a small CPU request deliberately) — not an error, and the gauge simply pins at full. `runs` is the workflows that actually ran the step, so `cost_per_run` here is the step's unit cost when it runs and steps skipped because derivatives already existed do not dilute it. Sorted by total spend.",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 15,
+        "h": 11
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT step, COUNT(DISTINCT workflow_name) AS runs, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_run, ROUND(AVG(runtime_minutes), 1) AS avg_minutes, ROUND(AVG(cpu_efficiency), 2) AS cpu_eff, ROUND(AVG(ram_efficiency), 2) AS ram_eff, ROUND(SUM(cpu_core_hours), 1) AS cpu_core_hours, ROUND(SUM(ram_gb_hours), 1) AS ram_gb_hours, ROUND(SUM(gpu_hours), 1) AS gpu_hours FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND step <> '' GROUP BY step ORDER BY total_cost DESC"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false,
+          "fields": []
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total_cost"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cost_per_run"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "(cpu_eff|ram_eff)"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.75
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Spend by node instance type",
+      "description": "Where the pods actually landed. Instance type drives the hourly rate, so a step whose cost moves without its resource-hours moving is a placement effect, not a workload change. `pods_per_node` is the packing ratio — a low ratio on an expensive type means capacity paid for and left idle. GPU types are identifiable by a non-zero `gpu_hours`.",
+      "gridPos": {
+        "x": 15,
+        "y": 26,
+        "w": 9,
+        "h": 11
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT node_instance_type, ROUND(SUM(total_cost_usd), 2) AS total_cost, COUNT(DISTINCT node) AS nodes, COUNT(*) AS pods, ROUND(COUNT(*) * 1.0 / NULLIF(COUNT(DISTINCT node), 0), 1) AS pods_per_node, ROUND(SUM(gpu_hours), 1) AS gpu_hours FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND node_instance_type <> '' GROUP BY node_instance_type ORDER BY total_cost DESC LIMIT 25"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false,
+          "fields": []
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total_cost"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 400,
+      "type": "row",
+      "title": "👤 Per-run and per-participant detail",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "histogram",
+      "title": "Cost per run, distribution",
+      "description": "One observation per workflow. The spread is the point: runtime and cost are driven by BOLD run count and length per participant, so a wide distribution is expected and the mean alone hides it. Compare the bulk of the distribution, not the tail, when judging a right-sizing change. Runs still in flight at scrape time contribute a partial cost and sit artificially far left.",
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 8,
         "h": 9
       },
       "datasource": {
@@ -214,37 +923,99 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT CAST(date AS TIMESTAMP) AS time, ROUND(SUM(total_cost_usd), 2) AS daily_cost, ROUND(SUM(cpu_cost_usd), 2) AS cpu_cost, ROUND(SUM(memory_cost_usd), 2) AS memory_cost FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY 1 ORDER BY 1 ASC"
+          "rawSQL": "SELECT ROUND(SUM(total_cost_usd), 4) AS cost_per_run FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' GROUP BY workflow_name"
         }
       ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "currencyUSD"
+      "options": {
+        "fillOpacity": 85,
+        "legend": {
+          "showLegend": false
         }
       },
-      "description": "Total, CPU, and memory cost per day. Expect the most recent one or two points to fall as billing reconciles."
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 3,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      }
     },
     {
-      "id": 200,
-      "type": "row",
-      "title": "🧾 Breakdown",
-      "collapsed": false,
+      "id": 18,
+      "type": "barchart",
+      "title": "Spend by run outcome",
+      "description": "Money spent on runs that did not succeed. Joins `costs` to `workflow_runs` on workflow_name. `no run record` is not a failure category: a workflow gets its run record only when it finishes, so in-flight runs — and runs whose record predates this window — land there. Read it as 'unknown', and expect it to be large while a batch is running. The two tables also partition differently (cost on report date, workflow_runs on finish date), so a narrow window can leave genuinely-matched runs unmatched.",
       "gridPos": {
-        "x": 0,
-        "y": 16,
-        "w": 24,
-        "h": 1
+        "x": 8,
+        "y": 38,
+        "w": 6,
+        "h": 9
       },
-      "panels": []
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT CASE WHEN r.status IS NULL THEN 'no run record' ELSE r.status END AS outcome, ROUND(SUM(c.total_cost_usd), 2) AS total_cost FROM cloudpipe_metrics.costs c LEFT JOIN cloudpipe_metrics.workflow_runs r ON r.workflow_name = c.workflow_name WHERE CAST(c.date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(c.dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY 1 ORDER BY total_cost DESC"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "always",
+        "stacking": "none",
+        "barWidth": 0.6,
+        "groupWidth": 0.7,
+        "xTickLabelRotation": 0,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 85,
+            "gradientMode": "none",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": []
+      }
     },
     {
-      "id": 6,
-      "type": "bargauge",
-      "title": "Cost per run, by component",
-      "description": "Where the money goes: CPU, memory, GPU. Per workflow run, matching the `Cost per run` stat. Gross list price, as described in the notes — use it to compare components against each other, not to reconcile against the billed total.",
+      "id": 5,
+      "type": "table",
+      "title": "Spend by participant",
+      "description": "Top 50 by total cost, summed over every time the participant was processed. `runs` counts the distinct workflows, and `cost_per_run` divides by it. `days` counts the distinct report dates the participant appears on; it can exceed `runs` when a single run spanned midnight UTC. Probe rows carry no subject and appear as a blank row.",
       "gridPos": {
-        "x": 0,
-        "y": 17,
+        "x": 14,
+        "y": 38,
         "w": 10,
         "h": 9
       },
@@ -262,50 +1033,190 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT ROUND(SUM(gpu_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS \"GPU (gross)\", ROUND(SUM(gpu_cost_usd) * (SUM(total_cost_usd) / NULLIF(SUM(cpu_cost_usd + memory_cost_usd + gpu_cost_usd), 0)) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS \"GPU (net)\", ROUND(SUM(cpu_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS \"CPU (gross)\", ROUND(SUM(cpu_cost_usd) * (SUM(total_cost_usd) / NULLIF(SUM(cpu_cost_usd + memory_cost_usd + gpu_cost_usd), 0)) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS \"CPU (net)\", ROUND(SUM(memory_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS \"Memory (gross)\", ROUND(SUM(memory_cost_usd) * (SUM(total_cost_usd) / NULLIF(SUM(cpu_cost_usd + memory_cost_usd + gpu_cost_usd), 0)) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS \"Memory (net)\" FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> ''"
+          "rawSQL": "SELECT subject, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_run, ROUND(SUM(cpu_cost_usd), 2) AS cpu_cost, ROUND(SUM(memory_cost_usd), 2) AS memory_cost, ROUND(SUM(gpu_cost_usd), 2) AS gpu_cost, COUNT(DISTINCT workflow_name) AS runs, COUNT(DISTINCT date) AS days FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY subject ORDER BY total_cost DESC LIMIT 50"
         }
       ],
       "options": {
-        "orientation": "horizontal",
-        "displayMode": "gradient"
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false,
+          "fields": []
+        }
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "currencyUSD"
-        }
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*_cost$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cost_per_run"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          }
+        ]
       }
     },
     {
-      "id": 5,
-      "type": "table",
-      "title": "Spend by participant",
-      "description": "Top 50 by total cost, summed over every time the participant was processed. `runs` counts the distinct workflows — divide `total_cost` by it to get the per-run cost. `days` counts the distinct scrape dates the participant appears on; it can exceed `runs` when a single run spanned midnight UTC.",
+      "id": 500,
+      "type": "row",
+      "title": "🔍 Settlement and data quality",
+      "collapsed": true,
       "gridPos": {
-        "x": 10,
-        "y": 17,
-        "w": 14,
-        "h": 9
+        "x": 0,
+        "y": 47,
+        "w": 24,
+        "h": 1
       },
-      "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
-      },
-      "targets": [
+      "panels": [
         {
-          "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "id": 19,
+          "type": "table",
+          "title": "Settlement state by report date",
+          "description": "The audit trail behind the Settled share tile, one row per report date. `scrape_age_days` is how many days after the report date the record was written: the nightly scraper writes 1 and the settled re-scrape overwrites the same key at 3, so a date older than three days still reading 1 is a date whose re-scrape never landed — a data gap, not a billing delay. `adjustment_pct` is how much of the total reconciliation has contributed so far. `residual` is total minus CPU+memory+GPU and should equal `adjustment` while storage, network, and load-balancer costs are ~0; a residual that diverges from the adjustment means one of those has become non-trivial and the workflow grain no longer breaks out all of the spend.",
+          "gridPos": {
+            "x": 0,
+            "y": 48,
+            "w": 24,
+            "h": 9
           },
-          "rawSQL": "SELECT subject, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(cpu_cost_usd), 2) AS cpu_cost, ROUND(SUM(memory_cost_usd), 2) AS memory_cost, COUNT(DISTINCT workflow_name) AS runs, COUNT(DISTINCT date) AS days FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY subject ORDER BY total_cost DESC LIMIT 50"
+          "datasource": {
+            "uid": "cloudpipe-athena",
+            "type": "grafana-athena-datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "queryType": "table",
+              "format": 1,
+              "connectionArgs": {
+                "catalog": "__default",
+                "database": "__default",
+                "region": "__default"
+              },
+              "rawSQL": "SELECT date, MAX(scrape_age_days) AS scrape_age_days, COUNT(DISTINCT workflow_name) AS runs, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_adjustment_usd), 3) AS adjustment, ROUND(100.0 * SUM(total_adjustment_usd) / NULLIF(SUM(total_cost_usd), 0), 1) AS adjustment_pct, ROUND(SUM(total_cost_usd) - SUM(cpu_cost_usd + memory_cost_usd + gpu_cost_usd), 3) AS residual, MAX(schema_version) AS schema_version FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY date ORDER BY date DESC"
+            }
+          ],
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm",
+            "footer": {
+              "show": false,
+              "reducer": [],
+              "countRows": false,
+              "fields": []
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "cellOptions": {
+                  "type": "auto"
+                }
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "total_cost"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "currencyUSD"
+                  },
+                  {
+                    "id": "decimals",
+                    "value": 2
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "scrape_age_days"
+                },
+                "properties": [
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-text"
+                    }
+                  },
+                  {
+                    "id": "thresholds",
+                    "value": {
+                      "mode": "absolute",
+                      "steps": [
+                        {
+                          "color": "orange",
+                          "value": null
+                        },
+                        {
+                          "color": "green",
+                          "value": 3
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "adjustment_pct"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "percent"
+                  },
+                  {
+                    "id": "decimals",
+                    "value": 1
+                  }
+                ]
+              }
+            ]
+          }
         }
-      ],
-      "fieldConfig": {
-        "defaults": {}
-      }
+      ]
     }
   ]
 }

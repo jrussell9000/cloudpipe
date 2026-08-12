@@ -1,0 +1,232 @@
+# Diagnostic repro for GitHub #235 — the k=4 fastsurfer-long-parcellation OOM.
+#
+# WHAT THIS IS FOR. On 2026-08-11 a single mri_normalize in cloudpipe-zkrmj
+# (sub-R4PV7WZ3, k=4) grew to 25.97 GiB anonymous RSS while its three siblings sat
+# at 464/464/400 MB, and memory.oom.group took the whole pod down with it. Source
+# reading (mri_normalize.cpp / utils/mrinorm.cpp @ 4d15e6a) shows no allocation on
+# this path can exceed one 256^3 volume, so this is an allocation fault rather than
+# data-scaled demand. This manifest reproduces that one pod in isolation to find
+# where the failure actually lands.
+#
+# WHY NOT JUST RESUBMIT THE PIPELINE. check_fastsurfer_derivatives (src/inventory.py)
+# is a bare head_object existence check, and sub-R4PV7WZ3 already has all four
+# *_templated.tar.gz in derivatives/ (incomplete ones — 66 entries, IsRunning.lh+rh
+# present, surf/ missing white+pial). So fastsurfer-exists is True and a master
+# workflow submission SKIPS the entire anatomical phase. See the separate issue on
+# that; it is not what this manifest is testing.
+#
+# TWO DELIBERATE DIFFERENCES FROM THE PRODUCTION TEMPLATE:
+#   1. stdbuf -oL -eL. mri_normalize never calls setbuf, so stdout to the archived
+#      log is block-buffered and the original SIGKILL discarded the pending buffer —
+#      which is why the last visible line ("Applying bias correction") does NOT
+#      locate the crash. stdbuf sets LD_PRELOAD/_STDBUF_O, which propagates through
+#      brun_fastsurfer.sh to every descendant, so this run reports the true site.
+#   2. NO output artifacts. This must not publish to derivatives/fastsurfer/ — the
+#      subject's real (already-broken) derivatives are being handled separately.
+#
+# Inputs are the surviving scratch objects from the original failed workflow, so
+# nothing upstream has to be regenerated. Verify they still exist before submitting:
+#   aws s3 ls s3://<YOUR_S3_BUCKET>/scratch/cloudpipe-zkrmj/anat/ --recursive
+#
+# Submit with:
+#   argo -n argo-workflows submit scripts/manifests/fs235-parcellation-oom-repro.yaml
+#
+# Expected outcome under `ulimit -v 8G`: mri_normalize's malloc returns NULL and
+# FreeSurfer ErrorExit()s. Unlike SIGKILL, exit() flushes stdio — so this run should
+# yield the full progress log AND a named failure site, which the original could not.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: fs235-repro-
+  namespace: argo-workflows
+  labels:
+    cloudpipe.io/purpose: diagnostic
+    cloudpipe.io/issue: "235"
+spec:
+  entrypoint: repro
+  serviceAccountName: argo-workflows-runner
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+  # No retryStrategy on purpose: one attempt, one verdict. A retry here would only
+  # obscure whether the fault is deterministic.
+  arguments:
+    parameters:
+      - name: subjID
+        value: sub-R4PV7WZ3
+      - name: srcWorkflow          # whose scratch/ inputs to reuse
+        value: cloudpipe-zkrmj
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      - name: memCapGiB            # the RLIMIT_AS value under test
+        value: "8"
+
+  templates:
+    - name: repro
+      metadata:
+        labels:
+          cloudpipe.io/phase: anatomical
+          cloudpipe.io/step: long-parcellation-repro
+      nodeSelector:
+        karpenter.sh/nodepool: cpu-heavy-nodepool
+      volumes:
+        - name: work
+          emptyDir: {}
+      # k=4: matches the production expression (cpu 2k, memory 18G at k>3,
+      # ephemeral 12+4k) so the pod lands on the same instance class as the original.
+      podSpecPatch: |
+        containers:
+          - name: main
+            resources:
+              requests:
+                cpu: '8'
+                memory: '18G'
+                ephemeral-storage: '28G'
+      inputs:
+        artifacts:
+          - name: fslicense
+            path: /opt/freesurfer/.license
+            s3:
+              key: config/fslicense
+          - name: template-parcellated
+            path: /work/subjects/{{workflow.parameters.subjID}}_template
+            s3:
+              key: scratch/{{workflow.parameters.srcWorkflow}}/anat/template-parcellated.tar.gz
+          - name: ses-00A-seg
+            path: /work/subjects/ses-00A
+            s3:
+              key: scratch/{{workflow.parameters.srcWorkflow}}/anat/sessions-seg/ses-00A.tar.gz
+          - name: ses-02A-seg
+            path: /work/subjects/ses-02A
+            s3:
+              key: scratch/{{workflow.parameters.srcWorkflow}}/anat/sessions-seg/ses-02A.tar.gz
+          - name: ses-04A-seg
+            path: /work/subjects/ses-04A
+            s3:
+              key: scratch/{{workflow.parameters.srcWorkflow}}/anat/sessions-seg/ses-04A.tar.gz
+          - name: ses-06A-seg
+            path: /work/subjects/ses-06A
+            s3:
+              key: scratch/{{workflow.parameters.srcWorkflow}}/anat/sessions-seg/ses-06A.tar.gz
+
+      initContainers:
+        - name: download-fsaverage
+          image: '{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-cf6e136427e8740f8f356d8b63fd99a9242fa8b9'
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              memory: 256M
+              cpu: '1'
+          mirrorVolumeMounts: true
+          env:
+            - name: BUCKET
+              value: '{{workflow.parameters.bucket}}'
+          command: [python]
+          args:
+            - -c
+            - |
+              import boto3, os
+              from pathlib import Path
+
+              dest = Path("/work/subjects/fsaverage")
+              if dest.exists():
+                  print("fsaverage already present, skipping download.", flush=True)
+              else:
+                  s3 = boto3.client('s3')
+                  bucket = os.environ['BUCKET']
+                  prefix = 'config/fsaverage/'
+                  paginator = s3.get_paginator('list_objects_v2')
+                  for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                      for obj in page.get('Contents', []):
+                          key = obj['Key']
+                          rel = key[len(prefix):]
+                          if not rel:
+                              continue
+                          local = dest / rel
+                          local.parent.mkdir(parents=True, exist_ok=True)
+                          s3.download_file(bucket, key, str(local))
+                  print("fsaverage downloaded.", flush=True)
+
+      container:
+        image: '{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad'
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        env:
+          - name: FS_LICENSE
+            value: /opt/freesurfer/.license
+          - name: SUBJECTS_DIR
+            value: /work/subjects
+          - name: CPU_REQUEST
+            valueFrom:
+              resourceFieldRef:
+                containerName: main
+                resource: requests.cpu
+                divisor: '1'
+        command: [bash, -c]
+        args:
+          - |
+            SD=/work/subjects
+            CAP_GIB={{workflow.parameters.memCapGiB}}
+
+            # Same inherited-state guard as the production template: an upstream
+            # tarball can carry scripts/IsRunning.*, which wedges FastSurfer even in
+            # a fresh emptyDir. sub-R4PV7WZ3 is known to have these.
+            find "$SD" -name '*IsRunning*' -delete
+
+            K=4
+            THREADS=$(( CPU_REQUEST / K ))
+            [[ "$THREADS" -lt 2 ]] && THREADS=2
+            echo "[repro] cpu=${CPU_REQUEST} K=${K} --threads=${THREADS} cap=${CAP_GIB}G" >&2
+
+            # Force line buffering through the whole process tree so a crash cannot
+            # hide behind an unflushed stdio buffer (see header). Degrade gracefully
+            # if the image has no stdbuf rather than failing the run over it.
+            if command -v stdbuf >/dev/null 2>&1; then
+              BUF=(stdbuf -oL -eL)
+              echo "[repro] stdbuf found: descendants line-buffered" >&2
+            else
+              BUF=()
+              echo "[repro] WARNING: no stdbuf; crash site may be hidden by buffering" >&2
+            fi
+
+            ( while :; do
+                awk -v t="$(date -u +%H:%M:%S)" '
+                  /^anon /{a=$2} /^file /{f=$2}
+                  END {printf "[mem] %s anon=%.2fG file=%.2fG\n", t, a/1e9, f/1e9}' \
+                  /sys/fs/cgroup/memory.stat 2>/dev/null
+                sleep 10   # tighter than production's 30s; this run is short and we
+                           # want shape across the runaway, not a duty-cycle average
+              done ) >&2 &
+            MEMMON=$!
+
+            # The cap under test. RLIMIT_AS is per-process and inherited, so each
+            # FreeSurfer binary is capped individually — this is not a pod budget.
+            ( ulimit -v $((CAP_GIB * 1024 * 1024))   # KB
+              exec "${BUF[@]}" /fastsurfer/brun_fastsurfer.sh \
+                --subjects ses-00A=from-base ses-02A=from-base \
+                           ses-04A=from-base ses-06A=from-base \
+                --sd "$SD" --surf_only --edits --3T \
+                --long {{workflow.parameters.subjID}}_template \
+                --parallel "$K" --threads "$THREADS" )
+            RC=$?
+
+            kill $MEMMON 2>/dev/null
+            echo "[repro] brun_fastsurfer exit=${RC}" >&2
+            echo "[repro] container memory.peak=$(awk '{printf "%.2f", $1/1e9}' /sys/fs/cgroup/memory.peak 2>/dev/null || echo n/a)G" >&2
+
+            # The merged stdout above interleaves all four sessions. The per-session
+            # recon-surf.log is what actually names the failing command, so surface
+            # the tail of each one into the archived log.
+            for ses in ses-00A ses-02A ses-04A ses-06A; do
+              echo "===== ${ses} recon-surf.log (tail 40) =====" >&2
+              tail -40 "$SD/${ses}/scripts/recon-surf.log" 2>/dev/null \
+                || echo "  (no recon-surf.log)" >&2
+            done
+
+            exit $RC

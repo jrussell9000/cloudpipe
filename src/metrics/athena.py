@@ -69,6 +69,54 @@ _UNION_COLUMNS = {
         "pipeline",
         "image_tag",
         "completed_at",
+        # Grayordinate QC. NULL on volumetric-only runs and on every record
+        # written before the surface-func rollout, which is fine on both halves
+        # of the UNION: the raw JsonSerDe yields NULL for a missing key, and a
+        # Parquet file that lacks a Glue-declared column reads as NULL rather
+        # than failing the scan (verified 2026-08-08 for fsqc_qc's all-null
+        # columns).
+        "surf_L_n_vertices",
+        "surf_L_coverage_frac",
+        "surf_L_nan_frac",
+        "surf_L_tsnr_median",
+        "surf_R_n_vertices",
+        "surf_R_coverage_frac",
+        "surf_R_nan_frac",
+        "surf_R_tsnr_median",
+        "subcort_n_voxels",
+        "subcort_n_structures",
+        "subcort_space",
+    ],
+    # The whole table, unlike anat_qc below — every column here is either run
+    # identity, provenance, or a surface metric, and there is no subset to
+    # curate. `emit` is load-bearing rather than decorative: "grayordinate"
+    # means this record is the ONLY copy of that run's surface QC (the short
+    # path leaves FuncQC untouched), so a caller cannot know whether a join to
+    # func_preproc is possible without it.
+    "surface_sample": [
+        "subject",
+        "session",
+        "task",
+        "run",
+        "pipeline",
+        "image_tag",
+        "emit",
+        "stage_timings_s",
+        "total_runtime_s",
+        "peak_memory_gb",
+        "container_peak_memory_gb",
+        "completed_at",
+        "surf_L_n_vertices",
+        "surf_L_coverage_frac",
+        "surf_L_nan_frac",
+        "surf_L_tsnr_median",
+        "surf_R_n_vertices",
+        "surf_R_coverage_frac",
+        "surf_R_nan_frac",
+        "surf_R_tsnr_median",
+        "subcort_n_voxels",
+        "subcort_n_structures",
+        "subcort_space",
     ],
     "anat_qc": [
         "subject",
@@ -426,6 +474,91 @@ def cost_scope_clause(
     return ("WHERE " + " AND ".join(where)) if where else ""
 
 
+# Athena's GetQueryResults API hands every value back as a string in
+# `VarCharValue`, regardless of the column's real type. The declared type lives
+# separately, in ResultSetMetadata.ColumnInfo[].Type — mapped here.
+#
+# Integers map to pandas' nullable "Int64" rather than numpy int64 so that a
+# NULL does not silently promote the column to float and print a frame count as
+# `1437.0`. `decimal` maps to float: the cost columns are the only decimals in
+# this schema and are read to the cent, so Decimal exactness buys nothing.
+#
+# date/timestamp are deliberately absent and stay strings, matching the DuckDB
+# twin (which returns `date` and `completed_at` as strings too). Callers slice
+# them positionally — export_batch_metrics.analyze_costs() does `str(v)[:10]` —
+# so parsing them here would be a silent behaviour change between engines, not
+# an improvement.
+_ATHENA_NUMERIC_TYPES = {
+    "tinyint": "Int64",
+    "smallint": "Int64",
+    "integer": "Int64",
+    "int": "Int64",
+    "bigint": "Int64",
+    "real": "float64",
+    "float": "float64",
+    "double": "float64",
+    "decimal": "float64",
+}
+
+
+def _cast_athena_types(df, col_types: dict[str, str]):
+    """Cast a string-valued Athena result frame to its declared column types.
+
+    Without this every column is an object-dtype string, so `.sum()` on a cost
+    column concatenates decimal literals instead of adding them — which is how
+    `export_batch_metrics.py` came to die with
+    `could not convert string to float: '0.335430.23187...'` while the DuckDB
+    engine returned the same query correctly.
+
+    Unknown or complex types (array/row/map/json/varbinary) are left as strings
+    rather than guessed at: this is a read path, and a wrong cast would corrupt
+    values more quietly than no cast at all.
+    """
+    import pandas as pd
+
+    for name, athena_type in col_types.items():
+        if name not in df.columns:
+            continue
+        if athena_type == "boolean":
+            df[name] = df[name].map({"true": True, "false": False}).astype("boolean")
+            continue
+        target = _ATHENA_NUMERIC_TYPES.get(athena_type)
+        if target is None:
+            continue
+        # errors="coerce" so one unparseable value becomes NULL instead of
+        # failing the whole read; Athena should never emit one, but a partially
+        # malformed JSON record reaching a `double` column has precedent here.
+        numeric = pd.to_numeric(df[name], errors="coerce")
+        df[name] = numeric.astype(target) if target == "float64" else numeric.round().astype(target)
+    return df
+
+
+# Glue/Hive column names are case-insensitive and stored LOWERCASE — declaring
+# `surf_L_n_vertices` in a table yields `surf_l_n_vertices`, and that lowercased
+# catalog name is the Label Athena returns. The values still arrive: the openx
+# JsonSerDe matches the mixed-case JSON keys regardless. Only the name differs.
+#
+# DuckDB infers its column names from the JSON keys, so without this the two
+# engines return identical data under different names, and
+# `df["surf_L_coverage_frac"]` works on one engine and KeyErrors on the other.
+# The mixed-case names are the documented ones (docs/metrics_data_dictionary.md)
+# and what the emitter writes, so Athena is the side that gets corrected.
+#
+# Derived from _UNION_COLUMNS rather than hand-listed: any future mixed-case
+# field is covered as soon as it reaches that list, which the five-place schema
+# convention already requires. Today it is the eight FuncQC surf_L_*/surf_R_*
+# columns; subcort_* need no entry because they are already lowercase.
+_CANONICAL_CASE = {
+    col.lower(): col for cols in _UNION_COLUMNS.values() for col in cols if col != col.lower()
+}
+
+
+def _restore_column_case(df):
+    """Undo Glue's lowercasing of mixed-case column names."""
+    renames = {c: _CANONICAL_CASE[c] for c in df.columns if c in _CANONICAL_CASE}
+    return df.rename(columns=renames) if renames else df
+
+
 class CloudpipeMetrics:
     """Query the cloudpipe_metrics Athena database."""
 
@@ -485,6 +618,31 @@ class CloudpipeMetrics:
         unaffected until explicitly opted in.
         """
         return self._query("func_preproc", filters, dt_from, dt_to, compacted)
+
+    def surface_qc(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return grayordinate (surface) QC metrics as a DataFrame.
+
+        Same per-BOLD-run grain as func_qc(), and this is the table to prefer
+        for surface questions: it is written by BOTH of preproc.py's
+        grayordinate paths, whereas func_qc's surf_*/subcort_* copy is absent
+        on the `--emit grayordinate` short path and stale whenever a run's
+        surfaces were recomputed without its volumetric output.
+
+        Filter or read `emit` to know which case you have: "both" means
+        func_qc carries the same values for that run, "grayordinate" means
+        this record is the only copy.
+
+        Not the same row count as func_qc() over the same window — only runs
+        that actually produced surfaces appear here, and a run reprocessed for
+        surfaces alone appears under the dt of that later pass.
+        """
+        return self._query("surface_sample", filters, dt_from, dt_to, compacted)
 
     def anat_qc(
         self,
@@ -954,10 +1112,13 @@ class CloudpipeMetrics:
         rows: list[dict] = []
         paginator = self._athena.get_paginator("get_query_results")
         columns: list[str] = []
+        col_types: dict[str, str] = {}
         for page in paginator.paginate(QueryExecutionId=qid):
             result = page["ResultSet"]
             if not columns:
-                columns = [c["Label"] for c in result["ResultSetMetadata"]["ColumnInfo"]]
+                info = result["ResultSetMetadata"]["ColumnInfo"]
+                columns = [c["Label"] for c in info]
+                col_types = {c["Label"]: c["Type"] for c in info}
             for row in result["Rows"]:
                 values = [d.get("VarCharValue", None) for d in row["Data"]]
                 if values != columns:  # skip header row
@@ -966,4 +1127,8 @@ class CloudpipeMetrics:
                     # hand back a DataFrame with missing values rather than an error.
                     rows.append(dict(zip(columns, values, strict=True)))
 
-        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=pd.Index(columns))
+        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=pd.Index(columns))
+        # Cast first, rename second: col_types is keyed on the labels Athena
+        # returned, so restoring the case before casting would leave the numeric
+        # columns as strings.
+        return _restore_column_case(_cast_athena_types(df, col_types))

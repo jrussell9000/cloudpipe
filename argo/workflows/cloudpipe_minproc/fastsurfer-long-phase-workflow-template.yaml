@@ -159,7 +159,7 @@ spec:
       # of GPU node time; discovering the assumption was wrong costs a failed
       # batch. TODO: drop this once a real run confirms seg_only never reads it.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -500,7 +500,10 @@ spec:
     # block), so cpu == total threads by construction rather than by keeping two
     # files in agreement. The division is exact at every k: 4/1, 4/2, 6/3, 8/4.
     #
-    # Memory stays max(6, 2k) GB and is deliberately NOT tied to this — see below.
+    # Memory is 13G at k<=3 / 18G at k=4 and is deliberately NOT tied to this — see
+    # below. It does not scale on 2k: peak is set by how many sessions sit in the
+    # memory-heavy normalization stage at once, which the measured table below
+    # captures directly.
     #
     # 6 -> max(4, 2k), i.e. the floor drops 6 -> 4 and k>=3 is unchanged.
     # WHY ONLY THE FLOOR MOVES: --threads 2 is a hard floor per instance, because
@@ -547,10 +550,11 @@ spec:
     #
     # There is no packing trick available. cpu-heavy-nodepool admits only 2xlarge and
     # 4xlarge, and 8000m exceeds a 2xlarge's 7910m ALLOCATABLE outright — before the
-    # ~685m of daemonsets (guardduty 200m, cloudwatch 250m, kube-proxy 100m,
-    # fluent-bit 50m, aws-node 25m, ebs-csi 10m, kubecost 50m) that leave ~7225m
-    # schedulable. So trimming daemonsets cannot help either; the constraint is
-    # structural.
+    # ~635m of daemonsets (guardduty 200m, cloudwatch 250m, kube-proxy 100m,
+    # aws-node 25m, ebs-csi 10m, kubecost 50m) that leave ~7275m schedulable.
+    # (This was ~685m/~7225m before fluent-bit's 50m came off with the
+    # CloudWatch container-log pipeline; the conclusion is unchanged.) So
+    # trimming daemonsets cannot help either; the constraint is structural.
     #
     # Nor is the request oversized: a k=4 pod runs 4 instances x 2 threads = 8 threads
     # of real work, ~4/3 of a k=3 pod's. The only waste is stranding — 8000m held on
@@ -561,11 +565,94 @@ spec:
     # #75, whose levers are batch shape and instance floor — NOT a thread cut. Capping
     # cpu at 6 would emit --threads 1 at k=4 and serialize hemispheres.
     #
-    # Memory DID move: ram_efficiency 0.30 against the old max(6,2k)+2, i.e. ~2.25 GB
-    # average at k<=3 and ~4.2 GB at k=4. Dropping the "+ 2" gives 6G/8G, keeping
-    # ~2.7x/1.9x headroom over the mean. ram_efficiency is AVERAGE-based, which is why
-    # the cut is to 2x-ish rather than to the observed mean, and why no memory LIMIT
-    # is set: an underestimate should degrade to burst, not to an OOM.
+    # MEMORY IS SIZED FROM MEASURED PEAK, NOT ram_efficiency (#235). The previous
+    # 6G/8G came from ram_efficiency 0.30 and was described as "~2.7x/1.9x headroom
+    # over the mean". It was 0.43x-0.48x of the PEAK. Max pod_memory_working_set
+    # over every parcellation pod of the 2026-08-10 200-subject batch:
+    #
+    #                 request     n   median      p95      max   max/request
+    #     k<=3            6G    147   8.99 G  11.44 G  12.40 G      2.07x
+    #     k=4             8G     75  13.94 G  16.29 G  17.42 G      2.18x
+    #
+    # EVERY k=4 pod exceeded its request; the median exceeded it by 74%. A 2xlarge
+    # has only 14.82 G allocatable, so a k<=3 pod at p95 was holding 77% of the whole
+    # node's kubepods limit while telling the scheduler it needed 6 G. 13G/18G clears
+    # the observed max at both k and still fits its instance class (13 G + ~0.56 G of
+    # daemonset requests < 14.82 G on a 2xlarge; 18 G < 30.4 G on a 4xlarge, leaving
+    # room for the ~7.2 spare cores' worth of co-tenants). The raise is therefore
+    # close to free: `cpu: 6` already makes a k<=3 pod near-sole-tenant on a 2xlarge.
+    #
+    # This is the #129 lesson applied here — see docs/pipelines.md on segment-subregions:
+    # ram_efficiency is a LIFETIME AVERAGE and is structurally blind to a peak. It is
+    # not a sizing input. The two steps in this pipeline sized from cgroup peaks
+    # (segment-subregions-dl, fsqc) are the only two whose max/request is below 1.0.
+    #
+    # STILL NO MEMORY LIMIT, but NOT for the reason previously given here ("an
+    # underestimate should degrade to burst, not to an OOM" — it degraded to an OOM
+    # anyway, at the kubepods.slice level). The reason is that a limit cannot address
+    # what actually killed cloudpipe-zkrmj on 2026-08-11, and a limit tight enough to
+    # be useful would convert rare legitimate bursts into new deterministic failures.
+    # What the raised REQUEST buys is the thing the limit was wanted for: the scheduler
+    # now reserves what the pod actually takes, so the pod can no longer be a
+    # node-pressure victim of a co-tenant packed into memory it was already using.
+    #
+    # WHAT KILLED zkrmj, for the record, because it is NOT a sizing miss and must not
+    # be "fixed" by raising memory again. Kernel dmesg,
+    # /aws/containerinsights/cloudpipe/host, node ip-10-0-46-230, 00:41:35Z:
+    #
+    #     [  pid  ] ... rss_anon ...  name          (rss_anon is in 4 KB PAGES)
+    #     [  81799]      118799       mri_normalize     464 MB
+    #     [  81847]      118718       mri_normalize     464 MB
+    #     [  82259]     6807079       mri_normalize   25.97 GiB   <- victim
+    #     [  82365]      102425       mri_normalize     400 MB
+    #     oom-kill: constraint=CONSTRAINT_MEMCG, oom_memcg=/kubepods.slice,
+    #               task=mri_normalize, pid=82259
+    #
+    # ONE mri_normalize held 25.97 GiB of ANONYMOUS (unreclaimable) RSS during
+    # Intensity Normalization2 while its three siblings — same binary, same stage,
+    # same 256^3 uchar inputs — sat at 464/464/400 MB. A 57x single-process outlier,
+    # i.e. an allocation fault, NOT demand that scales with k or with the data.
+    #
+    # DO NOT restate this as "four concurrent streams are ~14 G" (an earlier draft of
+    # this comment did). The kernel table above is the whole pod's process list at the
+    # OOM instant: the three healthy streams held ~1.3 G COMBINED. The ~14 G median in
+    # the table above is pod_memory_working_set across all stages INCLUDING page cache,
+    # not four concurrent normalize processes. The request sizing stands on those pod
+    # peaks; the per-process story is separate and much smaller.
+    #
+    # No request and no limit prevents a runaway of that size — but a per-process
+    # RLIMIT_AS does, and the args block below now sets one (ulimit -v 8G) so a repeat
+    # loses one session instead of the whole workflow. The node was at 74.9% of
+    # capacity with one under-request co-tenant, so the co-tenancy story in #235 is
+    # not what happened either.
+    #
+    # RULED OUT — intensity scaling. mri_info-level and intensity-statistics checks on
+    # all four sessions of sub-R4PV7WZ3 come back clean: every volume is 256^3 uchar
+    # (aseg int16), 0-255, no float and no out-of-range values, and the FIRST
+    # mri_normalize in the same pod (nu.mgz -> T1.mgz) prints "white matter peak found
+    # at 110" for all four and exits 0 at ~572 MB max RSS. Measured WM mode is
+    # 110/110/109/109 and WM mean 104.5/104.5/103.1/104.5. A pre-flight mri_info gate
+    # would be a NO-OP here; do not add one. The one real outlier in the victim session
+    # (ses-04A) is segmentation extent, not intensity: 313,587 WM voxels vs 404-441k in
+    # its siblings, and 1211 control points removed vs 292/593/366.
+    #
+    # SOURCE READ (mri_normalize.cpp / utils/mrinorm.cpp @ 4d15e6a) — see docs/pipelines.md:
+    #   - Do NOT read the last log line as the crash site. mri_normalize never calls
+    #     setbuf/setvbuf, so stdout is block-buffered and SIGKILL discards the pending
+    #     buffer. The last unconditional fflush is mri_normalize.cpp:907, so everything
+    #     after it (MRI3dGentleNormalize, both MRI3dNormalize passes) is invisible.
+    #   - No allocation on this path exceeds one 256^3 volume (<=67 MB as float); the
+    #     count-scaled callocs in mrinorm.cpp are all in the -f / label paths this
+    #     command does not take. 25.97 GiB needs ~400 volume-sized allocations at once,
+    #     which is an allocation fault, not data-scaled demand.
+    #   - MRIbuildBiasImage (mrinorm.cpp:1347) does leak a volume per call — it ignores
+    #     its mri_bias output parameter and re-MRIclones at line 1358 without freeing.
+    #     At num_3d_iter=2 that is ~134 MB. Real, but not the 26 GiB.
+    #
+    # The sampler in the args block below emits cgroup v2 memory.peak plus the
+    # anon/file split, so the NEXT batch replaces the table above with a number that
+    # separates real demand from reclaimable page cache (pod_memory_working_set
+    # includes active page cache, so the figures above are an upper bound).
     #
     # ephemeral-storage scales with k here (unlike the other anatomical steps,
     # which take a flat 20G) because this pod holds the most at once: the
@@ -577,7 +664,7 @@ spec:
           resources:
             requests:
               cpu: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 > 4 ? len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 : 4}}'
-              memory: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 > 6 ? len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 : 6}}G'
+              memory: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]")) > 3 ? 18 : 13}}G'
               ephemeral-storage: '{{=12 + 4 * len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))}}G'
 
     nodeSelector:
@@ -591,7 +678,7 @@ spec:
       # recon-surf.sh registers each timepoint to fsaverage, which is not carried
       # in either the template or the per-session scratch tarballs.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -682,9 +769,127 @@ spec:
           fi
           echo "cpu request=${CPU_REQUEST} K=${K} --threads=${THREADS} (threads_hemi=$((THREADS / 2)))" >&2
 
-          /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}} --threads "$THREADS"
+          # Memory instrumentation (#235). The sizing above had to be reconstructed
+          # from CloudWatch after the fact because this step carried no sampler; the
+          # numbers it replaced came from ram_efficiency, a lifetime AVERAGE that is
+          # structurally blind to a peak. `anon` is the unreclaimable half of the
+          # footprint and `file` is page cache the kernel drops under pressure —
+          # pod_memory_working_set folds the two together, so only this split can say
+          # whether the 13G/18G request is real demand or cache. 30 s gives enough
+          # shape over a 20-40 min step without flooding the archived log.
+          ( while :; do
+              awk -v t="$(date -u +%H:%M:%S)" '
+                /^anon /{a=$2} /^file /{f=$2}
+                END {printf "[mem] %s anon=%.2fG file=%.2fG\n", t, a/1e9, f/1e9}' \
+                /sys/fs/cgroup/memory.stat 2>/dev/null
+              sleep 30
+            done ) >&2 &
+          MEMMON=$!
+
+          # PER-PROCESS ADDRESS-SPACE CAP (#235). RLIMIT_AS is per-process and is
+          # inherited by every child, so this caps each FreeSurfer binary
+          # individually — it is NOT an aggregate budget across the K instances.
+          #
+          # WHY: what killed cloudpipe-zkrmj was ONE mri_normalize at 26.0 GiB RSS /
+          # 30.2 GiB VA while its three siblings sat at 464/464/400 MB. Because
+          # memory.oom.group is set on this container, that single runaway took
+          # argoexec, bash and all four brun_fastsurfer instances with it, losing the
+          # whole workflow. Capping address space converts that into one failed
+          # mri_normalize (malloc returns NULL -> FreeSurfer ErrorExit) and one failed
+          # session, leaving the other K-1 to finish.
+          #
+          # WHY 8G: the largest per-process max-RSS FreeSurfer's own FSTIME wrapper
+          # recorded across four COMPLETE k=4 parcellation runs (267g8, 28dmm, 2hpvg,
+          # 2sq7m) is 1.93 GB. 8G is 4.1x that, and the runaway is cut at ~1/4 of the
+          # VA it actually reached. It also holds at every k: one capped runaway plus
+          # K-1 healthy streams (~0.5 G each) stays under the 13G/18G request.
+          #
+          # RLIMIT_AS caps VIRTUAL address space, not RSS, so the margin is only real
+          # while FreeSurfer's VA/RSS ratio stays near 1 — it was 1.06 on the healthy
+          # processes in the zkrmj kernel dump. glibc can reserve up to 8*ncores 64 MB
+          # malloc arenas under thread contention, but --threads 2 per instance keeps
+          # that to a few; if a future cpu raise makes arenas material, set
+          # MALLOC_ARENA_MAX rather than inflating this number.
+          #
+          # Scoped to a subshell on purpose: RLIMIT_AS cannot be raised again by an
+          # unprivileged process, so leaking it into the extract_qc.py loop below
+          # would cap those too for no reason.
+          ( ulimit -v $((8 * 1024 * 1024))   # KB
+            exec /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}} --threads "$THREADS" )
           FASTSURFER_EXIT=$?
+          kill $MEMMON 2>/dev/null
+          # cgroup v2 memory.peak is an exact kernel-maintained high-water mark for
+          # this container, not a sample, so a sub-30s transient cannot hide from it.
+          echo "[mem] K=${K} surface-stage peak=$(awk '{printf "%.2f", $1/1e9}' /sys/fs/cgroup/memory.peak 2>/dev/null || echo n/a)G" >&2
+
+          # PER-SESSION COMPLETION GUARD (#245). brun_fastsurfer.sh EXITS 0 EVEN WHEN
+          # A SESSION FAILED. Measured directly on sub-R4PV7WZ3 (the #235 repro,
+          # 2026-08-12): ses-04A died in 3d normalization with
+          #
+          #   error: HISTOalloc(2001892225): could not allocate histogram
+          #   recon-all -s ses-04A exited with ERRORS
+          #
+          # while the wrapper reported `brun_fastsurfer exit=0` and the other three
+          # sessions finished cleanly. Without this guard the step exits 0 and
+          # publishes a ses-04A tarball containing scripts/IsRunning.lh+rh, 66 entries
+          # and no white/pial surfaces. `check_fastsurfer_derivatives` is a bare
+          # head_object, so that tarball marks the subject PERMANENTLY complete: the
+          # anatomical phase is skipped on every future submission and the subject can
+          # never self-heal, while registration and func-preproc run against a surf/
+          # missing its principal outputs.
+          #
+          # The fix is to not publish it. Every per-session output artifact is
+          # `optional: true`, so deleting an incomplete session directory means Argo
+          # skips that artifact — the derivative is then genuinely absent, the
+          # existence check correctly reports the session missing, and the next
+          # submission re-runs the phase. Self-healing is restored by making the
+          # failure legible rather than by adding a second source of truth.
+          #
+          # Rejection criteria, cheapest-first: an IsRunning marker is FastSurfer's own
+          # crashed/interrupted flag (the same hazard the input-side
+          # `find -name '*IsRunning*' -delete` above defends against, applied to
+          # outputs), and the four surface files are the principal outputs everything
+          # downstream consumes. Both are directory reads — no tarball inspection.
+          COMPLETE_SESSIONS=""
+          INCOMPLETE_SESSIONS=""
           for ses in $(python3 -c "import json,sys; print(' '.join(json.loads(sys.argv[1])))" '{{inputs.parameters.T1w_sessions}}'); do
+            sesdir="${SD}/${ses}"
+            reason=""
+            if [[ ! -d "$sesdir" ]]; then
+              reason="session directory absent"
+            elif compgen -G "${sesdir}/scripts/IsRunning.*" > /dev/null; then
+              reason="scripts/IsRunning.* present (recon-all did not finish)"
+            else
+              for surf in lh.white rh.white lh.pial rh.pial; do
+                if [[ ! -s "${sesdir}/surf/${surf}" ]]; then
+                  reason="surf/${surf} missing or empty"
+                  break
+                fi
+              done
+            fi
+            if [[ -n "$reason" ]]; then
+              echo "REJECTED ${ses}: ${reason} — not publishing its tarball (#245)." >&2
+              rm -rf "$sesdir"
+              INCOMPLETE_SESSIONS="${INCOMPLETE_SESSIONS} ${ses}"
+            else
+              COMPLETE_SESSIONS="${COMPLETE_SESSIONS} ${ses}"
+            fi
+          done
+          echo "[guard] complete:${COMPLETE_SESSIONS:- none} | rejected:${INCOMPLETE_SESSIONS:- none}" >&2
+
+          # Nothing usable came out of the pod. Exit 1 rather than 75: the one observed
+          # cause is a deterministic, data-dependent allocation in mri_normalize, and
+          # retrying it re-runs an identical failure — the #115 reasoning that keeps
+          # 137 out of the retry expression.
+          if [[ -z "$COMPLETE_SESSIONS" ]]; then
+            echo "ERROR: no session passed the completion guard; nothing to publish." >&2
+            exit 1
+          fi
+
+          # QC only for sessions that will actually be published — a rejected session's
+          # directory is gone, and QC for a derivative nobody can read is noise in the
+          # anat-qc table.
+          for ses in $COMPLETE_SESSIONS; do
             python3 /app/extract_qc.py \
               --subjects-dir "$SD" \
               --subj {{workflow.parameters.subjID}} \
@@ -719,6 +924,20 @@ spec:
             echo "ERROR: long_compat_segmentHA.py did not produce ${BASE}/base-tps (exit ${COMPAT_EXIT})." >&2
             echo "       base template is incomplete (white surfaces missing?); forcing retry (exit 75)." >&2
             exit 75
+          fi
+
+          # base-tps is written from the template's timepoint list, not from what is on
+          # disk, so a session the guard above rejected is still named in it. Leaving it
+          # there turns one bad session into a segment-subregions failure for the whole
+          # subject — the step reads base-tps and looks for a directory that no longer
+          # exists. Prune the rejected names so the k-1 good sessions still get their
+          # subregion outputs.
+          if [[ -n "$INCOMPLETE_SESSIONS" ]]; then
+            # One line on purpose: a YAML literal block scalar ends at the first line
+            # indented less than the block, so a column-0 python body would terminate
+            # the script, and an indented one would be an IndentationError.
+            python3 -c "import pathlib, sys; p = pathlib.Path(sys.argv[1]); rej = set(sys.argv[2:]); kept = [ln for ln in p.read_text().splitlines() if ln.strip() not in rej]; p.write_text('\n'.join(kept) + '\n'); print('[guard] pruned', sorted(rej), 'from base-tps;', len(kept), 'timepoints remain')" \
+              "$SD/$BASE/base-tps" $INCOMPLETE_SESSIONS
           fi
 
           exit $FASTSURFER_EXIT

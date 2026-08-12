@@ -4,6 +4,7 @@ Metric schemas for cloudpipe pipeline observability.
 Each dataclass maps to one S3 prefix and one Glue/Athena table:
 
   FuncQC          → metrics/func-preproc/   → cloudpipe_metrics.func_preproc
+  SurfaceSampleQC → metrics/surface-sample/ → cloudpipe_metrics.surface_sample
   AnatQC          → metrics/anat-qc/        → cloudpipe_metrics.anat_qc
   FsqcQC          → metrics/fsqc-qc/        → cloudpipe_metrics.fsqc_qc
   WorkflowRun     → metrics/workflow-runs/  → cloudpipe_metrics.workflow_runs
@@ -106,15 +107,40 @@ class FuncQC:
     total_runtime_s: float = 0.0
     peak_memory_gb: float = 0.0  # this run only (rusage, resets per run)
     container_peak_memory_gb: float = 0.0  # container lifetime; size limits.memory on this
-    pending_duration_s: float = (
-        0.0  # seconds from pod creation to container start (node wait + image pull)
-    )
+    # pending_duration_s is deliberately absent: it was removed from this schema
+    # in #147 (never emitted, and unmeasurable from inside the pod — the
+    # Downward API cannot expose metadata.creationTimestamp). The queue-wait
+    # field that still exists is WorkflowRun.pending_duration_s. It lingered as
+    # a dead dataclass field until 2026-08-11; do not reinstate it.
 
     # Provenance
     pipeline: str = "cloudpipe_minproc"
     image_tag: str = ""
     schema_version: str = "1.1"
     completed_at: str = field(default_factory=_now_utc)
+
+    # Grayordinate QC, present only on runs that also emit surfaces (--emit
+    # both). preproc.py computes these separately and folds them in with
+    # `qc.update(surf_metrics)` after the volumetric record is built, which is
+    # why they sit after completed_at here and in the Glue tables.
+    #
+    # None, not 0.0, is the "not computed" value: unlike gcor/aor/aqi above,
+    # these keys are absent from the record entirely on a volumetric-only run,
+    # and 0.0 is a legitimate measurement for every one of the fractions. A
+    # coverage_frac of 0.0 means the surface sampled no BOLD at all — the single
+    # most important thing this QC can tell you — so it must not collide with
+    # "there was no surface".
+    surf_L_n_vertices: int | None = None
+    surf_L_coverage_frac: float | None = None
+    surf_L_nan_frac: float | None = None
+    surf_L_tsnr_median: float | None = None
+    surf_R_n_vertices: int | None = None
+    surf_R_coverage_frac: float | None = None
+    surf_R_nan_frac: float | None = None
+    surf_R_tsnr_median: float | None = None
+    subcort_n_voxels: int | None = None
+    subcort_n_structures: int | None = None
+    subcort_space: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -131,6 +157,98 @@ class FuncQC:
     def s3_key(subject: str, session: str, task: str, run: str, dt: str | None = None) -> str:
         dt = dt or _today_utc()
         return f"metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json"
+
+
+# ---------------------------------------------------------------------------
+# Grayordinate (surface) QC
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SurfaceSampleQC:
+    """Per-BOLD-run grayordinate QC — the durable surface QC record.
+
+    S3 key: metrics/surface-sample/dt={dt}/{subject}_{session}_{task}_{run}_surf_qc.json
+
+    Overlaps FuncQC's surf_*/subcort_* block by design, and that redundancy is
+    not accidental. preproc.py has two paths that produce grayordinates:
+
+      --emit both         computes volumetric + surface QC together and writes
+                          the surface fields to BOTH this table and that run's
+                          FuncQC record.
+      --emit grayordinate the short path, used when a run's volumetric output
+                          already exists and the pass only adds surfaces on
+                          top. Writes ONLY here, deliberately leaving FuncQC
+                          alone rather than overwriting a real volumetric
+                          record with a partially-populated one (see
+                          _finish_grayordinate_only's docstring).
+
+    So THIS is the always-current copy for either path; FuncQC's is sometimes
+    absent and sometimes stale. Prefer this table when the question is about
+    surfaces, and FuncQC only when joining surfaces to volumetric motion/signal
+    metrics for the same run.
+
+    Constructed as a raw dict in preproc.py (_surface_qc_envelope + _surface_qc),
+    not through this constructor, so it can drift the way FuncQC did — see
+    docs/metrics_data_dictionary.md's drift checklist. Field order below follows
+    the emitter's dict order, which is also the Glue tables' column order.
+    """
+
+    subject: str
+    session: str
+    task: str
+    run: str
+
+    # Provenance. `emit` is the path that produced the record: "both" (full
+    # path, fields also in FuncQC) or "grayordinate" (short path, sole copy) —
+    # so it is the column that tells you whether FuncQC can be joined at all.
+    pipeline: str = "cloudpipe_minproc"
+    image_tag: str = ""
+    emit: str = ""
+
+    # Runtime. Same meanings as FuncQC's; `stage_timings_s` on the short path
+    # holds only the grayordinate stages, since nothing else ran.
+    stage_timings_s: dict[str, float] = field(default_factory=dict)
+    total_runtime_s: float = 0.0
+    peak_memory_gb: float = 0.0  # this run only (rusage, resets per run)
+    container_peak_memory_gb: float = 0.0  # container lifetime; size limits.memory on this
+
+    schema_version: str = "1.0"
+    completed_at: str = field(default_factory=_now_utc)
+
+    # Surface metrics. None, not 0.0, is "not computed" — 0.0 is a legitimate
+    # measurement for every fraction here, and a coverage_frac of 0.0 (the
+    # surface sampled no BOLD at all) is the single most important thing this
+    # QC can report, so it must not collide with "there was no surface".
+    surf_L_n_vertices: int | None = None
+    surf_L_coverage_frac: float | None = None
+    surf_L_nan_frac: float | None = None
+    surf_L_tsnr_median: float | None = None
+    surf_R_n_vertices: int | None = None
+    surf_R_coverage_frac: float | None = None
+    surf_R_nan_frac: float | None = None
+    surf_R_tsnr_median: float | None = None
+
+    # Subcortical block — absent, not zero, when the run sampled no subcortex.
+    subcort_n_voxels: int | None = None
+    subcort_n_structures: int | None = None
+    subcort_space: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self, indent: int | None = None) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> SurfaceSampleQC:
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+    @staticmethod
+    def s3_key(subject: str, session: str, task: str, run: str, dt: str | None = None) -> str:
+        dt = dt or _today_utc()
+        return f"metrics/surface-sample/dt={dt}/{subject}_{session}_{task}_{run}_surf_qc.json"
 
 
 # ---------------------------------------------------------------------------
@@ -725,15 +843,24 @@ class RegistrationQC:
     # error. Alone among these metrics it reads no image intensities — it tests
     # the transform itself, so it catches a warp that matches intensities well
     # but is not globally invertible (which positive det(J) everywhere does NOT
-    # guarantee). Only ice_mean_mm is gated (< 0.5 mm, sub-half-voxel on 1 mm
-    # MNI152); the rest are recorded for diagnosis.
-    # All four are absent — not zero — when the inverse warp could not be saved
-    # or the computation failed; verdict() skips absent keys, so ICE fails open.
+    # guarantee).
+    #
+    # NEVER POPULATED IN PRACTICE — all four are ABSENT, not zero. Computing them
+    # needs the inverse of the SyN fit, and fireants 1.5.0 raises
+    # NotImplementedError instead of producing one, so fst1w_to_mni.py no longer
+    # attempts it. Measured 2026-08-11: 0 of 582 records at schema 2.1 carry any
+    # ice_* value, and of 12 archived t1w-to-mni pod logs sampled across
+    # 2026-07-23..2026-08-11, 11 log the NotImplementedError and none emit a value.
+    # ice_mean_mm was gated (< 0.5 mm, sub-half-voxel on 1 mm MNI152) from
+    # 2026-07-23 until 2026-08-11, evaluating on zero sessions; that entry is
+    # withdrawn. The fields stay declared so the Athena columns exist and no schema
+    # bump is needed if the inverse lands upstream. Do not read a 0.0 here as a
+    # measurement — nothing writes one.
     ice_mean_mm: float = 0.0
     ice_p95_mm: float = 0.0
     ice_p99_mm: float = 0.0
     ice_max_mm: float = 0.0
-    centroid_displacement_mm: float = 0.0  # T1w→MNI only; mm; one of the three verdict thresholds
+    centroid_displacement_mm: float = 0.0  # T1w→MNI only; mm; recorded, not gated
 
     # BOLD→T1w only: task/run identity
     task: str = ""
