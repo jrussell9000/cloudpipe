@@ -1,0 +1,41 @@
+####################################################################
+# RBAC for the Argo status.nodes snapshot (#237).
+#
+# The snapshot runs as `argo-workflows-runner` rather than a dedicated
+# ServiceAccount on purpose: that SA already carries the EKS Pod Identity
+# association that grants S3 write to the metrics bucket, and a new SA would
+# need a matching Terraform association before it could write anything.
+#
+# What it lacks is `list`. The Helm chart's workflow RBAC
+# (`workflow.rbac.create: true` in gitops/apps/argo-workflows/values.yaml)
+# grants only `watch` and `get` on workflows, which is all a pipeline pod
+# needs. A bulk snapshot needs `list` — one paged LIST captures a whole
+# 300-workflow batch, where a loop of per-workflow GETs takes minutes.
+#
+# This Role is ADDITIVE and lives here rather than in the chart values so the
+# chart-owned Role stays chart-owned: Kubernetes unions all RoleBindings for a
+# subject, so granting `list` here cannot conflict with a chart upgrade.
+####################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argo-nodes-snapshot
+  namespace: argo-workflows
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflows"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-nodes-snapshot
+  namespace: argo-workflows
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argo-nodes-snapshot
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflows-runner
+    namespace: argo-workflows

@@ -30,6 +30,7 @@ locals {
   # aws_glue_catalog_table resource; nothing discovers them automatically.
   metric_prefixes = {
     func_qc           = "s3://${var.bucket}/metrics/func-preproc/"
+    surface_sample    = "s3://${var.bucket}/metrics/surface-sample/"
     anat_qc           = "s3://${var.bucket}/metrics/anat-qc/"
     fsqc_qc           = "s3://${var.bucket}/metrics/fsqc-qc/"
     registration_qc   = "s3://${var.bucket}/metrics/registration/"
@@ -84,6 +85,7 @@ locals {
   # for func_qc/registration_qc).
   compacted_targets = {
     func_preproc      = "s3://${var.bucket}/metrics/compacted/func_preproc/"
+    surface_sample    = "s3://${var.bucket}/metrics/compacted/surface_sample/"
     anat_qc           = "s3://${var.bucket}/metrics/compacted/anat_qc/"
     fsqc_qc           = "s3://${var.bucket}/metrics/compacted/fsqc_qc/"
     workflow_runs     = "s3://${var.bucket}/metrics/compacted/workflow_runs/"
@@ -267,6 +269,198 @@ resource "aws_glue_catalog_table" "func_preproc_compacted" {
     }
     columns {
       name = "completed_at"
+      type = "string"
+    }
+    # Grayordinate QC — see the identical block on the raw `func_preproc` table
+    # for why these sit after completed_at, why they were missing, and why the
+    # surf_l_/surf_r_ names are lowercase here while the emitter writes
+    # surf_L_/surf_R_. Declared on the compacted table too because compactor.py
+    # derives each Parquet file's columns from the fields the records actually
+    # carry rather than from the schemas.py dataclass, so the surface fields do
+    # reach the Parquet — a column undeclared here is invisible, not absent.
+    columns {
+      name = "surf_l_n_vertices"
+      type = "int"
+    }
+    columns {
+      name = "surf_l_coverage_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_l_nan_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_l_tsnr_median"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_n_vertices"
+      type = "int"
+    }
+    columns {
+      name = "surf_r_coverage_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_nan_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_tsnr_median"
+      type = "double"
+    }
+    columns {
+      name = "subcort_n_voxels"
+      type = "int"
+    }
+    columns {
+      name = "subcort_n_structures"
+      type = "int"
+    }
+    columns {
+      name = "subcort_space"
+      type = "string"
+    }
+  }
+}
+
+resource "aws_glue_catalog_table" "surface_sample_compacted" {
+  database_name = aws_glue_catalog_database.metrics.name
+  name          = "surface_sample_compacted"
+
+  table_type = "EXTERNAL_TABLE"
+
+  parameters = merge(local.compacted_partition_projection.surface_sample, {
+    "classification" = "parquet"
+    # 1.0 is the first version the emitter stamps. Records written before
+    # 2026-08-11 carry NO schema_version at all, which compactor.py groups
+    # under the literal "unknown" — declared here so the pre-fix batch stays
+    # readable rather than landing outside the enum and returning zero rows
+    # with a successful query status (#241). Do not drop "unknown" until
+    # those partitions are gone.
+    "projection.schema_version.values" = "unknown,1.0"
+  })
+
+  partition_keys {
+    name = "dt"
+    type = "string"
+  }
+  partition_keys {
+    name = "schema_version"
+    type = "string"
+  }
+
+  storage_descriptor {
+    location      = "s3://${var.bucket}/metrics/compacted/surface_sample/"
+    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
+
+    ser_de_info {
+      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+    }
+
+    columns {
+      name = "subject"
+      type = "string"
+    }
+    columns {
+      name = "session"
+      type = "string"
+    }
+    columns {
+      name = "task"
+      type = "string"
+    }
+    columns {
+      name = "run"
+      type = "string"
+    }
+    columns {
+      name = "pipeline"
+      type = "string"
+    }
+    columns {
+      name = "image_tag"
+      type = "string"
+    }
+    columns {
+      name = "emit"
+      type = "string"
+    }
+    columns {
+      # Same struct as func_preproc's, deliberately: both come from the same
+      # timed_stage() dict. On the `grayordinate` short path only boldref and
+      # grayordinates are populated and the rest are NULL *within* the struct,
+      # since that path skips the warp chain entirely.
+      #
+      # 4d_warp leads with a digit, so SQL must quote it:
+      # stage_timings_s."4d_warp". Unquoted, Athena fails the WHOLE query with
+      # MALFORMED_QUERY, not just that column.
+      name = "stage_timings_s"
+      type = "struct<boldref:double,composite_warp:double,4d_warp:double,mask_warp:double,masking:double,confounds:double,grayordinates:double>"
+    }
+    columns {
+      name = "total_runtime_s"
+      type = "double"
+    }
+    columns {
+      name = "peak_memory_gb"
+      type = "double"
+    }
+    columns {
+      name = "container_peak_memory_gb"
+      type = "double"
+    }
+    columns {
+      name = "completed_at"
+      type = "string"
+    }
+    # surf_l_/surf_r_ are LOWERCASE here while the emitter writes surf_L_/surf_R_
+    # — see the long note on the raw `surface_sample` table for why, and why
+    # "fixing" the case makes the plan permanently dirty.
+    columns {
+      name = "surf_l_n_vertices"
+      type = "int"
+    }
+    columns {
+      name = "surf_l_coverage_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_l_nan_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_l_tsnr_median"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_n_vertices"
+      type = "int"
+    }
+    columns {
+      name = "surf_r_coverage_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_nan_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_tsnr_median"
+      type = "double"
+    }
+    columns {
+      name = "subcort_n_voxels"
+      type = "int"
+    }
+    columns {
+      name = "subcort_n_structures"
+      type = "int"
+    }
+    columns {
+      name = "subcort_space"
       type = "string"
     }
   }
@@ -2203,7 +2397,7 @@ resource "aws_glue_catalog_table" "func_preproc" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "subject,session,task,run,n_frames,n_nss_frames,tr_seconds,mean_fd,median_fd,max_fd,n_fd_above_0p2,n_fd_above_0p5,pct_fd_above_0p5,mean_dvars,dvars_std,mean_global_signal,tsnr_median,gcor,aor,aqi,n_acompcor_wm,n_acompcor_csf,n_tcompcor,n_cosines,stage_timings_s,total_runtime_s,peak_memory_gb,container_peak_memory_gb,pipeline,image_tag,schema_version,completed_at"
+        paths                   = "subject,session,task,run,n_frames,n_nss_frames,tr_seconds,mean_fd,median_fd,max_fd,n_fd_above_0p2,n_fd_above_0p5,pct_fd_above_0p5,mean_dvars,dvars_std,mean_global_signal,tsnr_median,gcor,aor,aqi,n_acompcor_wm,n_acompcor_csf,n_tcompcor,n_cosines,stage_timings_s,total_runtime_s,peak_memory_gb,container_peak_memory_gb,pipeline,image_tag,schema_version,completed_at,surf_L_n_vertices,surf_L_coverage_frac,surf_L_nan_frac,surf_L_tsnr_median,surf_R_n_vertices,surf_R_coverage_frac,surf_R_nan_frac,surf_R_tsnr_median,subcort_n_voxels,subcort_n_structures,subcort_space"
         "ignore.malformed.json" = "true"
       }
     }
@@ -2344,6 +2538,242 @@ resource "aws_glue_catalog_table" "func_preproc" {
     }
     columns {
       name = "completed_at"
+      type = "string"
+    }
+    # Grayordinate QC. Positioned after completed_at because that is the
+    # emitter's own key order: preproc.py computes these separately and folds
+    # them in with `qc.update(surf_metrics)` after the volumetric record is
+    # already built.
+    #
+    # Undeclared here from the surface-func rollout until 2026-08-11, so all
+    # eleven read as absent through Athena while DuckDB (which infers columns
+    # from the JSON itself) returned them — the two engines of
+    # export_batch_metrics.py disagreed on eleven columns with no error on
+    # either side. Populated on 2,996 of 3,012 runs in the 2026-08-10 batch;
+    # NULL on any run that produced no surfaces.
+    #
+    # `surf_l_`/`surf_r_` are LOWERCASE here even though the emitter writes
+    # `surf_L_`/`surf_R_`, and that mismatch is deliberate. Glue stores every
+    # column name lowercased, but the AWS provider compares the stored name
+    # against this config case-SENSITIVELY, so declaring `surf_L_n_vertices`
+    # produces a diff that can never converge: the first apply reported success
+    # and the next plan still wanted all eight renamed, on every run forever. A
+    # perpetually dirty plan is worse than cosmetic here — a clean plan is how
+    # you tell whether a change actually landed, and this module already carries
+    # unrelated drift.
+    #
+    # Nothing downstream needs the mixed case at this layer. Athena identifiers
+    # are case-insensitive, the SerDe `paths` parameter below keeps the emitter's
+    # mixed case (it is matched against the raw JSON keys, not treated as an
+    # identifier), and athena.py::_restore_column_case renames the lowercased
+    # labels back to the documented mixed-case names on read.
+    columns {
+      name = "surf_l_n_vertices"
+      type = "int"
+    }
+    columns {
+      name = "surf_l_coverage_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_l_nan_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_l_tsnr_median"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_n_vertices"
+      type = "int"
+    }
+    columns {
+      name = "surf_r_coverage_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_nan_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_tsnr_median"
+      type = "double"
+    }
+    columns {
+      name = "subcort_n_voxels"
+      type = "int"
+    }
+    columns {
+      name = "subcort_n_structures"
+      type = "int"
+    }
+    columns {
+      name = "subcort_space"
+      type = "string"
+    }
+  }
+}
+
+resource "aws_glue_catalog_table" "surface_sample" {
+  # Added 2026-08-11 (#241). The prefix existed and was actively written from
+  # the surface-func rollout onward, but its artifact key had no dt= component,
+  # so partition projection — the only thing publishing partitions since the
+  # crawlers were removed — had nothing to project and Athena could not see the
+  # prefix at all. The writer now templates dt=; this table makes it readable.
+  #
+  # Not redundant with func_preproc's surf_*/subcort_* block, despite the
+  # identical field names: preproc.py's `grayordinate` short path writes ONLY
+  # here (it leaves FuncQC alone rather than overwriting a real volumetric
+  # record with a partial one), so for those runs this table is the sole copy.
+  database_name = aws_glue_catalog_database.metrics.name
+  name          = "surface_sample"
+
+  table_type = "EXTERNAL_TABLE"
+
+  parameters = merge(local.partition_projection.surface_sample, {
+    "classification"        = "json"
+    "compressionType"       = "none"
+    "typeOfData"            = "file"
+    "ignore.malformed.json" = "true"
+  })
+
+  partition_keys {
+    name = "dt"
+    type = "string"
+  }
+
+  storage_descriptor {
+    location      = "s3://${var.bucket}/metrics/surface-sample/"
+    input_format  = "org.apache.hadoop.mapred.TextInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+
+    ser_de_info {
+      serialization_library = "org.openx.data.jsonserde.JsonSerDe"
+      parameters = {
+        # Mixed case is CORRECT here and must not be lowercased to match the
+        # `columns` blocks below: this parameter is matched against the raw JSON
+        # keys, not treated as a Hive identifier. A name in `columns` but absent
+        # from `paths` reads NULL.
+        paths                   = "subject,session,task,run,pipeline,image_tag,emit,stage_timings_s,total_runtime_s,peak_memory_gb,container_peak_memory_gb,schema_version,completed_at,surf_L_n_vertices,surf_L_coverage_frac,surf_L_nan_frac,surf_L_tsnr_median,surf_R_n_vertices,surf_R_coverage_frac,surf_R_nan_frac,surf_R_tsnr_median,subcort_n_voxels,subcort_n_structures,subcort_space"
+        "ignore.malformed.json" = "true"
+      }
+    }
+
+    columns {
+      name = "subject"
+      type = "string"
+    }
+    columns {
+      name = "session"
+      type = "string"
+    }
+    columns {
+      name = "task"
+      type = "string"
+    }
+    columns {
+      name = "run"
+      type = "string"
+    }
+    columns {
+      name = "pipeline"
+      type = "string"
+    }
+    columns {
+      name = "image_tag"
+      type = "string"
+    }
+    columns {
+      # Which preproc.py path wrote this record: "both" (full path — the same
+      # values are also in that run's func_preproc row) or "grayordinate" (short
+      # path — this row is the only copy). The column to read before attempting
+      # a join to func_preproc.
+      name = "emit"
+      type = "string"
+    }
+    columns {
+      # See the compacted table's note: same struct as func_preproc's because
+      # both come from the same timed_stage() dict, and on the short path only
+      # boldref/grayordinates are populated.
+      name = "stage_timings_s"
+      type = "struct<boldref:double,composite_warp:double,4d_warp:double,mask_warp:double,masking:double,confounds:double,grayordinates:double>"
+    }
+    columns {
+      name = "total_runtime_s"
+      type = "double"
+    }
+    columns {
+      name = "peak_memory_gb"
+      type = "double"
+    }
+    columns {
+      name = "container_peak_memory_gb"
+      type = "double"
+    }
+    columns {
+      # A data column on this raw table and a PARTITION KEY on
+      # surface_sample_compacted — which is why the compacted table's column
+      # list is this one minus this field, and why _UNION_COLUMNS omits it.
+      name = "schema_version"
+      type = "string"
+    }
+    columns {
+      name = "completed_at"
+      type = "string"
+    }
+    # `surf_l_`/`surf_r_` are LOWERCASE here even though the emitter writes
+    # `surf_L_`/`surf_R_`, and that mismatch is deliberate — the same reasoning
+    # as on func_preproc. Glue stores every column name lowercased, but the AWS
+    # provider compares the stored name against this config case-SENSITIVELY, so
+    # declaring `surf_L_n_vertices` produces a diff that can never converge: the
+    # apply reports success and the next plan still wants all eight renamed,
+    # forever. Athena identifiers are case-insensitive, the SerDe `paths`
+    # parameter above keeps the emitter's mixed case, and
+    # athena.py::_restore_column_case renames the lowercased labels back to the
+    # documented names on read.
+    columns {
+      name = "surf_l_n_vertices"
+      type = "int"
+    }
+    columns {
+      name = "surf_l_coverage_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_l_nan_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_l_tsnr_median"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_n_vertices"
+      type = "int"
+    }
+    columns {
+      name = "surf_r_coverage_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_nan_frac"
+      type = "double"
+    }
+    columns {
+      name = "surf_r_tsnr_median"
+      type = "double"
+    }
+    # Absent, not zero, when the run sampled no subcortex.
+    columns {
+      name = "subcort_n_voxels"
+      type = "int"
+    }
+    columns {
+      name = "subcort_n_structures"
+      type = "int"
+    }
+    columns {
+      name = "subcort_space"
       type = "string"
     }
   }

@@ -35,6 +35,7 @@ import argparse
 import collections
 import csv
 import json
+import re
 import subprocess
 import sys
 import warnings
@@ -76,6 +77,65 @@ FUNCTIONAL_PHASE_STEPS: tuple[str, ...] = (
     "surface-sample",
     "surface-resample",
 )
+
+# `bold_to_t1w.py` exits 65 — and only 65 — when its relative-NMI sanity floor
+# rejects a run as degenerate; the session driver then deletes that run's output
+# directory, so the transform genuinely does not exist and func-preproc correctly
+# fails on the missing input. The driver records the exit code verbatim
+# ("bold_to_t1w.py exited 65"), which is the only thing distinguishing that
+# expected outcome from a bold-to-t1w failure that IS a defect — an OOMKill, a
+# spot preemption, or "pod terminated before this run's result was recorded".
+# Matching on the code rather than on `status != "succeeded"` is what keeps the
+# issue #114 OOM regression from being explained away as a QC rejection.
+B2T_QC_REJECTION_RE = re.compile(r"exited\s+65\b")
+
+
+def per_run_bold_to_t1w_rows(df: pd.DataFrame) -> dict[tuple[str, str, str, str], dict]:
+    """Index each run's `bold-to-t1w` outcome by (subject, session, task, run).
+
+    Per-run rows only: the session-level aggregate (task == run == "na") is the
+    fallback recorder's row for a skipped or dead pod and says nothing about an
+    individual run.
+
+    `failure_reason` is guarded rather than assumed, because records written
+    before that column existed — and hand-built frames in tests — may not carry
+    it. A missing reason never matches the QC pattern, which is the safe
+    direction: report the gap rather than explain it away.
+    """
+    b2t = df[(df["step"] == "bold-to-t1w") & (df["task"] != "na") & (df["run"] != "na")]
+    if "failure_reason" not in b2t.columns:
+        b2t = b2t.assign(failure_reason="")
+    return (
+        b2t.assign(failure_reason=b2t["failure_reason"].fillna(""))
+        .groupby(["subject", "session", "task", "run"])[["status", "failure_reason"]]
+        .last()
+        .to_dict("index")
+    )
+
+
+def classify_bold_to_t1w_evidence(b2t_row: dict | None) -> tuple[bool, str]:
+    """Explain a missing func-preproc run against the per-run bold-to-t1w gate.
+
+    Takes that run's `bold-to-t1w` step_outcomes row (None when it has none) and
+    returns `(qc_rejected, note)`:
+
+    - `qc_rejected` — the registration was rejected by the relative-NMI floor and
+      its transform discarded, so the absent func-preproc output is the correct
+      result rather than a defect. Reported in `details`, not `missing`.
+    - `note` — a suffix for the `missing` entry when bold-to-t1w failed for some
+      OTHER reason, which IS a defect. Carrying the recorded reason here is what
+      turns "unexplained gap" into a diagnosis without an S3 log dig.
+
+    Both empty means bold-to-t1w has nothing to say about this run: it succeeded,
+    or never recorded a per-run row at all.
+    """
+    if not b2t_row or b2t_row["status"] == "succeeded":
+        return False, ""
+    reason = b2t_row.get("failure_reason") or ""
+    if B2T_QC_REJECTION_RE.search(reason):
+        return True, ""
+    return False, f" — bold-to-t1w {b2t_row['status']}: {reason or 'no reason recorded'}"
+
 
 KUBECOST_BASE_URL = "https://kubecost.<YOUR_DOMAIN>"
 
@@ -481,6 +541,25 @@ class TestBatchValidator:
         rejection) — it is reported in `details`, not `missing`, so it does not
         read the same as an unexplained recording failure. See #146.
 
+        There are TWO such QC gates, and until #221 this only knew about the
+        session-level one. `bold-to-t1w` rejects individual runs on its
+        relative-NMI sanity floor (exit 65) and the session driver discards the
+        output, so func-preproc then fails on a transform that genuinely does not
+        exist — for that one run, in a session whose t1w-to-mni succeeded. Those
+        runs are reported alongside the session-gated ones instead of as
+        unexplained gaps; the 2026-08-10 200-subject batch read `RESULT: FAIL` on
+        six of them while having zero actual defects. A bold-to-t1w failure with
+        any other cause (OOMKill, spot preemption, a mid-loop pod death) is still
+        an unexplained gap, annotated with the recorded reason.
+
+        Since #222 the func-preproc driver records such a run as `skipped` with
+        `upstream_failed_step="bold-to-t1w"` rather than letting it fail on the
+        absent transform. That is deliberately NOT what this keys off — any
+        non-`succeeded` status routes through the same bold-to-t1w evidence
+        check, so records from either side of that change are explained
+        identically and a driver that regressed to `failed` would not silently
+        become an unexplained gap.
+
         Limitation: if outcome recording failed for *every* functional step of a
         subject that did have BOLD, it is indistinguishable here from a subject with
         no BOLD, and would be silently excluded. Exclusions are listed in `details`
@@ -488,7 +567,7 @@ class TestBatchValidator:
         """
         steps_sql = ", ".join(f"'{s}'" for s in (*FUNCTIONAL_PHASE_STEPS, "t1w-to-mni"))
         df: pd.DataFrame = self._m._run_sql(f"""
-            SELECT subject, session, task, run, status, step
+            SELECT subject, session, task, run, status, step, failure_reason
             FROM cloudpipe_metrics.step_outcomes
             WHERE subject IN ({self._subject_in})
               AND step IN ({steps_sql})
@@ -586,9 +665,12 @@ class TestBatchValidator:
         func = df[(df["step"] == "func-preproc") & (df["task"] != "na") & (df["run"] != "na")]
         func_status = func.groupby(["subject", "session", "task", "run"])["status"].last()
 
+        b2t_rows = per_run_bold_to_t1w_rows(df)
+
         unexplained_missing: list[str] = []
         subjects_with_unexplained_gaps: set[str] = set()
         gated: list[tuple[str, str]] = []  # (subject, session) pairs, deduped below
+        run_gated: list[tuple[str, str, str, str]] = []  # (subject, session, task, run)
         found = 0
         for row in triples.itertuples(index=False):
             key = (row.subject, row.session, row.task, row.run)
@@ -597,19 +679,28 @@ class TestBatchValidator:
                 found += 1
                 continue
 
+            # The session gate takes precedence over the per-run one: in a
+            # session whose t1w-to-mni failed, bold-to-t1w's own outcome is not
+            # meaningful evidence about why func-preproc has no record.
             session_qc = t1w_mni_status.get((row.subject, row.session))
             if session_qc is not None and session_qc != "succeeded":
                 gated.append((row.subject, row.session))
                 continue
 
+            qc_rejected, b2t_note = classify_bold_to_t1w_evidence(b2t_rows.get(key))
+            if qc_rejected:
+                run_gated.append(key)
+                continue
+
             subjects_with_unexplained_gaps.add(row.subject)
             if status is None:
                 unexplained_missing.append(
-                    f"{row.subject} {row.session} {row.task} {row.run} (no func-preproc records)"
+                    f"{row.subject} {row.session} {row.task} {row.run} "
+                    f"(no func-preproc records){b2t_note}"
                 )
             else:
                 unexplained_missing.append(
-                    f"{row.subject} {row.session} {row.task} {row.run} [{status}]"
+                    f"{row.subject} {row.session} {row.task} {row.run} [{status}]{b2t_note}"
                 )
 
         missing = [f"{s} (no func-preproc records)" for s in no_records] + unexplained_missing
@@ -627,6 +718,16 @@ class TestBatchValidator:
                 f"sessions gated by t1w-to-mni QC: {len(gated_sessions)} ({len(gated)} runs) "
                 "— func-preproc correctly skipped, not a recording gap: "
                 + ", ".join(f"{s} {ses}" for s, ses in gated_sessions)
+            )
+
+        gated_runs = sorted(set(run_gated))
+        if gated_runs:
+            details.append(
+                f"runs gated by bold-to-t1w QC: {len(gated_runs)} — the registration "
+                "was rejected as degenerate and its transform discarded, so "
+                "func-preproc has no output for the run (recorded `skipped` since "
+                "issue #222, `failed` before it), not a recording gap: "
+                + ", ".join(f"{s} {ses} {t} {r}" for s, ses, t, r in gated_runs)
             )
 
         # Subject-level figure kept for continuity with the old headline number,
@@ -660,8 +761,9 @@ class TestBatchValidator:
             triage=(
                 "Check bold-to-t1w and func-preproc step_outcomes for failed subjects. "
                 "Re-submit the workflow for affected subjects. Runs listed under "
-                "'gated by t1w-to-mni QC' in details need no action — they are the "
-                "correct result of a QC rejection, not a recording defect."
+                "'gated by t1w-to-mni QC' or 'gated by bold-to-t1w QC' in details "
+                "need no action — they are the correct result of a QC rejection, not "
+                "a recording defect."
             ),
         )
 

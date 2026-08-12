@@ -31,6 +31,7 @@ from .athena import anatomical_join_sql, cost_scope_clause
 
 _PREFIXES = {
     "func_qc": "metrics/func-preproc/",
+    "surface_qc": "metrics/surface-sample/",
     "anat_qc": "metrics/anat-qc/",
     "fsqc_qc": "metrics/fsqc-qc/",
     "registration_qc": "metrics/registration/",
@@ -92,6 +93,18 @@ class CloudpipeMetrics:
 
     def func_qc(self, dt_from: str | None = None, dt_to: str | None = None, **filters: Any):
         return self._query("func_qc", filters, dt_from, dt_to)
+
+    def surface_qc(self, dt_from: str | None = None, dt_to: str | None = None, **filters: Any):
+        """Return grayordinate (surface) QC metrics as a DataFrame.
+
+        DuckDB twin of athena.CloudpipeMetrics.surface_qc — read that
+        docstring for the grain and for why `emit` matters. Needs no column
+        list, unlike the Athena side: DuckDB infers the schema from the JSON,
+        so the nullable subcort_* fields need no declaration and the
+        mixed-case surf_L_*/surf_R_* names come back as written rather than
+        lowercased by Glue.
+        """
+        return self._query("surface_qc", filters, dt_from, dt_to)
 
     def anat_qc(self, dt_from: str | None = None, dt_to: str | None = None, **filters: Any):
         return self._query("anat_qc", filters, dt_from, dt_to)
@@ -503,6 +516,16 @@ class CloudpipeMetrics:
                                 union_by_name=true, sample_size=-1,
                                 hive_partitioning=true)
         {where}
-        ORDER BY completed_at DESC
         """
-        return self._con.execute(sql).df()
+        # ORDER BY only if the column is actually there. union_by_name already
+        # tolerates a field that only some records carry, but an ORDER BY naming
+        # a wholly-absent column is a BinderException that fails the entire
+        # query — not a NULL sort. `surface-sample` records written before
+        # 2026-08-11 have no completed_at at all (the emitter did not stamp one
+        # until #241), so the sort cannot be assumed. Resolved off the lazy
+        # relation rather than a second DESCRIBE, which would re-scan every file
+        # under sample_size=-1.
+        rel = self._con.sql(sql)
+        if "completed_at" in rel.columns:
+            rel = rel.order("completed_at DESC")
+        return rel.df()

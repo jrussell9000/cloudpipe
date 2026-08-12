@@ -89,11 +89,21 @@ resource "kubernetes_config_map_v1" "workflow_controller" {
     # outruns label propagation still cannot exceed it (#206) — excess workflows
     # are held in Pending until a slot frees.
     #
-    # 100, not the 50/25 the Prefect Variables use: this is a runaway backstop,
-    # not the working cap. It applies namespace-wide across BOTH pipelines
-    # (ADR 008), so setting it to either pipeline's cap would silently hold the
-    # other pipeline's workflows Pending whenever the first is at capacity.
-    "namespaceParallelism" = "100"
+    # Above the Prefect Variables, never equal to one: this is a runaway
+    # backstop, not the working cap. It applies namespace-wide across BOTH
+    # pipelines (ADR 008), so setting it to either pipeline's cap would silently
+    # hold the other pipeline's workflows Pending whenever the first is at
+    # capacity — which presents as a stalled batch, not a rejected submission.
+    #
+    # 400 = cloudpipe's 300 target + first-level's 25 + headroom. Raised from 100
+    # for the 300-concurrent full-ABCD run; at 100 it was itself the binding cap
+    # (a 300-wide submission ran 100 and left 200 Pending).
+    #
+    # Keep this consistent with the two Variables. The invariant is
+    # namespaceParallelism > cloudpipe-max-concurrent + first-level-max-concurrent;
+    # this value does NOT set the working concurrency, so raising it alone
+    # changes nothing until `prefect variable set cloudpipe-max-concurrent 300`.
+    "namespaceParallelism" = "400"
 
     # Global cap across all namespaces. Only argo-workflows runs workflows, so
     # this is effectively a second, looser ceiling above namespaceParallelism.

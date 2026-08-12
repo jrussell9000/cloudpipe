@@ -1,7 +1,7 @@
 {
   "uid": "cloudpipe-failure-triage",
   "title": "CloudPipe — Failure Triage",
-  "description": "Failed and skipped pipeline steps with their category and reason, from step_outcomes. Skipped is a normal outcome, not a problem — see the dashboard notes.",
+  "description": "Pipeline failures, organised by what a triager actually does: separate root causes from downstream casualties, separate QC-gate rejections from crashes, then read the detail. Skipped steps are a normal outcome and live in their own row at the bottom.",
   "tags": [
     "cloudpipe",
     "failures",
@@ -37,23 +37,23 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 9,
-        "h": 5
+        "w": 10,
+        "h": 6
       },
       "options": {
         "mode": "markdown",
-        "content": "### 🔧 What went wrong, and where\n\nEvery pipeline step records its own outcome, per participant and per scan. This dashboard shows the two non-successful ones.\n\n**Skipped is normal.** A step is skipped when its output already exists — reprocessing a participant whose anatomical was already done skips the whole anatomical branch on purpose. A high skip count usually means work was *saved*, not lost.\n\n**Failed needs a person.** `failure_category` groups causes; `upstream_failed_step` tells you when a step failed only because something before it did — fix the root step, not the symptom.\n\n**History is kept, not replaced.** Records are per workflow attempt, so a failure that has since been fixed by reprocessing still appears here. Narrow the time range to the batch you care about."
+        "content": "### 🔧 What went wrong, and what to fix\n\nEvery pipeline step records its own outcome per participant, session and BOLD run. Read this dashboard top to bottom — each row answers the next question.\n\n**Fix root causes, not casualties.** One failed step fails everything after it in the same session, and each casualty records its own `failed` row. The row below separates the two by replaying the per-run chain (`t1w-to-mni → bold-to-t1w → func-preproc → surface-sample → surface-resample`), because the `upstream_failed_step` field is written empty in practice.\n\n**A QC rejection is not a crash.** `t1w-to-mni` and `bold-to-t1w` exit 65 when their own quality gate rejects an otherwise clean run. Those are in their own row, with the gated metric and the bound it crossed. Everything else — crashed, killed, or output missing — is in the hard-failures row.\n\n**Ignore `failure_category`.** The in-pod writers hardcode `unknown` — `classify_failure()` is deliberately not wired in yet (GitHub #67), and the DAG-level recorder that does call it has no message to match on, since Argo exposes no task-message variable. `failure_reason` is the field that carries real detail; the reason-families panel below is the classification, done in the query.\n\n**History is kept, not replaced.** Records are per workflow attempt, so a failure since fixed by reprocessing still appears. Narrow the time range to the batch you care about."
       }
     },
     {
       "id": 1,
       "type": "stat",
-      "title": "Participants affected",
+      "title": "Participants with incomplete output",
       "gridPos": {
-        "x": 9,
+        "x": 10,
         "y": 0,
-        "w": 5,
-        "h": 5
+        "w": 4,
+        "h": 6
       },
       "datasource": {
         "uid": "cloudpipe-athena",
@@ -69,7 +69,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT COUNT(DISTINCT subject) AS failed_subjects FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+          "rawSQL": "SELECT COUNT(DISTINCT subject) AS incomplete_subjects FROM cloudpipe_metrics.subject_manifests WHERE overall_status <> 'succeeded' AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
         }
       ],
       "fieldConfig": {
@@ -81,7 +81,7 @@
           }
         }
       },
-      "description": "Distinct participants with at least one failed step in range. Reprocessed-and-since-fixed participants still count while their failed attempt is in the window.",
+      "description": "The true blast radius, from subject_manifests.overall_status. This is the number to trust — Pipeline Throughput's workflow status does NOT reflect it: a workflow whose per-run steps failed still finishes 'Succeeded', so subject-level damage is invisible there.",
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -92,12 +92,12 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Failed steps",
+      "title": "Root-cause failures",
       "gridPos": {
         "x": 14,
         "y": 0,
-        "w": 5,
-        "h": 5
+        "w": 4,
+        "h": 6
       },
       "datasource": {
         "uid": "cloudpipe-athena",
@@ -113,7 +113,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT COUNT(*) AS failed_steps FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+          "rawSQL": "WITH f AS (SELECT workflow_name, session, task, run, step, CASE step WHEN 't1w-to-mni' THEN 1 WHEN 'bold-to-t1w' THEN 2 WHEN 'func-preproc' THEN 3 WHEN 'surface-sample' THEN 4 WHEN 'surface-resample' THEN 5 ELSE 0 END AS pos FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)), attributed AS (SELECT COALESCE(min_by(r.step, r.pos), '') AS root_step FROM f a LEFT JOIN f r ON a.workflow_name = r.workflow_name AND a.session = r.session AND r.pos > 0 AND a.pos > 0 AND r.pos < a.pos AND (r.task = 'na' OR (r.task = a.task AND r.run = a.run)) GROUP BY a.workflow_name, a.session, a.task, a.run, a.step) SELECT COUNT(*) AS root_failures FROM attributed WHERE root_step = ''"
         }
       ],
       "fieldConfig": {
@@ -125,7 +125,7 @@
           }
         }
       },
-      "description": "Total failed step records — larger than the participant count, since one workflow can fail several steps, and one upstream failure cascades.",
+      "description": "Failed steps with no earlier failure in the same session to blame. These are the ones worth investigating — the number of distinct things actually broken.",
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -136,12 +136,12 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Skipped steps",
+      "title": "Downstream casualties",
       "gridPos": {
-        "x": 19,
+        "x": 18,
         "y": 0,
-        "w": 5,
-        "h": 5
+        "w": 3,
+        "h": 6
       },
       "datasource": {
         "uid": "cloudpipe-athena",
@@ -157,7 +157,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT COUNT(*) AS skipped_steps FROM cloudpipe_metrics.step_outcomes WHERE status = 'skipped' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+          "rawSQL": "WITH f AS (SELECT workflow_name, session, task, run, step, CASE step WHEN 't1w-to-mni' THEN 1 WHEN 'bold-to-t1w' THEN 2 WHEN 'func-preproc' THEN 3 WHEN 'surface-sample' THEN 4 WHEN 'surface-resample' THEN 5 ELSE 0 END AS pos FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)), attributed AS (SELECT COALESCE(min_by(r.step, r.pos), '') AS root_step FROM f a LEFT JOIN f r ON a.workflow_name = r.workflow_name AND a.session = r.session AND r.pos > 0 AND a.pos > 0 AND r.pos < a.pos AND (r.task = 'na' OR (r.task = a.task AND r.run = a.run)) GROUP BY a.workflow_name, a.session, a.task, a.run, a.step) SELECT COUNT(*) AS casualties FROM attributed WHERE root_step <> ''"
         }
       ],
       "fieldConfig": {
@@ -165,11 +165,55 @@
           "unit": "short",
           "color": {
             "mode": "fixed",
-            "fixedColor": "blue"
+            "fixedColor": "yellow"
           }
         }
       },
-      "description": "Steps that did not need to run because their output already existed. This is the pipeline working as designed — high is good, not bad.",
+      "description": "Failed steps that had an earlier failure in the same session. Nothing to fix here — they clear when their root does. Root + casualties = every failed step record.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "QC rejections",
+      "gridPos": {
+        "x": 21,
+        "y": 0,
+        "w": 3,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH f AS (SELECT step, subject, session, task, run FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND step IN ('t1w-to-mni', 'bold-to-t1w') AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)), q AS (SELECT subject, session, task, run, registration_type FROM cloudpipe_metrics.registration WHERE verdict = 'fail' AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) - INTERVAL '1' DAY AND CAST($__timeTo() AS DATE) + INTERVAL '1' DAY) SELECT COUNT(*) AS qc_rejections FROM f JOIN q ON f.subject = q.subject AND f.session = q.session AND ((f.step = 't1w-to-mni' AND q.registration_type = 't1w_to_mni') OR (f.step = 'bold-to-t1w' AND q.registration_type = 'bold_to_t1w' AND f.task = q.task AND f.run = q.run))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        }
+      },
+      "description": "Registration steps that ran to completion and were rejected by their own quality gate (exit 65). Counted by joining to registration.verdict = 'fail', not by parsing failure_reason — the reason string differs by step. See the QC row below for which gate fired.",
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -180,25 +224,25 @@
     {
       "id": 100,
       "type": "row",
-      "title": "🔎 What failed",
+      "title": "🎯 Root causes — what is actually broken",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 5,
+        "y": 6,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 4,
-      "type": "stat",
-      "title": "Most common cause",
+      "id": 10,
+      "type": "table",
+      "title": "Failures by step, split into root causes and casualties",
       "gridPos": {
         "x": 0,
-        "y": 6,
-        "w": 6,
-        "h": 5
+        "y": 7,
+        "w": 12,
+        "h": 9
       },
       "datasource": {
         "uid": "cloudpipe-athena",
@@ -214,61 +258,250 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT failure_category FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND failure_category <> '' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) GROUP BY failure_category ORDER BY COUNT(*) DESC LIMIT 1"
+          "rawSQL": "WITH f AS (SELECT workflow_name, subject, session, task, run, step, CASE step WHEN 't1w-to-mni' THEN 1 WHEN 'bold-to-t1w' THEN 2 WHEN 'func-preproc' THEN 3 WHEN 'surface-sample' THEN 4 WHEN 'surface-resample' THEN 5 ELSE 0 END AS pos FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)), attributed AS (SELECT a.step, a.subject, COALESCE(min_by(r.step, r.pos), '') AS root_step FROM f a LEFT JOIN f r ON a.workflow_name = r.workflow_name AND a.session = r.session AND r.pos > 0 AND a.pos > 0 AND r.pos < a.pos AND (r.task = 'na' OR (r.task = a.task AND r.run = a.run)) GROUP BY a.step, a.subject, a.workflow_name, a.session, a.task, a.run) SELECT step, CASE WHEN root_step = '' THEN 'ROOT CAUSE' ELSE 'downstream of ' || root_step END AS attribution, COUNT(*) AS failed_units, COUNT(DISTINCT subject) AS participants FROM attributed GROUP BY 1, 2 ORDER BY (CASE WHEN attribution = 'ROOT CAUSE' THEN 0 ELSE 1 END), failed_units DESC"
         }
       ],
+      "options": {
+        "cellHeight": "sm",
+        "sortBy": []
+      },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "orange"
-          },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "infrastructure": {
-                  "color": "yellow",
-                  "index": 0
-                },
-                "algorithm": {
-                  "color": "red",
-                  "index": 1
-                },
-                "data": {
-                  "color": "orange",
-                  "index": 2
-                },
-                "dependency": {
-                  "color": "purple",
-                  "index": 3
-                },
-                "unknown": {
-                  "color": "gray",
-                  "index": 4
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "attribution"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "ROOT CAUSE": {
+                        "text": "ROOT CAUSE",
+                        "color": "red",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "downstream of .*",
+                      "result": {
+                        "color": "yellow",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
                 }
               }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed_units"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "gradient"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "description": "One row per (step, attribution). A `failed_unit` is one failed step record — one session for t1w-to-mni, one BOLD run for everything downstream. Attribution replays the per-run chain, since `upstream_failed_step` is written empty: a step is a casualty if an earlier step in the same session failed (session-scoped failures apply to every run of that session). Work the ROOT CAUSE rows."
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Failure reason families",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 9
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT COALESCE(NULLIF(regexp_replace(regexp_replace(regexp_replace(failure_reason, 'sub-[A-Za-z0-9]+', 'sub-*'), 'ses-[A-Za-z0-9]+', 'ses-*'), '(task|run)-[A-Za-z0-9]+', '$1-*'), ''), '(no reason recorded — pod died before it could write one)') AS reason_family, COUNT(*) AS occurrences, COUNT(DISTINCT subject) AS participants, array_join(array_agg(DISTINCT step ORDER BY step), ', ') AS steps FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) GROUP BY 1 ORDER BY occurrences DESC"
+        }
+      ],
+      "options": {
+        "cellHeight": "auto",
+        "sortBy": []
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "reason_family"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "wrapText": true
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 460
+              }
+            ]
+          }
+        ]
+      },
+      "description": "`failure_reason` grouped after stripping participant, session, task and run identifiers out of the string. Without that normalisation these are near-unique — the same t1w-to-mni failure appears once per participant because the reason embeds an S3 path — and no grouping is possible. An empty reason means the pod was killed (spot preemption, eviction) before it could upload its record: /tmp/step_outcomes is an output artifact, so a hard kill leaves nothing to write."
+    },
+    {
+      "id": 12,
+      "type": "barchart",
+      "title": "Failures over time, by step",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT date_format(date_trunc('hour', from_iso8601_timestamp(recorded_at)), '%m-%d %Hh') AS hour, step, COUNT(*) AS failures FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) GROUP BY 1, 2 ORDER BY 1"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "step"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": false
             }
-          ]
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "hour",
+            "mode": "outer"
+          }
+        }
+      ],
+      "options": {
+        "xField": "hour",
+        "orientation": "vertical",
+        "stacking": "normal",
+        "showValue": "auto",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
-      "description": "The failure_category appearing most often in range. Start here, then filter the table below to that category.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 90
+          }
+        },
+        "overrides": []
+      },
+      "description": "Hourly bucket, stacked by step. A single tall bar is one bad batch or one bad node; a flat trickle across many hours is a systematic problem. Bucketed as a formatted string rather than a Grafana time field, because every Athena panel here returns a table — an hour with no failures has no bar rather than a zero."
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "🧪 QC-gate rejections — the code ran, the gate rejected the output",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 20,
+      "type": "text",
+      "title": "What these are",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 7,
+        "h": 10
+      },
       "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "textMode": "value",
-        "justifyMode": "center"
+        "mode": "markdown",
+        "content": "Both registration steps evaluate their own output and `sys.exit(65)` on a `fail` verdict, so the driver discards the outputs. **Nothing crashed** — these need a look at the gate as much as at the participant.\n\nThe QC record uploads *before* the exit, so `registration.verdict` is the reliable discriminator. `failure_reason` is not: `bold-to-t1w` records `exited 65`, but `t1w-to-mni` records `expected output not found` because its recorder checks S3 rather than the exit code.\n\n**The gates, and what they mean**\n\n| metric | fail bound | step |\n|---|---|---|\n| `lncc` | < 0.65 | t1w→MNI |\n| `jac_det_frac_negative` | > 0.005 | t1w→MNI |\n| `nmi_gain` | ≤ 0 | BOLD→T1w |\n\n`nmi_gain ≤ 0` is structural, not calibrated: the fitted transform scored no better than doing nothing. `lncc` is a fitted constant and has been recalibrated before — a cluster of rejections down near 0.2 is a real failure, a cluster just under 0.65 is worth questioning.\n\n`mask_dice` and `centroid_displacement_mm` are recorded but **not** gated; the rigid magnitude metrics were gated in schema 2.3 and reverted, because they measure field-of-view prescription, not quality. `ice_mean_mm` was a third t1w→MNI gate from 2026-07-23 to 2026-08-11 and was never once evaluated — fireants cannot invert a SyN fit, so the metric was always absent and the gate failed open. It is withdrawn, so historical `fail` records cannot have been caused by it."
       }
     },
     {
-      "id": 5,
+      "id": 21,
       "type": "table",
-      "title": "Every failed & skipped step",
+      "title": "Which gate fired, and by how much",
       "gridPos": {
-        "x": 6,
-        "y": 6,
-        "w": 18,
-        "h": 12
+        "x": 7,
+        "y": 24,
+        "w": 17,
+        "h": 10
       },
       "datasource": {
         "uid": "cloudpipe-athena",
@@ -284,7 +517,104 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT recorded_at, subject, session, task, run, step, status, failure_category, failure_reason, upstream_failed_step FROM cloudpipe_metrics.step_outcomes WHERE status IN ('failed', 'skipped') AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) ORDER BY recorded_at DESC"
+          "rawSQL": "WITH f AS (SELECT recorded_at, workflow_name, step, subject, session, task, run FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND step IN ('t1w-to-mni', 'bold-to-t1w') AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)), q AS (SELECT subject, session, task, run, registration_type, schema_version, lncc, jac_det_frac_negative, mask_dice, centroid_displacement_mm, nmi_gain, rigid_disp_max_mm FROM cloudpipe_metrics.registration WHERE verdict = 'fail' AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) - INTERVAL '1' DAY AND CAST($__timeTo() AS DATE) + INTERVAL '1' DAY) SELECT f.recorded_at, f.subject, f.session, f.task, f.run, f.step, array_join(filter(ARRAY[CASE WHEN q.registration_type = 't1w_to_mni' AND q.lncc < 0.65 THEN format('lncc %.3f < 0.65', q.lncc) END, CASE WHEN q.registration_type = 't1w_to_mni' AND q.jac_det_frac_negative > 0.005 THEN format('folding %.4f > 0.005', q.jac_det_frac_negative) END, CASE WHEN q.registration_type = 'bold_to_t1w' AND q.nmi_gain <= 0.0 THEN format('nmi_gain %.5f <= 0', q.nmi_gain) END], x -> x IS NOT NULL), ' + ') AS gate_fired, q.mask_dice AS ungated_mask_dice, q.centroid_displacement_mm AS ungated_centroid_mm, q.rigid_disp_max_mm AS ungated_rigid_disp_max_mm, q.schema_version, f.workflow_name FROM f JOIN q ON f.subject = q.subject AND f.session = q.session AND ((f.step = 't1w-to-mni' AND q.registration_type = 't1w_to_mni') OR (f.step = 'bold-to-t1w' AND q.registration_type = 'bold_to_t1w' AND f.task = q.task AND f.run = q.run)) ORDER BY f.recorded_at DESC"
+        }
+      ],
+      "options": {
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "recorded_at",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gate_fired"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 300
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "ungated_.*"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          }
+        ]
+      },
+      "description": "One row per rejected registration, joined from step_outcomes to the registration QC record. `gate_fired` names every bound the record crossed and its value, so a rejection can be judged without opening Athena. The `ungated_*` columns are recorded-only context, deliberately outside the gate — do not read them as reasons. `workflow_name` is the key for pod logs at s3://<bucket>/logs/{workflow}/{pod}/main.log, which outlive the workflow in Argo."
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "⛔ Hard failures — crashed, killed, or output missing",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 30,
+      "type": "table",
+      "title": "Every failure that was not a QC rejection",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 11
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH f AS (SELECT recorded_at, workflow_name, step, subject, session, task, run, failure_reason, CASE step WHEN 't1w-to-mni' THEN 1 WHEN 'bold-to-t1w' THEN 2 WHEN 'func-preproc' THEN 3 WHEN 'surface-sample' THEN 4 WHEN 'surface-resample' THEN 5 ELSE 0 END AS pos FROM cloudpipe_metrics.step_outcomes WHERE status = 'failed' AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)), qc AS (SELECT subject, session, task, run, registration_type FROM cloudpipe_metrics.registration WHERE verdict = 'fail' AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) - INTERVAL '1' DAY AND CAST($__timeTo() AS DATE) + INTERVAL '1' DAY), attributed AS (SELECT a.recorded_at, a.workflow_name, a.step, a.subject, a.session, a.task, a.run, a.failure_reason, COALESCE(min_by(r.step, r.pos), '') AS root_step FROM f a LEFT JOIN f r ON a.workflow_name = r.workflow_name AND a.session = r.session AND r.pos > 0 AND a.pos > 0 AND r.pos < a.pos AND (r.task = 'na' OR (r.task = a.task AND r.run = a.run)) GROUP BY a.recorded_at, a.workflow_name, a.step, a.subject, a.session, a.task, a.run, a.failure_reason) SELECT a.recorded_at, a.subject, a.session, a.task, a.run, a.step, CASE WHEN a.root_step = '' THEN 'ROOT CAUSE' ELSE 'downstream of ' || a.root_step END AS attribution, a.failure_reason, a.workflow_name FROM attributed a LEFT JOIN qc ON a.subject = qc.subject AND a.session = qc.session AND ((a.step = 't1w-to-mni' AND qc.registration_type = 't1w_to_mni') OR (a.step = 'bold-to-t1w' AND qc.registration_type = 'bold_to_t1w' AND a.task = qc.task AND a.run = qc.run)) WHERE qc.subject IS NULL ORDER BY a.recorded_at DESC"
         }
       ],
       "options": {
@@ -297,12 +627,16 @@
         ]
       },
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {
+            "filterable": true
+          }
+        },
         "overrides": [
           {
             "matcher": {
               "id": "byName",
-              "options": "status"
+              "options": "attribution"
             },
             "properties": [
               {
@@ -311,65 +645,20 @@
                   {
                     "type": "value",
                     "options": {
-                      "failed": {
-                        "text": "failed",
+                      "ROOT CAUSE": {
+                        "text": "ROOT CAUSE",
                         "color": "red",
                         "index": 0
-                      },
-                      "skipped": {
-                        "text": "skipped",
-                        "color": "orange",
-                        "index": 1
                       }
                     }
-                  }
-                ]
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-background",
-                  "mode": "basic"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "failure_category"
-            },
-            "properties": [
-              {
-                "id": "mappings",
-                "value": [
+                  },
                   {
-                    "type": "value",
+                    "type": "regex",
                     "options": {
-                      "infrastructure": {
-                        "text": "infrastructure",
+                      "pattern": "downstream of .*",
+                      "result": {
                         "color": "yellow",
-                        "index": 0
-                      },
-                      "algorithm": {
-                        "text": "algorithm",
-                        "color": "red",
                         "index": 1
-                      },
-                      "data": {
-                        "text": "data",
-                        "color": "orange",
-                        "index": 2
-                      },
-                      "dependency": {
-                        "text": "dependency",
-                        "color": "purple",
-                        "index": 3
-                      },
-                      "unknown": {
-                        "text": "unknown",
-                        "color": "gray",
-                        "index": 4
                       }
                     }
                   }
@@ -381,6 +670,10 @@
                   "type": "color-background",
                   "mode": "basic"
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 210
               }
             ]
           },
@@ -395,12 +688,277 @@
                 "value": {
                   "wrapText": true
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 520
               }
             ]
           }
         ]
       },
-      "description": "Most recent first. Sort or filter by `status` to separate the two — they are very different things. When `upstream_failed_step` is populated, this step is a casualty rather than a cause."
+      "description": "The failures that need a person: something crashed, was killed, or produced no output. QC rejections are excluded (they are in the row above), so filtering `attribution = ROOT CAUSE` here gives the actual work queue. Use the column filters to narrow by step or participant. `failure_category` and `upstream_failed_step` are deliberately not shown — both are written empty or constant, see the notes at the top."
+    },
+    {
+      "id": 400,
+      "type": "row",
+      "title": "⏭️ Skipped steps — normal, and usually not about failure",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 40,
+      "type": "table",
+      "title": "Skipped steps, with any failure in the same session",
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 15,
+        "h": 9
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "WITH o AS (SELECT workflow_name, subject, session, step, status, recorded_at FROM cloudpipe_metrics.step_outcomes WHERE status IN ('skipped', 'failed') AND from_iso8601_timestamp(recorded_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)), sk AS (SELECT * FROM o WHERE status = 'skipped'), fl AS (SELECT workflow_name, session, array_join(array_agg(DISTINCT step ORDER BY step), ', ') AS failed_steps FROM o WHERE status = 'failed' GROUP BY 1, 2) SELECT max(sk.recorded_at) AS recorded_at, sk.subject, sk.session, array_join(array_agg(DISTINCT sk.step ORDER BY sk.step), ', ') AS skipped_steps, COALESCE(max(fl.failed_steps), '— nothing failed here —') AS failed_in_same_session, sk.workflow_name FROM sk LEFT JOIN fl ON sk.workflow_name = fl.workflow_name AND sk.session = fl.session GROUP BY sk.subject, sk.session, sk.workflow_name ORDER BY 1 DESC"
+        }
+      ],
+      "options": {
+        "cellHeight": "auto",
+        "sortBy": [
+          {
+            "displayName": "recorded_at",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed_in_same_session"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "— nothing failed here —": {
+                        "text": "— nothing failed here —",
+                        "color": "green",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 230
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "skipped_steps"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "wrapText": true
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 340
+              }
+            ]
+          }
+        ]
+      },
+      "description": "Grouped per participant × session, since skips arrive in whole branches rather than one at a time. `failed_in_same_session` is the only way to tell a benign skip from a cascade: green means nothing failed alongside it, so the branch was skipped for want of input or because the output already existed. A step name there means look at that step first."
+    },
+    {
+      "id": 41,
+      "type": "text",
+      "title": "Why a step is skipped",
+      "gridPos": {
+        "x": 15,
+        "y": 47,
+        "w": 9,
+        "h": 9
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Skipped is not failed.** Three different things produce it, and the record cannot tell them apart on its own:\n\n1. **The output already exists.** Reprocessing a participant whose anatomical is done skips the whole anatomical branch on purpose. Work saved.\n2. **There is no input.** A session with no usable BOLD run skips the entire functional branch — `bold-to-t1w`, `func-preproc`, `surface-sample`, `surface-resample`, all four, for that session. This is the common case, and it is why such a participant reads `partial` rather than `succeeded`.\n3. **Something upstream failed.** The genuine cascade.\n\n`failure_category` reads `dependency` on **every** skip regardless of which of the three it was — it is hardcoded for skipped status, not inferred, so it carries no information. Use the `failed_in_same_session` column instead.\n\nA whole four-step branch skipped for one session with nothing failed is case 2, and needs no action beyond deciding whether that session should have been submitted."
+      }
+    },
+    {
+      "id": 500,
+      "type": "row",
+      "title": "👥 Blast radius — which participants lost output",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 50,
+      "type": "table",
+      "title": "Participants with incomplete output, worst first",
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT completed_at, subject, overall_status, cardinality(failed_steps) AS n_failed_units, cardinality(skipped_steps) AS n_skipped_units, array_join(array_distinct(failed_steps), ', ') AS which_steps_failed, array_join(array_distinct(skipped_steps), ', ') AS which_steps_skipped, cardinality(outputs_available) AS n_outputs_available, workflow_name FROM cloudpipe_metrics.subject_manifests WHERE overall_status <> 'succeeded' AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) ORDER BY n_failed_units DESC, n_skipped_units DESC"
+        }
+      ],
+      "options": {
+        "cellHeight": "auto",
+        "sortBy": [
+          {
+            "displayName": "n_failed_units",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "overall_status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "failed": {
+                        "text": "failed",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "partial": {
+                        "text": "partial",
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "n_failed_units"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "gradient"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "which_steps_.*"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "wrapText": true
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 300
+              }
+            ]
+          }
+        ]
+      },
+      "description": "From subject_manifests, the per-participant rollup written at workflow exit. `partial` means some outputs landed and some did not — the workflow itself may still have finished 'Succeeded', which is why this row exists and Pipeline Throughput cannot answer the question. The unit counts are of failed/skipped step records (one per session, or per BOLD run downstream of registration), so a participant with four bad runs scores 4 per affected step; `which_steps_*` de-duplicates to the step names."
     }
   ]
 }

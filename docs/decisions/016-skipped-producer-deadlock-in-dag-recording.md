@@ -104,10 +104,32 @@ Concretely:
     `{{tasks.X.status}}`
   - the per-run recorders that survive
     (`record-outcome-func-preproc-dagtask`,
-    `record-outcome-surface-sample-dagtask`,
-    `record-outcome-surface-resample-dagtask`) fire on
-    `X.Failed || X.Skipped` only — never on bare `X` — because the pod
-    already recorded its own successes
+    `record-outcome-surface-resample-dagtask`,
+    `record-outcome-bold-to-t1w-step`) fire on
+    `X.Failed || X.Errored || X.Skipped` only — never on bare `X` — because the
+    pod already recorded its own successes.
+
+    `.Errored` is not redundant with `.Failed`: Argo maps `Failed` to
+    `NodeFailed` (the pod ran and exited non-zero) and `Errored` to `NodeError`
+    (the controller could not run or track it — `pod deleted`, node shutdown).
+    Spot preemption produces the latter, and it is exactly the case where the
+    in-pod records are lost: `write_outcome()` writes to `/tmp/step_outcomes`,
+    which only reaches S3 as an output artifact uploaded *after* the main
+    container exits, so a hard kill loses every record for that session. The
+    original `Failed`-only gate left that unrecorded; a 2026-08-10 200-subject
+    batch showed 34 producer pods terminated by "imminent node shutdown" plus
+    one `pod deleted`.
+
+    `record-outcome-surface-sample-dagtask` no longer exists as its own task:
+    `surface-sample` shares `functional-preprocessing-dagtask` as its producer
+    (stage 1 runs inside that pod) and had an identical gate, differing only by
+    `step:`, so it is now recorded by the same pod via a repeatable `--step`.
+    Each step keeps its own expected-output verification, per-run status and S3
+    record; only the pod is shared, and one step's failure does not suppress the
+    other's record. This merge is legal here for the same reason the gate is:
+    the second step name is a static literal, not a reference to a producer's
+    outputs. It is also distinct from the `withItems` hazard below — one pod
+    recording two steps of the *same* producer adds no cross-branch wait.
 - The master-template refactor (issue #73, closed) found a further
   constraint worth recording here: **Argo resolves a DAG task's `depends`
   statically, before `withItems`/`withParam` expansion**, so a looped

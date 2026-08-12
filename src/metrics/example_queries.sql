@@ -119,11 +119,15 @@ ORDER BY finished_at DESC;
 --    Filter on `verdict` rather than re-deriving thresholds here: the bounds live
 --    in _T1W_MNI_THRESHOLDS and are retuned as batch distributions accumulate, so
 --    any copy in this file goes stale (this comment block used to hold one, and did).
---    As of 2026-07-25 the gate is fail-only over lncc, jac_det_frac_negative and
---    ice_mean_mm; mask_dice and centroid_displacement_mm are recorded but ungated,
---    so a row can have a poor mask_dice and still read `pass`. t1w_to_mni therefore
---    never emits 'warn' any more — select the raw columns and set your own bound if
---    you want a soft band.
+--    As of 2026-08-11 the gate is fail-only over lncc and jac_det_frac_negative;
+--    mask_dice and centroid_displacement_mm are recorded but ungated, so a row can
+--    have a poor mask_dice and still read `pass`. t1w_to_mni therefore never emits
+--    'warn' any more — select the raw columns and set your own bound if you want a
+--    soft band.
+--    The ice_* columns exist but are NEVER POPULATED (fireants cannot produce the
+--    SyN inverse). ice_mean_mm was a third gate from 2026-07-23 to 2026-08-11 and
+--    evaluated on zero sessions. Do not AVG() or threshold them — COUNT(ice_mean_mm)
+--    is 0 on every partition written so far.
 --    NOTE: schema 2.0 renamed dice -> mask_dice and ncc -> lncc. There is no
 --    `dice`/`ncc` column on this table any more. Metric values are not comparable
 --    across schema_version boundaries (jac_det_* changed meaning at 2.0 -> 2.1).

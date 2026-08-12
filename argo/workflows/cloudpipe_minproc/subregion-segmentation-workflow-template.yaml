@@ -284,7 +284,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-c2ba15155f39af001ca6bd2f0045f759234ab879"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-34fd35825a707887639dd303103b80d978a04ae9"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -316,11 +316,33 @@ spec:
           # Do not lower this from an averaged efficiency metric either. Use the
           # probe, which reads the peak directly.
           memory: 4.5G
-          # Keep in sync with `--threads 4` on every segment_subregions call
-          # below, or the pod throttles. The 90% mean CPU efficiency measured for
-          # the fused pod was dominated by these three regions, so it carries
-          # over; the DL pod's is unmeasured.
-          cpu: '4'
+          # 3.5, NOT 4, and deliberately half a core BELOW the `--threads 4` on
+          # every segment_subregions call below. This breaks the old
+          # "keep the request in sync with --threads" rule on purpose; read this
+          # before restoring 4.
+          #
+          # Why: a request of 4 is the single worst number for bin-packing on
+          # this pool. Measured 2026-08-11 mid-batch at 200 concurrent, a
+          # c*.2xlarge has 7.91 cpu allocatable and 0.705 cpu of DaemonSet
+          # requests, leaving 7.21 usable. Two 4-cpu pods need 8 and do not fit,
+          # so each of these pods took a whole node to itself: 83 of 148
+          # cpu-heavy nodes were carrying exactly ONE workflow pod, and the pool
+          # ran at 45% of allocatable cpu. At 3.5 two fit (7.0 <= 7.21), and a
+          # 4xlarge (15.19 usable) fits four instead of three.
+          #
+          # What it costs: measured usage is median 3.55 / p90 4.12 cpu, so this
+          # pod already wants slightly more than 4 and will now be mildly
+          # oversubscribed. There is NO cpu limit here, so 3.5 is a scheduling
+          # weight, not a cap — an unpacked node still lets all 4 threads run
+          # flat out. Only when a node is genuinely full does each co-tenant
+          # settle near 3.5/4 = ~90% of its threads, i.e. ~50 min -> ~55 min on
+          # this step. Halving its node count is worth 5 minutes.
+          #
+          # --threads stays at 4 on purpose: thread-count changes in this
+          # codebase have been non-monotonic and have altered numerical basins
+          # (see #138 / t1w-to-mni), so the safe lever is the request, which
+          # cannot change results.
+          cpu: '3.5'
           # The three GEMS regions are the bulk of /out — per-timepoint label
           # volumes plus the template dir. Unchanged from the fused pod's 5G
           # rather than re-apportioned, since these outputs dominated it.
@@ -668,7 +690,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-c2ba15155f39af001ca6bd2f0045f759234ab879"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-34fd35825a707887639dd303103b80d978a04ae9"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -694,9 +716,12 @@ spec:
           # It does NOT exclude the 16 GiB instance type, and do not write a
           # comment here claiming it does — measured 2026-08-03, a
           # c8i-flex.2xlarge has 14.82 GB allocatable and only 0.554 GB of
-          # daemonset memory REQUESTS (cloudwatch-agent, fluent-bit, guardduty,
+          # daemonset memory REQUESTS (cloudwatch-agent, guardduty,
           # ebs-csi; aws-node / kube-proxy / efs-csi request none), leaving
-          # 14.27 GB for a workload pod. 13G fits that with room. In the
+          # 14.27 GB for a workload pod (that measurement also included
+          # fluent-bit, since removed, so 0.554 GB is now an over-estimate and
+          # 14.27 GB an under-estimate — the conclusion only gets safer). 13G
+          # fits that with room. In the
           # 2026-08-03 batch the split was total — 7/7 attempts on the 16 GiB
           # type OOMKilled at 5G, 10/10 on 32 GiB types did not.
           #
@@ -716,10 +741,17 @@ spec:
           # Keep in sync with `--threads 4` on both calls below. Carried over
           # from the fused pod; the 90% mean CPU efficiency that justified it was
           # dominated by the GEMS regions, so it is NOT evidence for this pod.
-          # Worth revisiting: at 4 CPU this pod competes for the last core slot
-          # on a 4xlarge already holding three GEMS pods (3x4 + 4 = 16 vs 15.89
-          # allocatable), so it may briefly wait. Lowering it is unmeasured, and
-          # doubling a 33-second step costs little — but measure before changing.
+          #
+          # Left at 4 while the GEMS pod above dropped to 3.5, because the
+          # packing argument that motivated that change does not apply here: this
+          # pod's binding dimension is MEMORY (13G), not cpu. On a 4xlarge
+          # (30.7 G allocatable) only two 13G pods fit regardless of cpu, so
+          # shaving cpu buys no additional co-tenancy. The old note here worked
+          # out 3x4 + 4 = 16 vs 15.89 allocatable; that sum is now 3x3.5 + 4 =
+          # 14.5 and fits, so the "may briefly wait" caveat no longer holds.
+          #
+          # Lowering it is still unmeasured, and this step is ~33 s, so there is
+          # little to win. Measure before changing.
           cpu: '4'
           # Small: two per-session label volumes and two stats files. The fused
           # pod's 5G was sized for the GEMS label volumes, which do not land here.

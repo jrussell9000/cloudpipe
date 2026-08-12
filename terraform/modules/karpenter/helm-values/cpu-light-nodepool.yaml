@@ -56,9 +56,39 @@ spec:
   # below intended, just counted correctly. Revisit if
   # surface-resample-session-template moves off this pool (its 2 CPU request is
   # a poor fit for a t-series pool otherwise full of 100m pods).
+  #
+  # RE-DERIVED 2026-08-10 for 300 concurrent. The 640Gi above cleared 100
+  # concurrent but does not clear 300, and neither does `cpu: 160`. Two
+  # corrections to the reasoning above:
+  #
+  # 1. The 246.9Gi/16-node figure was CLIPPED BY THE 256Gi LIMIT — it is a floor
+  #    on demand at 100 concurrent, not the natural peak. Do not scale it as if
+  #    it were an observed maximum.
+  # 2. The derivation counts surface-resample-session-template as this pool's
+  #    only heavyweight. It is not: fsqc-metrics-template requests 5G/2cpu and
+  #    has NO skip gate (see that template's header), so it runs once per
+  #    subject on every workflow, reprocesses included.
+  #
+  # Size on the PACKING RATIO instead, which is the durable measurement from the
+  # pilot: 16 nodes carried ~36 cpu of requests = 2.25 of 4 vCPU per node (56%).
+  # The shortfall is consolidation lag plus the poor fit of 2-cpu pods on 4-vCPU
+  # nodes, and neither improves with scale. So:
+  #   300/100 * 36 cpu requests           ~= 108 cpu of requests
+  #   108 / 2.25 cpu-per-node             ~=  48 nodes
+  #   48 nodes * 4 vCPU                   ~= 192 cpu of NODE CAPACITY  -> over 160
+  #   48 nodes * 15.43Gi                  ~= 740Gi                     -> over 640Gi
+  #
+  # Both limits bind, because 108 cpu of pod requests is only 68% of `cpu: 160`
+  # while the nodes carrying it need 192. Comparing requests against these
+  # limits is the same unit error that caused the 100-concurrent stall.
+  #
+  # Set to 64 nodes: 4x the 16 the pilot reached, ~33% headroom over the 48-node
+  # projection to absorb the clustering the clipped measurement could not show.
+  # Expressed in matching node-capacity units so neither limit silently caps the
+  # other: 64 * 4 vCPU = 256, 64 * 15.43Gi = 987Gi -> 1024Gi.
   limits:
-    cpu: 160
-    memory: 640Gi
+    cpu: 256
+    memory: 1024Gi
   template:
     spec:
       expireAfter: 720h
