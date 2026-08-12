@@ -658,8 +658,23 @@ spec:
         # status only — no exit-code or output-parameter reference. See ADR
         # 016: referencing functional-preprocessing-dagtask's outputs here
         # deadlocks the session DAG whenever it is Skipped.
+        #
+        # `.Errored` as well as `.Failed`: a spot-preempted or deleted pod lands
+        # in phase Error, not Failed, and that is precisely the case where the
+        # in-pod writer lost its records — /tmp/step_outcomes is uploaded as an
+        # output artifact after the main container exits, so a hard kill leaves
+        # nothing to upload. Omitting Errored left that gap uncovered.
+        #
+        # Both steps recorded by ONE pod (--step is repeatable). surface-sample
+        # (stage 1, grayordinate extraction) has no Argo task of its own — it
+        # runs inside the func-preproc pod — so it shares this producer and gate
+        # and differed only by `step:`. Each still gets its own expected-output
+        # check and record; only the pod is shared.
         - name: record-outcome-func-preproc-dagtask
-          depends: functional-preprocessing-dagtask.Failed || functional-preprocessing-dagtask.Skipped
+          depends: >-
+            functional-preprocessing-dagtask.Failed ||
+            functional-preprocessing-dagtask.Errored ||
+            functional-preprocessing-dagtask.Skipped
           templateRef:
             name: outcome-recorder
             template: record-step-outcome
@@ -667,28 +682,7 @@ spec:
             parameters:
               - name: step
                 value: func-preproc
-              - name: status
-                value: '{{tasks.functional-preprocessing-dagtask.status}}'
-              - name: subject
-                value: '{{workflow.parameters.subjID}}'
-              - name: session
-                value: '{{inputs.parameters.session}}'
-              - name: bucket
-                value: '{{workflow.parameters.bucket}}'
-              - name: metrics-bucket
-                value: '{{workflow.parameters.metrics-bucket}}'
-
-        # Stage 1 (grayordinate extraction) has no Argo task of its own — it
-        # runs inside the func-preproc pod — so this fallback hangs off the
-        # same producer task and distinguishes itself only by `step:`.
-        - name: record-outcome-surface-sample-dagtask
-          depends: functional-preprocessing-dagtask.Failed || functional-preprocessing-dagtask.Skipped
-          templateRef:
-            name: outcome-recorder
-            template: record-step-outcome
-          arguments:
-            parameters:
-              - name: step
+              - name: step2
                 value: surface-sample
               - name: status
                 value: '{{tasks.functional-preprocessing-dagtask.status}}'
@@ -728,10 +722,15 @@ spec:
 
         # Fallback aggregate record — surface-resample-session-template now
         # records its own per-run outcomes directly (see ADR 016). Fires only
-        # on Failed || Skipped (surface-resample is skipped once every
-        # dtseries already exists), never on bare success.
+        # on Failed || Errored || Skipped (surface-resample is skipped once every
+        # dtseries already exists), never on bare success. Errored covers the
+        # spot-preemption case, where the in-pod records die with /tmp before
+        # the artifact upload runs.
         - name: record-outcome-surface-resample-dagtask
-          depends: surface-resample-dagtask.Failed || surface-resample-dagtask.Skipped
+          depends: >-
+            surface-resample-dagtask.Failed ||
+            surface-resample-dagtask.Errored ||
+            surface-resample-dagtask.Skipped
           templateRef:
             name: outcome-recorder
             template: record-step-outcome
@@ -798,7 +797,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-db370b69f7fa6cef8138b23dd811b5f9af8d17d5"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

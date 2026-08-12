@@ -77,6 +77,11 @@ Outputs written to --outdir:
   <prefix>_space-MNI152NLin2009cAsym_brainmask.nii.gz  MNI-space brain mask
   <prefix>_space-MNI152NLin2009cAsym_bold.nii.gz       final masked MNI BOLD
   <prefix>_desc-confounds_timeseries.tsv                confound regressors
+
+Exit codes:
+  0   success — including a Stage 5b downgrade to volumetric-only
+  66  a required input does not exist; nothing was computed (EXIT_MISSING_INPUT)
+  1   anything else
 """
 
 import argparse
@@ -89,6 +94,7 @@ import re
 import resource
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -1235,7 +1241,17 @@ def _surface_qc_envelope(
     reprocessed as --emit both would otherwise leave the earlier file in
     place — describing a different run, from a different image, under the
     current run's name.
+
+    schema_version and completed_at are not decoration. The compactor groups
+    raw records by schema_version and writes each group to a
+    schema_version=<v>/ partition, which is a *projected* partition key on
+    surface_sample_compacted — a record without the field lands under
+    schema_version=unknown, outside the enum, and Athena then returns zero
+    rows with a successful query status rather than an error (#241). Field
+    order here is the Glue tables' column order; keep them in step.
     """
+    from datetime import datetime, timezone
+
     return {
         "subject": args.subj,
         "session": args.session,
@@ -1248,6 +1264,8 @@ def _surface_qc_envelope(
         "total_runtime_s": round(total_runtime_s, 2),
         "peak_memory_gb": round(peak_memory_gb, 3),
         "container_peak_memory_gb": round(container_peak_memory_gb, 2),
+        "schema_version": "1.0",
+        "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
@@ -1398,6 +1416,73 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+# Exit code for "a required input does not exist". Distinct from 1 (a real
+# compute failure) so a run the upstream QC gate already rejected is
+# distinguishable at a glance in the log, in the driver, and in Athena. Issue
+# #222: `bold-to-t1w` exits 65 on its relative-NMI floor and its driver
+# discards the run's output directory, so this run's transform is *supposed* to
+# be absent — but antsApplyTransforms discovered that at Stage 2 and the run
+# died with a 25-line CalledProcessError traceback indistinguishable from an
+# OOM or an ANTs crash.
+#
+# Deliberately absent from the func-preproc retryStrategy expression (which
+# retries "64", "75", "143" only): a missing upstream artifact is not
+# transient, and a retry would re-download the same empty prefix eight times
+# while spending the session's shared retry budget.
+EXIT_MISSING_INPUT = 66
+
+
+def missing_inputs(args: argparse.Namespace) -> list[str]:
+    """Required input paths that do not exist, as `flag: path` strings.
+
+    Which inputs are actually read depends on --emit, and over-checking would
+    turn a working configuration into a refusal: the grayordinate short path
+    skips Stages 2-5 and Stage 6, so it never opens the brain mask or the
+    motion file, and only that path passes --mni-bold-in. The T1w→MNI pair is
+    required on every path — the short path still warps the subcortical block
+    with it (extract_subcortical).
+    """
+    required = [
+        ("--bold", args.bold),
+        ("--mni-template", args.mni_template),
+        ("--aseg", args.aseg),
+        ("--bold2t1w-affine", args.bold2t1w_affine),
+        ("--t1w2mni-affine", args.t1w2mni_affine),
+        ("--t1w2mni-warp", args.t1w2mni_warp),
+    ]
+    if args.emit in ("volumetric", "both"):
+        required += [("--brainmask", args.brainmask), ("--motion-file", args.motion_file)]
+    if args.emit in ("grayordinate", "both"):
+        required.append(("--surf-dir", args.surf_dir))
+    if args.emit == "grayordinate":
+        required.append(("--mni-bold-in", args.mni_bold_in))
+    return [f"{flag}: {path}" for flag, path in required if not Path(path).exists()]
+
+
+def refuse_if_inputs_missing(args: argparse.Namespace, prefix: str) -> None:
+    """Exit EXIT_MISSING_INPUT if any required input is absent, computing nothing.
+
+    Runs before Stage 1 rather than letting the first program that opens the
+    file decide: the failure this replaces was antsApplyTransforms exiting 1 at
+    Stage 2, which surfaced as a CalledProcessError traceback that reads exactly
+    like a crash. See EXIT_MISSING_INPUT.
+    """
+    absent = missing_inputs(args)
+    if not absent:
+        return
+    for item in absent:
+        print(f"[preproc] MISSING INPUT {item}", flush=True)
+    hint = ""
+    if any(item.startswith("--bold2t1w-affine") for item in absent):
+        hint = " (bold-to-t1w rejected this run on its QC floor and discarded the transform)"
+    print(
+        f"[preproc] SKIPPING {prefix} — required input(s) absent{hint}; "
+        f"nothing computed, exiting {EXIT_MISSING_INPUT}",
+        flush=True,
+    )
+    sys.exit(EXIT_MISSING_INPUT)
+
+
 def main() -> None:
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -1406,6 +1491,9 @@ def main() -> None:
     prefix = f"{args.subj}_{args.session}_{args.task}_{args.run}"
 
     print(f"=== preproc: {prefix} ===", flush=True)
+
+    refuse_if_inputs_missing(args, prefix)
+
     pipeline_start = time.monotonic()
     _timings: dict = {}
 

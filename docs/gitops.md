@@ -79,8 +79,6 @@ Key overrides in `values.yaml`:
 
 | Setting | Value | Why |
 |---|---|---|
-| `controller.parallelism` | `1000` | Allow up to 1000 concurrently running workflows across all templates |
-| `controller.resourceRateLimit` | `limit: 50, burst: 90` | Throttle K8s API pod creates to avoid API server overload during mass submission. Raised from 20/35 after GitHub #66 consolidated functional-preprocessing and bold-to-t1w to one pod per run — the earlier ceiling was sized against pre-consolidation pod counts and became the throughput limiter. |
 | `controller.configMap.create` | `false` | Terraform owns the controller ConfigMap (bucket name must stay in sync with `var.globus_s3_destination_bucket`) |
 | `server.extraArgs` | `--auth-mode=sso --auth-mode=client` | SSO via Dex; CLI token auth as fallback |
 | `controller.deploymentAnnotations` | `secret.reloader.stakater.com/reload: "argo-db"` | Reloader restarts the controller pod when the `argo-db` K8s Secret changes (e.g. after RDS password rotation) |
@@ -90,6 +88,8 @@ Key overrides in `values.yaml`:
 Both `controller` and `server` run on the `argo` managed node group (taint `argoproj.io/backend=true`). Pipeline pods (runner SA) land on Karpenter-provisioned nodes.
 
 `artifactRepository` is intentionally absent from `values.yaml` — it is defined in the controller ConfigMap managed by Terraform so the S3 bucket name stays in sync with the Terraform variable.
+
+**Anything whose only chart consumer is the controller ConfigMap renders nowhere.** Because `controller.configMap.create` is `false`, `templates/controller/workflow-controller-config-map.yaml` is never rendered — so `controller.parallelism`, `controller.namespaceParallelism`, `controller.resourceRateLimit`, `server.sso` and `artifactRepository` are all *silently inert* if set in `values.yaml`. They live in `terraform/modules/argo-workflows/main.tf` instead. This bit twice: a documented pod-creation rate limit was never in effect until GitHub #206, and a `server.sso` block carried two stale-looking domain literals that no running pod ever read until GitHub #17. Add controller-config settings to the Terraform module, never here.
 
 ### prefect
 
@@ -120,7 +120,6 @@ A plain Helm chart containing raw manifests (`templates/`). Not an upstream depe
 | `argo-server-rbac.yaml` | ClusterRoles and bindings for the Argo server and `argo-admin` SA (node reader, SSO RBAC, events reader cross-namespace) |
 | `cluster-secret-store.yaml` | `ClusterSecretStore` named `aws-secrets-manager` pointing to Secrets Manager in <YOUR_AWS_REGION> |
 | `external-secrets-patch.yaml` | Patch for External Secrets Operator — ClusterRole/ClusterRoleBinding also created by Terraform (`terraform/modules/addons/external-secrets.tf`); ArgoCD manages the live state |
-| `fluent-bit-config.yaml` | Fluent Bit ConfigMap — routes argo-workflows container logs to `/aws/containerinsights/cloudpipe/argo-workflows` CloudWatch log group; all other pods go to the generic application log group |
 | `storage-class.yaml` | `ebs-sc` StorageClass (gp3, encrypted, default) — also created by Terraform; ArgoCD manages the live state |
 
 ### reloader
@@ -143,6 +142,8 @@ Installs CRDs and all three components (controller, webhook, cainjector) on the 
 
 Watches Ingress and Service objects for hostnames in `<YOUR_DOMAIN>` and creates Route53 records. `policy: upsert-only` — will not delete records. `txtOwnerId: cloudpipe` prevents collisions if a second External DNS instance is deployed.
 
+The `domainFilters` entry is one of the two intentionally hardcoded base-domain literals — see [Hardcoded base domain](#hardcoded-base-domain-policy-and-exceptions).
+
 ### prometheus-operator-crds
 
 Installs only the CRDs (ServiceMonitor, PodMonitor, PrometheusRule, etc.). Kept as a **separate** Application from `prometheus` so the CRDs are established before any chart that defines a ServiceMonitor syncs — including the stack itself. Ordering, not exclusivity: the full stack does run, in the `prometheus` app below.
@@ -155,6 +156,8 @@ Helm chart: `prometheus-community/kube-prometheus-stack` v77.14.0. Runs the Prom
 
 Helm chart: `grafana/grafana` v8.10.1. The dashboard JSONs live alongside the chart in `gitops/apps/grafana/dashboards/` and are provisioned as ConfigMaps, so a dashboard change ships through git like any other manifest — it is not edited in the UI. Grafana's AWS access (Athena query, Glue read, S3) comes from a Pod Identity association defined in Terraform, not from static credentials. See [observability.md](observability.md) for the dashboard inventory.
 
+SSO URLs and the admin email are single-sourced from Terraform via the `grafana-oidc-config` ConfigMap and expanded by Grafana's own `$__env{...}` at startup, but the **ingress host cannot be** — see [Hardcoded base domain](#hardcoded-base-domain-policy-and-exceptions).
+
 ### nvidia-device-plugin
 
 Helm chart: `nvidia/nvidia-device-plugin` v0.19.1. Advertises GPUs to the scheduler and configures **time-slicing at 3 replicas per physical GPU** (`failRequestsGreaterThanOne: false`), which is what lets 3 pods share one card.
@@ -165,7 +168,18 @@ Helm chart: `nvidia/nvidia-device-plugin` v0.19.1. Advertises GPUs to the schedu
 
 Standard AWS CSI and networking add-ons. Helm-managed by ArgoCD; IAM is managed by Pod Identity associations in Terraform.
 
-(The `aws-efs-csi-driver` app was removed once `subregion-seg`, the last EFS PVC consumer, moved to S3 checkpointing — GitHub #77. An orphaned `efs.csi.aws.com` CSIDriver object still survives in-cluster with no owning Application; it is inert.)
+(The `aws-efs-csi-driver` app was removed once `subregion-seg`, the last EFS PVC consumer, moved to S3 checkpointing — GitHub #77.)
+
+> **Deleting an Application does not always delete everything it created.** Removing
+> `aws-efs-csi-driver` left its `efs.csi.aws.com` CSIDriver object and its
+> `aws-efs-csi-driver` namespace behind for three months, unowned by any Application
+> ([#213](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/213), cleaned up by hand).
+> The CSIDriver carried `helm.sh/resource-policy: keep`, which tells Helm — and therefore
+> ArgoCD — to leave the resource in place when the release goes. That annotation exists so a
+> driver *upgrade* cannot yank the CSIDriver out from under mounted volumes; the cost is that a
+> genuine *removal* leaves residue nothing prunes. After removing an Application, check for
+> leftovers (`kubectl get csidriver,crd,ns` and anything else cluster-scoped) rather than
+> assuming the app-of-apps swept them.
 
 ---
 
@@ -177,7 +191,7 @@ This boundary matters when troubleshooting. A resource that Terraform creates wi
 |---|---|
 | Helm release: ArgoCD itself | Terraform (`argocd.tf`) |
 | Helm releases: all other apps | ArgoCD |
-| ArgoCD ApplicationSet + root-app | Terraform (bootstrapped), then ArgoCD self-manages |
+| ArgoCD ApplicationSet + root-app | Terraform only (`kubectl_manifest.argocd_root_app`). No Application watches `gitops/bootstrap/`, so a change to `root-app.yaml` needs `terraform apply` — pushing it to git does nothing. |
 | EKS add-ons (vpc-cni, coredns, etc.) | Terraform |
 | Karpenter NodePools / NodeClass | Terraform (via module) |
 | IAM roles and Pod Identity associations | Terraform |
@@ -188,6 +202,61 @@ This boundary matters when troubleshooting. A resource that Terraform creates wi
 | `globus-credentials` ExternalSecret | ArgoCD |
 | StorageClass (`ebs-sc`) | Both (Terraform creates; ArgoCD manages ongoing state) |
 | `external-secrets-cert-controller-patch` ClusterRole/Binding | Both (Terraform creates; ArgoCD manages ongoing state) |
+
+---
+
+## Hardcoded base domain: policy and exceptions
+
+Terraform single-sources the base domain from `var.domain` (`terraform/variables.tf`), and
+`terraform/locals.tf` derives `argocd_url` / `argo_url` / `prefect_url` / `grafana_url` from it.
+On the **gitops** side that is not fully achievable, and the remaining literals are a deliberate
+decision (GitHub #17), not an oversight.
+
+**Why it can't be fully parameterized.** A Helm `values.yaml` is *data*, not a template — Helm
+renders `templates/`, never values. So a setting that lives in a **subchart's** value tree (for
+example `grafana.ingress.hosts`) cannot reference a variable from inside the file. It can only be
+overridden from outside the chart, or moved into the parent chart's `templates/`. A value is
+therefore single-sourceable exactly when some *runtime* consumer expands it:
+
+| Mechanism | Works because | Used by |
+|---|---|---|
+| `$__env{DOMAIN}` | Grafana's own binary interpolates it at startup | `grafana.ini` `root_url`, `auth.generic_oauth` URLs (GitHub #16) |
+| `configMapKeyRef` env var | kubelet resolves it at pod start | `DOMAIN` / `ADMIN_EMAIL` from the Terraform-managed `grafana-oidc-config` ConfigMap |
+| Terraform interpolation | rendered before the object is applied | everything in `terraform/`, incl. the live Argo `sso` key |
+
+Kubernetes reads an Ingress `host` **literally** — there is no interpolator in that path at all.
+
+**The two remaining literals, and why each stays:**
+
+| Location | Value | Why it stays |
+|---|---|---|
+| [`gitops/apps/grafana/values.yaml`](https://github.com/jrussell9000/cloudpipe/blob/main/gitops/apps/grafana/values.yaml) | `ingress.hosts[0]` and the `external-dns.alpha.kubernetes.io/hostname` annotation | Subchart values consumed as literals by the Ingress object. Removing them means either disabling the subchart ingress and re-implementing it in the parent chart's `templates/`, or injecting `helm.parameters` from the ApplicationSet — both cost more risk than the duplication. |
+| [`gitops/apps/external-dns/values.yaml`](https://github.com/jrussell9000/cloudpipe/blob/main/gitops/apps/external-dns/values.yaml) | `domainFilters[0]` | Rendered into a `--domain-filter=` container arg. Same constraint. |
+
+`gitops/apps/prefect/values.yaml` still holds three literals (`prefectUiApiUrl`,
+oauth2-proxy's `oidc-issuer-url` and `redirect-url`). These *are* env-var-backed upstream
+(`PREFECT_UI_API_URL`, `OAUTH2_PROXY_OIDC_ISSUER_URL`, `OAUTH2_PROXY_REDIRECT_URL`) and so could
+follow the `configMapKeyRef` row above — deferred because a wrong `redirect-url` locks the Prefect
+UI out, so it needs a deliberate deploy plus an end-to-end login check rather than a drive-by edit.
+
+**Two traps if you do attempt broader parameterization.** The obvious approach — add a uniform
+`spec.source.helm.parameters` block to the `cluster-addons` ApplicationSet template — breaks in two
+places:
+
+1. `gitops/apps/pipelines/` has **no `Chart.yaml`**; it is a plain-manifest Application (an
+   app-of-apps pointer to `workflow-templates`). Setting `spec.source.helm` makes ArgoCD treat it
+   as a Helm chart, and with `prune: true` that misfires on the production WorkflowTemplates.
+2. `gitops/apps/prometheus/values.yaml` already has a `grafana:` key (kube-prometheus-stack's
+   subchart), so a blanket `grafana.ingress.*` parameter leaks into a second chart.
+
+Note also that `root-app.yaml` is applied by Terraform with `file()`, not `templatefile()`
+(`terraform/argocd.tf`). Switching it to `templatefile()` would let `var.domain` reach the
+ApplicationSet without introducing a second source of truth — `{{ }}` (ArgoCD) and `${ }`
+(Terraform) do not collide. That is the path to take if this is revisited.
+
+**When changing the domain**, then, these files need a manual edit alongside `var.domain`:
+`gitops/apps/grafana/values.yaml`, `gitops/apps/external-dns/values.yaml`,
+`gitops/apps/prefect/values.yaml`.
 
 ---
 

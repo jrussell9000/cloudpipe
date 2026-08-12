@@ -68,6 +68,15 @@ spec:
           configMapKeyRef:
             name: cloudpipe-config
             key: ecr_registry
+      # Required by the metrics-emission step. Declared here so a standalone
+      # submission resolves it; under the master this default is ignored (a
+      # templateRef inherits `templates` only) and the master's own
+      # workflow-scope value wins. See issue #212.
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
 
   entrypoint: surface-resample-entrypoint
 

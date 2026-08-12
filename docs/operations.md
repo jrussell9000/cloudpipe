@@ -292,9 +292,28 @@ argo delete -n argo-workflows --completed
 
 A test batch validates the full observability stack — outcome tracking (StepOutcome,
 SubjectManifest, WorkflowRun) and Kubecost cost attribution — before committing to a production
-run. The canonical subject list is `tools/cloudpipe_test_sample.csv` (100 subjects).
+run. The canonical subject list is `tools/cloudpipe_test_sample.csv` (100 subjects);
+`tools/cloudpipe_test_sample_200.csv` (200 subjects) is the concurrency-scaling batch.
 
 **Prerequisites:** VPN connected, AWS SSO active, `kubectl` context set to `cloudpipe`.
+
+### Generating a subject list
+
+`scripts/make_test_sample.py` draws a sample stratified by session count k, because cost
+and wall clock scale near-linearly in k ($0.096 at k=1 to $0.305 at k=4) — a random draw's
+k-mix drifts from the corpus and makes extrapolation to the full 11,628 unreliable.
+
+```bash
+pixi run python scripts/make_test_sample.py 200 -o tools/cloudpipe_test_sample_200.csv
+```
+
+By default the draw is **seeded from the previous 100-subject sample**, so the smaller batch
+is a strict subset and the two runs differ only in concurrency. That requires flushing those
+subjects first (Step 1 below) — otherwise their existing `derivatives/fastsurfer/` causes the
+inventory step to skip the whole anatomical phase, omitting the GPU-heavy work and
+understating load. Pass `--exclude-prior` to draw entirely fresh subjects instead.
+
+The seed is fixed (`--seed`), so the same command reproduces the same list.
 
 ---
 
@@ -486,8 +505,35 @@ Runs missing because their session failed the `t1w-to-mni` QC gate are a **known
 gap — `func-preproc` is correctly skipped downstream of the rejection, not a recording defect —
 and are listed separately under `details` as `sessions gated by t1w-to-mni QC: N (M runs)` rather
 than in the failure list. This is expected residual (the documented outcome of `NONE` sampling's
-deterministic bad basins, see ADR 012) and does not by itself fail the check. Any run in the
-failure list that is *not* under that heading is unexplained and needs investigation.
+deterministic bad basins, see ADR 012) and does not by itself fail the check.
+
+There are **two** such QC gates (issue #221). The second is per **run**, not per session:
+`bold-to-t1w` rejects an individual run on its relative-NMI sanity floor (exit 65) and the
+session driver discards that run's transform, so `func-preproc` has no input to work from — in a
+session whose `t1w-to-mni` succeeded. Those runs are listed under `details` as
+`runs gated by bold-to-t1w QC: N` and likewise need no action. When both gates apply to the same
+run, only the session-level one is reported.
+
+Since issue #222 the func-preproc driver detects the discarded transform up front and records
+that run as `skipped` with `upstream_failed_step=bold-to-t1w`, logging one line:
+
+```
+[driver] SKIPPED sub-VKLJZA5A_ses-06A_task-rest_run-01 — no bold_to_t1w transform (QC-rejected upstream): ..._desc-bold2t1w_itk.txt
+```
+
+Before that it ran `preproc.py` anyway and the run died at the composite-warp stage with an
+`antsApplyTransforms` `CalledProcessError` traceback, which reads exactly like an OOM or an ANTs
+crash — the 2026-08-10 batch needed two pod logs out of `s3://<YOUR_S3_BUCKET>/logs/` and a
+`derivatives/registration/` listing to establish otherwise. The validator keys off the
+**bold-to-t1w** row either way, so records written before #222 (`failed`) and after it
+(`skipped`) are reported identically. If you see the old traceback in a recent batch, the pod is
+running a pre-#222 image — check the pinned SHA.
+
+Only exit 65 counts as that gate. A `bold-to-t1w` failure from any other cause — an OOMKill, a
+spot preemption, a mid-loop pod death recorded as `pod terminated before this run's result was
+recorded` — is a real defect and stays in the failure list, annotated with the recorded reason.
+Any run in the failure list that is *not* under either gated heading is unexplained and needs
+investigation.
 
 `Pod attempt exit codes` counts **pod attempts**, not steps. Every other check describes a
 step *after* `retryStrategy` has run, so a step that was OOMKilled and then succeeded on
@@ -614,7 +660,7 @@ earlier runs of the same subjects.
 |---|---|---|
 | SubjectManifest | 100/100 | `exit_handler.py` pod logs in Argo UI for missing subjects |
 | StepOutcome steps | 9/9 | outcome-recorder task `depends` expressions in WorkflowTemplate |
-| func-preproc per-run coverage | all expected runs | unexplained gaps: Argo UI → subject → session phase → bold-to-t1w / func-preproc pod logs. Gaps listed under "gated by t1w-to-mni QC" need no action. |
+| func-preproc per-run coverage | all expected runs | unexplained gaps: Argo UI → subject → session phase → bold-to-t1w / func-preproc pod logs. Gaps listed under "gated by t1w-to-mni QC" or "gated by bold-to-t1w QC" need no action. |
 | WorkflowRun schema v1.1 | 100/100 | Image SHA in `metrics-exit-handler` WorkflowTemplate; re-submit affected subjects |
 | Kubecost API cost attribution | 100/100 | Widen `--window-end`; confirm `subjectid` pod label is set in master WorkflowTemplate |
 | Athena cost rows | 100/100 | Re-trigger scraper against `--bucket cloudpipe-metrics`; confirm the column is declared in `terraform/modules/metrics/` (there is no crawler) |
@@ -965,7 +1011,9 @@ bad = df[df["pct_fd_above_0p5"].astype(float) > 10][["subject", "session", "run"
 # fire at all sits ~17 sd below the mean. Gate on the failure modes instead:
 reg = m.registration_qc(registration_type="t1w_to_mni")
 folded = reg[reg["jac_det_frac_negative"].astype(float) > 0.005]   # deformation folding
-inconsistent = reg[reg["ice_mean_mm"].astype(float) > 0.5]         # round-trip residual
+poor_lncc = reg[reg["lncc"].astype(float) < 0.65]                  # intensity agreement
+# NOT `ice_mean_mm`: it is never populated (fireants cannot invert a SyN fit), so
+# the column is empty on every partition and any filter on it matches nothing.
 
 # For bold_to_t1w the single gate is nmi_gain — how much NMI the fitted transform
 # buys over identity. Note raw nmi ~1.02 is a GOOD score here (identity ~1.011),

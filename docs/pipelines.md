@@ -108,10 +108,12 @@ processing         (skipped if all five                   │
 |---|---|
 | `master-pipeline-dag` (this diagram) | `record-outcome-anatomical-dagtask`, `record-outcome-session-dagtask` (phase-level aggregates), `record-outcome-subregion-seg-dagtask`, `record-outcome-fsqc-metrics-dagtask` |
 | Anatomical child DAG | `record-outcome-fastsurfer-dagtask` |
-| Session-level child DAG | `record-outcome-func-preproc-dagtask`, `record-outcome-surface-sample-dagtask`, `record-outcome-surface-resample-dagtask` |
+| Session-level child DAG | `record-outcome-func-preproc-dagtask` (records both `func-preproc` and `surface-sample`), `record-outcome-surface-resample-dagtask` |
 | Registration child DAG | `record-outcome-t1w-to-mni-step`, `record-outcome-bold-to-t1w-step` |
 
-Each `record-outcome-*` task depends on `<producer>.Succeeded || .Failed || .Skipped`, so it runs on every terminal status. For a task that carries no `when:` clause of its own — `fsqc-metrics` is the example — `Skipped` means *an upstream branch failed*, not that the work was already done.
+Phase-level `record-outcome-*` tasks depend on `<producer>.Succeeded || .Failed || .Skipped`, so they run on every terminal status. For a task that carries no `when:` clause of its own — `fsqc-metrics` is the example — `Skipped` means *an upstream branch failed*, not that the work was already done.
+
+The per-run recorders whose producer writes its own outcomes in-pod are instead **fallbacks**, gated on `<producer>.Failed || .Errored || .Skipped` — never on bare success, so a healthy session pays for zero recorder pods. `.Errored` covers spot preemption (`pod deleted` / node shutdown), which is phase `Error`, not `Failed`, and is the case where the in-pod records never reach S3. See [ADR 016](decisions/016-skipped-producer-deadlock-in-dag-recording.md).
 
 > A record fan-out must never reference a **skipped** producer's output parameters: Argo cannot resolve them and the DAG deadlocks. This is why outcome recording passes the producer's `.status` rather than its outputs.
 
@@ -322,8 +324,64 @@ Reassembles `SUBJECTS_DIR` from **B's parcellated template** (not A's — `long_
 
 `podSpecPatch` sets resources dynamically based on session count k:
 - CPU: `max(4, 2k)` — the **total** thread count, spent as `--threads cpu/k` across k `--parallel` instances. The division is exact at every k: 4/1, 4/2, 6/3, 8/4.
-- Memory: `max(6, 2k)G` — its own floor, deliberately not tied to the CPU expression
+- Memory: `13G` at k≤3, `18G` at k=4 — its own expression, deliberately not tied to the CPU one and **not** scaled on 2k
 - Ephemeral storage: `(12 + 4k)G`
+
+**Memory is sized from measured peak, not `ram_efficiency` (#235).** The previous `max(6, 2k)G` was derived from `ram_efficiency` 0.30 and described as carrying 1.9–2.7× headroom over the mean. Against max `pod_memory_working_set` over every parcellation pod of the 2026-08-10 200-subject batch it was 0.43–0.48× of the **peak**:
+
+| | request | n | median | p95 | max | max/request |
+|---|---|---|---|---|---|---|
+| k≤3 | 6G | 147 | 8.99 G | 11.44 G | 12.40 G | **2.07×** |
+| k=4 | 8G | 75 | 13.94 G | 16.29 G | 17.42 G | **2.18×** |
+
+Every k=4 pod exceeded its request, the median by 74%. A 2xlarge has only **14.82 G** allocatable, so a k≤3 pod at p95 held 77% of the whole node's `kubepods` limit while telling the scheduler it needed 6 G — the scheduler was free to pack 8.8 G of co-tenants into memory the pod was already using. `13G`/`18G` clears the observed max at both k and changes no instance class: 13 G + ~0.56 G of daemonset requests fits a 2xlarge, and k=4 is already on a 4xlarge for `cpu: 8`, where 18 G leaves ~11.9 G for the co-tenants its ~7.2 spare cores can hold.
+
+This is the #129 lesson applied to a second step: `ram_efficiency` is a **lifetime average** and is structurally blind to a peak. Across the whole pipeline, the only two steps whose max/request is below 1.0 (`segment-subregions-dl`, `fsqc-metrics`) are the two sized from cgroup `memory.peak`; every step sized from `ram_efficiency` is over.
+
+**No memory limit is set** — but not for the reason previously recorded ("an underestimate should degrade to burst, not to an OOM"; it degraded to an OOM anyway, at the `kubepods.slice` level). A memory limit cannot address what killed `cloudpipe-zkrmj` on 2026-08-11. The kernel's process table at the OOM instant (`rss_anon` is in 4 KB pages):
+
+| pid | `rss_anon` | | |
+|---|---|---|---|
+| 81799 | 118,799 | 464 MB | |
+| 81847 | 118,718 | 464 MB | |
+| **82259** | **6,807,079** | **25.97 GiB** | ← victim |
+| 82365 | 102,425 | 400 MB | |
+
+One `mri_normalize` held 25.97 GiB of anonymous RSS during Intensity Normalization2 while its three siblings — same binary, same stage, same 256³ uchar inputs — sat at 464/464/400 MB. That 57× single-process outlier is an allocation fault, not demand that scales with k or with the data, and no *request* or *limit* value survives it.
+
+> Do **not** restate this as "four concurrent streams are ~14 G" (an earlier draft of this section did). The table above is the whole pod's process list, and the three healthy streams held ~1.3 G *combined*. The ~14 G median in the sizing table is `pod_memory_working_set` across all stages **including page cache** — not four concurrent normalize processes. The request sizing rests on those pod peaks; the per-process story is separate and far smaller.
+
+What the raised *request* buys is the thing a limit was wanted for: the scheduler now reserves what the pod actually takes, so it can no longer become the victim of a co-tenant packed into memory it was already using.
+
+**A per-process address-space cap does what a memory limit cannot.** The container runs `brun_fastsurfer.sh` under `ulimit -v 8G` in a subshell. `RLIMIT_AS` is per-process and inherited, so it caps each FreeSurfer binary individually rather than budgeting the pod. Because `memory.oom.group` is set on this container, the single 26 GiB runaway took `argoexec`, `bash` and all four `brun_fastsurfer` instances with it and lost the whole workflow; under the cap the runaway's `malloc` returns NULL, FreeSurfer `ErrorExit`s, and only that one session fails. **8G** is 4.1× the largest per-process max-RSS FreeSurfer's own `FSTIME` wrapper recorded across four *complete* k=4 runs (`267g8`, `28dmm`, `2hpvg`, `2sq7m`): **1.93 GB**. One capped runaway plus k−1 healthy streams (~0.5 G each) stays inside the 13G/18G request at every k. `RLIMIT_AS` bounds *virtual* address space, so the margin holds only while FreeSurfer's VA/RSS ratio stays near 1 — it was 1.06 on the healthy processes above.
+
+**What the FreeSurfer source says** (`mri_normalize.cpp` / `utils/mrinorm.cpp` @ `4d15e6a`). The failing call is `mri_normalize -seed 1234 -mprage -aseg aseg.presurf.mgz -mask brainmask.mgz norm.mgz brain.mgz`, which takes the `if (mri_aseg)` branch at `mri_normalize.cpp:735`. Three findings:
+
+1. **The last log line does not localize the crash.** `mri_normalize` never calls `setbuf`/`setvbuf`, so stdout to the tee'd log is block-buffered and a `SIGKILL` discards whatever is pending. The last unconditional `fflush(stdout)` is at `mri_normalize.cpp:907`, just after the aseg block. So `Applying bias correction` is guaranteed flushed, but everything after line 907 — `MRI3dGentleNormalize`, both `MRI3dNormalize` passes — is invisible. **Do not read the final log line as the crash site**; the death window is "anywhere after 907".
+2. **Nothing on this path allocates more than a volume.** `MRInormGentlyFindControlPoints` (`mrinorm.cpp:1096`) is O(1) memory: one 256³ uchar `MRIalloc` plus a fixed 7×7×7 window scan. The only `count`-scaled heap allocations in `mrinorm.cpp` (lines 2852, 2913–15, 2965–67) live in `MRI3dUseFileControlPoints` / `MRI3dUseLabelControlPoints` — the `-f` and label paths, which this command does not take. Everything else is a 256³ MRI, ≤67 MB as float. **Reaching 25.97 GiB needs ~400 simultaneous volume-sized allocations**, which no legitimate branch here performs — consistent with an allocation fault (runaway loop or corruption), not with data-scaled demand.
+3. **There is a real leak, but it is two orders of magnitude too small.** `MRIbuildBiasImage` (`mrinorm.cpp:1347`) takes `mri_bias` as an output parameter, then unconditionally does `mri_bias = MRIclone(mri_src, NULL)` at line 1358 — discarding the caller's buffer without freeing it. `MRI3dNormalize:1446` passes `mri_bias` expecting reuse, so every call leaks a full volume. At `num_3d_iter = 2` that is ~134 MB. Real, worth reporting upstream, **not** the 26 GiB.
+
+**Intensity scaling is ruled out; do not add an `mri_info` pre-flight gate.** `mri_info`-level and intensity-statistics checks on all four sessions of `sub-R4PV7WZ3` come back clean: every volume is 256³ uchar (`aseg` int16), range 0–255, no float and no out-of-range values, and the *first* `mri_normalize` in the same pod (`nu.mgz → T1.mgz`) prints `white matter peak found at 110` for all four sessions and exits 0 at ~572 MB max RSS. Measured WM mode is 110/110/109/109 and WM mean 104.5/104.5/103.1/104.5 — a header check would be a no-op. The one real outlier in the victim session (`ses-04A`) is **segmentation extent**, not intensity: 313,587 WM voxels vs 404–441k in its siblings, and 1211 control points removed vs 292/593/366.
+
+The container also emits cgroup v2 `memory.peak` and a 30 s `anon`/`file` split to the archived log, so the next batch replaces the sizing table above with a figure that separates real demand from reclaimable page cache (`pod_memory_working_set` folds the two together, making those numbers an upper bound).
+
+**The runaway is now identified: a garbage histogram bin count.** Re-running `sub-R4PV7WZ3` under the cap on 2026-08-12 (49m48s, container `memory.peak` **10.95 G** against the 18G request, no OOM kill, workflow `Succeeded`) produced the error the `SIGKILL` had been destroying:
+
+```
+ses-04A: 3d normalization pass 1 of 2
+ses-04A: white matter peak found at 110
+ses-04A: error: Cannot allocate memory
+ses-04A: error: HISTOalloc(2001892225): could not allocate histogram
+ses-04A: recon-all -s ses-04A exited with ERRORS
+```
+
+`HISTOalloc` was asked for **2,001,892,225 bins**. That is the 25.97 GiB. So the reading above needs one correction: finding 2 ("no legitimate branch allocates this") stands and is in fact *why* — the bin count is nonsense, not a large-but-legitimate volume — but the failure is **deterministic and specific to this session's data**, reproducing at the same point on a clean re-run, and it is localized to the 3d-normalization pass rather than to the "anywhere after line 907" window of finding 1. Making the process die by `ErrorExit` instead of `SIGKILL` is what made it legible: the cap bought a diagnosis, not just containment. The remaining question is which computation feeds `nbins`; `ses-04A`'s segmentation-extent outlier (313,587 WM voxels vs 404–441k in its siblings) is the obvious suspect.
+
+**Per-session completion guard (#245).** The same re-run exposed a second defect: `brun_fastsurfer.sh` reported **`exit=0`** while `ses-04A` had errored out. Since `check_fastsurfer_derivatives` (step 7) is a bare `head_object`, an exit-0 step publishes a truncated `ses-04A_templated.tar.gz` — 66 entries, `scripts/IsRunning.lh+rh` present, no `lh.white`/`rh.white`/`lh.pial`/`rh.pial` — and that tarball marks the subject **permanently complete**. The anatomical phase is then skipped on every future submission, the subject can never self-heal, and registration and func-preproc run against a `surf/` missing its principal outputs.
+
+So the container now validates each session before Argo can publish it, rejecting any that has an `IsRunning` marker or is missing a non-empty white/pial surface per hemisphere, and **deleting the directory**. Every per-session output artifact is `optional: true`, so a deleted directory means the artifact is skipped and the derivative is genuinely absent — the existence check then correctly reports the session missing and the next submission re-runs the phase. Self-healing is restored by making the failure legible, not by adding a second source of truth. Rejected sessions are also pruned from `base-tps` (written from the template's timepoint list, not from what is on disk), so one bad session does not fail `segment-subregions` for the whole subject. If *no* session survives, the step exits **1** — not 75 — because a deterministic allocation failure re-run is an identical failure, the same reasoning that keeps 137 out of the retry expression (#115).
+
+This is the output-side counterpart to the input-side `find "$SD" -name '*IsRunning*' -delete` guard: the same marker, applied to what the pod produces rather than to what it inherits.
 
 **`--threads 2` per instance is a hard floor.** `recon-surf.sh:319-321` branches rather than scales:
 
@@ -554,9 +612,9 @@ Three things about that order are deliberate and easy to get wrong:
 
 **Float16 output rationale:** MNI BOLD is written as float16 NIfTI (`DT_FLOAT16`, datatype 512). This halves the in-memory allocation (~6.3 GB vs ~12.6 GB for a 400-frame run). FSL, AFNI, and FreeSurfer all upcast float16 to float32 on load. Confound regressors are derived entirely from native-space float32 data. Quantization error at typical BOLD baseline (~1000 units) is ~0.5 units, negligible for GLM/FC/ICA analyses. tSNR is computed with float32 accumulators before writing (required to avoid overflow when summing 300+ frames).
 
-Resources: 4G memory request, 6G limit (TODO(perf): validate limit empirically against observed peak usage — intermediate ANTs warp operations may exceed 6G on longer runs; check `metrics/func-preproc` QC JSONs for `peak_memory_gb` before adjusting), 3 CPU, 20G ephemeral-storage request, 30G limit. CPU was cut from 6 in [#96](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/96) — mean `cpu_efficiency` across 26 pods was 0.347, ~2.1 of 6 cores. The driver derives `--threads` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` from the pod's own CPU request (downward API `resourceFieldRef`, env `CPU_REQUEST`) rather than a hardcoded constant, so the request is the single source of truth and cannot drift from the thread count. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`); ephemeral storage grew because the pod holds the session's whole `func/` and `registration/` prefixes plus the extracted FastSurfer tree. The driver deletes each run's working directory once it is tarred, so intermediates do not accumulate across runs.
+Resources: 4G memory request, 6G limit (TODO(perf): validate limit empirically against observed peak usage — intermediate ANTs warp operations may exceed 6G on longer runs; check `metrics/func-preproc` QC JSONs for `peak_memory_gb` before adjusting), 2 CPU, 20G ephemeral-storage request, 30G limit. CPU was cut 6 → 3 in [#96](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/96) — mean `cpu_efficiency` across 26 pods was 0.347, ~2.1 of 6 cores — then 3 → 2 after a live re-measurement over 65 pods mid-batch at 200 concurrent (2026-08-11) showed median 1.15 CPU and p90 3.19, i.e. 38% of the request, the step being largely S3-I/O-bound. At 2 CPU three pods share a `c*.2xlarge` where only two fit at 3. The request must stay an integer: `resourceFieldRef` rounds a fractional CPU request up, which would decouple the thread count from the reservation. The driver derives `--threads` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` from the pod's own CPU request (downward API `resourceFieldRef`, env `CPU_REQUEST`) rather than a hardcoded constant, so the request is the single source of truth and cannot drift from the thread count. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`); ephemeral storage grew because the pod holds the session's whole `func/` and `registration/` prefixes plus the extracted FastSurfer tree. The driver deletes each run's working directory once it is tarred, so intermediates do not accumulate across runs.
 
-`ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` is set by the driver per run (to `CPU_REQUEST // jobs`, floored at 1) rather than on the container, so raising `jobs` splits the CPU request across concurrent runs instead of letting each grab the whole request and over-subscribe the node. `jobs` is `1`, and with the CPU request now at 3, `jobs=3` would leave one thread per run while still tripling peak memory.
+`ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` is set by the driver per run (to `CPU_REQUEST // jobs`, floored at 1) rather than on the container, so raising `jobs` splits the CPU request across concurrent runs instead of letting each grab the whole request and over-subscribe the node. `jobs` is `1`, and with the CPU request now at 2, `jobs=2` already leaves one thread per run and anything above 2 floors at 1 while still multiplying peak memory.
 
 Retry limit: 8, as a per-template override of the same spec-level budget. This is the pipeline's bottleneck step and it runs on the spot-only `cpu-heavy-nodepool`, making it the most reclaim-exposed pod in the workflow — two back-to-back reclaims on one step were observed 2026-08-03 ([#115](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/115)). The policy is `Always` with an expression filtering to infrastructure causes; `OnFailure` only half-honoured that filter, since a node shutdown lands in phase `Failed` but a reclaimed pod lands in phase `Error`. A retry re-runs the whole session, so a reclaim costs a session's in-flight work rather than a single run's.
 
@@ -658,13 +716,34 @@ Failure modes:
 - `antsApplyTransforms` crash → transform files incomplete; re-run registration for this session
 - OOM → memory limit hit; check `peak_memory_gb` in QC JSON; may need to increase limit after validation
 
+Not a failure mode, though it used to look like one (issue #222). `preproc.py`
+checks its required inputs **before** Stage 1 and exits `66`
+(`EXIT_MISSING_INPUT`) if one is absent, logging `[preproc] MISSING INPUT` and
+`[preproc] SKIPPING <prefix>`; the driver pre-checks the run's own
+`bold_to_t1w_{task}_{run}/` outputs and does not launch it at all:
+
+```
+[driver] SKIPPED sub-VKLJZA5A_ses-06A_task-rest_run-01 — no bold_to_t1w transform (QC-rejected upstream): ..._desc-bold2t1w_itk.txt
+```
+
+That is the expected outcome when `bold-to-t1w` rejects a run on its QC floor
+(exit `65`) and its driver discards the transform. The run records
+`status="skipped"` with `upstream_failed_step="bold-to-t1w"` and
+`failure_category="dependency"`, and it is excluded from both the driver's
+failure counts and its exit rule — so a session whose every run was gated
+upstream still exits 0 rather than reporting a func-preproc failure. Exit `66` is
+deliberately absent from the `retryStrategy` expression: a missing upstream
+artifact will not appear on a retry.
+
 ---
 
 ### Phase 5 — Observability and cleanup
 
 #### Outcome recording (`record-step-outcome`)
 
-After each substantive pipeline step, a sibling DAG task invokes `outcome-recorder` (WorkflowTemplate `outcome-recorder`, template `record-step-outcome`). The sibling depends on the step with `depends: "X || X.Failed || X.Skipped"` so it runs regardless of the upstream step's terminal status. Failure of the outcome recorder does not propagate — it uses `continueOn: {failed: true, error: true}`.
+After each substantive pipeline step, a sibling DAG task invokes `outcome-recorder` (WorkflowTemplate `outcome-recorder`, template `record-step-outcome`). Phase-level recorders depend on the step with `depends: "X || X.Failed || X.Skipped"` so they run regardless of the upstream step's terminal status; per-run recorders whose producer records in-pod are fallbacks gated on `X.Failed || X.Errored || X.Skipped`. Failure of the outcome recorder does not propagate — it uses `continueOn: {failed: true, error: true}`.
+
+`step` is accompanied by an optional `step2` parameter: steps that share a producer task and gate and differ only by name are recorded by a single pod (`func-preproc` + `surface-sample`). Each still gets its own output verification and record.
 
 Runs on `cpu-light-nodepool`, 128M memory, 100m CPU.
 
@@ -819,7 +898,7 @@ Two templates, running **concurrently**, each independently staging its own copy
 
 Artifact inputs are statically declared, since Argo requires all artifact paths to be known at template definition time. The DAG sets `failFast: false`, so one pod failing does not cancel the other — they produce independent derivatives, and a DL failure should not discard 50 minutes of GEMS work.
 
-**`segment-subregions-gems-template`** — thalamus, brainstem, hippo-amygdala. Image `cloudpipe/freesurfer`, node `cpu-heavy-nodepool`, **4.5G / 4 CPU / 5G ephemeral-storage** (no memory limit). No TensorFlow is imported in this pod at all.
+**`segment-subregions-gems-template`** — thalamus, brainstem, hippo-amygdala. Image `cloudpipe/freesurfer`, node `cpu-heavy-nodepool`, **4.5G / 3.5 CPU / 5G ephemeral-storage** (no memory limit). No TensorFlow is imported in this pod at all. The CPU request is deliberately half a core *below* the tool's `--threads 4`: at 4 no two pods fit on a `c*.2xlarge` (7.21 CPU usable after the DaemonSet tax), which is why 83 of 148 `cpu-heavy` nodes were carrying a single workflow pod when measured at 200 concurrent on 2026-08-11. There is no CPU limit, so the request is a scheduling weight rather than a cap — only a genuinely full node throttles the pod, and then to ~90% of its threads.
 
 **`segment-subregions-dl-template`** — hypothalamic subunits and ScLimbic. Same image and node pool, **13G / 4 CPU / 2G ephemeral-storage** (no memory limit), with `TF_ENABLE_ONEDNN_OPTS=0`.
 
@@ -829,7 +908,7 @@ Until [#134](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/134)
 
 The 5G came from a 3.38 GB peak inferred from `ram_efficiency`, which is a **lifetime average**. It is right for the three GEMS regions — they hold ~3.5 GB for ~50 of the fused pod's ~55 minutes — and blind to what follows: step 4 (`mri_segment_hypothalamic_subunits`, TensorFlow) allocates ~8 GB more in under a minute. With no memory limit that overrun is not a container-limit kill but the kernel firing inside `kubepods` and picking this container, so it presented as `OOMKilled` on 7/7 attempts that landed on a 16 GiB instance type and 0/10 on 32 GiB types, and the retry policy turned every one of them into a silent success. Measured directly with `scripts/manifests/subregion-oom-probe.yaml` (cgroup v2 `memory.peak`, an exact high-water mark rather than a sample): step-4 peak **16.28 G with oneDNN on, 11.87 G with it off**, for +10 s of wall clock. The peak does not scale with timepoint count (11.91 G at one timepoint, 11.87 G at three) — the tool processes sessions in a loop and frees between them. 13G sits above the measured peak, so the scheduler reserves what the pod will actually take and cannot pack a co-tenant into it — that, rather than the node size, is the fix. It does **not** exclude the 16 GiB instance type: such a node has 14.82 GB allocatable against only 0.554 GB of daemonset memory requests, so 13G fits it and the pod simply becomes the sole tenant. Do not re-derive either request from an averaged efficiency metric.
 
-#129 fixed the size of the request; #134 fixed its **shape**. Reserving 13G for ~55 minutes covered a peak lasting ~30 seconds — 0.9% of the pod's lifetime. Splitting it lets a `c8i-flex.4xlarge` (31.44 GB / 15.89 CPU allocatable, measured 2026-08-03) hold three GEMS pods where it held two fused ones, since a 4.5G/4CPU pod is CPU-bound rather than memory-bound.
+#129 fixed the size of the request; #134 fixed its **shape**. Reserving 13G for ~55 minutes covered a peak lasting ~30 seconds — 0.9% of the pod's lifetime. Splitting it lets a `c8i-flex.4xlarge` (31.44 GB / 15.89 CPU allocatable, measured 2026-08-03) hold three GEMS pods where it held two fused ones, since a 4.5G GEMS pod is CPU-bound rather than memory-bound. The later 4 → 3.5 CPU trim takes that to four per `4xlarge`.
 
 The two pods can run concurrently because the DL tools do not consume GEMS output. Verified against the FreeSurfer 7.4.1 sources: in `--s` mode `mri_segment_hypothalamic_subunits` reads exactly one subject file, `mri/nu.mgz`, and `mri_sclimbic_seg` reads `mri/nu.mgz` plus an optional `mri/transforms/talairach.xfm.lta`. Both are FastSurfer outputs each pod has staged for itself; neither tool opens `ThalamicNuclei*`, `brainstemSs*` or `*hippoAmygLabels*`. **Re-check this before any FreeSurfer version bump.**
 

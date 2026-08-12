@@ -41,7 +41,8 @@ CAVEATS -- READ BEFORE TRUSTING A NUMBER OUT OF THIS
   incomplete records exist on a node, never an exact figure.
 - Node capacity (15205 millicores schedulable) is the 4xlarge figure derived
   in issue #132 (allocatable minus guardduty/cloudwatch-agent/kube-proxy/
-  fluent-bit/aws-node/ebs-csi/kubecost-network-costs daemonset overhead).
+  aws-node/ebs-csi/kubecost-network-costs daemonset overhead). The figure
+  predates disabling fluent-bit, so it is ~50m conservative now.
   Every node in this analysis IS a 4xlarge by construction: cpu-heavy-nodepool
   is the only pool admitting the 8-core long-parcellation request, and no
   smaller instance in that pool's families can fit it.
