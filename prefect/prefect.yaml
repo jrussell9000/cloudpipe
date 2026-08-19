@@ -1,6 +1,42 @@
 name: cloudpipe-queue-manager
 prefect-version: "3.x"
 
+# The `image:` refs below point at PRIVATE ECR
+# (<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com), repointed 2026-08-17 off
+# `public.ecr.aws/l9e7l1h1/`. This is Step 6 of
+# handoffs/ecr-private-registry-migration.md, and it closes assessment finding N5
+# (the flow runner was the last consumer still pulling from the public gallery —
+# unpinned AND outside the Inspector scanning configuration, so the RA-5 "all
+# images are continuously scanned" claim did not hold for it).
+#
+# ⚠️ EDITING THIS FILE CHANGES NOTHING BY ITSELF. Prefect stores
+# `job_variables.image` server-side per deployment and only re-reads it on an
+# explicit deploy. Until someone runs
+#
+#   cd prefect && PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
+#     prefect deploy --all
+#
+# the live flow runner keeps pulling the OLD image and `git diff` looks clean.
+# build-prefect-flow-runner.yaml prints a reminder to the step summary, but a
+# printed warning is not an enforcement point.
+#
+# That was verified rather than assumed: `prefect deployment inspect` still
+# reported the public image after this file was committed. The deploy was then
+# run 2026-08-17 and all four deployments now store the private ref, so file and
+# server agree AS OF THAT DATE ONLY. The next edit to this file re-opens the gap
+# — check the server, not the diff:
+#
+#   prefect deployment inspect <name>/<name> | grep -A1 "'image':"
+#
+# The registry literal is hand-maintained in three places — here,
+# .github/workflows/build-prefect-flow-runner.yaml (`IMAGE`), and
+# images/prefect-flow-runner/build.sh. Nothing keeps them in sync.
+#
+# `:latest` (with `image_pull_policy: Always`) is intentional and is how a rebuild
+# reaches the runner without a redeploy. It is also the one workload that a future
+# Kyverno require-digest policy (finding H6) would reject — see the note in
+# tools/nist-800-171-compliance-todo.md under C3 before enforcing that cluster-wide.
+
 pull:
   - prefect.deployments.steps.set_working_directory:
       directory: /opt/prefect
@@ -13,7 +49,7 @@ deployments:
       job_variables:
         namespace: prefect
         service_account_name: prefect-worker
-        image: public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
+        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
         image_pull_policy: Always
         finished_job_ttl: 60
     schedules: []
@@ -28,7 +64,7 @@ deployments:
       job_variables:
         namespace: prefect
         service_account_name: prefect-worker
-        image: public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
+        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
         image_pull_policy: Always
         finished_job_ttl: 60
     schedules: []
@@ -43,7 +79,7 @@ deployments:
       job_variables:
         namespace: prefect
         service_account_name: prefect-worker
-        image: public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
+        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
         image_pull_policy: Always
         finished_job_ttl: 60
     schedules:
@@ -66,7 +102,7 @@ deployments:
       job_variables:
         namespace: prefect
         service_account_name: prefect-worker
-        image: public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
+        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
         image_pull_policy: Always
         finished_job_ttl: 60
     schedules:

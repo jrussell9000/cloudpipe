@@ -17,7 +17,12 @@ spec:
     # deliberately absent: a real OOMKill here is deterministic (#120, #129, #134
     # each needed a config change, not a retry), so retrying it only burns the
     # enlarged budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    # The codes are matched in the message too: a pod that dies in its init or wait
+    # container never populates exitCode, so that arm alone is dead for the whole
+    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
+    # its producer was skipped or failed, and a consumer retry cannot re-run the
+    # producer. See the master template for the detail.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -162,8 +167,17 @@ spec:
         # NO TRAILING SLASH on input directory keys — see the func-preproc
         # template for the measured reason (a zero-byte directory-marker object
         # makes Argo download nothing and still exit 0).
+        # Optional because this stage DELETES this artifact on success (see the
+        # reclaim block below), so a second pod for an already-assembled session
+        # legitimately finds nothing. Mandatory, a 404 here killed the init
+        # container with exit 64 before the driver could run — and Argo spent 45
+        # minutes retrying the absent key first, burning node time and the
+        # workflow's activeDeadlineSeconds. Observed 10× on 2026-08-17, when an
+        # OOMKilled controller lost pod-completion events and re-created nodes
+        # whose work was already in S3. The driver re-checks S3 per run instead.
         - name: components
           path: /data/components
+          optional: true
           archive:
             none: {}
           s3:
@@ -229,7 +243,7 @@ spec:
       # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
       # rewrites this to sha-<commit> once the first build lands, and only after
       # confirming that tag actually reached the registry.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench:sha-2a68d1ff59f502694429e3dd9608ecde51af3ee0"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:3991cad2ae7265cc34ddda55c3c91845ae6a92eb9d5d8bb479ce192ac5238881"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -269,8 +283,11 @@ spec:
         from datetime import datetime, timezone
         from pathlib import Path
 
+        import boto3
+
         SUBJ = "{{workflow.parameters.subjID}}"
         SES = "{{inputs.parameters.session}}"
+        BUCKET = "{{workflow.parameters.bucket}}"
         RUNS = json.loads(r"""{{inputs.parameters.runs}}""")
         TARGET_SPHERE = "{{inputs.parameters.target-sphere}}"
         TARGET_AREA = "{{inputs.parameters.target-area}}"
@@ -376,6 +393,69 @@ spec:
         pending = [r for r in RUNS if not r.get("surf_target_exists")]
         print(f"[driver] {SES}: {len(pending)} of {len(RUNS)} runs need assembly")
 
+        # --- grayordinate component reclaim -------------------------------
+        #
+        # The components are a bulky intermediate: ~2.2 GiB per session, about
+        # half of all derivative storage, versus ~71 TiB projected across the
+        # full cohort. They exist only to be assembled into the dtseries below,
+        # and are reconstructible from the volumetric output via preproc.py's
+        # `--emit grayordinate` short path, so they are deleted once the artifact
+        # built from them is intact rather than kept forever.
+        #
+        # Matches _MIN_OUTPUT_BYTES["surface-resample"] in
+        # src/metrics/outcome_recorder.py. Existence alone is not evidence of
+        # validity — a 1 MB truncation of a 264 MB upload passed an existence
+        # check on 2026-07-22 — and this is the one check standing between a
+        # truncated dtseries and deleting its only cheap regeneration input.
+        MIN_DTSERIES_BYTES = 10_000_000
+
+        def dtseries_is_intact(prefix):
+            """True if this run's assembled dtseries is present and above floor."""
+            out = OUT_DIR / f"{prefix}_space-fsLR32k_bold.dtseries.nii"
+            if not out.is_file():
+                print(f"[reclaim] keeping {prefix} components: no dtseries at {out}")
+                return False
+            size = out.stat().st_size
+            if size < MIN_DTSERIES_BYTES:
+                print(f"[reclaim] keeping {prefix} components: dtseries only "
+                      f"{size} B (< {MIN_DTSERIES_BYTES} floor)")
+                return False
+            return True
+
+        def dtseries_in_s3(prefix):
+            """True if this run's dtseries is ALREADY in S3, above the floor.
+
+            This stage deletes its own input on success, so a second pod for a
+            session that already assembled finds no components for work that is
+            in fact done — a controller restart that lost the completion event,
+            or a retry after the artifact upload. `pending` cannot see that: it
+            comes from `bold-runs`, which inventory computed before this pod ran.
+            Asking S3 directly re-evaluates the same
+            `components_exist OR surf_target_exists` disjunction inventory uses
+            (src/inventory.py), at the moment it actually matters.
+            """
+            key = (f"derivatives/func_surf/{SUBJ}/{SES}/fsLR32k/"
+                   f"{prefix}_space-fsLR32k_bold.dtseries.nii")
+            try:
+                head = boto3.client("s3").head_object(Bucket=BUCKET, Key=key)
+            except Exception:
+                # 404, or any credential/network fault. Either way we have no
+                # evidence of a finished dtseries, so fall through to the
+                # failure path rather than silently claiming success.
+                return False
+            # Same floor as the local check: a truncated upload is not a result.
+            return head["ContentLength"] >= MIN_DTSERIES_BYTES
+
+        # Runs excluded from `pending` already had their dtseries verified in S3
+        # by inventory's surf_target_exists, so their components are reclaimable
+        # with no local check — this is what clears the backlog left by sessions
+        # assembled before reclaim existed.
+        reclaimable = [
+            f"{SUBJ}_{SES}_{r['task']}_{r['run']}"
+            for r in RUNS
+            if r.get("surf_target_exists") and r.get("components_exist", True)
+        ]
+
         # Stage 1 writes the session geometry once; without it nothing can be
         # resampled, so fail fast rather than once per run.
         missing_anat = [
@@ -422,6 +502,14 @@ spec:
                             )
                             continue
 
+                    if not comp_dir.is_dir() and dtseries_in_s3(prefix):
+                        # Already assembled by an earlier pod for this session,
+                        # which then reclaimed these components. Re-entrancy,
+                        # not failure: the derivative this run owes exists.
+                        print(f"[driver] SKIP {prefix}: dtseries already in S3, "
+                              f"components already reclaimed")
+                        continue
+
                     if not comp_dir.is_dir():
                         # The components tarball is per run and may legitimately
                         # be absent if Stage 1 failed for this run alone.
@@ -450,6 +538,8 @@ spec:
                         print(f"[driver] FAILED {prefix} (exit {rc})")
                         failed.append(prefix)
                         reason_by_prefix[prefix] = f"cifti_assemble.py exited {rc}"
+                    elif dtseries_is_intact(prefix):
+                        reclaimable.append(prefix)
                 except Exception as exc:
                     print(f"[driver] FAILED {prefix}: unexpected error")
                     traceback.print_exc()
@@ -477,6 +567,46 @@ spec:
                     status, reason = "succeeded", ""
                 write_outcome("surface-resample", task, rid, status, reason)
         print(f"[driver] {len(pending) - len(failed)} succeeded, {len(failed)} failed")
+
+        # Reclaim runs after the outcome records are written, so a failure in
+        # here can never cost us the StepOutcome facts for this session.
+        #
+        # ORDERING CAVEAT: for runs assembled in this pod the dtseries is still
+        # LOCAL at this point — Argo uploads output artifacts after the main
+        # container exits, so there is a window where the components are gone
+        # and their replacement is not yet in S3. A kill inside that window
+        # (spot preemption) loses both. That is recoverable, not data loss:
+        # inventory reports surf_exists = components_exist OR surf_target_exists,
+        # so both being absent reads as false and the next workflow re-extracts
+        # via `--emit grayordinate`. Deliberate trade — see docs/pipelines.md.
+        if reclaimable:
+            keys = [
+                {"Key": f"derivatives/func_surf/{SUBJ}/{SES}/components/"
+                        f"{p}_desc-grayordcomponents_bold.tar.gz"}
+                for p in reclaimable
+            ]
+            try:
+                # One call per session rather than per run; delete_objects caps
+                # at 1000 keys and a session has at most single digits.
+                resp = boto3.client("s3").delete_objects(
+                    Bucket=BUCKET, Delete={"Objects": keys, "Quiet": True}
+                )
+                # Quiet mode reports only failures. A key that was already gone
+                # is not one of them: S3 deletes are idempotent and a missing
+                # key still succeeds, which is what makes this safe to re-run.
+                errors = resp.get("Errors", [])
+                for e in errors:
+                    print(f"[reclaim] WARNING: {e.get('Key')}: "
+                          f"{e.get('Code')} {e.get('Message')}")
+                print(f"[reclaim] deleted {len(keys) - len(errors)} of "
+                      f"{len(keys)} component tarballs for {SES}")
+            except Exception:
+                # Never fail an otherwise-good session over reclaim. The storage
+                # stays, the derivative is correct, and the next workflow for
+                # this subject retries the delete from the surf_target_exists
+                # branch above.
+                print("[reclaim] WARNING: reclaim failed, components retained")
+                traceback.print_exc()
 
         if pending and len(failed) == len(pending):
             sys.exit(1)

@@ -23,8 +23,16 @@ mypy = ">=1.14,<2"
 
 [feature.lint.tasks]
 # Report-only (safe): no file changes
-lint = "ruff check ."
+#
+# `lint` is an AGGREGATE on purpose. CI's python_lint job runs ruff check AND
+# ruff format --check as two steps, so a `lint` that ran only the former made
+# "green locally" mean nothing: 14 of the 18 CI failures in the five weeks to
+# 2026-08-13 were python_lint, and every one of them failed on the format check
+# with `ruff check` passing. The granular tasks stay because CI invokes them
+# separately — one step per tool is what makes a failure legible at a glance.
+ruff-check = "ruff check ."
 fmt-check = "ruff format --check ."
+lint = { depends-on = ["ruff-check", "fmt-check"] }
 # Whitelist documents framework entrypoints (Prefect @flow) and public API that
 # vulture can't see are used. Exclude nested pixi envs (e.g. images/workbench/.pixi).
 deadcode = "vulture src images scripts prefect tests .vulture-whitelist.py --exclude '*/.pixi/*' --min-confidence 60 --ignore-names 'side_effect,Bucket,kw,self_inner'"
@@ -38,7 +46,7 @@ complexity = "ruff check --select C901 --statistics ."
 # contracts explicit before the density refactor. Deliberately NOT in `health`
 # yet — the baseline has findings; gating comes after they're triaged.
 typecheck = "mypy"
-health = { depends-on = ["lint", "fmt-check", "deadcode"] }
+health = { depends-on = ["lint", "deadcode"] }
 # Mutating (explicit): only these two change files
 format = "ruff format ."
 lint-fix = "ruff check --fix ."

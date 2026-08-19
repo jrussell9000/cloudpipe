@@ -399,8 +399,38 @@ def count_pod_attempts(workflows: list[dict]) -> dict[str, collections.Counter]:
     return dict(per_step)
 
 
+def split_bold_evidence(df: pd.DataFrame, subjects: list[str]) -> tuple[list[str], list[str]]:
+    """Split `subjects` into (has BOLD evidence, has none) given functional outcomes.
+
+    Pure and shared on purpose. check_func_preproc_coverage EXCLUDES the second
+    group from its denominator, and check_anat_only_delivery is the check that
+    then holds that group to account — if the two computed the set separately
+    they could drift, and a subject could fall through the gap between them.
+
+    Positive evidence of BOLD is either a per-run row or any functional-phase row
+    that is not a skip; see check_func_preproc_coverage for why presence alone is
+    insufficient.
+    """
+    in_scope = set(df["subject"].tolist())
+    per_run = df[(df["task"] != "na") & (df["run"] != "na")]
+    functional_non_skip = df[df["step"].isin(FUNCTIONAL_PHASE_STEPS) & (df["status"] != "skipped")]
+    has_bold = set(per_run["subject"].tolist()) | set(functional_non_skip["subject"].tolist())
+    eligible = [s for s in subjects if s in in_scope and s in has_bold]
+    no_bold = [s for s in subjects if s not in in_scope or s not in has_bold]
+    return eligible, no_bold
+
+
 class TestBatchValidator:
     """Run pass/fail validation checks against cloudpipe_metrics Athena tables."""
+
+    # Class-level defaults so an instance built without __init__ still works.
+    # tests/test_validate_test_batch.py constructs via __new__ to inject a mock
+    # metrics client, and every check has to stay reachable that way.
+    _func_df: pd.DataFrame | None = None
+    _no_bold: list[str] | None = None
+    _s3 = None
+    _data_bucket = "<YOUR_S3_BUCKET>"
+    _region = "<YOUR_AWS_REGION>"
 
     def __init__(
         self,
@@ -409,6 +439,7 @@ class TestBatchValidator:
         region: str = "<YOUR_AWS_REGION>",
         cost_date_from: str | None = None,
         cost_date_to: str | None = None,
+        data_bucket: str = "<YOUR_S3_BUCKET>",
     ):
         self.subjects = subjects
         self._m = CloudpipeMetrics(bucket=bucket, region=region)
@@ -417,6 +448,38 @@ class TestBatchValidator:
         # by scrape date as well as subject — see check_cost_summary.
         self._cost_date_from = cost_date_from
         self._cost_date_to = cost_date_to
+        # Derivatives live in the data bucket, not the metrics bucket. Only
+        # check_anat_only_delivery reads it, so the client is built on demand —
+        # every other check is Athena-only and must not require S3 credentials.
+        self._data_bucket = data_bucket
+        self._region = region
+        self._s3 = None
+        # Shared between check_func_preproc_coverage and
+        # check_anat_only_delivery so the two cannot disagree about which
+        # subjects have BOLD evidence. Order-independent: whichever runs first
+        # populates them.
+        self._func_df: pd.DataFrame | None = None
+        self._no_bold: list[str] | None = None
+
+    def _s3_client(self):
+        if self._s3 is None:
+            import boto3
+
+            self._s3 = boto3.client("s3", region_name=self._region)
+        return self._s3
+
+    def _functional_outcomes(self) -> pd.DataFrame:
+        """Functional-phase (plus t1w-to-mni) step outcomes for the batch, cached."""
+        if self._func_df is None:
+            steps_sql = ", ".join(f"'{s}'" for s in (*FUNCTIONAL_PHASE_STEPS, "t1w-to-mni"))
+            self._func_df = self._m._run_sql(f"""
+                SELECT subject, session, task, run, status, step, failure_reason
+                FROM cloudpipe_metrics.step_outcomes
+                WHERE subject IN ({self._subject_in})
+                  AND step IN ({steps_sql})
+                ORDER BY subject, session, task, run
+            """)
+        return self._func_df
 
     # ------------------------------------------------------------------
     # Outcome tracking checks
@@ -564,15 +627,11 @@ class TestBatchValidator:
         subject that did have BOLD, it is indistinguishable here from a subject with
         no BOLD, and would be silently excluded. Exclusions are listed in `details`
         for exactly that reason — check them against the batch you expected.
+        `check_anat_only_delivery` now holds every excluded subject to account
+        against its anatomical derivatives, so an exclusion that is really a lost
+        subject fails there rather than passing silently here (plan 009 §4).
         """
-        steps_sql = ", ".join(f"'{s}'" for s in (*FUNCTIONAL_PHASE_STEPS, "t1w-to-mni"))
-        df: pd.DataFrame = self._m._run_sql(f"""
-            SELECT subject, session, task, run, status, step, failure_reason
-            FROM cloudpipe_metrics.step_outcomes
-            WHERE subject IN ({self._subject_in})
-              AND step IN ({steps_sql})
-            ORDER BY subject, session, task, run
-        """)
+        df: pd.DataFrame = self._functional_outcomes()
 
         # An entirely empty result is NOT evidence that every subject is func-less —
         # it is also exactly what a broken outcome recorder looks like, and passing
@@ -594,8 +653,7 @@ class TestBatchValidator:
 
         # df is non-empty, so at least one subject recorded a functional step and
         # `eligible` cannot be empty.
-        in_scope = set(df["subject"].tolist())
-
+        #
         # Presence in df is NOT evidence the subject has BOLD. A subject with no
         # usable functional scans still produces functional-phase rows: the master
         # template records one session-level `skipped` /
@@ -618,19 +676,15 @@ class TestBatchValidator:
         # presence — a BOLD-less subject's `t1w-to-mni succeeded` row is not
         # evidence of BOLD and must not promote it into `has_bold` (#153).
         per_run = df[(df["task"] != "na") & (df["run"] != "na")]
-        functional_non_skip = df[
-            df["step"].isin(FUNCTIONAL_PHASE_STEPS) & (df["status"] != "skipped")
-        ]
-        has_bold = set(per_run["subject"].tolist()) | set(functional_non_skip["subject"].tolist())
-
-        eligible = [s for s in self.subjects if s in in_scope and s in has_bold]
-        no_func_data = [s for s in self.subjects if s not in in_scope or s not in has_bold]
+        eligible, no_func_data = split_bold_evidence(df, self.subjects)
+        self._no_bold = no_func_data
 
         details = []
         if no_func_data:
             details.append(
                 f"{len(no_func_data)} subject(s) excluded — no BOLD runs in the "
-                f"requested scan types: {', '.join(no_func_data)}"
+                f"requested scan types: {', '.join(no_func_data)} "
+                "(held to account by the 'anat-only delivery' check)"
             )
 
         # Per-session t1w-to-mni QC status. A session that failed this gate
@@ -764,6 +818,227 @@ class TestBatchValidator:
                 "'gated by t1w-to-mni QC' or 'gated by bold-to-t1w QC' in details "
                 "need no action — they are the correct result of a QC rejection, not "
                 "a recording defect."
+            ),
+        )
+
+    def check_anat_only_delivery(self) -> ValidationResult:
+        """Subjects excluded from func coverage must still have delivered anatomy.
+
+        The blind spot this closes (plan 009 §4): coverage is counted in
+        functional runs, so a subject with zero expected runs contributes 0 to
+        both the numerator and the denominator and is indistinguishable from a
+        subject that completed. An anat-only subject can therefore be lost
+        outright — its anatomical phase hung or failed — while the batch reads
+        clean. `sub-6LMU82AJ` was lost that way in the 2026-08-14 batch and did
+        not appear in that batch's FAIL list; the FAIL came from unrelated causes,
+        so had those been absent the loss would have gone unreported.
+
+        The existence test is the ADR 017 `_complete.json` marker and nothing
+        else. A prefix listing, an object count, or a probe for any single file
+        all answer "yes" for a half-uploaded tree, and reaching that state needs
+        no bug — a spot reclaim mid-upload produces it. The marker is written
+        only after every other object in the tree, so it is the one object whose
+        presence implies the rest. `src/inventory.py` gates on it identically.
+
+        Expected sessions come from the batch's own StepOutcome records rather
+        than from a static roster: the question is whether what the pipeline
+        actually saw for this subject was delivered.
+
+        Note on `long-template/`: it is reported but does NOT decide pass/fail.
+        The longitudinal template's presence for a single-session subject was not
+        verifiable when this was written (`derivatives/` had been flushed), and a
+        validator that fails a healthy batch on an unverified assumption is the
+        recurring defect this file's history is mostly about — see the
+        false-FAIL notes in check_func_preproc_coverage. Session markers decide;
+        a missing template surfaces as a warning to investigate.
+        """
+        if self._no_bold is None:
+            df = self._functional_outcomes()
+            if df.empty:
+                # An empty result is already a hard failure in the coverage
+                # check; do not also claim anything about anatomy here.
+                return ValidationResult(
+                    check="anat-only delivery",
+                    passed=True,
+                    warning=True,
+                    found=0,
+                    expected=0,
+                    details=[
+                        "No functional step_outcomes at all — anat-only delivery NOT "
+                        "checked. See the func-preproc coverage failure."
+                    ],
+                    triage="Fix outcome recording first, then re-run.",
+                )
+            _, self._no_bold = split_bold_evidence(df, self.subjects)
+
+        excluded = self._no_bold
+        if not excluded:
+            return ValidationResult(
+                check="anat-only delivery",
+                passed=True,
+                found=0,
+                expected=0,
+                details=["No subjects were excluded from func-preproc coverage."],
+            )
+
+        subject_in = ", ".join(f"'{s}'" for s in excluded)
+        ses_df: pd.DataFrame = self._m._run_sql(f"""
+            SELECT DISTINCT subject, session
+            FROM cloudpipe_metrics.step_outcomes
+            WHERE subject IN ({subject_in})
+              AND session <> 'na'
+        """)
+        sessions: dict[str, list[str]] = {}
+        for row in ses_df.itertuples(index=False):
+            sessions.setdefault(row.subject, []).append(row.session)
+
+        s3 = self._s3_client()
+
+        def marker_exists(key: str) -> bool:
+            try:
+                s3.head_object(Bucket=self._data_bucket, Key=key)
+                return True
+            except Exception:  # noqa: BLE001 — absent marker is the answer, not an error
+                return False
+
+        missing: list[str] = []
+        details: list[str] = []
+        template_warnings: list[str] = []
+        delivered = 0
+        for subj in excluded:
+            ses = sorted(sessions.get(subj, []))
+            if not ses:
+                # No session-level record at all: the subject did not get far
+                # enough to enumerate its sessions, which is itself the loss.
+                missing.append(f"{subj} (no session-level StepOutcome records — subject lost?)")
+                continue
+
+            gaps = [
+                s
+                for s in ses
+                if not marker_exists(f"derivatives/fastsurfer/{subj}/{s}/_complete.json")
+            ]
+            if gaps:
+                missing.append(
+                    f"{subj} ({len(gaps)}/{len(ses)} session(s) without "
+                    f"_complete.json: {', '.join(gaps)})"
+                )
+                continue
+
+            delivered += 1
+            if not marker_exists(f"derivatives/fastsurfer/{subj}/long-template/_complete.json"):
+                template_warnings.append(f"{subj} ({len(ses)} session(s))")
+
+        details.append(
+            f"{len(excluded)} subject(s) had no BOLD evidence and were excluded from "
+            f"func-preproc coverage; {delivered}/{len(excluded)} have complete "
+            "anatomical derivatives for every session the pipeline recorded."
+        )
+        if template_warnings:
+            details.append(
+                f"{len(template_warnings)} of those lack "
+                "`long-template/_complete.json` despite complete per-session trees "
+                "(reported, not failed — see docstring): " + ", ".join(template_warnings)
+            )
+
+        return ValidationResult(
+            check="anat-only delivery",
+            passed=len(missing) == 0,
+            warning=bool(template_warnings),
+            found=delivered,
+            expected=len(excluded),
+            missing=missing,
+            details=details,
+            triage=(
+                "These subjects contribute no functional runs, so they are invisible "
+                "to the coverage check by construction. A missing _complete.json means "
+                "the anatomical phase did not deliver — check the fastsurfer steps in "
+                "the Argo UI for a hang or a failure, and re-submit the subject. "
+                "Do not substitute a prefix listing for the marker: a half-uploaded "
+                "tree lists non-empty."
+            ),
+        )
+
+    def check_terminal_workflow_phase(self, workflows: list[dict] | None) -> ValidationResult:
+        """A workflow that ends `Error` is a lost subject even if no count moved.
+
+        Plan 009 §4's second half. Every other check reads records the pipeline
+        *wrote*; a workflow that died before writing them moves no numerator and
+        no denominator, so it can vanish from the report entirely — which is the
+        same shape of blind spot as the anat-only one.
+
+        `Error` fails; `Failed` is reported but not failed here. The distinction
+        is deliberate: `Failed` is the ordinary outcome of a step that ran and
+        returned non-zero, and the QC gates make some of those correct results,
+        already classified by the coverage check. Failing on `Failed` here would
+        re-fail runs that check just explained — and gating on
+        `status != succeeded` rather than on a specific exit code is a
+        false-alarm generator this file has been bitten by before.
+
+        Scoped per subject, not per workflow: under `--since` a batch may contain
+        a resubmission, so an `Error` workflow whose subject also has a
+        `Succeeded` one is a recovered subject and is reported without failing.
+        """
+        if not workflows:
+            return ValidationResult(
+                check="Terminal workflow phase",
+                passed=True,
+                warning=True,
+                found=0,
+                expected=0,
+                details=[
+                    "No Argo workflows readable — terminal phase NOT checked. "
+                    "Workflow objects expire 24h after completion (ttlStrategy)."
+                ],
+                triage="Run within a day of the batch, with cluster access.",
+            )
+
+        by_subject: dict[str, set[str]] = {}
+        for wf in workflows:
+            subject = ((wf.get("metadata") or {}).get("labels") or {}).get("subjectid")
+            phase = (wf.get("status") or {}).get("phase") or "Unknown"
+            if subject:
+                by_subject.setdefault(subject, set()).add(phase)
+
+        unrecovered: list[str] = []
+        recovered: list[str] = []
+        failed_subjects: list[str] = []
+        for subject, phases in sorted(by_subject.items()):
+            if "Error" in phases:
+                if "Succeeded" in phases:
+                    recovered.append(subject)
+                else:
+                    unrecovered.append(f"{subject} (workflow phase Error, no Succeeded run)")
+            elif "Failed" in phases:
+                failed_subjects.append(subject)
+
+        details = [f"Scope: {len(workflows)} workflows over {len(by_subject)} subjects."]
+        if recovered:
+            details.append(
+                f"{len(recovered)} subject(s) had an Error workflow but also a "
+                "Succeeded one (resubmitted and recovered): " + ", ".join(recovered)
+            )
+        if failed_subjects:
+            details.append(
+                f"{len(failed_subjects)} subject(s) ended `Failed` — reported here, "
+                "classified by the coverage check, not failed on phase alone: "
+                + ", ".join(failed_subjects)
+            )
+
+        return ValidationResult(
+            check="Terminal workflow phase",
+            passed=not unrecovered,
+            warning=bool(failed_subjects) or bool(recovered),
+            found=len(by_subject) - len(unrecovered),
+            expected=len(by_subject),
+            missing=unrecovered,
+            details=details,
+            triage=(
+                "Phase `Error` means the workflow itself died — a controller error, a "
+                "deleted pod, or an exhausted retry on a node-level kill — rather than "
+                "a step returning non-zero. It writes no outcome records, so no "
+                "coverage number moves. Check the Argo UI for the workflow's message "
+                "and re-submit the subject."
             ),
         )
 
@@ -1073,6 +1348,14 @@ def main() -> None:
         "--subjects", required=True, help="Path to subjects CSV (subject_id column)"
     )
     parser.add_argument("--bucket", default="cloudpipe-metrics")
+    parser.add_argument(
+        "--data-bucket",
+        default="<YOUR_S3_BUCKET>",
+        help=(
+            "Bucket holding derivatives/, read by the anat-only delivery check "
+            "(the `bucket` key in the cloudpipe-config ConfigMap)"
+        ),
+    )
     parser.add_argument("--region", default="<YOUR_AWS_REGION>")
     parser.add_argument(
         "--namespace",
@@ -1122,14 +1405,24 @@ def main() -> None:
         region=args.region,
         cost_date_from=cost_from,
         cost_date_to=cost_to,
+        data_bucket=args.data_bucket,
     )
+
+    # Fetched once and shared: each call shells out to `argo list -o json`, which
+    # returns every workflow's full status.nodes for the whole namespace.
+    workflows = fetch_batch_workflows(subjects, args.namespace, since)
 
     results: list[ValidationResult] = [
         validator.check_subject_manifests(),
         validator.check_step_outcomes(),
         validator.check_func_preproc_coverage(),
+        # Must follow the coverage check: it holds that check's exclusions to
+        # account. It recomputes them if run alone, so the order is an
+        # optimisation, not a correctness requirement.
+        validator.check_anat_only_delivery(),
         validator.check_workflow_run_schema(),
-        validator.check_pod_attempts(fetch_batch_workflows(subjects, args.namespace, since), since),
+        validator.check_terminal_workflow_phase(workflows),
+        validator.check_pod_attempts(workflows, since),
     ]
 
     if args.cost:

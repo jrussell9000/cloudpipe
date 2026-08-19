@@ -17,7 +17,24 @@ spec:
     # below. 137 is deliberately absent: a real OOMKill here is deterministic
     # (#120, #129, #134 each needed a config change, not a retry), so retrying it
     # only burns the enlarged budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    # The codes are matched in the message too: a pod that dies in its init or wait
+    # container never populates exitCode, so that arm alone is dead for the whole
+    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
+    # its producer was skipped or failed, and a consumer retry cannot re-run the
+    # producer. See the master template for the detail.
+    #
+    # An activeDeadlineSeconds kill is ALSO excluded, and that exclusion is what
+    # makes the parcellation deadline below work at all. Verified with a probe
+    # workflow on 2026-08-18 (argo lint cannot show this): when a template deadline
+    # fires, the kubelet SIGTERMs the pod, so Argo records
+    #     phase=Failed  exitCode=143
+    #     message="Pod was active on the node longer than the specified deadline"
+    # The 143 arm above therefore MATCHES a deadline kill. Without this exclusion a
+    # 3h deadline would not bound anything — it would retry 8 times for 24h of burn,
+    # strictly worse than the unbounded hang it was added to catch. A step that
+    # blows a deadline sized at ~1.75x its observed maximum is deterministic, not
+    # transient, so it must fail on the first occurrence.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -109,7 +126,7 @@ spec:
 
     initContainers:
       - name: download-t1w-inputs
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -150,7 +167,7 @@ spec:
       # runs surface registration. It is not included in per-subject tarballs, so it
       # is fetched per pod from config/fsaverage/ in S3 (~480 MiB, 312 objects).
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -187,7 +204,7 @@ spec:
                 print("fsaverage downloaded.", flush=True)
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:6da3131b48d6d7ea417dae17498d2d8d95d61ece195aa57a2d73b395cab749dd"
       imagePullPolicy: IfNotPresent
       volumeMounts:
       - name: work
@@ -325,6 +342,31 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
+    # Bounds a wedged topology correction. recon-surf.sh runs the hemispheres as
+    # sibling PIDs and `wait`s on them in order, and only lh's stdout reaches the
+    # pod log — so a hung rh presents as a log whose last line is
+    # "recon-all ... finished without error", with no error anywhere and no exit
+    # code ever produced. Nothing else in the step can catch that: the exit-75
+    # truncated-surface guard below only runs AFTER run_fastsurfer.sh returns, and
+    # the retryStrategy needs a terminal pod to fire. Before this deadline the only
+    # backstop was the master workflow's 24h activeDeadlineSeconds, so one such
+    # subject held a 4-cpu cpu-heavy pod and a concurrency slot for a full day.
+    #
+    # Observed on sub-6FGUTK6K (cloudpipe-qqtg7, 2026-08-18): rh mris_fix_topology
+    # ran 3.0h and then FAILED with "euler number != 2", handing off to FreeSurfer's
+    # mris_topo_fixer fallback, which spun at 100% cpu with no progress output and
+    # no bound. Deterministic — the seed is fixed at 1234 and the input surface is
+    # identical, so every retry reproduces it exactly (cf. the #235 HISTOalloc
+    # subject-deterministic pattern). Two attempts burned 8.4h and 4.2h.
+    #
+    # 3h is sized from 1102 successful parcellation pods in cluster history:
+    #     min 21.5m   median 46.9m   p90 67.6m   max 102.4m
+    # so 10800s is ~1.75x the observed maximum. Every other historical failure of
+    # this step is a spot reclaim, which lands far below the deadline and still
+    # retries normally on the "imminent node shutdown" arm. Raise this if healthy
+    # p90 ever approaches ~2h; do NOT raise it to accommodate a subject that hangs.
+    activeDeadlineSeconds: 10800
+
     volumes:
       - name: work
         emptyDir: {}
@@ -332,7 +374,7 @@ spec:
     initContainers:
       # recon-surf.sh registers to fsaverage, which is not in the template tarball.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -369,7 +411,7 @@ spec:
                 print("fsaverage downloaded.", flush=True)
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:6da3131b48d6d7ea417dae17498d2d8d95d61ece195aa57a2d73b395cab749dd"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

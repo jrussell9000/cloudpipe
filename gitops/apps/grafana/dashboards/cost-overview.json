@@ -42,13 +42,13 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "### 💰 What the pipeline costs\n\nEvery pod is tagged with the subject it is processing and the pipeline step it is running; Kubecost's allocation data is read once a day at two grains — per workflow (`costs`) and per pod (`pod_costs`). The pod grain sums back to the workflow grain exactly, so the drill-downs below reconcile with the headline by construction.\n\n**Unit cost is per _run_, not per person.** One workflow = one participant processed once. Test batches reuse a fixed subject list, so the same people are reprocessed constantly. Dividing spend by distinct participants has reported $0.85 where the real unit cost was $0.27, so these panels divide by distinct workflows.\n\n**⚠️ Check the _Settled share_ tile first.** Cloud billing reconciles over roughly three days. A figure scraped the day after a run has historically overstated the settled cost by a **median of ~51%**. When that tile is below 100%, part of this window is provisional.\n\n**Components are pre-reconciliation.** CPU + memory + GPU exclude the billing adjustment that arrives later; the total includes it. The gap is the _Reconciliation_ tile — plus any storage, network, or load-balancer cost, which the workflow grain does not break out.\n\n**Rows without a participant are probe runs** — infrastructure warm-ups — and are excluded from per-run figures."
+        "content": "### 💰 What the pipeline costs\n\nEvery pod is tagged with the subject it is processing and the pipeline step it is running; Kubecost's allocation data is read once a day at two grains — per workflow (`costs`) and per pod (`pod_costs`). The pod grain sums back to the workflow grain exactly, so the drill-downs below reconcile with the headline by construction.\n\n**Unit cost is per _subject processed_, not per distinct person.** One workflow = one participant processed once, and that is the unit every panel here divides by. Test batches reuse a fixed subject list, so the same people are reprocessed constantly. Dividing spend by distinct participants has reported $0.85 where the real unit cost was $0.27, so these panels divide by distinct workflows.\n\n**The word _run_ is avoided here on purpose.** On the QC dashboards a run is a single BOLD acquisition, and a subject has several. Nothing on this dashboard is priced per BOLD run.\n\n**⚠️ Check the _Settled share_ tile first.** Cloud billing reconciles over roughly three days. A figure scraped the day after a workflow has historically overstated the settled cost by a **median of ~51%**. When that tile is below 100%, part of this window is provisional.\n\n**Components are pre-reconciliation.** CPU + memory + GPU exclude the billing adjustment that arrives later; the total includes it. The gap is the _Reconciliation_ tile — plus any storage, network, or load-balancer cost, which the workflow grain does not break out.\n\n**Rows without a participant are probe workflows** — infrastructure warm-ups — and are excluded from per-subject figures."
       }
     },
     {
       "id": 2,
       "type": "stat",
-      "title": "Cost per run",
+      "title": "Cost per subject",
       "gridPos": {
         "x": 9,
         "y": 0,
@@ -82,7 +82,7 @@
           }
         }
       },
-      "description": "The headline number: total spend divided by distinct workflows — the cost of processing one participant once. Two traps this avoids. It is NOT an average of per-row costs (rows are per workflow per report date, so a run spanning midnight UTC contributes several rows), and it does NOT divide by distinct participants, which inflates the figure by the reprocessing multiple — with a fixed test-batch subject list that ran ~3.2x over the 30 days to 2026-08-09, turning a true $0.27 into $0.85. The July 2026 rightsizing is often quoted as taking this from $0.74 to $0.36; that pair came from day+1 scrapes, and on the settled re-scrape of the same 2026-07-31 A/B it reads $0.379 -> $0.304 per run. Even that is soft — the two cohorts share only 2 of 10 subjects, and per-POD cost is flat between them ($0.0212 vs $0.0208), so most of the gap is BOLD run count, not rightsizing.",
+      "description": "The headline number: total spend divided by distinct workflows — the cost of processing one participant once. Two traps this avoids. It is NOT an average of per-row costs (rows are per workflow per report date, so a workflow spanning midnight UTC contributes several rows), and it does NOT divide by distinct participants, which inflates the figure by the reprocessing multiple — with a fixed test-batch subject list that ran ~3.2x over the 30 days to 2026-08-09, turning a true $0.27 into $0.85. The July 2026 rightsizing is often quoted as taking this from $0.74 to $0.36; that pair came from day+1 scrapes, and on the settled re-scrape of the same 2026-07-31 A/B it reads $0.379 -> $0.304 per subject. Even that is soft — the two cohorts share only 2 of 10 subjects, and per-POD cost is flat between them ($0.0212 vs $0.0208), so most of the gap is BOLD run count, not rightsizing.",
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -127,7 +127,7 @@
           }
         }
       },
-      "description": "Sum over every cost record in range, including probe runs and reprocessing. This is the money actually spent, not a per-participant estimate.",
+      "description": "Sum over every cost record in range, including probe workflows and reprocessing. This is the money actually spent, not a per-participant estimate.",
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -138,7 +138,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Runs / participants",
+      "title": "Workflows / participants",
       "gridPos": {
         "x": 19,
         "y": 0,
@@ -159,7 +159,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT COUNT(DISTINCT workflow_name) AS runs, COUNT(DISTINCT subject) AS participants FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> ''"
+          "rawSQL": "SELECT COUNT(DISTINCT workflow_name) AS workflows, COUNT(DISTINCT subject) AS participants FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> ''"
         }
       ],
       "fieldConfig": {
@@ -172,7 +172,7 @@
           }
         }
       },
-      "description": "`runs` = distinct workflows with attributed cost in range — one workflow is one participant processed once. `participants` = distinct people behind those runs. The two diverge whenever a subject is reprocessed, which is routine here because test batches reuse a fixed subject list; over a typical month `runs` has been ~3x `participants`. Probe runs (no subject tag) are excluded from both.",
+      "description": "`workflows` = distinct workflows with attributed cost in range — one workflow is one participant processed once. `participants` = distinct people behind those workflows. The two diverge whenever a subject is reprocessed, which is routine here because test batches reuse a fixed subject list; over a typical month `workflows` has been ~3x `participants`. Probe workflows (no subject tag) are excluded from both.",
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -410,7 +410,7 @@
     {
       "id": 12,
       "type": "timeseries",
-      "title": "Cost per run over time",
+      "title": "Cost per subject over time",
       "gridPos": {
         "x": 12,
         "y": 8,
@@ -431,7 +431,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT CAST(date AS TIMESTAMP) AS time, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_run FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' GROUP BY 1 ORDER BY 1 ASC"
+          "rawSQL": "SELECT CAST(date AS TIMESTAMP) AS time, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_subject FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' GROUP BY 1 ORDER BY 1 ASC"
         }
       ],
       "fieldConfig": {
@@ -467,7 +467,7 @@
           "sort": "none"
         }
       },
-      "description": "The unit-cost trend — the number a right-sizing change should move. One series, so no legend: the title names it. Read a single point with care: cost is bucketed by report date, so a run that spanned midnight UTC lands partly on each of two days and pushes both points below the true per-run cost. Only compare dates whose whole batch ran inside one UTC day, and only once the Settled share tile reads 100%."
+      "description": "The unit-cost trend — the number a right-sizing change should move. One series, so no legend: the title names it. Read a single point with care: cost is bucketed by report date, so a workflow that spanned midnight UTC lands partly on each of two days and pushes both points below the true per-subject cost. Only compare dates whose whole batch ran inside one UTC day, and only once the Settled share tile reads 100%."
     },
     {
       "id": 200,
@@ -485,8 +485,8 @@
     {
       "id": 6,
       "type": "barchart",
-      "title": "Cost per run, by component",
-      "description": "Which resource the money buys, per workflow run. Three bars, one hue: the job here is comparing magnitudes, not telling identities apart. These are Kubecost's pre-reconciliation component costs, so they sum to slightly less than Cost per run — the difference is the Reconciliation tile above, and it is the same scalar for all three components, which is why showing a second 'net' bar per component (the old design) added no information.",
+      "title": "Cost per subject, by component",
+      "description": "Which resource the money buys, per subject processed. Three bars, one hue: the job here is comparing magnitudes, not telling identities apart. These are Kubecost's pre-reconciliation component costs, so they sum to slightly less than Cost per subject — the difference is the Reconciliation tile above, and it is the same scalar for all three components, which is why showing a second 'net' bar per component (the old design) added no information.",
       "gridPos": {
         "x": 0,
         "y": 17,
@@ -507,7 +507,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT 'CPU' AS component, ROUND(SUM(cpu_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_run FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' UNION ALL SELECT 'GPU', ROUND(SUM(gpu_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' UNION ALL SELECT 'Memory', ROUND(SUM(memory_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' ORDER BY cost_per_run DESC"
+          "rawSQL": "SELECT 'CPU' AS component, ROUND(SUM(cpu_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_subject FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' UNION ALL SELECT 'GPU', ROUND(SUM(gpu_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' UNION ALL SELECT 'Memory', ROUND(SUM(memory_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' ORDER BY cost_per_subject DESC"
         }
       ],
       "options": {
@@ -549,8 +549,8 @@
     {
       "id": 13,
       "type": "barchart",
-      "title": "Cost per run, by pipeline phase",
-      "description": "From `pod_costs`, rolled up by the `cloudpipe.io/phase` pod label — the coarse answer to 'which part of the pipeline costs the money'. Anatomical segmentation dominates by design. Phases past the top five fold into `other` rather than earning their own bar; pods with no phase label (Argo helper pods) appear as `unlabelled`. Every pod is counted, so this sums to the full workflow cost and reconciles with Cost per run.",
+      "title": "Cost per subject, by pipeline phase",
+      "description": "From `pod_costs`, rolled up by the `cloudpipe.io/phase` pod label — the coarse answer to 'which part of the pipeline costs the money'. Anatomical segmentation dominates by design. Phases past the top five fold into `other` rather than earning their own bar; pods with no phase label (Argo helper pods) appear as `unlabelled`. Every pod is counted, so this sums to the full workflow cost and reconciles with Cost per subject.",
       "gridPos": {
         "x": 6,
         "y": 17,
@@ -571,7 +571,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH scoped AS (SELECT CASE WHEN phase = '' THEN 'unlabelled' ELSE phase END AS phase, workflow_name, total_cost_usd FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())), runs AS (SELECT COUNT(DISTINCT workflow_name) AS n FROM scoped), per_phase AS (SELECT phase, SUM(total_cost_usd) AS c FROM scoped GROUP BY 1), ranked AS (SELECT phase, c, ROW_NUMBER() OVER (ORDER BY c DESC) AS rn FROM per_phase) SELECT CASE WHEN rn <= 5 THEN phase ELSE 'other' END AS phase, ROUND(SUM(c) / NULLIF((SELECT n FROM runs), 0), 4) AS cost_per_run FROM ranked GROUP BY 1 ORDER BY cost_per_run DESC"
+          "rawSQL": "WITH scoped AS (SELECT CASE WHEN phase = '' THEN 'unlabelled' ELSE phase END AS phase, workflow_name, total_cost_usd FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())), workflows AS (SELECT COUNT(DISTINCT workflow_name) AS n FROM scoped), per_phase AS (SELECT phase, SUM(total_cost_usd) AS c FROM scoped GROUP BY 1), ranked AS (SELECT phase, c, ROW_NUMBER() OVER (ORDER BY c DESC) AS rn FROM per_phase) SELECT CASE WHEN rn <= 5 THEN phase ELSE 'other' END AS phase, ROUND(SUM(c) / NULLIF((SELECT n FROM workflows), 0), 4) AS cost_per_subject FROM ranked GROUP BY 1 ORDER BY cost_per_subject DESC"
         }
       ],
       "options": {
@@ -613,8 +613,8 @@
     {
       "id": 14,
       "type": "barchart",
-      "title": "Cost per run, by step (top 12)",
-      "description": "The same `pod_costs` data one level finer, by the `cloudpipe.io/step` pod label. This is the actionable ranking: the step at the top is where a runtime or request change buys the most. The divisor is distinct workflows in the whole window, not just the workflows that ran this step, so a step that is skipped when derivatives already exist reads lower here than in Step economics below — that table's `runs` column tells you which case you are in.",
+      "title": "Cost per subject, by step (top 12)",
+      "description": "The same `pod_costs` data one level finer, by the `cloudpipe.io/step` pod label. This is the actionable ranking: the step at the top is where a runtime or request change buys the most. The divisor is distinct workflows in the whole window, not just the workflows that ran this step, so a step that is skipped when derivatives already exist reads lower here than in Step economics below — that table's `workflows` column tells you which case you are in.",
       "gridPos": {
         "x": 15,
         "y": 17,
@@ -635,7 +635,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH scoped AS (SELECT step, workflow_name, total_cost_usd FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND step <> ''), runs AS (SELECT COUNT(DISTINCT workflow_name) AS n FROM scoped) SELECT step, ROUND(SUM(total_cost_usd) / NULLIF((SELECT n FROM runs), 0), 4) AS cost_per_run FROM scoped GROUP BY step ORDER BY cost_per_run DESC LIMIT 12"
+          "rawSQL": "WITH scoped AS (SELECT step, workflow_name, total_cost_usd FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND step <> ''), workflows AS (SELECT COUNT(DISTINCT workflow_name) AS n FROM scoped) SELECT step, ROUND(SUM(total_cost_usd) / NULLIF((SELECT n FROM workflows), 0), 4) AS cost_per_subject FROM scoped GROUP BY step ORDER BY cost_per_subject DESC LIMIT 12"
         }
       ],
       "options": {
@@ -691,7 +691,7 @@
       "id": 15,
       "type": "table",
       "title": "Step economics",
-      "description": "Cost next to the efficiency that produced it — this is what makes the pod grain actionable rather than merely descriptive. `cpu_eff` / `ram_eff` are Kubecost's usage-over-request ratios: an expensive step with low efficiency is over-requested, and that is where per-pod cost is reducible. Values above 1.0 mean the pod burst past its request (routine for the GPU steps, which set a small CPU request deliberately) — not an error, and the gauge simply pins at full. `runs` is the workflows that actually ran the step, so `cost_per_run` here is the step's unit cost when it runs and steps skipped because derivatives already existed do not dilute it. Sorted by total spend.",
+      "description": "Cost next to the efficiency that produced it — this is what makes the pod grain actionable rather than merely descriptive. `cpu_eff` / `ram_eff` are Kubecost's usage-over-request ratios: an expensive step with low efficiency is over-requested, and that is where per-pod cost is reducible. Values above 1.0 mean the pod burst past its request (routine for the GPU steps, which set a small CPU request deliberately) — not an error, and the gauge simply pins at full. `workflows` is the count that actually ran the step, so `cost_per_subject` here is the step's unit cost when it does run and steps skipped because derivatives already existed do not dilute it. Sorted by total spend.",
       "gridPos": {
         "x": 0,
         "y": 26,
@@ -712,7 +712,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT step, COUNT(DISTINCT workflow_name) AS runs, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_run, ROUND(AVG(runtime_minutes), 1) AS avg_minutes, ROUND(AVG(cpu_efficiency), 2) AS cpu_eff, ROUND(AVG(ram_efficiency), 2) AS ram_eff, ROUND(SUM(cpu_core_hours), 1) AS cpu_core_hours, ROUND(SUM(ram_gb_hours), 1) AS ram_gb_hours, ROUND(SUM(gpu_hours), 1) AS gpu_hours FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND step <> '' GROUP BY step ORDER BY total_cost DESC"
+          "rawSQL": "SELECT step, COUNT(DISTINCT workflow_name) AS workflows, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_subject, ROUND(AVG(runtime_minutes), 1) AS avg_minutes, ROUND(AVG(cpu_efficiency), 2) AS cpu_eff, ROUND(AVG(ram_efficiency), 2) AS ram_eff, ROUND(SUM(cpu_core_hours), 1) AS cpu_core_hours, ROUND(SUM(ram_gb_hours), 1) AS ram_gb_hours, ROUND(SUM(gpu_hours), 1) AS gpu_hours FROM cloudpipe_metrics.pod_costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND step <> '' GROUP BY step ORDER BY total_cost DESC"
         }
       ],
       "options": {
@@ -754,7 +754,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "cost_per_run"
+              "options": "cost_per_subject"
             },
             "properties": [
               {
@@ -888,7 +888,7 @@
     {
       "id": 400,
       "type": "row",
-      "title": "👤 Per-run and per-participant detail",
+      "title": "👤 Per-workflow and per-participant detail",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -901,8 +901,8 @@
     {
       "id": 17,
       "type": "histogram",
-      "title": "Cost per run, distribution",
-      "description": "One observation per workflow. The spread is the point: runtime and cost are driven by BOLD run count and length per participant, so a wide distribution is expected and the mean alone hides it. Compare the bulk of the distribution, not the tail, when judging a right-sizing change. Runs still in flight at scrape time contribute a partial cost and sit artificially far left.",
+      "title": "Cost per subject, distribution",
+      "description": "One observation per workflow. The spread is the point: runtime and cost are driven by BOLD run count and length per participant, so a wide distribution is expected and the mean alone hides it. Compare the bulk of the distribution, not the tail, when judging a right-sizing change. Workflows still in flight at scrape time contribute a partial cost and sit artificially far left.",
       "gridPos": {
         "x": 0,
         "y": 38,
@@ -923,7 +923,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT ROUND(SUM(total_cost_usd), 4) AS cost_per_run FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' GROUP BY workflow_name"
+          "rawSQL": "SELECT ROUND(SUM(total_cost_usd), 4) AS cost_per_subject FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND subject IS NOT NULL AND subject <> '' GROUP BY workflow_name"
         }
       ],
       "options": {
@@ -947,8 +947,8 @@
     {
       "id": 18,
       "type": "barchart",
-      "title": "Spend by run outcome",
-      "description": "Money spent on runs that did not succeed. Joins `costs` to `workflow_runs` on workflow_name. `no run record` is not a failure category: a workflow gets its run record only when it finishes, so in-flight runs — and runs whose record predates this window — land there. Read it as 'unknown', and expect it to be large while a batch is running. The two tables also partition differently (cost on report date, workflow_runs on finish date), so a narrow window can leave genuinely-matched runs unmatched.",
+      "title": "Spend by workflow outcome",
+      "description": "Money spent on workflows that did not succeed. Joins `costs` to `workflow_runs` on workflow_name. `no workflow record` is not a failure category: a workflow gets its record only when it finishes, so in-flight workflows — and workflows whose record predates this window — land there. Read it as 'unknown', and expect it to be large while a batch is running. The two tables also partition differently (cost on report date, workflow_runs on finish date), so a narrow window can leave genuinely-matched workflows unmatched.",
       "gridPos": {
         "x": 8,
         "y": 38,
@@ -969,7 +969,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT CASE WHEN r.status IS NULL THEN 'no run record' ELSE r.status END AS outcome, ROUND(SUM(c.total_cost_usd), 2) AS total_cost FROM cloudpipe_metrics.costs c LEFT JOIN cloudpipe_metrics.workflow_runs r ON r.workflow_name = c.workflow_name WHERE CAST(c.date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(c.dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY 1 ORDER BY total_cost DESC"
+          "rawSQL": "SELECT CASE WHEN r.status IS NULL THEN 'no workflow record' ELSE r.status END AS outcome, ROUND(SUM(c.total_cost_usd), 2) AS total_cost FROM cloudpipe_metrics.costs c LEFT JOIN cloudpipe_metrics.workflow_runs r ON r.workflow_name = c.workflow_name WHERE CAST(c.date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(c.dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY 1 ORDER BY total_cost DESC"
         }
       ],
       "options": {
@@ -1012,7 +1012,7 @@
       "id": 5,
       "type": "table",
       "title": "Spend by participant",
-      "description": "Top 50 by total cost, summed over every time the participant was processed. `runs` counts the distinct workflows, and `cost_per_run` divides by it. `days` counts the distinct report dates the participant appears on; it can exceed `runs` when a single run spanned midnight UTC. Probe rows carry no subject and appear as a blank row.",
+      "description": "Top 50 by total cost, summed over every time the participant was processed. `workflows` counts the distinct workflows, and `cost_per_subject` divides by it. `days` counts the distinct report dates the participant appears on; it can exceed `workflows` when a single workflow spanned midnight UTC. Probe rows carry no subject and appear as a blank row.",
       "gridPos": {
         "x": 14,
         "y": 38,
@@ -1033,7 +1033,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT subject, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_run, ROUND(SUM(cpu_cost_usd), 2) AS cpu_cost, ROUND(SUM(memory_cost_usd), 2) AS memory_cost, ROUND(SUM(gpu_cost_usd), 2) AS gpu_cost, COUNT(DISTINCT workflow_name) AS runs, COUNT(DISTINCT date) AS days FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY subject ORDER BY total_cost DESC LIMIT 50"
+          "rawSQL": "SELECT subject, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_cost_usd) / NULLIF(COUNT(DISTINCT workflow_name), 0), 4) AS cost_per_subject, ROUND(SUM(cpu_cost_usd), 2) AS cpu_cost, ROUND(SUM(memory_cost_usd), 2) AS memory_cost, ROUND(SUM(gpu_cost_usd), 2) AS gpu_cost, COUNT(DISTINCT workflow_name) AS workflows, COUNT(DISTINCT date) AS days FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY subject ORDER BY total_cost DESC LIMIT 50"
         }
       ],
       "options": {
@@ -1075,7 +1075,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "cost_per_run"
+              "options": "cost_per_subject"
             },
             "properties": [
               {
@@ -1128,7 +1128,7 @@
                 "database": "__default",
                 "region": "__default"
               },
-              "rawSQL": "SELECT date, MAX(scrape_age_days) AS scrape_age_days, COUNT(DISTINCT workflow_name) AS runs, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_adjustment_usd), 3) AS adjustment, ROUND(100.0 * SUM(total_adjustment_usd) / NULLIF(SUM(total_cost_usd), 0), 1) AS adjustment_pct, ROUND(SUM(total_cost_usd) - SUM(cpu_cost_usd + memory_cost_usd + gpu_cost_usd), 3) AS residual, MAX(schema_version) AS schema_version FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY date ORDER BY date DESC"
+              "rawSQL": "SELECT date, MAX(scrape_age_days) AS scrape_age_days, COUNT(DISTINCT workflow_name) AS workflows, ROUND(SUM(total_cost_usd), 2) AS total_cost, ROUND(SUM(total_adjustment_usd), 3) AS adjustment, ROUND(100.0 * SUM(total_adjustment_usd) / NULLIF(SUM(total_cost_usd), 0), 1) AS adjustment_pct, ROUND(SUM(total_cost_usd) - SUM(cpu_cost_usd + memory_cost_usd + gpu_cost_usd), 3) AS residual, MAX(schema_version) AS schema_version FROM cloudpipe_metrics.costs WHERE CAST(date AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) AND CAST(dt AS DATE) BETWEEN DATE($__timeFrom()) AND DATE($__timeTo()) GROUP BY date ORDER BY date DESC"
             }
           ],
           "options": {

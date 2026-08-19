@@ -12,9 +12,14 @@ spec:
       labels:
         cloudpipe.io/phase: inventory
         cloudpipe.io/step: subject-data-inventory
+    # `Always`, not `OnFailure`: OnFailure cannot see phase=Error, so a
+    # control-plane-throttled or deleted pod got zero retries out of a budget of
+    # three. Same defect and same reasoning as globus-transfer-workflow-template
+    # (issue #269) — this is a cpu-light read-only step, so retrying every
+    # terminal failure is cheaper than reasoning about which ones deserve it.
     retryStrategy:
       limit: "3"
-      retryPolicy: OnFailure
+      retryPolicy: Always
       backoff:
         duration: "30s"
         factor: "2"
@@ -31,7 +36,7 @@ spec:
             path: /tmp/subregions_exists.txt
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -52,3 +57,90 @@ spec:
         - '{{workflow.parameters.subjID}}'
         - --bucket
         - '{{workflow.parameters.bucket}}'
+
+  # Re-reads the FastSurfer completion markers AFTER the anatomical phase and
+  # splits the inventory into the sessions that have derivatives and those that
+  # do not. The session-level fan-out is driven by THIS, not by the inventory
+  # array (issue #270).
+  #
+  # The two are not interchangeable. subject-data-inventory runs before the
+  # anatomical phase and describes the subject's INPUTS: `t1w_available` means
+  # "there is a T1w in mmps_mproc for this session". The functional half needs
+  # the opposite question — "did the anatomical phase publish derivatives for
+  # this session" — and the answer differs whenever the #248 completion guard
+  # rejects one timepoint and passes the others, which is precisely the case
+  # that guard exists to handle. Fanning out on the input list then produces a
+  # branch whose first pod dies staging an input artifact that was never
+  # written: the workflow reports phase `Error`, and a subject with 25 of 27
+  # pods green (cloudpipe-knwr6 / sub-GNV5ZKU4) is recorded the same as one
+  # where nothing ran at all.
+  #
+  # This runs on the anatomical gate rather than inside the anatomical phase
+  # because that phase is `when:`-skipped on any reprocess, and a fan-out may
+  # not reference a skipped producer's output parameters (ADR 016) — the DAG
+  # deadlocks. As a separate always-runs task it costs one cpu-light pod of a
+  # few seconds, and it is a genuine re-check on the reprocess path too: markers
+  # deleted between the two passes are caught here rather than 40 minutes later.
+  - name: published-sessions-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: inventory
+        cloudpipe.io/step: published-sessions
+    inputs:
+      parameters:
+        # The inventory pass's JSON array, verbatim.
+        - name: inventory-json
+    retryStrategy:
+      limit: "3"
+      # `Always`, not `OnFailure`: a throttled control plane produces phase
+      # Error, which OnFailure cannot see (issue #269). This step is a handful
+      # of head_objects — there is no non-transient way for it to fail except a
+      # malformed inventory array, which retrying merely re-reports.
+      retryPolicy: Always
+      backoff:
+        duration: "30s"
+        factor: "2"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    outputs:
+      parameters:
+        # The fan-out list. Inventory items, published sessions only.
+        - name: session-items
+          valueFrom:
+            path: /tmp/session_items.json
+        - name: rejected-sessions
+          valueFrom:
+            path: /tmp/rejected_sessions.json
+        # Plain integer, so the recorder fan-out's `when:` guard is a string
+        # comparison rather than an expression over a JSON array.
+        - name: rejected-count
+          valueFrom:
+            path: /tmp/rejected_count.txt
+
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+          ephemeral-storage: 500M
+        limits:
+          ephemeral-storage: 500M
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+      command: [python, /app/inventory.py]
+      args:
+        - --mode
+        - published-sessions
+        - --subject
+        - '{{workflow.parameters.subjID}}'
+        - --bucket
+        - '{{workflow.parameters.bucket}}'
+        - --inventory-json
+        - '{{inputs.parameters.inventory-json}}'

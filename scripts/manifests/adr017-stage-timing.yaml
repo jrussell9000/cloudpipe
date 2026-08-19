@@ -1,0 +1,93 @@
+# ADR 017 tasks 7.7 / 7.8 (and the deferred 1.4): time the exploded read paths
+# against the tarball path they replaced, cold, from inside the cluster.
+#
+# In-cluster on purpose — the whole question is per-object request overhead
+# against S3 in the same region, and a workstation over a VPN measures the VPN.
+# One pod runs all three timings so they share a node, a NIC and a warm TLS
+# session pool; the only thing that differs is the access pattern.
+#
+# The tarball baseline is `scratch/adr017-timing/ses-00A.tar.gz`, built from the
+# same published tree so the comparison is byte-for-byte the same data. The old
+# corpus was flushed at cutover (task 7.3), so a real tarball no longer exists.
+#
+# Run:
+#   kubectl -n argo-workflows apply -f scripts/manifests/adr017-stage-timing.yaml
+#   kubectl -n argo-workflows logs -f adr017-stage-timing
+#   kubectl -n argo-workflows delete pod adr017-stage-timing
+apiVersion: v1
+kind: Pod
+metadata:
+  name: adr017-stage-timing
+  namespace: argo-workflows
+spec:
+  serviceAccountName: argo-workflows-runner
+  restartPolicy: Never
+  nodeSelector:
+    karpenter.sh/nodepool: cpu-light-nodepool
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+  containers:
+    - name: main
+      image: "<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/fsqc:sha-ef3f3ab4e4e78345f90f6552ae398da9e9d9b8b0"
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: PYTHONPATH
+          value: /app
+        - name: BUCKET
+          value: <YOUR_S3_BUCKET>
+        - name: PREFIX
+          value: derivatives/fastsurfer/sub-00NPMHND/ses-00A
+        - name: TARBALL
+          value: scratch/adr017-timing/ses-00A.tar.gz
+      command: ["python", "-c"]
+      args:
+        - |
+          import io, os, tarfile, time
+          import boto3
+          import fs_derivatives as fsd
+
+          s3 = boto3.client("s3")
+          B, P, T = os.environ["BUCKET"], os.environ["PREFIX"], os.environ["TARBALL"]
+
+          def timed(label, fn):
+              t = time.monotonic()
+              extra = fn()
+              print(f"{label:<44} {time.monotonic() - t:7.2f}s   {extra}", flush=True)
+
+          # 7.7 — the downstream-analysis case: one stats file, nothing else.
+          def one_object():
+              body = s3.get_object(Bucket=B, Key=f"{P}/stats/aseg.stats")["Body"].read()
+              return f"{len(body) / 1024:.1f} KiB"
+
+          # 7.7 baseline — what the same read cost before: pull the whole archive
+          # and expand it to reach one file. Extracted to disk rather than held in
+          # a BytesIO, matching what stage_and_run.py used to do.
+          def tarball_expand():
+              buf = io.BytesIO()
+              s3.download_fileobj(B, T, buf)
+              size = buf.tell()
+              buf.seek(0)
+              with tarfile.open(fileobj=buf, mode="r|gz") as tf:
+                  tf.extractall("/tmp/from_tarball", filter="tar")
+              n = sum(len(f) for _, _, f in os.walk("/tmp/from_tarball"))
+              return f"{size / 2**20:.1f} MiB archive, {n} files"
+
+          # 7.8 / 1.4 — the whole-tree consumer case: 268 objects + marker + manifest.
+          def exploded_stage():
+              r = fsd.stage(B, P, "/tmp/from_exploded")
+              return f"{r['files']} objects, {r['created']} links, {r['marker']['total_bytes'] / 2**20:.1f} MiB"
+
+          timed("7.7  single stats/aseg.stats (exploded)", one_object)
+          timed("7.7  tarball download + expand", tarball_expand)
+          timed("7.8  whole-tree exploded stage", exploded_stage)
+      resources:
+        requests:
+          cpu: '2'
+          memory: 3G
+          ephemeral-storage: 4G
+        limits:
+          memory: 4G
+          ephemeral-storage: 6G

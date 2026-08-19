@@ -1004,8 +1004,12 @@ resource "aws_glue_catalog_table" "pod_costs_compacted" {
   table_type = "EXTERNAL_TABLE"
 
   parameters = merge(local.compacted_partition_projection.pod_costs, {
-    "classification"                   = "parquet"
-    "projection.schema_version.values" = "1.0"
+    "classification" = "parquet"
+    # 1.1 adds the no-spot counterfactual columns (node_capacity_type and the
+    # two rates). 1.0 stays declared: those records are not rewritten, and a
+    # version missing from this enum is not a projected partition, so its rows
+    # return zero with a SUCCESS status rather than an error.
+    "projection.schema_version.values" = "1.0,1.1"
   })
 
   partition_keys {
@@ -1113,6 +1117,26 @@ resource "aws_glue_catalog_table" "pod_costs_compacted" {
     columns {
       name = "node_instance_type"
       type = "string"
+    }
+    columns {
+      # Schema 1.1+. "spot" on every Karpenter-provisioned node (all four
+      # nodepools are spot-only, ADR 007), "on-demand" on the EKS managed
+      # nodegroup nodes, "" on rows written before 1.1.
+      name = "node_capacity_type"
+      type = "string"
+    }
+    columns {
+      # Schema 1.1+. The two rates behind the no-spot counterfactual: what the
+      # node cost per hour after Kubecost's reconciliation, and AWS list price
+      # for the same instance type. NULL (not 0) when unknown — a 0 would make
+      # the ratio meaningless, so queries must guard on > 0, not on NOT NULL
+      # alone. See CloudpipeMetrics.spot_savings().
+      name = "node_effective_usd_per_hour"
+      type = "double"
+    }
+    columns {
+      name = "node_ondemand_usd_per_hour"
+      type = "double"
     }
     columns {
       name = "scrape_age_days"
@@ -1864,7 +1888,7 @@ resource "aws_glue_catalog_table" "pod_costs" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "completed_at,cpu_core_hours,cpu_cost_usd,cpu_efficiency,date,gpu_cost_usd,gpu_hours,memory_cost_usd,network_cost_usd,node,node_instance_type,phase,pipeline,pod,pv_cost_usd,ram_efficiency,ram_gb_hours,runtime_minutes,schema_version,scrape_age_days,session,step,subject,total_adjustment_usd,total_cost_usd,workflow_name"
+        paths                   = "completed_at,cpu_core_hours,cpu_cost_usd,cpu_efficiency,date,gpu_cost_usd,gpu_hours,memory_cost_usd,network_cost_usd,node,node_capacity_type,node_effective_usd_per_hour,node_instance_type,node_ondemand_usd_per_hour,phase,pipeline,pod,pv_cost_usd,ram_efficiency,ram_gb_hours,runtime_minutes,schema_version,scrape_age_days,session,step,subject,total_adjustment_usd,total_cost_usd,workflow_name"
         "ignore.malformed.json" = "true"
       }
     }
@@ -1961,6 +1985,26 @@ resource "aws_glue_catalog_table" "pod_costs" {
     columns {
       name = "node_instance_type"
       type = "string"
+    }
+    columns {
+      # Schema 1.1+. "spot" on every Karpenter-provisioned node (all four
+      # nodepools are spot-only, ADR 007), "on-demand" on the EKS managed
+      # nodegroup nodes, "" on rows written before 1.1.
+      name = "node_capacity_type"
+      type = "string"
+    }
+    columns {
+      # Schema 1.1+. The two rates behind the no-spot counterfactual: what the
+      # node cost per hour after Kubecost's reconciliation, and AWS list price
+      # for the same instance type. NULL (not 0) when unknown — a 0 would make
+      # the ratio meaningless, so queries must guard on > 0, not on NOT NULL
+      # alone. See CloudpipeMetrics.spot_savings().
+      name = "node_effective_usd_per_hour"
+      type = "double"
+    }
+    columns {
+      name = "node_ondemand_usd_per_hour"
+      type = "double"
     }
     columns {
       name = "scrape_age_days"

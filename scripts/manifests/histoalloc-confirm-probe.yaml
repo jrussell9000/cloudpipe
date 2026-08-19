@@ -1,0 +1,444 @@
+# Confirmation probe for the mri_normalize HISTOalloc failure.
+# See docs/pipelines.md, the "garbage histogram bin count" subsection.
+#
+# READ THIS FIRST: THE MECHANISM IS ALREADY SETTLED FROM SOURCE.
+# An earlier version of this manifest ran an N-iteration determinism test to
+# separate "uninitialized read" from "deterministic function of the intermediate".
+# That question was answered by reading FreeSurfer v7.4.1 source on 2026-08-15 and
+# the determinism arms are GONE. Do not re-add them. The chain is:
+#
+#   1. mri_normalize.cpp:805 (the `if(mri_aseg)` branch our command takes) calls
+#      MRIapplyBiasCorrectionSameGeometry().
+#   2. mrinorm.cpp:3652:  val *= (target_val / bias)
+#      No zero guard, no clamp, no NaN removal on this branch. (The `-surface`
+#      branch at mri_normalize.cpp:505 DOES call MRIremoveNaNs right after the
+#      same call — so upstream knows this division can go non-finite. The aseg
+#      branch simply doesn't.)
+#   3. A near-zero interpolated bias yields a huge finite voxel:
+#      110 * 110 / 5.8e-6 ~= 2.1e9, exactly the observed magnitude.
+#   4. MRI3dNormalize's own guards don't catch it either: FZERO(bias)
+#      (mrinorm.cpp:1470) tests exact zero only, and the `norm > 255` clamp at
+#      :1475 is gated on `mri_norm->type == MRI_UCHAR` while :1410 has already
+#      forced MRI_FLOAT — so that clamp is DEAD on this path.
+#   5. Pass 1's find_tissue_intensities -> MRIhistogram(mri_src, 0)
+#      (mrinorm.cpp:3371) -> nbins = nint(fmax - fmin + 1.0) (mrihisto.cpp:121)
+#      -> ~2.1e9.
+#   6. HISTOalloc allocates 2 float arrays => 8 bytes/bin => 15.9 GiB => ErrorExit.
+#
+# The arithmetic fingerprint that proves step 5 is reading a REAL value rather than
+# garbage: all four observed bin counts are exactly 128k+1, and 128 is precisely the
+# float32 ULP at magnitude 2e9 — so the +1 in the values IS the `+ 1.0` in the
+# source. Four independent values on that lattice is ~1 in 2.7e8 by chance.
+#
+# It also explains why no INPUT property predicts which sessions fail: the trigger
+# is the BIAS FIT (control-point geometry), not the intensities. That is why
+# control-point counts, saturation, WM-peak location and NaN/Inf screening all
+# failed to generalise across the three victims. Stop looking for a data-side gate.
+#
+# FreeSurfer 8 does NOT fix this. utils/mrihisto.cpp, utils/histo.cpp and
+# utils/mrinorm.cpp are byte-identical across v7.4.1, v8.0.0, v8.1.0, v8.2.0 and
+# dev (md5 6f471ccf / 402aac69 / 27617d37). Verified against a positive control:
+# CMakeLists.txt differs across all four refs and mri_normalize.cpp differs between
+# 7.4.1 and 8.2.0 (its only change is a copyVolGeom -> struct-assignment refactor in
+# LTA handling, a path we don't take). A version bump is not a mitigation.
+#
+# WHAT IS STILL WORTH MEASURING — and it is the only reason to run this.
+# Three questions, all cheap, none needing more than one pipeline attempt:
+#
+#   Q1  Is the ~2e9 voxel on disk in norm.mgz, or created in-memory?
+#       Predicted: NOT on disk (norm.mgz should be ~0-255), because step 2 above
+#       happens after norm.mgz is read. If it IS on disk, an external clamp becomes
+#       a viable one-line fix and that changes the whole mitigation picture — which
+#       is why this is measured rather than assumed.
+#
+#   Q2  Does raising the address-space cap let it complete, and is the output sane?
+#       bin_size works out to ~1.0, so the real data sits in bins 0-255 and the
+#       remaining ~2.1e9 bins are empty, while peak finding is already restricted to
+#       wm_val +/- 20. So it may well produce CORRECT output for ~16 GiB of wasted
+#       RAM. If so, "raise the cap" is a real mitigation. Note the cost: k=4
+#       sessions run in parallel, so pod sizing is the blocker, not correctness.
+#
+#   Q3  Is the bias field's minimum actually near zero?
+#       Direct confirmation of step 3. mri_normalize's `-W <ctrl> <bias>` writes the
+#       bias volume from MRI3dNormalize (mrinorm.cpp:1447) — but note that write is
+#       AFTER the crash point (control-point finding at :1418 precedes it), so it
+#       only yields a file if Q2 comes back "completes". Q3 is therefore
+#       conditional on Q2 and must not be treated as a required output.
+#
+# STAGE 1 IS SHORT. In the original failure the first mri_normalize started at
+# 22:50:02 and the crash was logged at 22:52:08 — about two minutes of compute, not
+# the ~45 min a full surf run takes. Budget well under an hour for the whole probe.
+#
+# PUBLISHES NOTHING. No output artifacts, and brun_fastsurfer.sh is invoked directly
+# rather than through the production publish stage. sub-GNV5ZKU4's real derivatives
+# (ses-00A + long-template published; ses-02A correctly rejected by the #245 guard)
+# must not be touched.
+#
+# IMAGE PINS ARE THE FAILING BATCH'S, NOT TODAY'S. cloudpipe-knwr6 ran
+# fastsurfer:sha-56abbdf3, not the current sha-5d429ab9. Both verified in ECR
+# 2026-08-15. Keeping the batch's tag means a surprising result cannot be waved away
+# as "different build".
+#
+# DEADLINE. The four scratch objects were confirmed present 2026-08-15, written
+# 2026-08-14T21:59-22:47Z, so the 7-day rule expires them around 2026-08-21. After
+# that this cannot run as written. Re-verify immediately before submitting:
+#   aws s3api list-objects-v2 --bucket <YOUR_S3_BUCKET> \
+#     --prefix scratch/cloudpipe-knwr6/anat/ \
+#     --query 'Contents[].[Key,Size,LastModified]' --output text
+# (s3api, not `aws s3 ls` — the latter prints LOCAL time, which has cost a whole
+# investigation here before)
+#
+# FILED UPSTREAM as freesurfer/freesurfer#1452 (2026-08-15). The draft that became
+# it is plans/histoalloc-upstream-issue-draft.md. Note the issue does NOT yet carry
+# this probe's Q1/Q3 measurements — if they come back as predicted (norm.mgz clean,
+# bias min_positive ~1e-5) they are worth adding as a comment, since they turn the
+# inferred step 3 above into an observed one.
+#
+# Submit with:
+#   argo -n argo-workflows submit scripts/manifests/histoalloc-confirm-probe.yaml
+#
+# RUN 1: histoalloc-confirm-lqzql, 2026-08-15 20:30:33Z. Stage 1 REPRODUCED —
+# HISTOalloc(2128137089), byte-identical to what ses-02A produced in the 2026-08-14
+# batch, which also confirms the earlier cross-batch divergence came from the upstream
+# GPU stage regenerating norm.mgz rather than from nondeterminism in mri_normalize.
+# Then SPOT-RECLAIMED at 16m29s (`pod deleted`) with stages 2-3 unrun. Two lessons,
+# both now fixed above: stage 1 must run the victim alone, and stage1.log is buffered
+# to a file that is only cat'd when stage 1 ENDS, so `argo logs` shows nothing for the
+# whole run. To watch it live:
+#   kubectl -n argo-workflows exec <pod> -c main -- \
+#     grep -E 'HISTOalloc|white matter peak' /tmp/stage1.log
+# That exec is the only reason run 1 yielded anything at all. The S3 archive DID get
+# written (s3://<YOUR_S3_BUCKET>/logs/histoalloc-confirm-lqzql/.../main.log) but is **197 bytes**
+# — the three [probe] header lines and nothing else, because the reproduction was still
+# sitting in an un-cat'd /tmp/stage1.log when the pod died. An archived log is not the
+# same as a useful one.
+#
+# RUN 2: histoalloc-confirm-rw94n, 2026-08-15, Succeeded in 6m22s. ALL THREE QUESTIONS
+# ANSWERED — there is no reason to run this again unless the code changes.
+#
+#   Stage 1  reproduced HISTOalloc(2128137089), the same value a third time.
+#
+#   Q1 = NO, and it cannot be otherwise. norm.mgz on disk is uint8, max 160
+#        (min_positive 3, NaN=0, Inf=0); nu.mgz 3-255; T1.mgz 2-252. A uint8 file
+#        cannot hold 2e9, so the outlier is manufactured in-memory after the read and
+#        NO EXTERNAL CLAMP IS POSSIBLE. Mitigation B is dead.
+#
+#   Q2 = NO at 24G — but read the reason, it is not "the allocation is too big".
+#        cgroup memory.peak hit 17.53G = 2 x 8.51 GiB, so the histogram at
+#        mrinorm.cpp:3371 DID allocate and populate. What failed is the SECOND one:
+#        `hsmooth = HISTOsmooth(h, NULL, 2)` at :3379 -> HISTOcopy -> HISTOalloc(nbins).
+#        Two live histograms need ~34 GiB before a single volume is counted, so the true
+#        requirement is ~36 GiB PER SESSION at k=4 => ~140 GiB of request to save 1% of
+#        sessions. Mitigation A is dead in practice.
+#
+#   Q3 = not answered, and now unanswerable by this route: it died before
+#        mrinorm.cpp:1447 writes the bias volume, so -W produced no /tmp/bias.mgz. The
+#        near-zero divisor therefore remains INFERRED. Getting it would need either a
+#        ~40 GiB cap (to clear :3379) or a debugger/instrumented build.
+#
+# Consequence for the upstream issue (freesurfer/freesurfer#1452): the memory figure is
+# 31.7 GiB for the PAIR, not 15.9 GiB for one histogram, and a bound must land BEFORE
+# :3371 to help at all.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: histoalloc-confirm-
+  namespace: argo-workflows
+  labels:
+    cloudpipe.io/purpose: diagnostic
+spec:
+  entrypoint: probe
+  serviceAccountName: argo-workflows-runner
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+  # 2h. Stage 1 fails in ~2 min; stage 2 is seconds; stage 3 is the only open-ended
+  # one (a 2.1e9-bin HISTOsmooth is slow) and is deliberately given its own timeout
+  # below so it cannot eat the whole budget silently.
+  activeDeadlineSeconds: 7200
+  # No retryStrategy on purpose: one attempt, one verdict. cpu-heavy-nodepool is
+  # spot-only, so a reclaim means resubmit — do not add a retry, it would overwrite
+  # the log this exists to read.
+  arguments:
+    parameters:
+      - name: subjID
+        value: sub-GNV5ZKU4
+      - name: srcWorkflow          # whose scratch/ intermediates to replay
+        value: cloudpipe-knwr6
+      - name: victimSession
+        value: ses-02A
+      - name: controlSession       # a session from the same subject that PASSED
+        value: ses-00A
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      - name: fastsurferTag
+        value: sha-56abbdf344cb276e4bc792e9653c83b396747518
+      - name: pythonTag
+        value: sha-8a65ce05bb13da7efe11a40397d48eb2989f8df0
+      # Stage 1 reproduces production exactly (8G). Stage 3 answers Q2 and needs
+      # room for a 15.9 GiB histogram plus the volumes already resident.
+      - name: prodCapGiB
+        value: "8"
+      - name: raisedCapGiB
+        value: "24"
+
+  templates:
+    - name: probe
+      metadata:
+        labels:
+          cloudpipe.io/phase: anatomical
+          cloudpipe.io/step: histoalloc-confirm
+      nodeSelector:
+        karpenter.sh/nodepool: cpu-heavy-nodepool
+      volumes:
+        - name: work
+          emptyDir: {}
+      # cpu/ephemeral match production k=2 (cpu max(2k,4)=4, ephemeral 12+4k=20G).
+      # memory is RAISED from production's 13G to 30G solely for stage 3's Q2 arm —
+      # a 15.9 GiB allocation cannot even be attempted under 13G. cpu-heavy nodes
+      # report >=~90Gi allocatable, so this still schedules.
+      podSpecPatch: |
+        containers:
+          - name: main
+            resources:
+              requests:
+                cpu: '4'
+                memory: '30G'
+                ephemeral-storage: '20G'
+      inputs:
+        artifacts:
+          - name: fslicense
+            path: /opt/freesurfer/.license
+            s3:
+              key: config/fslicense
+          - name: template-parcellated
+            path: /work/subjects/{{workflow.parameters.subjID}}_template
+            s3:
+              key: scratch/{{workflow.parameters.srcWorkflow}}/anat/template-parcellated.tar.gz
+          - name: ses-00A-seg
+            path: /work/subjects/ses-00A
+            s3:
+              key: scratch/{{workflow.parameters.srcWorkflow}}/anat/sessions-seg/ses-00A.tar.gz
+          - name: ses-02A-seg
+            path: /work/subjects/ses-02A
+            s3:
+              key: scratch/{{workflow.parameters.srcWorkflow}}/anat/sessions-seg/ses-02A.tar.gz
+
+      initContainers:
+        # recon-surf.sh registers to fsaverage, which is not in the staged tarballs.
+        - name: download-fsaverage
+          image: '{{workflow.parameters.ecr-registry}}/cloudpipe/python:{{workflow.parameters.pythonTag}}'
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              memory: 256M
+              cpu: '1'
+          mirrorVolumeMounts: true
+          env:
+            - name: BUCKET
+              value: '{{workflow.parameters.bucket}}'
+          command: [python]
+          args:
+            - -c
+            - |
+              import boto3, os
+              from pathlib import Path
+
+              dest = Path("/work/subjects/fsaverage")
+              if dest.exists():
+                  print("fsaverage already present, skipping download.", flush=True)
+              else:
+                  s3 = boto3.client('s3')
+                  bucket = os.environ['BUCKET']
+                  prefix = 'config/fsaverage/'
+                  paginator = s3.get_paginator('list_objects_v2')
+                  for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                      for obj in page.get('Contents', []):
+                          key = obj['Key']
+                          rel = key[len(prefix):]
+                          if not rel:
+                              continue
+                          local = dest / rel
+                          local.parent.mkdir(parents=True, exist_ok=True)
+                          s3.download_file(bucket, key, str(local))
+                  print("fsaverage downloaded.", flush=True)
+
+      container:
+        image: '{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:{{workflow.parameters.fastsurferTag}}'
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        env:
+          - name: FS_LICENSE
+            value: /opt/freesurfer/.license
+          - name: SUBJECTS_DIR
+            value: /work/subjects
+          - name: CPU_REQUEST
+            valueFrom:
+              resourceFieldRef:
+                containerName: main
+                resource: requests.cpu
+                divisor: '1'
+        command: [bash, -c]
+        args:
+          - |
+            set -o pipefail
+            SD=/work/subjects
+            SUBJ={{workflow.parameters.subjID}}
+            VICTIM={{workflow.parameters.victimSession}}
+            CONTROL={{workflow.parameters.controlSession}}
+            PROD_CAP={{workflow.parameters.prodCapGiB}}
+            RAISED_CAP={{workflow.parameters.raisedCapGiB}}
+
+            SESSIONS=$(cd "$SD" && ls -d ses-* 2>/dev/null | sort | tr '\n' ' ')
+            K=$(echo $SESSIONS | wc -w)
+            # THREADS is pinned to production's k=2 value rather than derived from this
+            # pod's k=1, so the victim runs down the same numerical path it did in the
+            # batch. FreeSurfer thread counts have changed results elsewhere in this
+            # pipeline (see the t1w-to-mni ITK notes), so do not let it float to 4 just
+            # because stage 1 now runs one session.
+            THREADS=2
+
+            echo "[probe] subject=$SUBJ victim=$VICTIM control=$CONTROL staged_k=$K threads=$THREADS" >&2
+
+            # Locate a python with nibabel. The fastsurfer base ships one in /venv
+            # for its own inference; do not assume `python3` on PATH is it.
+            PY=""
+            for c in /venv/bin/python /venv/bin/python3 python3 python; do
+              if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import nibabel' 2>/dev/null; then
+                PY="$c"; break
+              fi
+            done
+            if [[ -z "$PY" ]]; then
+              echo "[probe] FATAL: no python with nibabel; cannot answer Q1/Q2/Q3." >&2
+              exit 1
+            fi
+            echo "[probe] using python: $PY" >&2
+
+            # Volume statistics. Reports the max, where it is, and how many voxels are
+            # absurd — the point is not just "max is big" but "how localised is it",
+            # which is what decides whether a clamp could ever be safe.
+            cat > /tmp/volstats.py <<'PYEOF'
+            import sys
+            import numpy as np
+            import nibabel as nib
+
+            for path in sys.argv[1:]:
+                try:
+                    d = np.asanyarray(nib.load(path).dataobj, dtype=np.float64)
+                except Exception as exc:
+                    print(f"  {path}: UNREADABLE ({exc})")
+                    continue
+                finite = np.isfinite(d)
+                nan_n = int(np.isnan(d).sum())
+                inf_n = int(np.isinf(d).sum())
+                f = d[finite]
+                if f.size == 0:
+                    print(f"  {path}: no finite voxels at all")
+                    continue
+                mx = float(f.max())
+                idx = np.unravel_index(int(np.nanargmax(np.where(finite, d, -np.inf))), d.shape)
+                over255 = int((f > 255).sum())
+                over1e6 = int((f > 1e6).sum())
+                # smallest strictly-positive value matters for a bias volume: it is
+                # the divisor that blows up
+                pos = f[f > 0]
+                minpos = float(pos.min()) if pos.size else float("nan")
+                print(f"  {path}")
+                print(f"      dtype_on_disk={nib.load(path).get_data_dtype()} shape={d.shape}")
+                print(f"      min={float(f.min()):.6g} max={mx:.9g} at {idx}")
+                print(f"      min_positive={minpos:.6g}  NaN={nan_n} Inf={inf_n}")
+                print(f"      voxels>255={over255}  voxels>1e6={over1e6}")
+                if mx > 1e6:
+                    print(f"      *** nbins would be nint(max-min+1) = {int(round(mx - float(f.min()) + 1.0))}")
+            PYEOF
+
+            echo "" >&2
+            echo "[probe] ############ STAGE 1: reproduce the failure at production cap ############" >&2
+            # VICTIM ONLY, deliberately. The first run (histoalloc-confirm-lqzql) passed
+            # both sessions and was spot-reclaimed at 16m29s with stages 2-3 unrun: the
+            # victim crashes in ~2 min but brun waits on the healthy control's full ~45
+            # min surf run, so ~90% of the exposure window bought nothing. Stage 2 reads
+            # the control's norm.mgz straight out of the STAGED tarball — it never needed
+            # stage 1 to have processed it. Do not re-add the control here.
+            ( ulimit -v $((PROD_CAP * 1024 * 1024))
+              exec stdbuf -oL -eL /fastsurfer/brun_fastsurfer.sh \
+                --subjects "${VICTIM}=from-base" \
+                --sd "$SD" --surf_only --edits --3T \
+                --long "${SUBJ}_template" \
+                --parallel 1 --threads "$THREADS" ) > /tmp/stage1.log 2>&1
+            S1=$?
+            cat /tmp/stage1.log >&2
+            NBINS=$(grep -o 'HISTOalloc([0-9]*)' /tmp/stage1.log | head -1 | tr -dc '0-9' || true)
+            echo "[probe] stage 1: exit=$S1 nbins=${NBINS:-none}" >&2
+            if [[ -z "$NBINS" ]]; then
+              echo "[probe] NOTE: stage 1 did not reproduce HISTOalloc. Stages 2-3 still run" >&2
+              echo "[probe]       (the volume stats are informative either way), but Q2 becomes" >&2
+              echo "[probe]       unanswerable and this is itself a finding worth reporting." >&2
+            fi
+
+            echo "" >&2
+            echo "[probe] ############ STAGE 2 (Q1): is the 2e9 voxel ON DISK? ############" >&2
+            for ses in "$VICTIM" "$CONTROL"; do
+              echo "[probe] --- $ses (victim=$( [[ $ses == "$VICTIM" ]] && echo yes || echo no )) ---" >&2
+              # norm.mgz is the INPUT to the failing call; T1.mgz/nu.mgz/brain.mgz
+              # bracket it so we can see where the range first blows up.
+              for v in nu.mgz T1.mgz norm.mgz brainmask.mgz aseg.presurf.mgz brain.mgz; do
+                [[ -f "$SD/$ses/mri/$v" ]] && "$PY" /tmp/volstats.py "$SD/$ses/mri/$v" >&2
+              done
+            done
+            echo "[probe] Q1 VERDICT: if norm.mgz max is ~0-255 the outlier is NOT on disk and is" >&2
+            echo "[probe]             created in-memory at mrinorm.cpp:3652 — no external clamp is" >&2
+            echo "[probe]             possible. If norm.mgz max is ~2e9, a clamp IS possible." >&2
+
+            echo "" >&2
+            echo "[probe] ############ STAGE 3 (Q2/Q3): raised cap, standalone re-run ############" >&2
+            if [[ ! -f "$SD/$VICTIM/mri/norm.mgz" ]]; then
+              echo "[probe] SKIP: no norm.mgz for $VICTIM, stage 1 died before writing it." >&2
+            else
+              # Exactly the command recon-all issued, run from the same cwd because
+              # every path in it is relative. -W additionally writes the pass-1
+              # control-point and bias volumes (mrinorm.cpp:1447) IF it gets that far.
+              # timeout bounds a 2.1e9-bin HISTOsmooth so it cannot silently consume
+              # the workflow deadline.
+              ( cd "$SD/$VICTIM/mri" && \
+                ulimit -v $((RAISED_CAP * 1024 * 1024)) && \
+                exec timeout 3600 stdbuf -oL -eL mri_normalize \
+                  -seed 1234 -mprage -aseg aseg.presurf.mgz -mask brainmask.mgz \
+                  -W /tmp/cp.mgz /tmp/bias.mgz \
+                  norm.mgz /tmp/brain-raisedcap.mgz ) > /tmp/stage3.log 2>&1
+              S3=$?
+              cat /tmp/stage3.log >&2
+              echo "[probe] stage 3: exit=$S3 (124 = hit the 1h timeout)" >&2
+              echo "[probe] peak cgroup memory: $(awk '{printf "%.2fG", $1/1e9}' /sys/fs/cgroup/memory.peak 2>/dev/null || echo n/a)" >&2
+
+              if [[ -f /tmp/brain-raisedcap.mgz ]]; then
+                echo "[probe] Q2 = YES, it completed at ${RAISED_CAP}G. Output stats:" >&2
+                "$PY" /tmp/volstats.py /tmp/brain-raisedcap.mgz >&2
+                echo "[probe]    Judge SANITY from those stats, not from exit=0: a completed run" >&2
+                echo "[probe]    whose output still carries a 2e9 voxel is NOT a usable result." >&2
+              else
+                echo "[probe] Q2 = NO, still failed at ${RAISED_CAP}G. Raising the cap is not a" >&2
+                echo "[probe]    mitigation; only rejection (status quo) and an upstream fix remain." >&2
+              fi
+
+              if [[ -f /tmp/bias.mgz ]]; then
+                echo "[probe] Q3: pass-1 bias field written. Its min_positive is the divisor:" >&2
+                "$PY" /tmp/volstats.py /tmp/bias.mgz >&2
+                echo "[probe]    Expect min_positive ~1e-5 or smaller. 110*110/5.8e-6 ~= 2.1e9." >&2
+              else
+                echo "[probe] Q3: no bias volume — expected if it died before mrinorm.cpp:1447." >&2
+              fi
+            fi
+
+            echo "" >&2
+            echo "[probe] ############ SUMMARY ############" >&2
+            echo "[probe] stage1_exit=$S1 stage1_nbins=${NBINS:-none} stage3_exit=${S3:-skipped}" >&2
+            # Exit 0 regardless: the probe succeeded if it produced measurements. A
+            # non-zero exit would only make Argo mark a successful experiment failed.
+            exit 0

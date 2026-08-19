@@ -4,6 +4,15 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG FS_VERSION=7.4.1
 ARG FS_URL=https://surfer.nmr.mgh.harvard.edu/pub/dist/freesurfer/${FS_VERSION}/freesurfer-linux-ubuntu22_amd64-${FS_VERSION}.tar.gz
 
+# `apt-get upgrade` is the same-release security upgrade (NIST SP 800-171 SI-2,
+# finding N1) — deliberately not `dist-upgrade`. `upgrade` only moves already-installed
+# packages to a newer revision of the SAME Ubuntu release and never installs or removes
+# one, so it collects backported CVE fixes (libc6 2.35 → 2.35-0ubuntu3.14) with no
+# version jump and no ABI change. It runs in this layer, after the install, so both
+# share one apt index fetch and the `rm -rf` still drops the index.
+#
+# It applies only to the apt-managed packages: the FreeSurfer tree unpacked below is a
+# vendored upstream tarball with its own bundled libraries and is untouched by apt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         bc \
@@ -15,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-scipy \
         python3-nibabel \
         python3-pip \
+    && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
 # python3-boto3 from apt (Ubuntu 22.04) ships a botocore old enough to predate
@@ -23,7 +33,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the older ECS-style 169.254.170.2. pip installs a current botocore instead.
 # No --root-user-action: apt's pip here is 22.0.2, older than the 22.1 release
 # that flag requires.
-RUN pip install --disable-pip-version-check --no-cache-dir boto3 botocore
+#
+# PINNED, with urllib3 named explicitly — see the matching note in
+# images/fastsurfer/Dockerfile, which explains why these are not lock-matched
+# and why all three publish images must stay on the same versions. This image
+# runs the same fs_derivatives.py publish path (subregion checkpoints), so an
+# unreproducible boto3/urllib3 resolution here has the same consequence: a
+# native crash in publish that cannot be pinned to a version set (#268). Note
+# this is a Python 3.10 runtime, unlike fastsurfer's 3.12 venv.
+RUN pip install --disable-pip-version-check --no-cache-dir \
+        boto3==1.43.72 \
+        botocore==1.43.72 \
+        urllib3==2.7.0
 
 RUN groupadd --gid 1000 nonroot && \
     useradd --uid 1000 --gid 1000 -m nonroot
@@ -104,5 +125,12 @@ ENV PYTHONPATH=/app:$FREESURFER_HOME/python/packages
 # bold_to_t1w wrapper and shared QC library
 COPY --chown=1000:1000 images/freesurfer/bold_to_t1w.py /app/bold_to_t1w.py
 COPY --chown=1000:1000 images/shared/registration_qc.py /app/registration_qc.py
+
+# Exploded-derivative publish/stage (ADR 017). This image is both a producer
+# (subregion-segmentation's checkpoint_save) and a consumer (bold-to-t1w, and
+# the subregion pods' FastSurfer inputs), so it needs both halves. boto3 is
+# already installed above.
+COPY --chown=1000:1000 images/shared/fs_derivatives.py /app/fs_derivatives.py
+COPY --chown=1000:1000 images/shared/restore_links.py /app/restore_links.py
 
 USER nonroot

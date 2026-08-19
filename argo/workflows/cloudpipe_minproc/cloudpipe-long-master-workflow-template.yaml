@@ -27,7 +27,30 @@ spec:
     # deliberately absent: a real OOMKill here is deterministic (#120, #129, #134
     # each needed a config change, not a retry), so retrying it only burns the
     # enlarged budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    #
+    # The codes are matched in the MESSAGE as well as in exitCode, and that is not
+    # redundant: a pod that dies in its init or wait container never populates
+    # outputs.exitCode, so the `in [...]` arm is structurally dead for the whole
+    # class of artifact-staging failures — argoexec's loader runs in init. Live
+    # status.nodes, 2026-08-15: 14 nodes reading `init: Error (exit code 64):
+    # artifact X failed to load` with no exitCode, and one `wait: Error (exit code
+    # 64): rpc error ... etcdserver: throttle` with exitCode "0". None retried.
+    # See #277, and #274 for the subject that was lost to it.
+    #
+    # The alternation is explicit on purpose: a looser `matches "exit code"` would
+    # quietly re-admit the 137 excluded above (`main: Error (exit code 137)`).
+    # exitCode stays as the primary arm because the message text is not a
+    # documented Argo contract; tests/argo/test_retry_expression.py pins both
+    # against captured strings.
+    #
+    # The trailing `not (...)` is the same reasoning as 137, one layer out. An
+    # artifact whose key is absent is absent because its PRODUCER was skipped or
+    # failed, and a consumer retry does not re-run the producer — S3 is
+    # read-after-write consistent, so there is nothing to wait for. 11 of the 14
+    # init failures in the 2026-08-15 sample were this shape; without the guard
+    # they would each burn all 8 attempts (~32m of backoff) to fail identically.
+    # Compare the exit-66 rule in docs/pipelines.md, which predates this.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -52,14 +75,47 @@ spec:
     strategy: OnPodSuccess
 
   # Maximum workflow runtime (https://argo-workflows.readthedocs.io/en/latest/walk-through/timeouts/)
-  activeDeadlineSeconds: 43200
+  #
+  # 24h, not the 12h this carried until 2026-08-17. The deadline is WALL CLOCK
+  # from startedAt with no term for whether the control plane was alive, so a
+  # controller outage spends every in-flight workflow's budget at once while
+  # none of them do any work. On 2026-08-17 an OOMKilled controller ran at a ~6%
+  # duty cycle, the batch slowed from ~6h to a 12h crawl, and the moment a
+  # healthy controller reconciled it failed 107 of 300 workflows with
+  # "retry exceeded workflow deadline" — zero of them for a pipeline reason.
+  # Raising it does not rescue workflows already in flight (each freezes its own
+  # copy of this spec at first reconcile), so the value has to be generous
+  # BEFORE the outage. A healthy 300-subject batch finishes in ~6h, so 24h still
+  # leaves 4x headroom as a runaway guard; the cost is that a genuinely wedged
+  # workflow holds its concurrency slot twice as long.
+  activeDeadlineSeconds: 86400
 
   # IRSA for running the workflow
   serviceAccountName: argo-workflows-runner
 
   # Time to live after workflow is completed, replaces ttlSecondsAfterFinished
+  #
+  # 4h, not 24h. This is a controller-memory control, not a housekeeping setting:
+  # the controller's informer caches every Workflow in the namespace, so retained
+  # objects are (completion rate x TTL) + concurrency, and Workflow objects
+  # dominate that cache over Pods. At 24h and a healthy ~80 completions/hr the
+  # 3000-subject leg plateaus near 2220 objects, which OOMKilled the controller at
+  # 4Gi on 2026-08-19 and would not fit 8Gi either. 4h caps steady state at ~620.
+  #
+  # The cost is real and bounded: per-attempt pod data — notably retried-pod exit
+  # codes in status.nodes — exists ONLY in Argo and never reaches Athena, so the
+  # forensics window for spot-churn retries shrinks from 24h to 4h. Pod logs are
+  # unaffected (archived to s3://<bucket>/logs/{workflow}/{pod}/main.log), as are
+  # the metrics records written in-pod by the exit handler.
+  #
+  # Two other places are derived from this number and must move with it:
+  #   - gitops/apps/argo-workflows/values.yaml — the controller memory limit.
+  #   - argo/workflows/ops/argo-nodes-snapshot-cronworkflow.yaml — the snapshot
+  #     cadence, cut from 4h to hourly here. A snapshot interval equal to the TTL
+  #     has NO margin: reaping is not punctual, and that job may legitimately
+  #     start an hour late. Never let the two values meet.
   ttlStrategy:
-    secondsAfterCompletion: 86400
+    secondsAfterCompletion: 14400
 
   podDisruptionBudget:
     minAvailable: "100%"
@@ -229,18 +285,43 @@ spec:
           # Skip anatomical processing if the FastSurfer derivatives were already created
           when: '{{tasks.subject-data-inventory-dagtask.outputs.parameters.fastsurfer-exists}} == "False"'
 
+        # Which sessions did the anatomical phase actually publish derivatives
+        # for? Asked once the anatomical gate clears, on the same `depends` the
+        # session fan-out used to carry, so it adds no serialization the fan-out
+        # did not already have. See the template for why this cannot be folded
+        # into either the inventory pass or the anatomical phase.
+        - name: published-sessions-dagtask
+          templateRef:
+            name: inventory
+            template: published-sessions-template
+          depends: "anatomical-processing-pipeline-dagtask.Succeeded || anatomical-processing-pipeline-dagtask.Skipped"
+          arguments:
+            parameters:
+              - name: inventory-json
+                value: '{{tasks.subject-data-inventory-dagtask.outputs.result}}'
+
         # Run registration and functional preprocessing per session once anatomical
-        # derivatives are available. Depends on anatomical succeeding OR being
-        # skipped (derivatives already exist).
-        # Fans out per-session processing over sessions with a T1w source discovered by
-        # inventory. Sessions without a T1w scan are excluded — they have no FastSurfer
-        # template/derivatives to register against — so their BOLD data is intentionally
-        # left unprocessed.
+        # derivatives are available.
         # Each instance runs registration then functional preprocessing sequentially.
         # All instances start simultaneously, subject to the master parallelism: 3 limit.
+        #
+        # The fan-out list is the published-sessions task's output, NOT inventory's
+        # array filtered on t1w_available (issue #270). Inventory answers "is there
+        # a T1w for this session in mmps_mproc", which is a statement about the
+        # subject's inputs; what this branch needs is "were derivatives published
+        # for this session", a statement about the anatomical phase's outputs. They
+        # agree until the #248 completion guard rejects one timepoint, at which
+        # point the old list fanned out a branch that died staging an input
+        # artifact nothing had written — turning a partial subject into workflow
+        # phase `Error`.
+        #
+        # Sessions without a T1w scan are still excluded, by the same filter, now
+        # applied inside the published-sessions pod: they have no FastSurfer
+        # derivatives to register against, so their BOLD data is intentionally left
+        # unprocessed and they are NOT counted as rejections.
         - name: session-level-pipeline-dagtask
           template: session-level-pipeline-dag-template
-          depends: "anatomical-processing-pipeline-dagtask.Succeeded || anatomical-processing-pipeline-dagtask.Skipped"
+          depends: published-sessions-dagtask.Succeeded
           arguments:
             parameters:
               - name: session
@@ -251,7 +332,7 @@ spec:
                 value: '{{item.nss_frames}}'
               - name: t1w-to-mni-exists
                 value: '{{item.t1w_to_mni_exists}}'
-          withParam: '{{= toJson(filter(jsonpath(tasks[''subject-data-inventory-dagtask''].outputs.result, "$[*]"), {#.t1w_available == true})) }}'
+          withParam: '{{tasks.published-sessions-dagtask.outputs.parameters.session-items}}'
 
         # Subcortical subfield/subregion segmentation (thalamus, brainstem,
         # hippo-amygdala, hypothalamic, ScLimbic). Runs as a single sequential
@@ -401,6 +482,52 @@ spec:
                 value: '{{workflow.parameters.bucket}}'
               - name: metrics-bucket
                 value: '{{workflow.parameters.metrics-bucket}}'
+
+        # One StepOutcome per session the anatomical phase declined to publish.
+        #
+        # Without this, #270's fix would be worse than the bug it replaces. The
+        # rejected session no longer fans out, so nothing fails, so the workflow
+        # succeeds — and exit_handler computes `overall_status: succeeded` for a
+        # subject that is missing a whole timepoint. Silence is the one outcome
+        # that must not be possible here: a Failed StepOutcome makes the exit
+        # handler report `partial`, which is what the subject is.
+        #
+        # `fastsurfer-long-parc` at session grain is the honest step name — it is
+        # the step that did not produce this session's tree, and the grain the
+        # data dictionary already documents for it. It does not collide with the
+        # subject-level record the anatomical sub-DAG writes under the same name,
+        # because `session` is part of the record's S3 key.
+        #
+        # `depends` is `.Succeeded` only, and must be: this task reads the
+        # producer's output parameters in both `when:` and `withParam`, and a
+        # fan-out that references a skipped producer's outputs deadlocks the DAG
+        # (ADR 016). If published-sessions itself fails there is no rejected list
+        # to record from, and the workflow fails on that task instead.
+        - name: record-outcome-rejected-sessions-dagtask
+          depends: published-sessions-dagtask.Succeeded
+          when: '{{tasks.published-sessions-dagtask.outputs.parameters.rejected-count}} != "0"'
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fastsurfer-long-parc
+              - name: status
+                value: Failed
+              - name: message
+                value: >-
+                  no FastSurfer _complete.json for this session after the
+                  anatomical phase; session excluded from functional processing
+              - name: session
+                value: '{{item}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+          withParam: '{{tasks.published-sessions-dagtask.outputs.parameters.rejected-sessions}}'
 
 #######################################
 #----- Anatomical Processing DAG -----#
@@ -584,17 +711,22 @@ spec:
         # Functional preprocessing runs once per (session, task, run) after all
         # registration steps (t1w-to-mni + bold-to-t1w) have completed.
         #
-        # registration-dagtask reports Succeeded even when t1w-to-mni-step
-        # failed (its outcome-recorder absorbs the failure), so gate
-        # explicitly on the real t1w-to-mni-step outcome: every func-preproc
-        # task in this session needs the shared t1w-to-mni transform, and
-        # spinning up cpu-heavy-nodepool pods just to fail on a missing
-        # artifact download is wasted cost.
+        # registration-dagtask reports Succeeded even when t1w-to-mni-step or
+        # bold-to-t1w-step failed (their outcome-recorders absorb the failure),
+        # so gate explicitly on both real outcomes: every func-preproc task in
+        # this session needs the shared t1w-to-mni transform AND its own run's
+        # bold-to-t1w transform, and spinning up cpu-heavy-nodepool pods just to
+        # fail on a missing artifact download is wasted cost.
+        #
+        # `Skipped` passes on both arms — each step is legitimately skipped when
+        # inventory found its outputs already present, and func-preproc must run.
         - name: functional-preprocessing-dagtask
           depends: registration-dagtask.Succeeded
           when: >-
-            '{{tasks.registration-dagtask.outputs.parameters.t1w-to-mni-status}}' == 'Succeeded' ||
-            '{{tasks.registration-dagtask.outputs.parameters.t1w-to-mni-status}}' == 'Skipped'
+            ('{{tasks.registration-dagtask.outputs.parameters.t1w-to-mni-status}}' == 'Succeeded' ||
+             '{{tasks.registration-dagtask.outputs.parameters.t1w-to-mni-status}}' == 'Skipped') &&
+            ('{{tasks.registration-dagtask.outputs.parameters.bold-to-t1w-status}}' == 'Succeeded' ||
+             '{{tasks.registration-dagtask.outputs.parameters.bold-to-t1w-status}}' == 'Skipped')
           template: functional-preprocessing-session-level-dag-template
           arguments:
             parameters:
@@ -797,7 +929,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

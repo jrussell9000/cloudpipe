@@ -5,12 +5,22 @@ Subject data inventory for cloudpipe_minproc.
 Discovers sessions and BOLD runs from S3, checks completion markers for
 prior pipeline steps, and looks up per-session metadata (nss_frames).
 
-Outputs:
+Two modes, both driven from the master DAG:
+
+`--mode inventory` (default) — the discovery pass, run before the anatomical phase.
   stdout                    JSON array; one object per session. Consumed by
-                            Argo's result output parameter, which feeds the
-                            session-level withParam fan-out in the master DAG.
+                            Argo's result output parameter.
   /tmp/fastsurfer_exists.txt  "True" or "False"; gates the anatomical phase.
   /tmp/subregions_exists.txt  "True" or "False"; gates the subregion-segmentation phase.
+
+`--mode published-sessions` — re-reads the completion markers AFTER the anatomical
+phase and splits the inventory into the sessions that actually have derivatives and
+those that do not. This is what the session-level fan-out is driven by; inventory's
+own array cannot be, because it describes the INPUTS (issue #270).
+  /tmp/session_items.json     the fan-out list: inventory items, published only.
+  /tmp/rejected_sessions.json JSON array of session IDs that were expected to be
+                              published and were not.
+  /tmp/rejected_count.txt     len(rejected), as a string, for a `when:` guard.
 """
 
 import argparse
@@ -89,8 +99,9 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
     Completion markers (terminal output files — presence proves the step finished):
       b2t_exists:  _desc-bold2t1w_itk.txt      (bold-to-t1w)
       func_exists: _space-MNI152NLin2009cAsym_bold.tar.gz  (functional preprocessing)
-      surf_exists: _desc-grayordcomponents_bold.tar.gz     (grayordinate extraction)
-      surf_target_exists: _space-fsLR32k_bold.dtseries.nii (fsLR/CIFTI assembly)
+      components_exist: _desc-grayordcomponents_bold.tar.gz (grayordinate extraction)
+      surf_target_exists: _space-fsLR32k_bold.dtseries.nii  (fsLR/CIFTI assembly)
+      surf_exists: components_exist OR surf_target_exists   (see below)
 
     func_exists and surf_exists gate independently: both derivatives come out of
     the same pod, but either can be missing on its own, and preproc.py takes the
@@ -98,6 +109,21 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
 
     surf_target_exists gates the separate surface-resample step, which consumes
     the grayordinate components and cannot run before surf_exists is true.
+
+    surf_exists means "grayordinate extraction finished for this run", NOT "its
+    components tarball is still in S3". The two stopped being the same thing when
+    surface-resample began deleting each run's components after verifying the
+    assembled dtseries: the components are a bulky intermediate (~2.2 GiB per
+    session, roughly half of all derivative storage) that is reconstructible from
+    the volumetric output, so they are reclaimed rather than kept.
+
+    Hence the OR below. The dtseries is strictly downstream of the components and
+    is 1:1 with them per run, so its presence is *stronger* evidence that
+    extraction succeeded than the components' own. Without the OR, every reclaimed
+    run would read as surf_exists=false forever, waking the func-preproc pod on
+    the `--emit grayordinate` short path to regenerate components that the next
+    resample would immediately delete again — paying cpu-heavy compute on every
+    subsequent workflow to reclaim storage that was already reclaimed.
     """
     for run in runs:
         task, run_id = run["task"], run["run"]
@@ -117,7 +143,7 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
         for field, s3_key in (
             ("b2t_exists", b2t_key),
             ("func_exists", func_key),
-            ("surf_exists", surf_key),
+            ("components_exist", surf_key),
             ("surf_target_exists", surf_target_key),
         ):
             try:
@@ -128,6 +154,14 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
                     run[field] = False
                 else:
                     raise
+
+        # See the docstring: extraction is done if EITHER the intermediate is
+        # still present or the artifact built from it is. components_exist is
+        # kept as its own key so callers can tell "never extracted" from
+        # "extracted and since reclaimed" — the driver in
+        # functional-preprocessing-workflow-template.yaml needs that distinction
+        # to know whether a re-run could reuse the components on local disk.
+        run["surf_exists"] = run["components_exist"] or run["surf_target_exists"]
 
 
 def check_t1w_completion(s3, bucket: str, subj: str, ses: str) -> bool:
@@ -190,40 +224,133 @@ def load_nss_volumes(s3, bucket: str, subj: str) -> dict[str, str]:
     }
 
 
-def check_fastsurfer_derivatives(s3, bucket: str, subj: str, sessions: list[str]) -> bool:
+def published_fastsurfer_sessions(s3, bucket: str, subj: str, sessions: list[str]) -> list[str]:
     """
-    Return True if every session has a FastSurfer templated tarball in S3.
+    Return the subset of `sessions` whose FastSurfer tree is COMPLETE in S3.
 
-    A missing tarball for any session means the anatomical phase must run.
-    The tarball is produced by fastsurfer-long-parcellation and contains the
-    longitudinal FreeSurfer outputs needed by registration and func-preproc.
+    Order-preserving, and the same marker test as check_fastsurfer_derivatives —
+    deliberately one implementation, so the boolean gate and the per-session
+    verdict cannot drift apart. `_complete.json` and nothing else (ADR 017); see
+    that function's docstring for why nothing else will do.
+
+    The difference between this and the boolean is WHEN it is asked. The boolean
+    runs before the anatomical phase and decides whether that phase runs at all.
+    This runs after it, to decide which sessions the functional half may fan out
+    over — the two are not the same question whenever the phase publishes some
+    sessions and not others, which is exactly what the #248 completion guard is
+    designed to do.
     """
-    missing = []
+    published = []
     for ses in sessions:
-        key = f"derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz"
+        key = f"derivatives/fastsurfer/{subj}/{ses}/_complete.json"
         try:
             s3.head_object(Bucket=bucket, Key=key)
         except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                missing.append(ses)
-            else:
+            if e.response["Error"]["Code"] != "404":
                 raise
+            continue
+        published.append(ses)
+    return published
+
+
+def split_published_sessions(
+    s3, bucket: str, subj: str, inventory: list[dict]
+) -> tuple[list[dict], list[str]]:
+    """
+    Split an inventory array into (fan-out items, rejected session IDs).
+
+    Only sessions with `t1w_available` are candidates. A session without a T1w
+    source is neither published nor rejected: it is intentionally unprocessed
+    (it has no anatomical to register against), it was never a candidate for
+    FastSurfer, and reporting it as a failure would mark most longitudinal
+    subjects partial forever.
+
+    Everything else divides in two, and the distinction is the whole point of
+    issue #270: a candidate session with a marker is publishable work, and a
+    candidate session WITHOUT one is a session the anatomical phase declined to
+    publish — almost always the #248 completion guard rejecting a crashed
+    `recon-surf` for that timepoint. Fanning out over the second kind produces a
+    branch that dies at stage time on a missing input artifact, which surfaces as
+    workflow phase `Error` and an `overall_status` of failed. The subject is then
+    indistinguishable from one where nothing worked, when in the observed case
+    (cloudpipe-knwr6 / sub-GNV5ZKU4) 25 of 27 pods succeeded.
+    """
+    candidates = [item for item in inventory if item.get("t1w_available")]
+    names = [item["session"] for item in candidates]
+    published = set(published_fastsurfer_sessions(s3, bucket, subj, names))
+
+    items = [item for item in candidates if item["session"] in published]
+    rejected = [ses for ses in names if ses not in published]
+    return items, rejected
+
+
+def check_fastsurfer_derivatives(s3, bucket: str, subj: str, sessions: list[str]) -> bool:
+    """
+    Return True if every session has a COMPLETE FastSurfer tree in S3.
+
+    A missing tree for any session means the anatomical phase must run. The tree
+    is produced by fastsurfer-long-parcellation and contains the longitudinal
+    FreeSurfer outputs needed by registration and func-preproc.
+
+    Completeness is tested by `_complete.json` and by nothing else (ADR 017).
+    Under the old tarball layout, one head_object on the tarball key was a
+    truthful "the whole thing is here", because a tarball is a single PUT. The
+    exploded layout has no such natural atom: a prefix listing, an object count,
+    or a probe for any individual file all answer "yes" for a tree whose upload
+    died halfway — and on spot that needs no bug at all, just a preemption
+    mid-upload. `_complete.json` is written after every other object, so its
+    presence is the only thing that still means what the tarball key used to.
+
+    Getting this wrong is not a subtle bug. This function is what makes the
+    pipeline skip the entire anatomical phase, so a false True marks a subject
+    permanently complete against a half-written tree — the #245 failure, which
+    cost a whole batch's worth of subjects the last time it happened.
+
+    The long-template is checked alongside the sessions, and must be: it is the
+    other tree the anatomical phase publishes, subregion-segmentation takes it as
+    a REQUIRED input artifact, and nothing else ever writes it. Omitting it makes
+    "all sessions present, template absent" read as True, which skips the only
+    phase that could produce the template — so subregion segmentation 404s on
+    every future submission while registration and func-preproc keep succeeding,
+    and the subject reports partial success instead of failure. The producer also
+    publishes the template BEFORE the sessions so that state cannot be reached in
+    the first place; this check is what lets a subject already in it recover.
+    """
+    published = set(published_fastsurfer_sessions(s3, bucket, subj, sessions))
+    missing = [ses for ses in sessions if ses not in published]
     if missing:
         print(f"Missing FastSurfer derivatives for sessions: {missing}", file=sys.stderr)
+
+    try:
+        s3.head_object(
+            Bucket=bucket, Key=f"derivatives/fastsurfer/{subj}/long-template/_complete.json"
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            print(f"Missing FastSurfer long-template derivative for {subj}", file=sys.stderr)
+            return False
+        raise
+
     return len(missing) == 0
 
 
 def check_subregions_derivatives(s3, bucket: str, subj: str) -> bool:
     """
-    Return True iff all five subregion-segmentation output tarballs exist in S3.
+    Return True iff all five subregion-segmentation output trees are COMPLETE in S3.
 
-    The outputs are subject-level (each tarball bundles all sessions), so this is
-    a single subject-level flag mirroring fastsurfer_exists. Requiring all five
+    The outputs are subject-level (each tree covers all sessions), so this is a
+    single subject-level flag mirroring fastsurfer_exists. Requiring all five
     (not any) means a partial or failed prior run re-runs cleanly; the phase's
     per-region resume guards then skip whatever regions did complete.
 
+    As with check_fastsurfer_derivatives, completeness is `_complete.json` and
+    nothing else (ADR 017). Note this check and the segmentation phase's own
+    `checkpoint_restore` now agree by construction: both ask the same question of
+    the same marker, so "already done in a prior run" and "skip this subject"
+    cannot drift apart.
+
     hippoamyg is gated alongside the original four so the cohort stays uniform: a
-    subject whose tarballs predate hippo-amygdala reports False and re-acquires
+    subject whose derivatives predate hippo-amygdala reports False and re-acquires
     the missing region on its next submission, rather than silently remaining a
     four-region outlier. Missing FastSurfer derivatives do not block this -- the
     anatomical phase regenerates them (it runs when fastsurfer-exists is False) --
@@ -233,7 +360,7 @@ def check_subregions_derivatives(s3, bucket: str, subj: str) -> bool:
     regions = ("thalamus", "brainstem", "hippoamyg", "hypothalamic", "sclimbic")
     missing = []
     for region in regions:
-        key = f"derivatives/subregions/{subj}/{subj}_{region}.tar.gz"
+        key = f"derivatives/subregions/{subj}/{region}/_complete.json"
         try:
             s3.head_object(Bucket=bucket, Key=key)
         except ClientError as e:
@@ -256,7 +383,7 @@ def build_inventory(s3, bucket: str, subj: str) -> tuple[list[dict], bool, bool]
         "session": str,
         "runs": [{"task": str, "run": str, "b2t_exists": bool,
                   "func_exists": bool, "surf_exists": bool,
-                  "surf_target_exists": bool}],
+                  "components_exist": bool, "surf_target_exists": bool}],
         "t1w_to_mni_exists": bool,
         "nss_frames": str,
       }
@@ -307,13 +434,54 @@ def build_inventory(s3, bucket: str, subj: str) -> tuple[list[dict], bool, bool]
     return result, fs_exists, subregions_exists
 
 
+def run_published_sessions(s3, bucket: str, subj: str, inventory_json: str) -> None:
+    """Write the three published-sessions outputs. See the module docstring."""
+    inventory = json.loads(inventory_json)
+    items, rejected = split_published_sessions(s3, bucket, subj, inventory)
+
+    if rejected:
+        # The single line an operator greps for. The workflow does NOT fail here:
+        # a rejected session is a partial subject, and failing the whole subject
+        # would discard the sessions that did work.
+        print(
+            f"WARNING: {len(rejected)} session(s) have no FastSurfer derivatives and "
+            f"will not be processed: {rejected}",
+            file=sys.stderr,
+        )
+    print(f"Fanning out over {len(items)} published session(s)", file=sys.stderr)
+
+    with open("/tmp/session_items.json", "w") as fh:
+        json.dump(items, fh)
+    with open("/tmp/rejected_sessions.json", "w") as fh:
+        json.dump(rejected, fh)
+    with open("/tmp/rejected_count.txt", "w") as fh:
+        fh.write(str(len(rejected)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="cloudpipe_minproc subject data inventory")
     parser.add_argument("--subject", required=True, help="BIDS subject ID (e.g. NDARINVXXXXXXXX)")
     parser.add_argument("--bucket", required=True, help="S3 bucket name")
+    parser.add_argument(
+        "--mode",
+        choices=("inventory", "published-sessions"),
+        default="inventory",
+        help="which pass to run (default: inventory)",
+    )
+    parser.add_argument(
+        "--inventory-json",
+        help="JSON array from the inventory pass; required for --mode published-sessions",
+    )
     args = parser.parse_args()
 
     s3 = boto3.client("s3")
+
+    if args.mode == "published-sessions":
+        if not args.inventory_json:
+            parser.error("--inventory-json is required with --mode published-sessions")
+        run_published_sessions(s3, args.bucket, args.subject, args.inventory_json)
+        return
+
     try:
         session_list, fs_exists, subregions_exists = build_inventory(s3, args.bucket, args.subject)
     except InventoryError as e:
