@@ -17,8 +17,16 @@ FROM public.ecr.aws/docker/library/python:3.10-slim-bookworm
 ARG FSQC_VERSION=2.1.7
 
 # libgomp1 is needed by scipy/scikit-image's OpenMP-threaded kernels.
+#
+# `apt-get upgrade` is the same-release security upgrade (NIST SP 800-171 SI-2,
+# finding N1) — deliberately not `dist-upgrade`. `upgrade` only moves already-installed
+# packages to a newer revision of the SAME Debian release (bookworm here) and never
+# installs or removes one, so it collects backported CVE fixes with no version jump.
+# The wheels installed below are manylinux and link against glibc's stable ABI, so a
+# revision bump underneath them is not a rebuild trigger.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
+    && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
 # fsqc is installed --no-deps with its runtime requirements listed explicitly, so
@@ -57,6 +65,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # createScreenshots.py, which the hippocampus/hypothalamus overlays go through,
 # is pure matplotlib. After any version bump, re-run the smoke test below AND a
 # real run_fsqc invocation — the startup package gate is only reachable that way.
+#
+# The final pip call pins boto3/botocore/urllib3. This image stages exploded
+# derivatives via fs_derivatives.py, the same publish path that segfaulted in
+# #268, so it must pin the SAME versions as images/fastsurfer/Dockerfile and
+# images/freesurfer/Dockerfile — see the note in the former for why.
 RUN pip install --disable-pip-version-check --root-user-action=ignore --no-cache-dir \
         nibabel \
         numpy \
@@ -73,7 +86,9 @@ RUN pip install --disable-pip-version-check --root-user-action=ignore --no-cache
     && pip install --disable-pip-version-check --root-user-action=ignore --no-cache-dir \
         --no-deps "fsqc==${FSQC_VERSION}" \
     && pip install --disable-pip-version-check --root-user-action=ignore --no-cache-dir \
-        boto3 botocore
+        boto3==1.43.72 \
+        botocore==1.43.72 \
+        urllib3==2.7.0
 
 # Fail the build if the trimmed dependency set above is insufficient. Three
 # distinct checks, because they catch different things:
@@ -113,7 +128,16 @@ RUN groupadd --gid 1000 nonroot && \
 # invalidate the (slow) dependency install.
 COPY images/fsqc/stage_and_run.py /app/stage_and_run.py
 
+# Exploded-derivative staging (ADR 017). stage_and_run.py imports fs_derivatives
+# directly (it has boto3 already), and fs_derivatives imports restore_links, so
+# both must be present and importable from /app.
+COPY images/shared/fs_derivatives.py /app/fs_derivatives.py
+COPY images/shared/restore_links.py /app/restore_links.py
+
+ENV PYTHONPATH=/app
+
 RUN python -c "import ast, pathlib; ast.parse(pathlib.Path('/app/stage_and_run.py').read_text())" \
-    && echo "stage_and_run.py parses OK"
+    && echo "stage_and_run.py parses OK" \
+    && python -c "import sys; sys.path.insert(0, '/app'); import stage_and_run; print('stage_and_run imports OK')"
 
 USER nonroot

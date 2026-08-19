@@ -17,7 +17,12 @@ spec:
     # 137 is deliberately absent: a real OOMKill here is deterministic (#120,
     # #129, #134 each needed a config change, not a retry), so retrying it only
     # burns the enlarged budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    # The codes are matched in the message too: a pod that dies in its init or wait
+    # container never populates exitCode, so that arm alone is dead for the whole
+    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
+    # its producer was skipped or failed, and a consumer retry cannot re-run the
+    # producer. See the master template for the detail.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -159,7 +164,7 @@ spec:
       # of GPU node time; discovering the assumption was wrong costs a failed
       # batch. TODO: drop this once a real run confirms seg_only never reads it.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -196,7 +201,7 @@ spec:
                 print("fsaverage downloaded.", flush=True)
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:6da3131b48d6d7ea417dae17498d2d8d95d61ece195aa57a2d73b395cab749dd"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -300,6 +305,17 @@ spec:
           region: <YOUR_AWS_REGION>
           key: 'config/fslicense'
 
+      # The scratch/ handoffs below stay TARBALLS, deliberately (ADR 017).
+      #
+      # ADR 017 exploded the durable derivatives under derivatives/fastsurfer/;
+      # it explicitly does NOT apply here, and a later cleanup should not
+      # "finish the job". These are write-once/read-once inside a single
+      # workflow, Argo's `archive: tar` round-trips their symlinks correctly in
+      # both directions, they expire on a 7-day lifecycle rule, and nothing
+      # outside the owning workflow may read them. None of the reasons for
+      # exploding — analyst access, selective fetch, existence gating — exists
+      # for a key nobody else can see.
+      #
       # Parcellated template from B — NOT the pre-parcellation one from A.
       # long_compat_segmentHA.py's cortical-ribbon step needs its white surfaces.
       - name: template-parcellated
@@ -365,69 +381,29 @@ spec:
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-10A.tar.gz'
 
     outputs:
+      # THE DURABLE DERIVATIVES ARE NOT ARTIFACTS ANY MORE (ADR 017).
+      #
+      # The seven `*_templated.tar.gz` / `_long-template.tar.gz` output artifacts
+      # that used to live here are replaced by in-pod `fs_derivatives.py publish`
+      # calls at the end of the args block below, writing one object per file
+      # under derivatives/fastsurfer/{subj}/{ses}/ and .../long-template/.
+      #
+      # Why they cannot be artifacts:
+      #   1. `archive: none` does nothing with symlinks — it neither uploads nor
+      #      recreates them — and a FastSurfer tree carries 14 aliases (measured
+      #      in all 81 trees sampled) that a SUBJECTS_DIR needs.
+      #   2. Argo gives NO ordering guarantee across one step's artifacts, and
+      #      _complete.json must be the last object written. Its whole meaning is
+      #      "every other object landed"; published as an artifact it would be a
+      #      marker that can precede what it certifies.
+      #
+      # The #245 guard below therefore no longer works by deleting a directory so
+      # that an `optional: true` artifact is skipped. It works by publishing only
+      # the sessions that passed — a positive act, not the absence of one.
+      #
+      # The QC JSONs stay artifacts: single files, no symlinks, no ordering
+      # requirement, and they go to the metrics bucket rather than derivatives/.
       artifacts:
-      - name: long-template-complete
-        path: '/work/subjects/{{workflow.parameters.subjID}}_template'
-        s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
-          key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz'
-
-      - name: ses-00A-templated
-        path: '/work/subjects/ses-00A'
-        s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
-          key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz'
-        optional: true
-
-      - name: ses-02A-templated
-        path: '/work/subjects/ses-02A'
-        s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
-          key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-02A_templated.tar.gz'
-        optional: true
-
-      - name: ses-04A-templated
-        path: '/work/subjects/ses-04A'
-        s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
-          key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-04A_templated.tar.gz'
-        optional: true
-
-      - name: ses-06A-templated
-        path: '/work/subjects/ses-06A'
-        s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
-          key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-06A_templated.tar.gz'
-        optional: true
-
-      - name: ses-08A-templated
-        path: '/work/subjects/ses-08A'
-        s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
-          key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-08A_templated.tar.gz'
-        optional: true
-
-      - name: ses-10A-templated
-        path: '/work/subjects/ses-10A'
-        s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-          bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
-          key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-10A_templated.tar.gz'
-        optional: true
-
       - name: ses-00A-anat-qc
         path: '/tmp/{{workflow.parameters.subjID}}_ses-00A_anat_qc.json'
         optional: true
@@ -567,20 +543,40 @@ spec:
     #
     # MEMORY IS SIZED FROM MEASURED PEAK, NOT ram_efficiency (#235). The previous
     # 6G/8G came from ram_efficiency 0.30 and was described as "~2.7x/1.9x headroom
-    # over the mean". It was 0.43x-0.48x of the PEAK. Max pod_memory_working_set
-    # over every parcellation pod of the 2026-08-10 200-subject batch:
+    # over the mean". It was 0.43x-0.48x of the PEAK.
     #
-    #                 request     n   median      p95      max   max/request
-    #     k<=3            6G    147   8.99 G  11.44 G  12.40 G      2.07x
-    #     k=4             8G     75  13.94 G  16.29 G  17.42 G      2.18x
+    # The tiers below come from cgroup v2 memory.peak — 621 pods over the 2026-08-14
+    # and 2026-08-17 300-subject batches, per plans/007-k4-parcellation-memory-decision.md.
+    # This SUPERSEDES the pod_memory_working_set table that stood here: working set
+    # counts active page cache, so it read high. Peak, and the anon share of it:
     #
-    # EVERY k=4 pod exceeded its request; the median exceeded it by 74%. A 2xlarge
-    # has only 14.82 G allocatable, so a k<=3 pod at p95 was holding 77% of the whole
-    # node's kubepods limit while telling the scheduler it needed 6 G. 13G/18G clears
-    # the observed max at both k and still fits its instance class (13 G + ~0.56 G of
-    # daemonset requests < 14.82 G on a 2xlarge; 18 G < 30.4 G on a 4xlarge, leaving
-    # room for the ~7.2 spare cores' worth of co-tenants). The raise is therefore
-    # close to free: `cpu: 6` already makes a k<=3 pod near-sole-tenant on a 2xlarge.
+    #          n   request     p50      p90      p99      max   over req   anon/peak
+    #   k=1   69       13G   3.80G    4.21G    4.56G    4.63G      0/69       94.0%
+    #   k=2  145       13G   7.37G    8.00G    8.60G    8.73G     0/145       95.5%
+    #   k=3  212       13G  10.89G   12.05G   13.16G   13.26G     6/212       96.7%
+    #   k=4  195       18G  14.45G   16.31G   17.55G   17.68G     0/195       96.2%
+    #
+    # Demand is LINEAR in k: peak ~= 0.26 + 3.55*k G (medians step +3.57/+3.52/+3.56).
+    # A two-tier 13G/18G split therefore mis-serves both ends of that line, and the
+    # exposed tier is k=3, NOT k=4 — six k=3 pods ran over their request while k=4
+    # exceeded 18G zero times in 195. At the other end the flat 13G over-requests k=1
+    # by ~2.8x and k=2 by ~1.5x, and k<=2 is 214 of the 621 pods, so the waste is not
+    # a corner case. Per-k tiers fix both directions at once.
+    #
+    # anon is 94-97% of peak at every k, so this is unreclaimable footprint: the
+    # scheduler cannot count on page cache being given back under pressure. Sizing
+    # against peak rather than working set is the conservative reading, not the loose
+    # one. All six over-request k=3 pods Succeeded — they were surviving on burst,
+    # which is precisely the node-pressure exposure this request is meant to remove.
+    #
+    # Peak is SUBJECT-DETERMINISTIC, not random: sub-RLMPLLW6 peaked 13.26G/13.19G
+    # and sub-E3DYU63E 13.16G/13.09G on the two batches two days apart. So a retry
+    # cannot heal an under-request here; only the request can.
+    #
+    # Each tier clears its measured max with headroom and still fits the instance
+    # class its cpu request already forces (5/9 G on a 2xlarge's 14.82 G allocatable;
+    # 14 G + ~0.56 G of daemonsets also fits a 2xlarge; 18 G < 30.4 G on a 4xlarge,
+    # leaving room for the ~7.2 spare cores' worth of co-tenants).
     #
     # This is the #129 lesson applied here — see docs/pipelines.md on segment-subregions:
     # ram_efficiency is a LIFETIME AVERAGE and is structurally blind to a peak. It is
@@ -656,15 +652,20 @@ spec:
     #
     # ephemeral-storage scales with k here (unlike the other anatomical steps,
     # which take a flat 20G) because this pod holds the most at once: the
-    # template, every session directory, surface intermediates for all k
-    # timepoints in parallel, and the output tarballs during upload.
+    # template, every session directory, and surface intermediates for all k
+    # timepoints in parallel. Note the exploded publish (ADR 017) needs LESS
+    # headroom than the tarballs it replaced — it streams each file straight to
+    # S3 rather than building a ~184 MB archive per session on disk first — so
+    # this figure is now conservative rather than tight.
     podSpecPatch: |
       containers:
         - name: main
           resources:
             requests:
               cpu: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 > 4 ? len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*2 : 4}}'
-              memory: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]")) > 3 ? 18 : 13}}G'
+              # Per-k tiers, each above its measured max (see the table above). k>=5 is
+              # unmeasured — 4k extrapolates the 0.26 + 3.55k fit with the same margin.
+              memory: '{{=len(jsonpath(inputs.parameters.T1w_sessions, "$[*]")) == 1 ? 5 : (len(jsonpath(inputs.parameters.T1w_sessions, "$[*]")) == 2 ? 9 : (len(jsonpath(inputs.parameters.T1w_sessions, "$[*]")) == 3 ? 14 : (len(jsonpath(inputs.parameters.T1w_sessions, "$[*]")) == 4 ? 18 : len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))*4)))}}G'
               ephemeral-storage: '{{=12 + 4 * len(jsonpath(inputs.parameters.T1w_sessions, "$[*]"))}}G'
 
     nodeSelector:
@@ -678,7 +679,7 @@ spec:
       # recon-surf.sh registers each timepoint to fsaverage, which is not carried
       # in either the template or the per-session scratch tarballs.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -715,7 +716,7 @@ spec:
                 print("fsaverage downloaded.", flush=True)
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:6da3131b48d6d7ea417dae17498d2d8d95d61ece195aa57a2d73b395cab749dd"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -838,12 +839,18 @@ spec:
           # never self-heal, while registration and func-preproc run against a surf/
           # missing its principal outputs.
           #
-          # The fix is to not publish it. Every per-session output artifact is
-          # `optional: true`, so deleting an incomplete session directory means Argo
-          # skips that artifact — the derivative is then genuinely absent, the
-          # existence check correctly reports the session missing, and the next
-          # submission re-runs the phase. Self-healing is restored by making the
-          # failure legible rather than by adding a second source of truth.
+          # The fix is to not publish it. Under ADR 017 that is now literal: the
+          # publish loop at the end of this script iterates COMPLETE_SESSIONS, so a
+          # rejected session's tree is never written and — critically — never gets a
+          # _complete.json. The derivative is then genuinely absent, the existence
+          # check (a head_object on that marker) correctly reports the session
+          # missing, and the next submission re-runs the phase. Self-healing is
+          # restored by making the failure legible rather than by adding a second
+          # source of truth.
+          #
+          # This used to work indirectly, by deleting the session directory so that
+          # Argo skipped its `optional: true` artifact. Publishing explicitly is the
+          # same guarantee without depending on artifact optionality.
           #
           # Rejection criteria, cheapest-first: an IsRunning marker is FastSurfer's own
           # crashed/interrupted flag (the same hazard the input-side
@@ -869,7 +876,6 @@ spec:
             fi
             if [[ -n "$reason" ]]; then
               echo "REJECTED ${ses}: ${reason} — not publishing its tarball (#245)." >&2
-              rm -rf "$sesdir"
               INCOMPLETE_SESSIONS="${INCOMPLETE_SESSIONS} ${ses}"
             else
               COMPLETE_SESSIONS="${COMPLETE_SESSIONS} ${ses}"
@@ -877,11 +883,19 @@ spec:
           done
           echo "[guard] complete:${COMPLETE_SESSIONS:- none} | rejected:${INCOMPLETE_SESSIONS:- none}" >&2
 
-          # Nothing usable came out of the pod. Exit 1 rather than 75: the one observed
-          # cause is a deterministic, data-dependent allocation in mri_normalize, and
-          # retrying it re-runs an identical failure — the #115 reasoning that keeps
-          # 137 out of the retry expression.
+          # DETECTION ONLY ABOVE — THE DIRECTORIES ARE REMOVED LATER, AND THE ORDER IS
+          # LOAD-BEARING. Removing them here cost two whole workflows in the 300-subject
+          # batch of 2026-08-12 (sub-R4PV7WZ3, sub-GNV5ZKU4): long_compat_segmentHA.py
+          # below tolerates an INCOMPLETE session directory — it ran fine against these
+          # very sessions before the guard existed — but not a MISSING one. It exited 1,
+          # base-tps was never written, and the exit-75 guard then retried a
+          # deterministic failure until the 8-attempt budget was gone
+          # ("retryStrategy.expression evaluated to false"), taking the subject's three
+          # or more GOOD sessions down with it. Deferring the removal to after that
+          # bridge keeps its input exactly as it was pre-guard, and the artifacts are
+          # collected at pod exit either way, so publication is still prevented.
           if [[ -z "$COMPLETE_SESSIONS" ]]; then
+            for ses in $INCOMPLETE_SESSIONS; do rm -rf "${SD}/${ses}"; done
             echo "ERROR: no session passed the completion guard; nothing to publish." >&2
             exit 1
           fi
@@ -926,6 +940,20 @@ spec:
             exit 75
           fi
 
+          # NOW remove the rejected sessions — after long_compat_segmentHA.py has had
+          # the directory layout it expects, and after the base-tps check above.
+          #
+          # Publication is already prevented by the publish loop below, which walks
+          # COMPLETE_SESSIONS only, so this removal is no longer what enforces #245.
+          # It is kept for two lesser reasons: it reclaims ephemeral-storage before
+          # the upload, and it means a rejected session cannot be published by a
+          # future edit that loops over the directory listing instead of the guard's
+          # verdict. The ordering constraint above still stands either way.
+          for ses in $INCOMPLETE_SESSIONS; do
+            echo "[guard] removing rejected ${ses} (publication already excluded)." >&2
+            rm -rf "${SD}/${ses}"
+          done
+
           # base-tps is written from the template's timepoint list, not from what is on
           # disk, so a session the guard above rejected is still named in it. Leaving it
           # there turns one bad session into a segment-subregions failure for the whole
@@ -939,5 +967,108 @@ spec:
             python3 -c "import pathlib, sys; p = pathlib.Path(sys.argv[1]); rej = set(sys.argv[2:]); kept = [ln for ln in p.read_text().splitlines() if ln.strip() not in rej]; p.write_text('\n'.join(kept) + '\n'); print('[guard] pruned', sorted(rej), 'from base-tps;', len(kept), 'timepoints remain')" \
               "$SD/$BASE/base-tps" $INCOMPLETE_SESSIONS
           fi
+
+          # PUBLISH THE DURABLE DERIVATIVES (ADR 017).
+          #
+          # One object per file under derivatives/fastsurfer/{subj}/…, with
+          # _links.json recording the 14 FreeSurfer-compatibility aliases and
+          # _complete.json written LAST as the tree's only existence gate.
+          #
+          # This runs in the main container, deliberately, NOT in an exit handler:
+          # an exit handler runs after a spot preemption has already destroyed the
+          # emptyDir, so there would be nothing left to upload. The pod that made
+          # the tree is the pod that publishes it.
+          #
+          # A publish failure must fail the step. Exiting 0 here with derivatives
+          # missing is the #245 shape all over again — a green step whose output the
+          # existence check will forever report as absent.
+          #
+          # ORDER IS LOAD-BEARING: LONG-TEMPLATE FIRST, SESSIONS SECOND.
+          #
+          # `check_fastsurfer_derivatives` gates the whole anatomical phase on the
+          # per-SESSION markers, and does not probe the long-template at all. So if
+          # the sessions were published first and the long-template publish then
+          # failed, S3 would hold every session marker and no template marker — and
+          # that state is a trap, not a retry:
+          #
+          #   inventory sees all sessions complete -> fastsurfer_exists = True
+          #   -> the anatomical phase is SKIPPED, on this and every future
+          #      submission, so nothing ever rewrites the long-template
+          #   -> registration and func-preproc still SUCCEED (they read only
+          #      {ses}/ trees, which are genuinely complete)
+          #   -> subregion-segmentation fails forever on its REQUIRED
+          #      long-template input artifact, 404.
+          #
+          # The subject then reports partial success rather than failure, which is
+          # how it hides. Publishing the template first inverts the dependency: a
+          # session marker cannot exist unless the template landed, so the existing
+          # session gate covers the template transitively.
+          #
+          # Every OTHER partial-publish state already self-heals, which is what
+          # makes this one the exception worth engineering around: die between two
+          # sessions and the unpublished session has no marker, so the gate reads
+          # False and the phase re-runs. The long-template was the one published
+          # tree with no gate over it.
+          DERIV_PREFIX="derivatives/fastsurfer/{{workflow.parameters.subjID}}"
+
+          # EXIT CODE FIDELITY IS LOAD-BEARING HERE — this used to be `|| exit 1`.
+          #
+          # `|| exit 1` collapses every way publish can end into one code, and this
+          # template already spends exit 1 on a genuinely deterministic failure (the
+          # completion guard above, when no session passed). The retry expression in
+          # cloudpipe-long-master-workflow-template.yaml therefore excludes 1 on
+          # purpose — so a publish that CRASHED was permanently unretryable.
+          #
+          # That cost a subject. In the 300-subject batch of 2026-08-14,
+          # sub-UPDUETFG (cloudpipe-jzdk8) segfaulted inside publish after ~3h of
+          # successful FastSurfer compute, with zero objects written:
+          #
+          #   11288 Segmentation fault (core dumped) python3 /app/fs_derivatives.py publish ...
+          #
+          # bash reported 139, `|| exit 1` laundered it to 1, the expression
+          # evaluated to false, and seven downstream nodes then failed on a 404 for
+          # the tree that was never uploaded. Frequency so far: 1 in ~237 publishes
+          # (see issue #268 for the root-cause work on the crash itself).
+          #
+          # So split the two cases rather than sharing a code:
+          #   >= 128  the child died on a signal. Nothing in fs_derivatives.py can
+          #           produce this — PublishError exits 1 cleanly — so it is
+          #           transient by construction and gets 75 (EX_TEMPFAIL), this
+          #           template's retryable-and-ours-alone code.
+          #   else    a clean non-zero exit, i.e. PublishError: empty tree, not a
+          #           directory, a link that escapes the tree. Deterministic;
+          #           retrying it eight times would just burn the budget. Stays 1.
+          #
+          # Retrying is safe because publish is idempotent up to its marker: objects
+          # overwrite, `_prune_stale` clears whatever a partial previous attempt
+          # left, and `_complete.json` is written last, so a retried publish either
+          # completes the tree or leaves it markerless — never half-marked.
+          publish_tree() {
+            local tree="$1" prefix="$2" label="$3" rc=0
+            echo "[publish] ${label} -> s3://{{workflow.parameters.bucket}}/${prefix}/" >&2
+            python3 /app/fs_derivatives.py publish "$tree" \
+              --bucket "{{workflow.parameters.bucket}}" \
+              --prefix "$prefix" \
+              --source-step fastsurfer-long-parc
+            rc=$?
+            if [[ $rc -ge 128 ]]; then
+              echo "ERROR: publish of ${label} died on signal $((rc - 128)) (exit ${rc}) — a crash, not a" >&2
+              echo "       rejection. Forcing a retryable exit 75 so the phase re-runs (#268)." >&2
+              exit 75
+            elif [[ $rc -ne 0 ]]; then
+              echo "ERROR: publish of ${label} failed deterministically (exit ${rc}); not retrying." >&2
+              exit 1
+            fi
+          }
+
+          # The long-template is published under a fixed `long-template/` name
+          # rather than {subj}_template/, so the subject prefix reads as
+          # {ses}/ dirs plus one long-template/ — no subject-id substring parsing
+          # to tell them apart.
+          publish_tree "${SD}/${BASE}" "${DERIV_PREFIX}/long-template" long-template
+
+          for ses in $COMPLETE_SESSIONS; do
+            publish_tree "${SD}/${ses}" "${DERIV_PREFIX}/${ses}" "${ses}"
+          done
 
           exit $FASTSURFER_EXIT

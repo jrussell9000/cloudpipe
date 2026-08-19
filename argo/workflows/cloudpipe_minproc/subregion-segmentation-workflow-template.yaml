@@ -28,7 +28,12 @@ spec:
     # deliberately absent: a real OOMKill here is deterministic — #129/#134 split
     # this very step's TensorFlow tail out to fix one, and no retry would have —
     # so retrying it only burns the enlarged budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    # The codes are matched in the message too: a pod that dies in its init or wait
+    # container never populates exitCode, so that arm alone is dead for the whole
+    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
+    # its producer was skipped or failed, and a consumer retry cannot re-run the
+    # producer. See the master template for the detail.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -184,91 +189,93 @@ spec:
 
         - name: long-template
           path: /opt/freesurfer/subjects/{{workflow.parameters.subjID}}_template
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template
 
         - name: ses-00A-templated
           path: /opt/freesurfer/subjects/ses-00A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-00A
 
         - name: ses-02A-templated
           path: /opt/freesurfer/subjects/ses-02A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-02A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-02A
 
         - name: ses-04A-templated
           path: /opt/freesurfer/subjects/ses-04A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-04A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-04A
 
         - name: ses-06A-templated
           path: /opt/freesurfer/subjects/ses-06A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-06A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-06A
 
         - name: ses-08A-templated
           path: /opt/freesurfer/subjects/ses-08A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-08A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-08A
 
         - name: ses-10A-templated
           path: /opt/freesurfer/subjects/ses-10A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-10A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-10A
 
-    outputs:
-      artifacts:
-        - name: thalamus-segmentation
-          path: /out/thalamus
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_thalamus.tar.gz
-
-        - name: brainstem-segmentation
-          path: /out/brainstem
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_brainstem.tar.gz
-
-        - name: hippoamyg-segmentation
-          path: /out/hippoamyg
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_hippoamyg.tar.gz
+    # NO OUTPUT ARTIFACTS (ADR 017). thalamus/brainstem/hippoamyg are published
+    # in-pod by checkpoint_save, one object per file under
+    # derivatives/subregions/{subj}/{region}/, with _complete.json written last.
+    #
+    # These five trees carry NO symlinks at all — 0 across all 125 measured — so
+    # unlike the FastSurfer trees they never needed tarballing in the first
+    # place; they inherited it from the sibling prefix. They are exploded here
+    # for one reason only: `_complete.json` is what makes the resume guard and
+    # `check_subregions_derivatives` honest about a half-finished upload.
+    #
+    # Declaring them as artifacts as well would re-upload identical bytes to the
+    # same keys at pod exit, and — worse — Argo does not order artifact uploads,
+    # so it could land a file object AFTER the marker that claims completeness.
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
@@ -284,7 +291,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-34fd35825a707887639dd303103b80d978a04ae9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:1ee2554075b40c90659b82faaa1113f542fb936d8015dc2529326ce9c707f91d"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -375,77 +382,92 @@ spec:
           source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" >/dev/null 2>&1 || true
           set -eu
 
+          # ADR 017: the FastSurfer inputs above are exploded prefixes now, and
+          # Argo cannot recreate a symlink. Replay each staged tree's manifest
+          # BEFORE anything reads it.
+          #
+          # This is not optional housekeeping here: `base-tps` in the template
+          # tree IS one of the 14 aliases (base-tps -> base-tps.fastsurfer), and
+          # the very next line reads it. Without the replay both loops below
+          # would fail on a missing file, and `set -eu` would abort the pod
+          # before a single segmentation ran.
+          #
+          # An `if` rather than `[[ ... ]] && ...`: under `set -e` a false test as
+          # the last command in a loop body aborts the script.
+          for tree in "${SD}/${BASE}" "${SD}"/ses-*; do
+            if [[ -d "$tree" ]]; then
+              "$PY" /app/restore_links.py "$tree"
+            fi
+          done
+
           # segment_subregions --long-base expects timepoints named {tp}.long.{base}.
           # FastSurfer writes bare session IDs (ses-00A, ses-02A, ...). Symlinks bridge
           # the naming gap; writes from segment_subregions land in the real directories.
+          # (Unrelated to the manifest replay above — these are OUR links, created
+          # at stage time, and are never published.)
           while IFS= read -r tp; do
             [[ -n "$tp" ]] && ln -sfn "${SD}/${tp}" "${SD}/${tp}.long.${BASE}"
           done < "${SD}/${BASE}/base-tps"
 
           mapfile -t SESSIONS < <(grep -v '^$' "${SD}/${BASE}/base-tps")
 
-          # S3 checkpoint helpers (GitHub #77). Each region's checkpoint key IS its
-          # final derivative key (derivatives/subregions/{subj}/{subj}_{region}.tar.gz
-          # — the same key this template's outputs.artifacts uploads at pod
-          # completion, and the same key src/inventory.py:check_subregions_derivatives
-          # checks), so "checkpoint restored" and "already done in a prior run" are
-          # the same check. Argo's own end-of-pod upload still fires afterward and
-          # re-uploads identical bytes to the same key — redundant but harmless, and
-          # it avoids reworking the declarative outputs.artifacts wiring.
+          # S3 checkpoint helpers (GitHub #77), now on the exploded layout (ADR 017).
+          # Each region's checkpoint prefix IS its final derivative prefix
+          # (derivatives/subregions/{subj}/{region}/ — the same prefix
+          # src/inventory.py:check_subregions_derivatives checks), so "checkpoint
+          # restored" and "already done in a prior run" remain the same check.
           #
-          # Applies the size-floor convention from
-          # src/metrics/outcome_recorder.py's _MIN_OUTPUT_BYTES / ADR 004's "size >
-          # 1 KB" guard: a checkpoint object that exists but is implausibly small is
-          # treated as absent rather than trusted. A checkpoint is only ever written
-          # AFTER a region's tool exits 0 and its output is collected into
-          # /out/<region> — never before — and a single boto3 upload is one atomic
-          # S3 PUT, so there is no window where a partially-written object becomes
-          # visible under this key.
+          # Two things got simpler in the move off tarballs:
+          #
+          #   - The size-floor heuristic is gone. It existed because a tarball key
+          #     that exists is not proof the tarball is whole, so an implausibly
+          #     small object was treated as absent. `_complete.json` answers that
+          #     question directly: it is written only after every file object
+          #     lands, so its presence IS completeness. A guess is replaced by a
+          #     fact.
+          #   - Argo's redundant end-of-pod re-upload is gone. The declarative
+          #     outputs.artifacts entries used to re-upload identical bytes to the
+          #     key checkpoint_save had already written; publishing in-pod means
+          #     the write happens exactly once.
+          #
+          # A checkpoint is still only ever written AFTER a region's tool exits 0
+          # and its output is collected into /out/<region> — never before.
           checkpoint_restore() {
             local region=$1 outdir=$2
-            local key="derivatives/subregions/${SUBJ}/${SUBJ}_${region}.tar.gz"
-            "$PY" - "$BUCKET" "$key" "$outdir" <<'PYEOF'
-          import io, sys, tarfile
-          import boto3
-          from botocore.exceptions import ClientError
-
-          bucket, key, outdir = sys.argv[1:4]
-          MIN_BYTES = 1024
-
-          s3 = boto3.client("s3", region_name="<YOUR_AWS_REGION>")
-          try:
-              head = s3.head_object(Bucket=bucket, Key=key)
-          except ClientError as exc:
-              if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
-                  sys.exit(1)
-              raise
-
-          if head["ContentLength"] < MIN_BYTES:
-              print(f"checkpoint {key} is only {head['ContentLength']} bytes -- treating as absent", file=sys.stderr)
-              sys.exit(1)
-
-          buf = io.BytesIO()
-          s3.download_fileobj(bucket, key, buf)
-          buf.seek(0)
-          with tarfile.open(fileobj=buf, mode="r:gz") as tf:
-              tf.extractall(outdir)
-          PYEOF
+            "$PY" /app/fs_derivatives.py stage "$outdir" \
+              --bucket "$BUCKET" \
+              --prefix "derivatives/subregions/${SUBJ}/${region}"
           }
 
+          # A publish that dies on a SIGNAL exits 128+signum, and under `set -e` that
+          # status becomes the pod's — 139 for a SIGSEGV, which the master
+          # retryStrategy expression does not match, so a transient crash would fail
+          # the phase permanently. Map it to 75 (EX_TEMPFAIL, retryable and ours
+          # alone). A clean non-zero exit is left alone: that is PublishError (empty
+          # tree, escaping link), deterministic, and should not retry. Same defect
+          # as the one that cost sub-UPDUETFG on the fastsurfer side in the
+          # 2026-08-14 batch — see issue #268 and the matching guard in
+          # fastsurfer-long-phase-workflow-template.yaml.
+          #
+          # Retrying is safe: publish overwrites, `_prune_stale` clears a partial
+          # previous attempt, and `_complete.json` lands last, so a retried publish
+          # either completes the tree or leaves it markerless.
+          #
+          # Duplicated verbatim in the sibling pod's script, like have_all_tps below
+          # — see the note there for why these two scripts do not share code.
           checkpoint_save() {
-            local region=$1 outdir=$2
-            local key="derivatives/subregions/${SUBJ}/${SUBJ}_${region}.tar.gz"
-            "$PY" - "$BUCKET" "$key" "$outdir" <<'PYEOF'
-          import io, sys, tarfile
-          import boto3
-
-          bucket, key, outdir = sys.argv[1:4]
-          buf = io.BytesIO()
-          with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-              tf.add(outdir, arcname=".")
-          buf.seek(0)
-          boto3.client("s3", region_name="<YOUR_AWS_REGION>").upload_fileobj(buf, bucket, key)
-          PYEOF
+            local region=$1 outdir=$2 rc=0
+            "$PY" /app/fs_derivatives.py publish "$outdir" \
+              --bucket "$BUCKET" \
+              --prefix "derivatives/subregions/${SUBJ}/${region}" \
+              --source-step subregion-segmentation || rc=$?
+            if [[ $rc -ge 128 ]]; then
+              echo "ERROR: publish of ${region} died on signal $((rc - 128)) (exit ${rc}); forcing retry (exit 75)." >&2
+              exit 75
+            fi
+            # A non-zero return still aborts the script via `set -e` at the call
+            # site, exactly as it did before.
+            return $rc
           }
 
           # Local-disk fallback guard: true only when EVERY timepoint already has an
@@ -598,89 +620,97 @@ spec:
 
         - name: long-template
           path: /opt/freesurfer/subjects/{{workflow.parameters.subjID}}_template
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_long-template.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template
 
         - name: ses-00A-templated
           path: /opt/freesurfer/subjects/ses-00A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-00A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-00A
 
         - name: ses-02A-templated
           path: /opt/freesurfer/subjects/ses-02A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-02A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-02A
 
         - name: ses-04A-templated
           path: /opt/freesurfer/subjects/ses-04A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-04A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-04A
 
         - name: ses-06A-templated
           path: /opt/freesurfer/subjects/ses-06A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-06A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-06A
 
         - name: ses-08A-templated
           path: /opt/freesurfer/subjects/ses-08A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-08A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-08A
 
         - name: ses-10A-templated
           path: /opt/freesurfer/subjects/ses-10A
           optional: true
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_ses-10A_templated.tar.gz
+            key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-10A
 
-    outputs:
-      artifacts:
-        - name: hypothalamic-segmentation
-          path: /out/hypothalamic
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_hypothalamic.tar.gz
-
-        - name: sclimbic-segmentation
-          path: /out/sclimbic
-          s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
-            bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
-            key: derivatives/subregions/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_sclimbic.tar.gz
+    # NO OUTPUT ARTIFACTS (ADR 017) — same reasoning as the GEMS pod above.
+    # hypothalamic/sclimbic are published in-pod by checkpoint_save under
+    # derivatives/subregions/{subj}/{region}/, marker last.
+    #
+    # Note for the hypothalamic tree specifically: it used to ship EMPTY
+    # per-session mri/ directories for sessions its segmentation did not cover.
+    # S3 has no directory objects and none are synthesized, so an uncovered
+    # session now has no objects at all under its prefix. fsqc already computes
+    # coverage from files actually present rather than from directory presence
+    # (`fsqc-anatomical-qc`, which was bitten by exactly this), so nothing
+    # downstream changes — but a future reader should not expect the empty dirs.
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     # /out is the packaging scratch dir the script collects results into before
-    # artifact upload. The container runs as non-root (UID 1000), which cannot
+    # publishing. The container runs as non-root (UID 1000), which cannot
     # mkdir at the image root filesystem, so /out and the FastSurfer subjects
     # dir must both be writable emptyDirs (no shared PVC — GitHub #77).
     volumes:
@@ -690,7 +720,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-34fd35825a707887639dd303103b80d978a04ae9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:1ee2554075b40c90659b82faaa1113f542fb936d8015dc2529326ce9c707f91d"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -804,61 +834,62 @@ spec:
           source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" >/dev/null 2>&1 || true
           set -eu
 
+          # ADR 017 manifest replay — same as the GEMS pod, and for the same
+          # reason: `base-tps` is itself an alias (base-tps -> base-tps.fastsurfer)
+          # and the next line reads it.
+          for tree in "${SD}/${BASE}" "${SD}"/ses-*; do
+            if [[ -d "$tree" ]]; then
+              "$PY" /app/restore_links.py "$tree"
+            fi
+          done
+
           mapfile -t SESSIONS < <(grep -v '^$' "${SD}/${BASE}/base-tps")
 
           # S3 checkpoint helpers, same contract as the GEMS pod's — see the
-          # comment there for the full rationale (checkpoint key == final
-          # derivative key, size-floor guard, atomic-PUT truncation safety). It is
-          # duplicated rather than shared because the alternative is baking a
-          # shell fragment into the freesurfer image, which costs an image rebuild
-          # and a pin commit for a few dozen lines. If you change one copy, change
-          # both — and note the two pods guard DISJOINT patterns, so they never
-          # race on the same key.
+          # comment there for the full rationale (checkpoint prefix == final
+          # derivative prefix; `_complete.json` replaces the old size-floor
+          # heuristic). Both copies now delegate to /app/fs_derivatives.py, so the
+          # duplication is four lines rather than forty; the shared logic moved
+          # into the image (ADR 017) exactly as that comment anticipated it would
+          # have to if it ever grew. If you change one copy, change both — and note
+          # the two pods guard DISJOINT regions, so they never race on the same
+          # prefix.
           checkpoint_restore() {
             local region=$1 outdir=$2
-            local key="derivatives/subregions/${SUBJ}/${SUBJ}_${region}.tar.gz"
-            "$PY" - "$BUCKET" "$key" "$outdir" <<'PYEOF'
-          import io, sys, tarfile
-          import boto3
-          from botocore.exceptions import ClientError
-
-          bucket, key, outdir = sys.argv[1:4]
-          MIN_BYTES = 1024
-
-          s3 = boto3.client("s3", region_name="<YOUR_AWS_REGION>")
-          try:
-              head = s3.head_object(Bucket=bucket, Key=key)
-          except ClientError as exc:
-              if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
-                  sys.exit(1)
-              raise
-
-          if head["ContentLength"] < MIN_BYTES:
-              print(f"checkpoint {key} is only {head['ContentLength']} bytes -- treating as absent", file=sys.stderr)
-              sys.exit(1)
-
-          buf = io.BytesIO()
-          s3.download_fileobj(bucket, key, buf)
-          buf.seek(0)
-          with tarfile.open(fileobj=buf, mode="r:gz") as tf:
-              tf.extractall(outdir)
-          PYEOF
+            "$PY" /app/fs_derivatives.py stage "$outdir" \
+              --bucket "$BUCKET" \
+              --prefix "derivatives/subregions/${SUBJ}/${region}"
           }
 
+          # A publish that dies on a SIGNAL exits 128+signum, and under `set -e` that
+          # status becomes the pod's — 139 for a SIGSEGV, which the master
+          # retryStrategy expression does not match, so a transient crash would fail
+          # the phase permanently. Map it to 75 (EX_TEMPFAIL, retryable and ours
+          # alone). A clean non-zero exit is left alone: that is PublishError (empty
+          # tree, escaping link), deterministic, and should not retry. Same defect
+          # as the one that cost sub-UPDUETFG on the fastsurfer side in the
+          # 2026-08-14 batch — see issue #268 and the matching guard in
+          # fastsurfer-long-phase-workflow-template.yaml.
+          #
+          # Retrying is safe: publish overwrites, `_prune_stale` clears a partial
+          # previous attempt, and `_complete.json` lands last, so a retried publish
+          # either completes the tree or leaves it markerless.
+          #
+          # Duplicated verbatim in the sibling pod's script, like have_all_tps below
+          # — see the note there for why these two scripts do not share code.
           checkpoint_save() {
-            local region=$1 outdir=$2
-            local key="derivatives/subregions/${SUBJ}/${SUBJ}_${region}.tar.gz"
-            "$PY" - "$BUCKET" "$key" "$outdir" <<'PYEOF'
-          import io, sys, tarfile
-          import boto3
-
-          bucket, key, outdir = sys.argv[1:4]
-          buf = io.BytesIO()
-          with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-              tf.add(outdir, arcname=".")
-          buf.seek(0)
-          boto3.client("s3", region_name="<YOUR_AWS_REGION>").upload_fileobj(buf, bucket, key)
-          PYEOF
+            local region=$1 outdir=$2 rc=0
+            "$PY" /app/fs_derivatives.py publish "$outdir" \
+              --bucket "$BUCKET" \
+              --prefix "derivatives/subregions/${SUBJ}/${region}" \
+              --source-step subregion-segmentation || rc=$?
+            if [[ $rc -ge 128 ]]; then
+              echo "ERROR: publish of ${region} died on signal $((rc - 128)) (exit ${rc}); forcing retry (exit 75)." >&2
+              exit 75
+            fi
+            # A non-zero return still aborts the script via `set -e` at the call
+            # site, exactly as it did before.
+            return $rc
           }
 
           # Local-disk fallback guard, same contract as the GEMS pod's: true only

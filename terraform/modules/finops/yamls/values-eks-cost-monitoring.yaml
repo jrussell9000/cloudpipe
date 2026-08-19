@@ -34,6 +34,52 @@ localStore:
     eks.amazonaws.com/nodegroup: backend
 
 finopsagent:
+  # The finops-agent subchart's defaults are sized, in its own words, for "a
+  # cluster with 10 nodes with 500 pods", and it warns that "in large clusters
+  # with hundreds of nodes, the agent can take 50Gi+ of RAM and use 5+ CPUs".
+  # A saturated cohort leg runs ~167 nodes, so the default 2048Mi limit is off
+  # by more than an order of magnitude for this cluster.
+  #
+  # It was OOMKilling accordingly: exitCode 137 with 106 restarts in 6h on
+  # 2026-08-19, each death mid-`ComputeCostData` (a ~2m40s pass over the whole
+  # spot fleet). This is the collector for per-pod cost attribution, so every
+  # kill is a hole in the cost record — the missing dt=2026-08-13 and
+  # dt=2026-08-16 cost partitions were both large-batch days.
+  #
+  # NOTE this is `finopsagent.resources`, NOT `finopsagent.agent.resources`.
+  # finopsagent is an alias for the finops-agent subchart (see the kubecost
+  # Chart.yaml dependencies), so this maps to that subchart's TOP-LEVEL
+  # `resources`, which its templates/deployment.yaml consumes as
+  # `.Values.resources`. There is no `resources` key under the `agent:` block
+  # below; putting it there renders nothing and fails silently.
+  #
+  # 8Gi is a deliberate compromise, not a measured ceiling: the true figure is
+  # unmeasurable while the process is being OOMKilled at its limit (the limit is
+  # the only "peak" you ever observe). The backend node is 13.78Gi and shared
+  # with Prometheus and the aggregator, so a limit large enough to satisfy the
+  # subchart's own 50Gi guidance does not fit at any node count we run. If this
+  # still OOMKills at ~167 nodes, the next lever is a larger backend instance
+  # type (m7g.2xlarge), not a bigger number here.
+  #
+  # The request is raised off 512Mi for the same reason as the aggregator: an
+  # 16x burst ratio schedules the pod as if it needed 512Mi and then lets it
+  # take 8Gi, which is how a node ends up overcommitted without the scheduler
+  # ever seeing it coming.
+  #
+  # Note `scrapeInterval: 30s` below is half the chart default and doubles the
+  # agent's retained sample volume. It is load-bearing for the per-pod cost
+  # model on short-lived workflow pods, so it stays — but it is a real
+  # contributor to this pod's memory, and is the first thing to revisit if the
+  # limit above proves insufficient.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+      ephemeral-storage: 50Mi
+    limits:
+      cpu: 2
+      memory: 8Gi
+      ephemeral-storage: 2Gi
   agent:
     collectorDataSource:
       # Chart 3.2.1 raised the default to 60s. cloudpipe's cost model is per-pod
@@ -66,6 +112,34 @@ frontend:
 aggregator:
   image:
     repository: kubecost/cost-model
+  # The chart ships `limits: {}` with the note "Consider setting a limit after a
+  # baseline has been established". Unlimited, this was the single largest
+  # consumer on the backend node — ~4.9Gi against a 3Gi request, i.e. 1.6x its
+  # own reservation on a node with 13.78Gi allocatable that also carries
+  # Prometheus, Grafana, ArgoCD and all of Prefect. That is how Prometheus came
+  # to be evicted in a loop on 2026-08-18: the kubelet ranks eviction by QoS
+  # class first, so a BestEffort Prometheus went before the Burstable pod that
+  # was actually consuming the memory.
+  #
+  # Baseline measured 2026-08-19 with the cluster idle, three samples over
+  # ~25min: 4391Mi / 4870Mi / 4690Mi. It oscillates rather than climbs, so 4870Mi
+  # is treated as the peak.
+  #
+  # request 5Gi  — honest reservation, so the scheduler stops placing this pod as
+  #                if it needed 3Gi and then letting it take 4.9Gi.
+  # limit   7Gi  — ~44% headroom over the observed peak. The point is to bound a
+  #                runaway, not to trim normal operation; sized so the worst case
+  #                still leaves ~6.7Gi on the node for everything else.
+  #
+  # If this starts OOMKilling (check `restartCount` on kubecost-aggregator-0),
+  # the cap is too low for the retention settings above — raise the limit rather
+  # than removing it, and re-measure the baseline first.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 5Gi
+    limits:
+      memory: 7Gi
   tolerations:
     - key: "CriticalAddonsOnly"
       value: "true"

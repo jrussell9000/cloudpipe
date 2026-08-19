@@ -30,7 +30,22 @@ spec:
     # deliberately absent: a real OOMKill here would be deterministic (peak
     # memory is a flat function of the largest single session, not of anything
     # stochastic), so retrying would burn the budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    # The codes are matched in the message too: a pod that dies in its init or wait
+    # container never populates exitCode, so that arm alone is dead for the whole
+    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
+    # its producer was skipped or failed, and a consumer retry cannot re-run the
+    # producer. See the master template for the detail.
+    #
+    # An activeDeadlineSeconds kill is ALSO excluded, and that exclusion is what
+    # makes the deadline below work at all. Verified with a probe workflow on
+    # 2026-08-18 (argo lint cannot show this): when a template deadline fires, the
+    # kubelet SIGTERMs the pod, so Argo records
+    #     phase=Failed  exitCode=143
+    #     message="Pod was active on the node longer than the specified deadline"
+    # The 143 arm above therefore MATCHES a deadline kill, and without this clause
+    # the deadline would multiply the burn by the retry limit rather than bound it.
+    # Same reasoning as fast-tmpl, where this was first found.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -143,6 +158,25 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
 
+    # Bounds a wedged screenshot pass. fsqc's QC render is the one part of this
+    # step with no internal timeout: createScreenshots() can stall indefinitely in
+    # matplotlib on a bad surface overlay, emitting no further output and never
+    # returning, so the pod produces no exit code and the retryStrategy above never
+    # fires. Observed on sub-RN93HUJE (cloudpipe-jtb6s, 2026-08-18): 288 minutes and
+    # still running, last line
+    #     UserWarning: WARNING: a problem occurred with the surface overlays
+    # Every other step in that workflow had already succeeded, so the subject was
+    # complete except for QC and would still have held its slot until the master
+    # workflow's 24h deadline.
+    #
+    # 30m is sized from 1218 successful fsqc pods in cluster history:
+    #     min 0.1m   median 1.1m   p90 8.0m   max 10.8m
+    # so 1800s is ~2.8x the observed maximum — a wider multiple than the 1.75x used
+    # for parcellation, because this distribution is far tighter in absolute terms
+    # and 30m is still trivial next to the 24h it replaces. A spot reclaim on
+    # cpu-light lands well below this and still retries on the node-shutdown arm.
+    activeDeadlineSeconds: 1800
+
     # The container runs as uid 1000 and cannot mkdir at the image root, so the
     # driver's --workdir must be a writable volume. /tmp in the image is used by
     # MPLCONFIGDIR/XDG_CACHE_HOME (see images/fsqc/Dockerfile) and is not sized
@@ -156,7 +190,7 @@ spec:
       # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
       # rewrites this to sha-<commit> once the first build lands, and only after
       # confirming that tag actually reached the registry.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fsqc:sha-d51990e89319d1fcb46e0971be23ce00a43a74cf"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fsqc@sha256:4d48884786140721c63a00f6caddca4065093ea0b463f9c6173a49242b4ee6f2"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

@@ -68,10 +68,15 @@ resource "aws_db_instance" "this" {
 
   auto_minor_version_upgrade = true
 
-  # Set deletion_protection = true before promoting to production.
-  # skip_final_snapshot must be false and a final_snapshot_identifier provided at that point.
-  deletion_protection = false
-  skip_final_snapshot = true
+  # AWS-side guard: DeleteDBInstance is refused while this is true, regardless of
+  # whether the call comes from Terraform, the console, or the CLI. Clearing it is a
+  # separate apply, which is the point — deletion takes two deliberate steps.
+  deletion_protection = var.db_deletion_protection
+
+  # A replacement (see replace_triggered_by below) still destroys the instance, so the
+  # final snapshot is what makes that recoverable.
+  skip_final_snapshot       = var.db_skip_final_snapshot
+  final_snapshot_identifier = var.db_skip_final_snapshot ? null : "${var.cluster_name}-argo-final"
 
   tags = var.tags
 

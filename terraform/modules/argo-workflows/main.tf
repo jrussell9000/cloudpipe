@@ -275,12 +275,14 @@ resource "kubernetes_ingress_v1" "this" {
       "alb.ingress.kubernetes.io/healthcheck-protocol" = "HTTP"
       "alb.ingress.kubernetes.io/healthcheck-path"     = "/"
 
-      # ALB access logging disabled — the log bucket uses SSE-KMS which ALB does not support.
+      # ALB access logging (H3) — delivered to the SSE-S3 access-log bucket, not the SSE-KMS
+      # master log bucket, which ALB cannot write to. See logging.tf.
+      #
       # idle_timeout raised to the ALB maximum (4000s): the Argo UI live-updates the DAG over a
       # Server-Sent Events stream that sends nothing between workflow events. At the 60s default,
       # any step running longer than a minute idles the stream out and the UI silently freezes on
       # stale state until refreshed.
-      "alb.ingress.kubernetes.io/load-balancer-attributes" = "access_logs.s3.enabled=false,idle_timeout.timeout_seconds=4000"
+      "alb.ingress.kubernetes.io/load-balancer-attributes" = "access_logs.s3.enabled=true,access_logs.s3.bucket=${var.access_log_bucket},access_logs.s3.prefix=alb-argo-workflows,idle_timeout.timeout_seconds=4000"
     }
   }
 

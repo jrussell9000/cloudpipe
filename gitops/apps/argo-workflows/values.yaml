@@ -19,6 +19,30 @@ argo-workflows:
       secret.reloader.stakater.com/reload: "argo-db"
       configmap.reloader.stakater.com/reload: "argo-workflows-controller-configmap"
 
+    # Two replicas, for rollout survival rather than throughput. The chart
+    # couples three things to this single value
+    # (templates/controller/workflow-controller-deployment.yaml): at `replicas: 1`
+    # it hardcodes `strategy: Recreate` AND injects
+    # LEADER_ELECTION_DISABLE=true. Recreate tears the old pod down BEFORE
+    # starting the new one, so a restart is a GUARANTEED reconciliation gap, not
+    # a risk of one. At 2 the chart emits RollingUpdate and leaves leader
+    # election on; only the lease holder reconciles, so the standby costs its
+    # request and almost no CPU.
+    #
+    # This is not hypothetical. The `argo-db` secret above rotates on a 7-day
+    # AWS Secrets Manager schedule (rds!db-eda99529..., next 2026-08-21) and
+    # Reloader restarts this deployment every time it does. Running workflow
+    # pods survive a controller gap on their own, but the controller is what
+    # enforces activeDeadlineSeconds — a gap long enough to blow deadlines
+    # retires work en masse, which is what the 2026-08-17 "107 failures" were
+    # (all `exceeded workflow deadline`, none of them real).
+    #
+    # Cost check before raising this further: requests are 2Gi each, so this
+    # reserves 4Gi of the argo nodegroup's 13.78Gi (was 18% allocated). The 8Gi
+    # LIMITS do sum past allocatable, which is safe only because leader election
+    # guarantees one of the two is idle. Do not run these active/active.
+    replicas: 2
+
     # parallelism / namespaceParallelism / resourceRateLimit are deliberately NOT
     # set here. The chart's only consumer of them is
     # templates/controller/workflow-controller-config-map.yaml, and
@@ -36,12 +60,38 @@ argo-workflows:
     # the informer cache growth that comes with larger batches. CPU is left
     # unlimited on purpose — throttling the controller stalls reconciliation of
     # every workflow at once.
+    #
+    # The memory limit is sized off *object count*, not concurrency. The informer
+    # caches every Workflow and Pod in the namespace, not just the running ones,
+    # and `ttlStrategy` keeps completed workflows resident after they finish. On
+    # 2026-08-17 a terminated 300-subject attempt overlapped its own resubmission
+    # — 608 workflows (some ~400 KB dehydrated) and ~1900 pods at once — and the
+    # controller OOMKilled 109 times in a 5m back-off loop, freezing the live
+    # batch. 2Gi survives one batch and not two.
+    #
+    # 4Gi then failed the same way on the 3000-subject full-cohort leg
+    # (2026-08-19, 24 OOMKills): 958 workflows / 452 pods, working set climbing
+    # ~0.44 GiB/hr to a 3.83 GiB peak. Note the inversion against 2026-08-17 —
+    # 4x FEWER pods but 1.6x more workflows needed twice the memory, so it is the
+    # Workflow objects that dominate, not the Pods.
+    #
+    # Retained objects are (completion rate x TTL) + concurrency, so the limit is
+    # only defensible alongside the TTL. At the 24h TTL this leg would plateau at
+    # ~2220 objects once throughput recovered to its healthy ~80/hr — above 8Gi.
+    # The master template's TTL is cut to 4h in the same change, capping steady
+    # state at ~620 objects, which 8Gi holds with margin. Do not raise the TTL
+    # back without re-sizing this limit.
+    #
+    # The request is raised off 512Mi as well, deliberately. An 8x burst ratio
+    # left the pod Burstable and scheduled as if it needed 512Mi, so it could
+    # land on a node with no room to reach its limit — the same request-vs-limit
+    # trap that produced two misleading batch post-mortems.
     resources:
       requests:
         cpu: 250m
-        memory: 512Mi
-      limits:
         memory: 2Gi
+      limits:
+        memory: 8Gi
 
     rbac:
       create: true

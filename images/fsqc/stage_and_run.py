@@ -5,14 +5,14 @@ One invocation handles one subject across all of its sessions. fsqc's notion of 
 directory *per session* — so fsqc's "subject" is our session, and the QC records
 this writes are keyed subject+session.
 
-The S3 layout this reads (see CLAUDE.md):
+The S3 layout this reads (exploded per-file objects — see CLAUDE.md and ADR 017):
 
-  derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz   -> extracts as {ses}/...
-  derivatives/subregions/{subj}/{subj}_hippoamyg.tar.gz         -> extracts as hippoamyg/{ses}/mri/...
-  derivatives/subregions/{subj}/{subj}_hypothalamic.tar.gz      -> extracts as hypothalamic/{ses}/mri/...
+  derivatives/fastsurfer/{subj}/{ses}/...          -> staged as {ses}/...
+  derivatives/subregions/{subj}/hippoamyg/...      -> staged as hippoamyg/{ses}/mri/...
+  derivatives/subregions/{subj}/hypothalamic/...   -> staged as hypothalamic/{ses}/mri/...
 
-Deliberately NOT downloaded: {subj}_thalamus.tar.gz, {subj}_brainstem.tar.gz,
-{subj}_sclimbic.tar.gz. No enabled fsqc module reads their output.
+Deliberately NOT staged: the thalamus, brainstem and sclimbic trees. No enabled
+fsqc module reads their output.
 
 Where the numbers come from, which is not uniform: the core, contrast, rotation
 and outlier-count metrics land in fsqc-results.csv, but the subregion modules
@@ -22,47 +22,42 @@ outliers/all.regions.stats. So a complete record needs both files plus each
 session's status.txt (which is the only thing distinguishing "module ran and
 found nothing" from "module never ran").
 
-Also deliberately NOT downloaded: {subj}_long-template.tar.gz. Every file the
-enabled modules read is per-session and ships in the templated tarball (verified
-against real derivatives: norm.mgz, aseg.mgz, aparc.DKTatlas+aseg.deep.mgz,
+Also deliberately NOT staged: the long-template tree. Every file the enabled
+modules read is per-session and ships in the session tree (verified against real
+derivatives: norm.mgz, aseg.mgz, aparc.DKTatlas+aseg.deep.mgz,
 transforms/talairach.lta, surf/[lr]h.w-g.pct.mgh, stats/aseg.stats,
 stats/[lr]h.aparc.DKTatlas.mapped.stats, scripts/recon-all.log are all present
-per session). The long-template tarball is ~480 MB against ~220 MB per session,
-so skipping it is the single largest transfer saving available here. Note the
-session list therefore comes from the S3 tarball listing rather than the
-template's `base-tps` file, which is empty for at least some subjects.
+per session). Measured at n=25, a long-template is a median 457 MiB uncompressed
+against 243 MiB for a session, so skipping it remains the single largest
+transfer saving available here.
+
+The session list comes from `_complete.json` markers in the S3 listing — not
+from the template's `base-tps` file, which is empty for at least some subjects,
+and not from bare session prefixes, which exist for a half-uploaded tree too.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import io
 import json
 import re
 import shutil
 import subprocess
 import sys
-import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
-from botocore.exceptions import ClientError
+import fs_derivatives
 
 REGION = "<YOUR_AWS_REGION>"
 
-# Argo's artifact upload and the segmentation template's own checkpoint_save()
-# both write the subregion keys, and they disagree about whether the region name
-# is a top-level tar member. Tolerate either by locating the session dirs after
-# extraction instead of assuming a prefix.
-SUBREGION_TARBALLS = ("hippoamyg", "hypothalamic")
-
-# A tarball that exists but is implausibly small is treated as absent, matching
-# the size-floor convention in src/metrics/outcome_recorder.py (_MIN_OUTPUT_BYTES)
-# and ADR 004. An empty-but-present tarball otherwise reads as "derivative
-# available" and yields a silently metric-less record.
-MIN_TARBALL_BYTES = 1024
+# The two subregion trees fsqc actually reads. Session directories are still
+# located after staging rather than assumed: the trees nest as
+# `{region}/{ses}/mri/...`, but merge_subregion tolerates either shape and the
+# cost of being wrong is a silently empty QC record.
+SUBREGION_REGIONS = ("hippoamyg", "hypothalamic")
 
 SESSION_RE = re.compile(r"^ses-[0-9]+[A-Z]$")
 
@@ -81,47 +76,56 @@ def log(msg: str) -> None:
 
 
 def discover_sessions(s3, bucket: str, subj: str) -> list[str]:
-    """Return the sessions that have a FastSurfer templated tarball in S3.
+    """Return the sessions with a COMPLETE FastSurfer tree in S3.
 
     Read from the S3 listing rather than the long-template's `base-tps` file:
     that file is empty for at least some subjects (confirmed on sub-086U18RD),
     and trusting it would silently QC zero sessions.
+
+    Enumerates `_complete.json` markers, not session prefixes (ADR 017). A
+    prefix that exists but has no marker is a partially-uploaded tree, which is
+    not a QC-able session: fsqc would run against whatever files happened to
+    land and emit a confident, wrong record. Listing the marker also keeps this
+    to one paginated call rather than a per-session head_object.
     """
     prefix = f"derivatives/fastsurfer/{subj}/"
-    suffix = "_templated.tar.gz"
+    marker = "/_complete.json"
     sessions = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
-            stem = obj["Key"].rsplit("/", 1)[-1]
-            if not stem.startswith(f"{subj}_") or not stem.endswith(suffix):
+            rel = obj["Key"][len(prefix) :]
+            if not rel.endswith(marker):
                 continue
-            ses = stem[len(subj) + 1 : -len(suffix)]
+            ses = rel[: -len(marker)]
             if SESSION_RE.match(ses):
                 sessions.append(ses)
     return sorted(sessions)
 
 
-def download_and_extract(s3, bucket: str, key: str, dest: Path) -> bool:
-    """Extract s3://{bucket}/{key} into dest. False if absent or implausibly small."""
-    try:
-        head = s3.head_object(Bucket=bucket, Key=key)
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
-            log(f"  absent: s3://{bucket}/{key}")
-            return False
-        raise
+def stage_tree(s3, bucket: str, prefix: str, dest: Path) -> bool:
+    """Stage an exploded derivative tree into dest. False if it is not published.
 
-    if head["ContentLength"] < MIN_TARBALL_BYTES:
-        log(f"  only {head['ContentLength']} bytes, treating as absent: {key}")
+    Wraps fs_derivatives.stage (ADR 017), which requires `_complete.json`, verifies
+    the file count and manifest digest, and replays the symlink manifest. The old
+    size-floor heuristic this replaced ("a tarball under 1 KB is probably absent")
+    is gone: a guess about wholeness is no longer needed when the producer records
+    it.
+
+    "Not published" and "published but corrupt" are deliberately NOT the same
+    outcome. An absent tree is routine — the subregion trees are optional, and a
+    session may simply not have been segmented — so it returns False and the
+    caller records reduced coverage. A tree whose marker exists but whose file
+    count or manifest digest does not match is a different animal: the producer
+    certified it complete and it is not. Swallowing that as "absent" would emit a
+    confident QC record with a session quietly dropped, which is the kind of
+    silent partial result the marker exists to prevent. So the existence check
+    comes first, and any StageError past it propagates.
+    """
+    if not fs_derivatives.exists(bucket, prefix, s3=s3):
+        log(f"  absent: s3://{bucket}/{prefix}/")
         return False
-
-    buf = io.BytesIO()
-    s3.download_fileobj(bucket, key, buf)
-    buf.seek(0)
-    dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fileobj=buf, mode="r:gz") as tf:
-        tf.extractall(dest)
+    fs_derivatives.stage(bucket, prefix, dest, s3=s3)
     return True
 
 
@@ -208,24 +212,24 @@ def stage(s3, bucket: str, subj: str, subjects_dir: Path, scratch: Path, label: 
     """Download and merge everything fsqc reads. Returns a coverage summary."""
     sessions = discover_sessions(s3, bucket, subj)
     if not sessions:
-        raise SystemExit(f"No FastSurfer templated tarballs found for {subj} — nothing to QC.")
+        raise SystemExit(f"No complete FastSurfer trees found for {subj} — nothing to QC.")
     log(f"Sessions with FastSurfer output: {', '.join(sessions)}")
 
     staged = []
     for ses in sessions:
-        key = f"derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz"
         log(f"Staging {ses}")
-        if download_and_extract(s3, bucket, key, subjects_dir):
+        # Each session lands in its own directory under $SUBJECTS_DIR, which is
+        # what the tarball's `{ses}/...` member paths used to produce.
+        if stage_tree(s3, bucket, f"derivatives/fastsurfer/{subj}/{ses}", subjects_dir / ses):
             staged.append(ses)
     if not staged:
-        raise SystemExit(f"No templated tarball could be staged for {subj}.")
+        raise SystemExit(f"No FastSurfer tree could be staged for {subj}.")
 
     coverage = {"sessions": staged}
-    for region in SUBREGION_TARBALLS:
-        key = f"derivatives/subregions/{subj}/{subj}_{region}.tar.gz"
+    for region in SUBREGION_REGIONS:
         log(f"Staging {region}")
         region_scratch = scratch / region
-        if download_and_extract(s3, bucket, key, region_scratch):
+        if stage_tree(s3, bucket, f"derivatives/subregions/{subj}/{region}", region_scratch):
             coverage[region] = merge_subregion(region_scratch, subjects_dir, region)
         else:
             coverage[region] = []

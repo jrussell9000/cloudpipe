@@ -39,7 +39,7 @@ prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
   -p subjects_file=s3://<YOUR_S3_BUCKET>/config/subjects.csv
 ```
 
-The flow gates concurrency: `ConcurrencyGate.count()` counts active Argo workflows and waits until below `max_concurrent` before submitting the next subject. `max_concurrent` is **not** a flow parameter — it's read live from the Prefect Variable `cloudpipe-max-concurrent` (fallback `50` when unset) on every poll cycle, so it can be changed mid-run with `prefect variable set cloudpipe-max-concurrent <N>` without restarting the flow. Use `start_index`/`end_index` to resume after a pause. The controller's `namespaceParallelism` (`100`) is the server-side backstop — see [ADR 008](decisions/008-prefect-as-queue-manager.md) for why a client-side gate alone cannot enforce the cap (#206).
+The flow gates concurrency: `ConcurrencyGate.count()` counts active Argo workflows and waits until below `max_concurrent` before submitting the next subject. `max_concurrent` is **not** a flow parameter — it's read live from the Prefect Variable `cloudpipe-max-concurrent` (fallback `50` when unset) on every poll cycle, so it can be changed mid-run with `prefect variable set cloudpipe-max-concurrent <N>` without restarting the flow. Use `start_index`/`end_index` to resume after a pause. The controller's `namespaceParallelism` (`400`) is the server-side backstop — see [ADR 008](decisions/008-prefect-as-queue-manager.md) for why a client-side gate alone cannot enforce the cap (#206).
 
 **Direct single-subject submission:**
 ```bash
@@ -185,13 +185,23 @@ The eight checks (executed in one pass):
 3. **Check run completion** — for each run, calls `head_object` on four S3 keys:
    - `b2t_exists`: `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_itk.txt`
    - `func_exists`: `derivatives/func/{subj}/{ses}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz`
-   - `surf_exists`: `derivatives/func_surf/{subj}/{ses}/components/{prefix}_desc-grayordcomponents_bold.tar.gz`
+   - `components_exist`: `derivatives/func_surf/{subj}/{ses}/components/{prefix}_desc-grayordcomponents_bold.tar.gz`
    - `surf_target_exists`: `derivatives/func_surf/{subj}/{ses}/fsLR32k/{prefix}_space-fsLR32k_bold.dtseries.nii`
+
+   plus one derived flag, `surf_exists = components_exist OR surf_target_exists` — the components are a reclaimed intermediate, so extraction is judged done if either it or the artifact built from it is present (see *Component reclaim* below).
 4. **Check T1w-to-MNI completion** — calls `head_object` on `derivatives/registration/{subj}/{ses}/t1w_to_mni/{prefix}_desc-t1w2mni_affine.mat` per session
 5. **Check T1w source availability** — `head_object` on `mmps_mproc/{subj}/{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz`, recorded as `t1w_available`
 6. **Load nss_volumes.csv** — downloads `config/nss_volumes.csv` once, looks up `nss_frames` per subject/session; exits 1 if the entry is missing
-7. **Check FastSurfer derivatives** — `head_object` on `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz`, writing `"True"`/`"False"` to `/tmp/fastsurfer_exists.txt`
-8. **Check subregion derivatives** — `head_object` on `derivatives/subregions/{subj}/{subj}_{region}.tar.gz` for all five regions, writing `/tmp/subregions_exists.txt`
+7. **Check FastSurfer derivatives** — `head_object` on `derivatives/fastsurfer/{subj}/{ses}/_complete.json`, writing `"True"`/`"False"` to `/tmp/fastsurfer_exists.txt`
+8. **Check subregion derivatives** — `head_object` on `derivatives/subregions/{subj}/{region}/_complete.json` for all five regions, writing `/tmp/subregions_exists.txt`
+
+Both gate on the **completion marker**, never on a prefix listing or an individual
+file ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)). Under the old
+tarball layout a single `head_object` was a truthful "the whole derivative is here",
+because a tarball is one atomic PUT. An exploded prefix has no such natural atom: a
+listing returns objects for a tree whose upload died halfway, and on spot that state
+arises with no bug at all. `_complete.json` is written after every other object, so
+its presence is the only thing that still carries the old meaning.
 
 Two of those deserve a note:
 
@@ -228,7 +238,7 @@ Failure modes:
 
 ### Phase 3 — Anatomical processing
 
-**Skipped when `fastsurfer-exists == "True"`** (all sessions have valid `_templated.tar.gz` derivatives).
+**Skipped when `fastsurfer-exists == "True"`** (every session has a `_complete.json` under `derivatives/fastsurfer/{subj}/{ses}/`).
 
 Four steps run as a DAG. All FastSurfer steps use image `cloudpipe/fastsurfer`. Steps A and C run on `gpu-nodepool`; B and D on `cpu-heavy-nodepool`.
 
@@ -363,6 +373,10 @@ What the raised *request* buys is the thing a limit was wanted for: the schedule
 
 **Intensity scaling is ruled out; do not add an `mri_info` pre-flight gate.** `mri_info`-level and intensity-statistics checks on all four sessions of `sub-R4PV7WZ3` come back clean: every volume is 256³ uchar (`aseg` int16), range 0–255, no float and no out-of-range values, and the *first* `mri_normalize` in the same pod (`nu.mgz → T1.mgz`) prints `white matter peak found at 110` for all four sessions and exits 0 at ~572 MB max RSS. Measured WM mode is 110/110/109/109 and WM mean 104.5/104.5/103.1/104.5 — a header check would be a no-op. The one real outlier in the victim session (`ses-04A`) is **segmentation extent**, not intensity: 313,587 WM voxels vs 404–441k in its siblings, and 1211 control points removed vs 292/593/366.
 
+> **Neither of those two numbers generalises to the other victims** (checked 2026-08-15 against the third victim, `sub-C9139NWM` `ses-06A`; see the rate paragraph below). Control points removed there were 461/866/464/**809** — the victim is *not* the outlier, and the passing `ses-02A` removed **more**. A different signal does stand out on that subject, and it too fails to generalise: the first `mri_normalize`'s paired peak detection reports `110, 92` for `ses-06A` against `110, 110` or `110, 109` for every sibling, while `sub-R4PV7WZ3` `ses-04A` reports `110` in all five of its detections. Each victim looks abnormal on a *different* axis and normal on the axes that flagged the others, so **do not build a data-side gate on any of them.** Segmentation extent survives only as untested on the third victim, not as confirmed.
+>
+> Intensity is ruled out on the raw inputs too, not just the intermediates: `nibabel` on the source T1w of both victims and both matched passing siblings gives 256³ float32, range 0–255, **zero NaN and zero Inf** in all four. Saturation is explicitly *not* the discriminator — `sub-GNV5ZKU4` `ses-00A` **passes** with 1.262% of voxels at 255, 14× the 0.091% of the failing `sub-C9139NWM` `ses-06A`. A clipping pass would break passing sessions without fixing failing ones.
+
 The container also emits cgroup v2 `memory.peak` and a 30 s `anon`/`file` split to the archived log, so the next batch replaces the sizing table above with a figure that separates real demand from reclaimable page cache (`pod_memory_working_set` folds the two together, making those numbers an upper bound).
 
 **The runaway is now identified: a garbage histogram bin count.** Re-running `sub-R4PV7WZ3` under the cap on 2026-08-12 (49m48s, container `memory.peak` **10.95 G** against the 18G request, no OOM kill, workflow `Succeeded`) produced the error the `SIGKILL` had been destroying:
@@ -375,11 +389,73 @@ ses-04A: error: HISTOalloc(2001892225): could not allocate histogram
 ses-04A: recon-all -s ses-04A exited with ERRORS
 ```
 
-`HISTOalloc` was asked for **2,001,892,225 bins**. That is the 25.97 GiB. So the reading above needs one correction: finding 2 ("no legitimate branch allocates this") stands and is in fact *why* — the bin count is nonsense, not a large-but-legitimate volume — but the failure is **deterministic and specific to this session's data**, reproducing at the same point on a clean re-run, and it is localized to the 3d-normalization pass rather than to the "anywhere after line 907" window of finding 1. Making the process die by `ErrorExit` instead of `SIGKILL` is what made it legible: the cap bought a diagnosis, not just containment. The remaining question is which computation feeds `nbins`; `ses-04A`'s segmentation-extent outlier (313,587 WM voxels vs 404–441k in its siblings) is the obvious suspect.
+`HISTOalloc` was asked for **2,001,892,225 bins**. That is the 25.97 GiB. So the reading above needs one correction: finding 2 ("no legitimate branch allocates this") stands and is in fact *why* — the bin count is nonsense, not a large-but-legitimate volume — and it is localized to the 3d-normalization pass rather than to the "anywhere after line 907" window of finding 1. Making the process die by `ErrorExit` instead of `SIGKILL` is what made it legible: the cap bought a diagnosis, not just containment.
 
-**Per-session completion guard (#245).** The same re-run exposed a second defect: `brun_fastsurfer.sh` reported **`exit=0`** while `ses-04A` had errored out. Since `check_fastsurfer_derivatives` (step 7) is a bare `head_object`, an exit-0 step publishes a truncated `ses-04A_templated.tar.gz` — 66 entries, `scripts/IsRunning.lh+rh` present, no `lh.white`/`rh.white`/`lh.pial`/`rh.pial` — and that tarball marks the subject **permanently complete**. The anatomical phase is then skipped on every future submission, the subject can never self-heal, and registration and func-preproc run against a `surf/` missing its principal outputs.
+**Root cause, traced to source 2026-08-15.** This paragraph previously read "deterministic and specific to this session's data" and named segmentation extent as the obvious suspect; a later revision that same day replaced that with an *uninitialized-read* hypothesis. **Both are wrong**, and the mechanism is now traced end to end in FreeSurfer v7.4.1 — the exact build in the image (`freesurfer-linux-ubuntu22_x86_64-7.4.1-20230614-7eb8460`). Start with the cross-batch bin counts, which is what first broke the "function of this session's data" reading:
 
-So the container now validates each session before Argo can publish it, rejecting any that has an `IsRunning` marker or is missing a non-empty white/pial surface per hemisphere, and **deleting the directory**. Every per-session output artifact is `optional: true`, so a deleted directory means the artifact is skipped and the derivative is genuinely absent — the existence check then correctly reports the session missing and the next submission re-runs the phase. Self-healing is restored by making the failure legible, not by adding a second source of truth. Rejected sessions are also pruned from `base-tps` (written from the template's timepoint list, not from what is on disk), so one bad session does not fail `segment-subregions` for the whole subject. If *no* session survives, the step exits **1** — not 75 — because a deterministic allocation failure re-run is an identical failure, the same reasoning that keeps 137 out of the retry expression (#115).
+| subject / session | 2026-08-12 | 2026-08-14 |
+|---|---|---|
+| `sub-R4PV7WZ3` `ses-04A` | 2001892225 | **2001892225** — identical |
+| `sub-GNV5ZKU4` `ses-02A` | 2109135873 | **2128137089** — differs by ~19M |
+| `sub-C9139NWM` `ses-06A` | — | 2001891713 |
+
+**The same source T1w produced a different `nbins` on a different day**, and **two unrelated subjects landed 512 apart** out of 2×10⁹. That killed "deterministic function of this session's anatomy" and made an uninitialized read look attractive — the values reinterpreted as float32 bit patterns are plausible garbage, and they cluster just under `INT_MAX`. **The uninitialized-read reading is nevertheless refuted, by arithmetic.** `nbins` is computed at `utils/mrihisto.cpp:121` as
+
+```c
+nbins = nint(fmax - fmin + 1.0);
+if (nbins <= 0) nbins = 255;   /* :122 — guards non-positive, not absurdly large */
+```
+
+All four observed counts — 2001891713, 2001892225, 2109135873, 2128137089 — are exactly **`128k + 1`**, and 128 is precisely the float32 ULP at magnitude 2×10⁹. The `+1` in the values *is* the `+ 1.0` in that expression, and `fmax` lands on the float32 lattice as a real number must. Four independent values on that lattice by chance is ~1 in 2.7×10⁸. So `nbins` is a faithful computation over a volume that genuinely contains a voxel of ~2×10⁹. Do not revive the uninitialized-read hypothesis. (Nor the earlier NaN one: casting `NaN`/`Inf` to `int32` on x86 `cvttss2si` yields `0x80000000`, a large *negative* value.)
+
+**Where the 2×10⁹ voxel comes from.** The `if (mri_aseg)` branch calls `MRIapplyBiasCorrectionSameGeometry` (`mri_normalize.cpp:805` in v7.4.1), whose inner loop at `utils/mrinorm.cpp:3652` is
+
+```c
+val *= (target_val / bias);   /* target_val = DEFAULT_DESIRED_WHITE_MATTER_VALUE = 110 */
+```
+
+with no zero guard, no clamp, and — unlike the `-surface` branch, which calls `MRIremoveNaNs` right after the identical call at `mri_normalize.cpp:505` — no non-finite sweep afterwards. A near-zero interpolated bias yields a huge *finite* voxel: `110 × 110 / 5.8e-6 ≈ 2.1e9`. `MRI3dNormalize`'s own guards then fail to catch it twice over: `FZERO(bias)` (`mrinorm.cpp:1470`) tests exact zero only, and the `norm > 255.0f` clamp at `:1475` is gated on `mri_norm->type == MRI_UCHAR` while `:1410` has already forced `MRI_FLOAT` — **the clamp is dead code on this path.**
+
+**The crash site is exact.** Pass 1's `MRInormFindControlPoints` → `find_tissue_intensities` calls `MRIhistogram(mri_src, 0)` at `mrinorm.cpp:3371`, between its two `printf("white matter peak found at %2.0f\n", …)` at `:3368` and `:3392` — which is why a victim log prints that line **once** and every healthy session prints it **twice**. The first peak search uses `MRIhistogramLabel` restricted to control-point voxels, and the outlier is not a control point, so it succeeds at 110; the whole-volume histogram immediately after hits it. `HISTOGRAM` holds two `float *`, so 8 bytes/bin → **15.9 GiB**, which the `ulimit -v 8G` cap converts into a legible `ErrorExit`. (`prune == 0` here — no `using csf threshold` lines appear anywhere in the log — which rules out the other `find_tissue_intensities` caller at `:3062`.)
+
+**This is why no data-side gate generalises.** The trigger is the *bias fit* — control-point geometry — not intensities. That is exactly the shape of the evidence in the note above: control-point counts, saturation fraction, WM-peak location and NaN/Inf screening each flagged a different victim and cleared the others. Stop looking for an intensity screen. A contributing condition, not a cause: ABCD minimally preprocessed input is already intensity-inhomogeneity corrected (Hagler et al. 2019), which is why `wm_snr_norm` sits essentially on top of `wm_snr_orig` in the metrics dictionary. With the multiplicative field already removed, the bias-field fit is unconstrained to begin with — plausibly why this path is reached on ABCD input at all and would be rarer on raw data.
+
+**FreeSurfer 8 does not fix it; a version bump is not a mitigation.** `utils/mrihisto.cpp`, `utils/histo.cpp` and `utils/mrinorm.cpp` are **byte-identical** across `v7.4.1`, `v8.0.0`, `v8.1.0`, `v8.2.0` and `dev` (md5 `6f471ccf…`, `402aac69…`, `27617d37…`). That was verified with a positive control — `CMakeLists.txt` differs across all four refs, and `mri_normalize.cpp` does differ between 7.4.1 and 8.2.0 (sole change: a `copyVolGeom` → struct-assignment refactor in LTA handling, on a path we do not take) — so the identical hashes are real and not a fetch artifact. `HISTOalloc` in `dev` still has no upper bound. **Filed upstream 2026-08-15 as [freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452)** (text retained at `plans/histoalloc-upstream-issue-draft.md`) — the ask is a one-line symmetric bound on an already-existing one-sided guard. But it is **not our fix path**: `images/fastsurfer/Dockerfile` is `FROM deepmi/fastsurfer:latest`, so a merged fix must traverse an FS release *plus* FastSurfer adoption. Do not plan around it landing.
+
+**Both candidate mitigations are now measured, and both are dead.** The probe (`histoalloc-confirm-rw94n`, 2026-08-15, 6m22s) reproduced `HISTOalloc(2128137089)` — byte-identical to what this session produced in the 2026-08-14 batch, which incidentally confirms the cross-batch divergence came from the upstream GPU stage regenerating `norm.mgz` rather than from any nondeterminism in `mri_normalize`.
+
+- **An external clamp is impossible.** `norm.mgz` on disk is `uint8`, max **160** (`min_positive` 3, zero NaN/Inf), as is `nu.mgz` (3–255) and `T1.mgz` (2–252). A `uint8` file cannot carry a 2×10⁹ voxel at all, so the outlier is unambiguously manufactured in-memory after the read. There is nothing outside the process to clamp.
+- **Raising the address-space cap does not work either, and the reason matters.** At a 24 GiB cap it still died on `HISTOalloc`, but cgroup `memory.peak` reached **17.53 G** — which is 2 × 8.51 GiB, i.e. the histogram at `mrinorm.cpp:3371` *did* allocate and populate. What failed is the **second** one: `hsmooth = HISTOsmooth(h, NULL, 2)` at `:3379` calls `HISTOcopy` → another `HISTOalloc(nbins)`. Two live histograms at this bin count need **~34 GiB** before any volume is counted, so the real requirement is ~36 GiB *per session* and k=4 run in parallel. That is ~140 GiB of request to salvage 1% of sessions.
+
+So the mitigation set is down to two: **status quo** — the #245 guard rejects the timepoint, #273 lets the subject land `partial` with its other sessions delivered, ~1% session loss — or an **upstream fix**, which is filed but which we cannot schedule.
+
+One correction for the upstream issue that follows from this: the memory figure is **31.7 GiB for the pair**, not the 15.9 GiB quoted for a single histogram, and a bound has to land *before* `:3371` to help.
+
+`scripts/manifests/histoalloc-confirm-probe.yaml` answers exactly that. `scratch/{workflow.name}/anat/` survives on a 7-day lifecycle, so the `sessions-seg/{ses}.tar.gz` and `template-parcellated.tar.gz` that fed a known failure can be re-staged byte-identically. It targets `sub-GNV5ZKU4` `ses-02A` (`cloudpipe-knwr6`, k=2 — the cheapest victim) with `ses-00A` as a passing in-subject control, pins the failing batch's image tags rather than today's, and runs three stages: reproduce at the production 8G cap; report dtype/min/max/min-positive/NaN/Inf/`voxels>255`/implied-`nbins` for `nu T1 norm brainmask aseg.presurf brain` on victim **and** control; then re-run the failing command standalone under a 24G cap with `-W /tmp/cp.mgz /tmp/bias.mgz` to capture the fitted bias field. It publishes nothing and exits 0 regardless, so a successful experiment is not recorded as a failed workflow. **Its inputs expire ~2026-08-21**, so a re-run after that needs a fresh victim.
+
+Two operational notes from running it, both now fixed in the manifest. Run 1 (`histoalloc-confirm-lqzql`) passed *both* sessions to `brun_fastsurfer.sh`, so although the victim crashed in ~2 min the step then waited ~45 min on the healthy control's full surf run — and it was spot-reclaimed at 16m29s with stages 2–3 unrun. Stage 1 needs the victim only; stage 2 reads the control's `norm.mgz` straight out of the staged tarball and never needed stage 1 to touch it. Run 2 finished in **6m22s**. Separately, stage 1 redirects to `/tmp/stage1.log` and only `cat`s it at the end, so `argo logs` shows nothing while it runs and the S3 archive of the reclaimed pod is **197 bytes** — an archived log is not the same as a useful one. To watch it live, `kubectl exec` into the pod and grep that file; that is the only reason run 1 yielded the reproduction at all.
+
+**It is not a one-subject curiosity.** The 300-subject batch of 2026-08-12 hit it twice — `sub-R4PV7WZ3` `ses-04A` (`HISTOalloc(2001892225)`) and `sub-GNV5ZKU4` `ses-02A` (`HISTOalloc(2109135873)`) — a 2/300 (0.67%) subject-level rate. All bin counts are ~2.0–2.1 × 10⁹, the same failure class rather than unrelated accidents. Under the cap neither OOM-killed its pod: across **356** parcellation attempts in that batch there were **zero** `137 OOMKilled` (both 137s carry `pod deleted`, i.e. spot).
+
+**The 2026-08-14 batch raises the rate to 3/300 (1.0%).** All **330** archived `fastsurfer-long-parcellation` logs from that batch were scanned for the guard's own `REJECTED ses-` line; there are exactly three, and every one is `HISTOalloc`:
+
+| workflow | subject | session | `nbins` |
+|---|---|---|---|
+| `cloudpipe-knwr6` | `sub-GNV5ZKU4` | `ses-02A` | 2128137089 |
+| `cloudpipe-72cq2` | `sub-C9139NWM` | `ses-06A` | 2001891713 |
+| `cloudpipe-tgmnx` | `sub-R4PV7WZ3` | `ses-04A` | 2001892225 |
+
+At 1.0% that is roughly **116 sessions** across the 11,628-subject cohort — sessions, not subjects, and that distinction is now load-bearing. The per-session guard rejects the bad timepoint and publishes the rest, and since #273 drives the session fan-out from published derivatives rather than from the inventory's `t1w_available` list, an affected subject lands `partial` with its remaining sessions delivered instead of `Error` with the whole subject lost.
+
+> **`cloudpipe-72cq2` and `cloudpipe-tgmnx` were briefly recorded elsewhere as "a spot kill orphaned a FastSurfer tree." That is wrong.** The anatomical phase ran to completion and succeeded in both; `fastsurfer-long-parcellation` exited 0 having rejected one timepoint on `HISTOalloc`. The downstream `The specified key does not exist` failures on `fastsurfer-orig` and `fastsurfer-output` were the #270 fan-out, not a lost upload. Verified against S3: `_complete.json` is present for every session and the long-template of both subjects and absent for exactly the rejected session — a one-to-one match with `published_fastsurfer_sessions()`, so #273's gate excludes precisely those two sessions and over-rejects nothing.
+
+**Per-session completion guard (#245).** The same re-run exposed a second defect: `brun_fastsurfer.sh` reported **`exit=0`** while `ses-04A` had errored out. An exit-0 step published a truncated `ses-04A` derivative — 66 entries, `scripts/IsRunning.lh+rh` present, no `lh.white`/`rh.white`/`lh.pial`/`rh.pial` — and because `check_fastsurfer_derivatives` (step 7) only asks whether the derivative exists, that marked the subject **permanently complete**. The anatomical phase is then skipped on every future submission, the subject can never self-heal, and registration and func-preproc run against a `surf/` missing its principal outputs.
+
+So the container validates each session before publishing it, rejecting any that has an `IsRunning` marker or is missing a non-empty white/pial surface per hemisphere.
+
+Since [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md) the guard works **positively**: the publish loop iterates the sessions that passed, so a rejected session is never written and never gets a `_complete.json`. It no longer depends on deleting a directory so that an `optional: true` artifact is skipped. The directory is still removed — for ephemeral-storage reclaim, and so that a future edit iterating the directory listing rather than the guard's verdict cannot publish a rejected session — but removal is no longer what enforces the guard.
+
+> **The deletion order is load-bearing.** Removing the directory at detection time cost two whole workflows in the 300-subject batch of 2026-08-12 (`sub-R4PV7WZ3`, `sub-GNV5ZKU4`). `long_compat_segmentHA.py` tolerates an *incomplete* session directory — it had been running against these very sessions before the guard existed — but not a *missing* one. It exited 1, `base-tps` was never written, and the exit-75 guard then retried a **deterministic** failure until the 8-attempt budget was gone (`retryStrategy.expression evaluated to false`), taking each subject's three-plus good sessions with it. Detection therefore runs before the bridge and removal after it. The derivative of a rejected session is genuinely absent — the existence check correctly reports the session missing and the next submission re-runs the phase. Self-healing is restored by making the failure legible, not by adding a second source of truth. Rejected sessions are also pruned from `base-tps` (written from the template's timepoint list, not from what is on disk), so one bad session does not fail `segment-subregions` for the whole subject. If *no* session survives, the step exits **1** — not 75 — because a deterministic allocation failure re-run is an identical failure, the same reasoning that keeps 137 out of the retry expression (#115).
 
 This is the output-side counterpart to the input-side `find "$SD" -name '*IsRunning*' -delete` guard: the same marker, applied to what the pod produces rather than to what it inherits.
 
@@ -413,8 +489,8 @@ After `brun_fastsurfer.sh` completes, per-session QC is extracted via `extract_q
 
 S3 outputs (one tarball per session plus the long-template):
 ```
-derivatives/fastsurfer/{subjID}/{subjID}_{ses}_templated.tar.gz   (ses-00A always; ses-02A–ses-10A optional)
-derivatives/fastsurfer/{subjID}/{subjID}_long-template.tar.gz
+derivatives/fastsurfer/{subjID}/{ses}/   (ses-00A always; ses-02A–ses-10A optional)
+derivatives/fastsurfer/{subjID}/long-template/
 ```
 Plus a QC record per session (optional) in the **metrics bucket**:
 ```
@@ -437,8 +513,8 @@ Failure modes:
 Runs [fsqc](https://github.com/Deep-MI/fsqc) over the finished anatomical derivatives to produce a per-session quality record. It depends on **both** the anatomical and subregion branches reaching a terminal state, but it is **non-fatal by construction**: the master DAG sets `failFast: false` and no task depends on this one, so a QC failure cannot hold back registration, functional preprocessing, or the derivatives.
 
 Reads from the derivatives bucket:
-- `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz` (all sessions)
-- `derivatives/subregions/{subj}/{subj}_{hippoamyg,hypothalamic}.tar.gz`
+- `derivatives/fastsurfer/{subj}/{ses}/` (all sessions)
+- `derivatives/subregions/{subj}/{hippoamyg,hypothalamic}/`
 
 Deliberately **not** read: the ~480 MB long-template tarball (nothing enabled reads it), nor the thalamus/brainstem/sclimbic tarballs.
 
@@ -463,9 +539,27 @@ Note this image is **not** a FastSurfer derivative — it is a ~930 MB `python:3
 
 ### Phase 4 — Per-session processing
 
-Runs once per session discovered by inventory. All sessions start simultaneously (subject to the master `parallelism: 3` limit on the master DAG). Each session runs two sub-DAGs in sequence: registration then functional preprocessing.
+Runs once per session that **has FastSurfer derivatives in S3**, which is not the same set as the sessions inventory discovered. All sessions start simultaneously (subject to the master `parallelism: 3` limit on the master DAG). Each session runs two sub-DAGs in sequence: registration then functional preprocessing.
 
-`session-level-pipeline-dag-template` receives per-session parameters from the inventory `withParam` fan-out: `session`, `runs`, `nss-frames`, `t1w-to-mni-exists`.
+#### The fan-out gate (`published-sessions-template`)
+
+A single `cpu-light` pod, `inventory` → `published-sessions-template`, sits between the anatomical gate and this phase. It re-reads `derivatives/fastsurfer/{subj}/{ses}/_complete.json` for every `t1w_available` session and splits the inventory array in two:
+
+| Output parameter | From | Contents |
+|---|---|---|
+| `session-items` | `/tmp/session_items.json` | the `withParam` list — inventory items for published sessions only |
+| `rejected-sessions` | `/tmp/rejected_sessions.json` | session IDs expected to be published and absent |
+| `rejected-count` | `/tmp/rejected_count.txt` | `len(rejected)`, for a `when:` guard |
+
+**Why this is not inventory's job.** Inventory runs *before* the anatomical phase, and `t1w_available` means "there is a T1w for this session in `mmps_mproc`" — a statement about the subject's inputs. This phase needs the opposite: "did the anatomical phase publish derivatives for this session". The two agree until the [#248](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/248) completion guard rejects one timepoint and passes the others, which is exactly what that guard exists to do. Fanning out on the input list then starts a branch whose first pod dies in *init* loading an artifact nothing wrote — `sub-GNV5ZKU4` / `cloudpipe-knwr6` reported workflow phase `Error` with 25 of 27 pods green ([#270](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/270)).
+
+**Why it is a separate task and not part of the anatomical phase.** That phase is `when:`-skipped on every reprocess, and a fan-out may not reference a skipped producer's output parameters — the DAG deadlocks ([ADR 016](decisions/016-skipped-producer-deadlock-in-dag-recording.md)). As an always-runs sibling on the same gate it costs a few seconds, and it re-checks the markers on the reprocess path too.
+
+Sessions with no T1w source are excluded by the same filter and are **not** counted as rejections: they were never FastSurfer candidates, so reporting them as failures would mark most longitudinal subjects partial forever.
+
+Each rejected session gets a `fastsurfer-long-parc` StepOutcome with `status: Failed` at session grain, which is what makes the exit handler report `overall_status: partial`. Without it the subject would report `succeeded` — nothing fails any more — while silently missing a timepoint.
+
+`session-level-pipeline-dag-template` receives per-session parameters from that fan-out: `session`, `runs`, `nss-frames`, `t1w-to-mni-exists`.
 
 #### Registration
 
@@ -481,7 +575,7 @@ Runs once per session discovered by inventory. All sessions start simultaneously
 **Skipped when `t1w-to-mni-exists == "true"`.**
 
 Artifacts in:
-- `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz` → `/fastsurfer/{subj}_{ses}/`
+- `derivatives/fastsurfer/{subj}/{ses}/` → `/fastsurfer/{subj}_{ses}/`
 - `config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii`
 
 Runs `fst1w_to_mni.py`: affine + SyN registration of `orig.mgz` to MNI152NLin2009cAsym using FireANTs. Uses `orig.mgz` (not the BIDS T1w) to ensure the source space matches the BOLD→T1w transform, which SynthMorph produces referenced to FreeSurfer conformed space (256³ 1mm isotropic). `brainmask.mgz` provides the skull-stripped mask in the same conformed space — no `--like` conversion needed.
@@ -530,7 +624,7 @@ a failed pod's output artifacts and that would throw away the successful runs.
 
 Artifacts in (downloaded once per session, not once per run):
 - `mmps_mproc/{subj}/{ses}/func/` → `/data/func/` — whole-prefix directory artifact carrying every run's BOLD + BIDS sidecar
-- `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz` → `/tmp/fastsurfer/{subj}_{ses}/`
+- `derivatives/fastsurfer/{subj}/{ses}/` → `/tmp/fastsurfer/{subj}_{ses}/`
 - `config/fslicense`
 
 Per-run inputs arrive as one directory artifact because Argo resolves
@@ -587,7 +681,7 @@ Artifacts in (downloaded once per session, not once per run):
 - `mmps_mproc/{subj}/{ses}/func/` → `/data/func/` — whole-prefix directory artifact carrying every run's BOLD, BIDS sidecar and motion params
 - `derivatives/registration/{subj}/{ses}/` → `/tmp/registration/` — whole-prefix directory artifact carrying `t1w_to_mni/` (shared by every run) and each `bold_to_t1w_{task}_{run}/`
 - `config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii`
-- `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz` → `/tmp/fastsurfer/{subj}_{ses}/` (for `mri/aseg.auto.mgz`)
+- `derivatives/fastsurfer/{subj}/{ses}/` → `/tmp/fastsurfer/{subj}_{ses}/` (for `mri/aseg.auto.mgz`)
 
 Collapsing the fan-out is what makes the FastSurfer tarball, MNI template and
 t1w→MNI warp a single download per session rather than one per run — see
@@ -677,6 +771,18 @@ S3 output:
 derivatives/func_surf/{subj}/{ses}/fsLR32k/{subj}_{ses}_{task}_{run}_space-fsLR32k_bold.dtseries.nii
 ```
 
+**Component reclaim.** After a run's dtseries is assembled, this pod deletes that run's `components/` tarball from S3. The components are a pure intermediate — measured at ~2.2 GiB per session, about half of all derivative storage and ~71 TiB projected across the full cohort — and are reconstructible from the volumetric output through preproc.py's `--emit grayordinate` short path. Storage is the dominant cost here relative to re-running the extraction, so they are reclaimed rather than kept.
+
+Three properties make this safe:
+
+- **Gated on a size floor, not existence.** A run is reclaimed only if its dtseries is present *and* at least 10 MB, matching `_MIN_OUTPUT_BYTES["surface-resample"]`. Existence alone is not evidence of validity: a 1 MB truncation of a 264 MB upload passed an existence check on 2026-07-22.
+- **Self-healing.** Inventory reports `surf_exists = components_exist OR surf_target_exists`. Argo uploads output artifacts only after the main container exits, so there is a window where the components are gone and the dtseries is not yet in S3; a spot preemption inside it loses both, which reads as `surf_exists = false` and re-extracts on the next workflow. Recoverable, not data loss.
+- **Never fatal.** A reclaim failure logs and leaves the storage in place. The derivative is already correct at that point, and the next workflow for the subject retries the delete.
+
+The OR in `surf_exists` is load-bearing. Without it a reclaimed run reads as never-extracted forever, waking the func-preproc pod on every subsequent workflow to rebuild components that the next resample immediately deletes again — paying `cpu-heavy` compute in perpetuity to reclaim storage already reclaimed.
+
+Note that reclaim only runs when the pod runs, and the pod is skipped once every run in the session has its dtseries. Sessions fully assembled *before* reclaim existed therefore keep their components until some run in that session needs assembling; clearing that backlog is a separate one-off sweep.
+
 **Grayordinate count.** With the atlas ROI applied the cortical component is the standard 59412 vertices, but the subcortical block is on `MNI152NLin2009cAsym`, not the `MNI152NLin6Asym` grid that standard 91282-grayordinate files use — so the total will not be 91282. That is intended, not a defect: cloudpipe does not exchange dense CIFTIs with the DCAN/ABCD-BIDS ecosystem, and matching that grid would have cost a second per-session registration for no benefit.
 
 **Static mesh staging (manual prerequisite).** The fsLR meshes come from the HCP `standard_mesh_atlases` package and must be staged under `s3://{bucket}/config/fsLR/` before this step can run. The template takes their filenames as parameters, templated on `{hemi}`, so restaging under different names is a parameter change rather than a code change:
@@ -759,7 +865,7 @@ Steps covered (step name values recorded):
 | `fastsurfer-template` | subject (covers template creation **and** segmentation — one pod since the anatomical phase moved off shared EFS) |
 | `fastsurfer-template-parc` | subject |
 | `fastsurfer-long-seg` | session |
-| `fastsurfer-long-parc` | session |
+| `fastsurfer-long-parc` | subject for the phase recorder; **session** for a guard-rejected session (see below) |
 | `t1w-to-mni` | session |
 | `bold-to-t1w` | run |
 | `func-preproc` | run |
@@ -769,6 +875,8 @@ Steps covered (step name values recorded):
 | `fsqc-metrics` | subject |
 | `anatomical-phase` | aggregate over all FastSurfer steps |
 | `session-phase` | aggregate over all session-level pipeline instances |
+
+`fastsurfer-long-parc` is written twice, at two grains, and they do not collide because `session` is part of the record's S3 key. The anatomical sub-DAG's recorder writes it once per subject with the task's own status. `record-outcome-rejected-sessions-dagtask` writes it again, `status: Failed` with a `session`, for each session the phase declined to publish — the phase itself succeeds in that case, so the subject-level record says `Succeeded` and the per-session records are the only evidence a timepoint is missing.
 
 `src/validate_test_batch.py::EXPECTED_STEP_NAMES` asserts on the first nine only — the batch-validation gate predates the surface, subregion and fsqc steps and deliberately checks a stable subset rather than the full list. Records predating the EFS removal also carry a retired `fastsurfer-template-seg` step value.
 
@@ -798,13 +906,13 @@ Inventory runs fresh on every submission. Prior step outputs are checked via `he
 
 | S3 completion marker | Gates |
 |---|---|
-| `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz` for **all sessions** | Entire anatomical phase |
+| `derivatives/fastsurfer/{subj}/{ses}/` for **all sessions** | Entire anatomical phase |
 | `derivatives/registration/{subj}/{ses}/t1w_to_mni/{subj}_{ses}_desc-t1w2mni_affine.mat` | `t1w-to-mni` for that session |
 | `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{subj}_{ses}_{task}_{run}_desc-bold2t1w_itk.txt` | `bold-to-t1w` for that run |
 | `derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz` | `func-preproc` for that run |
-| `derivatives/func_surf/{subj}/{ses}/components/{subj}_{ses}_{task}_{run}_desc-grayordcomponents_bold.tar.gz` | Grayordinate extraction (Stage 5b) for that run |
+| `derivatives/func_surf/{subj}/{ses}/components/{subj}_{ses}_{task}_{run}_desc-grayordcomponents_bold.tar.gz` **or** the dtseries below | Grayordinate extraction (Stage 5b) for that run — the components are reclaimed after assembly, so either one proves it ran |
 | `derivatives/func_surf/{subj}/{ses}/fsLR32k/{subj}_{ses}_{task}_{run}_space-fsLR32k_bold.dtseries.nii` | `surface-resample` for that run |
-| `derivatives/subregions/{subj}/{subj}_{region}.tar.gz` for **all five** regions | Entire subregion-segmentation phase |
+| `derivatives/subregions/{subj}/{region}/` for **all five** regions | Entire subregion-segmentation phase |
 | `mmps_mproc/{subj}/{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz` (source, not a derivative) | Whether the session counts toward `fastsurfer_exists` at all |
 
 To force a step to re-run, delete the marker key, then resubmit:
@@ -862,11 +970,13 @@ A downstream `record-outcome-subregion-seg-dagtask` records the phase outcome on
 
 FastSurfer longitudinal outputs must be in S3 — both segmentation pods read them from there directly:
 ```
-derivatives/fastsurfer/{subjID}/{subjID}_long-template.tar.gz
-derivatives/fastsurfer/{subjID}/{subjID}_ses-00A_templated.tar.gz
-derivatives/fastsurfer/{subjID}/{subjID}_ses-02A_templated.tar.gz   (optional)
+derivatives/fastsurfer/{subjID}/long-template/
+derivatives/fastsurfer/{subjID}/ses-00A/
+derivatives/fastsurfer/{subjID}/ses-02A/   (optional)
 ...
 ```
+Each of those prefixes must carry its `_complete.json`; a prefix without one is a
+partial upload and reads as absent.
 
 ### Standalone submission
 
@@ -920,7 +1030,11 @@ Both pods download `config/fslicense` and source `SetUpFreeSurfer.sh` with stric
 
 Results are collected into `/out`, which in each pod is its own **emptyDir volume** — the pod runs as UID 1000 and cannot `mkdir` at the image root filesystem.
 
-**Resume guards.** Each region checkpoints to and restores from its own final S3 key (`derivatives/subregions/{subjID}/{subjID}_{region}.tar.gz` — the same key the template's own `outputs.artifacts` uploads at pod completion): before a region runs, `checkpoint_restore` HEADs that key (applying a `> 1 KB` size floor, same convention as `src/metrics/outcome_recorder.py`'s `_MIN_OUTPUT_BYTES`) and downloads+extracts it if present instead of recomputing; after a region completes, `checkpoint_save` uploads it immediately. This survives a full workflow resubmit, not just an in-workflow pod retry, since S3 outlives pod/volume lifetime. A secondary `have_all_tps <glob>` guard still checks the pod's own local `emptyDir` — it only matters within a single still-running pod (e.g. a later region in the same script), since the `emptyDir` itself does not survive a pod retry. Both helpers are duplicated in both templates rather than shared, because sharing them means baking a shell/Python fragment into the `freesurfer` image — an image rebuild and a pin commit for a few dozen lines. The two copies guard disjoint patterns and disjoint keys, so the pods never race on the same check. Two weaker forms of `have_all_tps` were tried and are wrong:
+**Resume guards.** Each region checkpoints to and restores from its own final S3 prefix (`derivatives/subregions/{subjID}/{region}/`): before a region runs, `checkpoint_restore` stages that prefix if its `_complete.json` is present, instead of recomputing; after a region completes, `checkpoint_save` publishes it immediately. Because the checkpoint prefix *is* the derivative prefix, "checkpoint restored" and "already done in a prior run" stay the same question — and since [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md) it is the same question `check_subregions_derivatives` asks, so the phase's resume guard and the pipeline's skip gate cannot drift apart. This survives a full workflow resubmit, not just an in-workflow pod retry, since S3 outlives pod/volume lifetime.
+
+> Two things went away in the move off tarballs. The **`> 1 KB` size floor** is gone: it existed because a tarball key that exists is not proof the tarball is whole, and `_complete.json` answers that directly — a guess replaced by a fact. And the template's **`outputs.artifacts` re-upload** is gone: it used to write identical bytes to the key `checkpoint_save` had already written ("redundant but harmless"), which under the exploded layout would be worse than redundant, since Argo does not order artifact uploads and could land a file object after the marker claiming completeness.
+
+A secondary `have_all_tps <glob>` guard still checks the pod's own local `emptyDir` — it only matters within a single still-running pod (e.g. a later region in the same script), since the `emptyDir` itself does not survive a pod retry. Both checkpoint helpers are still duplicated across the two templates, but they are now four lines each rather than forty: the logic moved into `images/shared/fs_derivatives.py`, which is exactly the "bake it into the freesurfer image" step the old note said would be needed if they ever grew. The two copies guard disjoint regions, so the pods never race on the same prefix. Two weaker forms of `have_all_tps` were tried and are wrong:
 
 - Guarding on `{BASE}/mri/` never fires — `segment_subregions --long-base` writes outputs per-timepoint and never into the base directory, so the region recomputes from scratch on every retry. (Confirmed empirically: the `{BASE}_template/mri/` directory is empty in every uploaded tarball.)
 - Guarding on the *first* timepoint only is unsafe — the tools process all timepoints in a single invocation, so an interruption can leave `ses-00A` complete and later sessions missing. A first-timepoint guard would skip the region and silently upload a partial segmentation.
@@ -930,15 +1044,15 @@ Results are collected into `/out`, which in each pod is its own **emptyDir volum
 Regions 1–3 run in order inside `segment-subregions-gems-template`; regions 4–5 run in order inside `segment-subregions-dl-template`, concurrently with them. Runtimes below are per-subject for a **single-timepoint** subject and scale with timepoint count. Output filenames are verified against a real FreeSurfer 7.4.1 run — note the longitudinal stream writes `.long.` where the FreeSurfer wiki's cross-sectional examples show `.v13.T1` / `-T1.v22`.
 
 **1. Thalamic nuclei** — `segment_subregions thalamus --long-base {BASE} --threads 4`. GEMS/Bayesian atlas deformation, CPU-only, ~30–45 min.
-S3 output: `derivatives/subregions/{subjID}/{subjID}_thalamus.tar.gz`
+S3 output: `derivatives/subregions/{subjID}/thalamus/`
 Contents (per timepoint, in `mri/`): `ThalamicNuclei.long.mgz`, `ThalamicNuclei.long.FSvoxelSpace.mgz`, `ThalamicNuclei.long.volumes.txt`
 
 **2. Brainstem substructures** — `segment_subregions brainstem --long-base {BASE} --threads 4`. GEMS/Bayesian, CPU-only, ~15–25 min.
-S3 output: `derivatives/subregions/{subjID}/{subjID}_brainstem.tar.gz`
+S3 output: `derivatives/subregions/{subjID}/brainstem/`
 Contents (per timepoint, in `mri/`): `brainstemSsLabels.long.mgz`, `brainstemSsLabels.long.FSvoxelSpace.mgz`, `brainstemSsLabels.long.volumes.txt`
 
 **3. Hippocampal subfields + amygdala nuclei** — `segment_subregions hippo-amygdala --long-base {BASE} --threads 4`. GEMS/Bayesian, CPU-only, ~30–60 min. Requires FreeSurfer 7.3+ (image is 7.4.1) and the `average/HippoSF/atlas/` atlas kept in the `freesurfer` image.
-S3 output: `derivatives/subregions/{subjID}/{subjID}_hippoamyg.tar.gz`
+S3 output: `derivatives/subregions/{subjID}/hippoamyg/`
 Contents (per timepoint, in `mri/`):
 
 ```
@@ -953,11 +1067,11 @@ Contents (per timepoint, in `mri/`):
 That is 8 label maps per hemisphere (16 total): the primary segmentation plus three alternative *groupings* of the same result — `CA` (CA1/2/3/4), `HBT` (head/body/tail), and `FS60` (FreeSurfer 6.0-compatible) — a deliberate choice to keep every grouping analyzable rather than pick one. The packaging globs stay loose (`*hippoAmygLabels*`) so a FreeSurfer upgrade that reintroduces version suffixes does not silently drop outputs. All subregion labels stay in native T1w space; the subcortical structures are small and downstream analyses use them there rather than resampled into MNI.
 
 **4. Hypothalamic subunits** — `mri_segment_hypothalamic_subunits`, TensorFlow CNN, ~10 sec/session. Segments 5 bilateral hypothalamic subregions from model files in `$FREESURFER_HOME/models/`.
-S3 output: `derivatives/subregions/{subjID}/{subjID}_hypothalamic.tar.gz`
+S3 output: `derivatives/subregions/{subjID}/hypothalamic/`
 Contents (per session): `mri/hypothalamic_subunits_seg.v1.mgz`, `mri/hypothalamic_subunits_volumes.v1.csv`, `stats/hypothalamic_subunits_volumes.v1.stats`
 
 **5. ScLimbic** — `mri_sclimbic_seg`, U-Net, <1 min/session. Segments hypothalamus (coarse), mammillary bodies, basal forebrain, septal nuclei, NAcc, fornix.
-S3 output: `derivatives/subregions/{subjID}/{subjID}_sclimbic.tar.gz`
+S3 output: `derivatives/subregions/{subjID}/sclimbic/`
 Contents (per session): `mri/sclimbic.mgz`, `stats/sclimbic.stats`
 
 Steps 4–5 take space-separated `--s` args built from `base-tps`, so each tool is invoked once for all sessions rather than per-session.
@@ -965,8 +1079,8 @@ Steps 4–5 take space-separated `--s` args built from `base-tps`, so each tool 
 **T1-only:** `segment_subregions` and the two deep-learning tools expose no T2 input, so the T2w scans this pipeline ingests are not used in this phase.
 
 S3 outputs:
-- `derivatives/subregions/{subjID}/{subjID}_hypothalamic.tar.gz`
-- `derivatives/subregions/{subjID}/{subjID}_sclimbic.tar.gz`
+- `derivatives/subregions/{subjID}/hypothalamic/`
+- `derivatives/subregions/{subjID}/sclimbic/`
 
 **Backfill:** `check_subregions_derivatives` in `src/inventory.py` gates on all five regions, `hippoamyg` included. A subject whose tarballs predate hippo-amygdala therefore reports `subregions-exist=False` and re-enters the phase on its next submission rather than remaining a four-region outlier. The per-region resume guards skip whatever is already present, so only hippo computes.
 
@@ -1026,7 +1140,7 @@ aws s3 ls s3://<YOUR_S3_BUCKET>/derivatives/func/ --recursive \
 
 ### Concurrency accounting
 
-Both Prefect flows count all active Argo workflows via the same `lib/argo.py` `ConcurrencyGate` implementation. If both pipelines run simultaneously, coordinate the `cloudpipe-max-concurrent` and `first-level-max-concurrent` Prefect Variables (`prefect variable set <name> <N>`) so the combined load stays within cluster and Globus semaphore limits (semaphore cap: 8 concurrent Globus transfers) and at or below the controller's namespace-wide `namespaceParallelism` of `100`.
+Both Prefect flows count all active Argo workflows via the same `lib/argo.py` `ConcurrencyGate` implementation. If both pipelines run simultaneously, coordinate the `cloudpipe-max-concurrent` and `first-level-max-concurrent` Prefect Variables (`prefect variable set <name> <N>`) so the combined load stays within cluster and Globus semaphore limits (semaphore cap: 8 concurrent Globus transfers) and at or below the controller's namespace-wide `namespaceParallelism` of `400`.
 
 ### Forcing a step to re-run
 

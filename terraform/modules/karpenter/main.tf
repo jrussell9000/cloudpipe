@@ -48,8 +48,8 @@ resource "kubectl_manifest" "gpu-nodeclass" {
     {
       karpenter_node_iam_role_name = module.karpenter_infra.node_iam_role_name
       eks_cluster_name             = var.cluster_name
-      fastsurfer_ami_tag           = var.fastsurfer_ami_tag
-      fireants_ami_tag             = var.fireants_ami_tag
+      fastsurfer_ami_digest        = var.fastsurfer_ami_digest
+      fireants_ami_digest          = var.fireants_ami_digest
       eks_version                  = var.eks_version
   })
 

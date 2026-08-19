@@ -173,7 +173,7 @@ docs/                 — this documentation
 | S3 data bucket | `<YOUR_S3_BUCKET>` |
 | Argo namespace | `argo-workflows` |
 | ECR private registry (primary, `ecr-registry` param) | `{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/` |
-| ECR Public prefix (secondary — dual-push, rollback target) | `public.ecr.aws/l9e7l1h1/cloudpipe/` |
+| ECR Public prefix (secondary — dual-push, rollback target; being retired per image) | `public.ecr.aws/l9e7l1h1/cloudpipe/` |
 | Globus source collection (DAIRC MMPS) | `<YOUR_GLOBUS_SOURCE_COLLECTION_ID>` |
 | Globus destination collection | `<YOUR_GLOBUS_DEST_COLLECTION_ID>` |
 | Prefect server | `https://prefect.<YOUR_DOMAIN>` |

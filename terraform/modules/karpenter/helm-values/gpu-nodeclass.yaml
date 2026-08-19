@@ -7,14 +7,24 @@ spec:
   # Bottlerocket's immutable OS makes standard AMI customisation impractical.
   amiFamily: AL2023
 
-  # Select the most recently created AMI that has the matching fastsurfer tag,
-  # fireants tag, and EKS version. When a new pre-baked AMI is built (new
-  # fastsurfer/fireants release or base AMI refresh), Karpenter automatically
+  # Select the most recently created AMI carrying the matching fastsurfer
+  # digest, fireants digest, and EKS version. When a new pre-baked AMI is built
+  # (new fastsurfer/fireants image or base AMI refresh), Karpenter automatically
   # picks the newest matching AMI.
+  #
+  # Keyed on the image DIGEST rather than the git-sha tag. A rebuild at an
+  # unchanged commit produces the same tag but a different image; a tag-keyed
+  # selector would keep matching the old AMI while the workflow templates pinned
+  # the new digest, making the pre-bake a silent cache miss (#123). The AMIs also
+  # carry fastsurfer-image-tag / fireants-image-tag, but nothing selects on them.
+  #
+  # NOTE: an AMI baked before the digest-pinning change carries no *-image-digest
+  # tag and can therefore never match this selector. Rolling back to one requires
+  # adding the tags to it first (aws ec2 create-tags).
   amiSelectorTerms:
     - tags:
-        fastsurfer-image-tag: "${ fastsurfer_ami_tag }"
-        fireants-image-tag: "${ fireants_ami_tag }"
+        fastsurfer-image-digest: "${ fastsurfer_ami_digest }"
+        fireants-image-digest: "${ fireants_ami_digest }"
         eks-version: "${ eks_version }"
 
   # Use any available NVMe instance store as scratch for containers.

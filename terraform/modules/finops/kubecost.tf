@@ -240,9 +240,10 @@ resource "aws_vpc_security_group_egress_rule" "kubecost_lb" {
 # Creating an ingress for Kubecost
 resource "kubectl_manifest" "kubecost_ingress" {
   yaml_body = templatefile("${path.module}/yamls/kubecost-alb-ingress.yaml", {
-    hostname        = var.hostname
-    certificate_arn = var.certificate_arn
-    security_group  = aws_security_group.kubecost_lb.id
+    hostname          = var.hostname
+    certificate_arn   = var.certificate_arn
+    security_group    = aws_security_group.kubecost_lb.id
+    access_log_bucket = var.access_log_bucket
   })
   depends_on = [helm_release.kubecost]
 }

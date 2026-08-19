@@ -17,7 +17,12 @@ spec:
     # my output, re-run me" hatch. 137 is deliberately absent: a real OOMKill here
     # is deterministic (#120, #129, #134 each needed a config change, not a retry),
     # so retrying it only burns the enlarged budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    # The codes are matched in the message too: a pod that dies in its init or wait
+    # container never populates exitCode, so that arm alone is dead for the whole
+    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
+    # its producer was skipped or failed, and a consumer retry cannot re-run the
+    # producer. See the master template for the detail.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -111,11 +116,55 @@ spec:
       # a record task that references {{tasks.bold-to-t1w-step.outputs.*}} is
       # never instantiated when bold-to-t1w-step is Skipped (a skipped task
       # has no outputs), deadlocking the parent DAG.
-      - name: record-outcome-bold-to-t1w-step
+      # SPLIT into a failure arm and a skip arm, deliberately. The single combined
+      # task could not pass an exit code: this module's docstring notes that
+      # referencing {{tasks.<x>.exitCode}} carries the same omission hazard as
+      # outputs when x is SKIPPED, and the combined `depends` included .Skipped.
+      #
+      # Without the code, an OOMKill recorded as `failure_category: unknown` with
+      # `failure_reason: expected output not found` — indistinguishable from a
+      # crash, a data problem, or exhausted spot retries (observed on
+      # sub-KVPCDMNK ses-00A, 2026-08-18). A pod killed by the OOM killer is
+      # SIGKILLed, so it can never write its own in-pod record (ADR 016) — this
+      # fallback recorder is the ONLY place the cause can be captured, which is
+      # why it has to carry the code.
+      #
+      # exitCode is safe on THIS arm because the arm cannot fire for a skipped
+      # task: it depends on Failed/Errored only.
+      - name: record-outcome-bold-to-t1w-failed-step
         depends: >-
           bold-to-t1w-step.Failed ||
-          bold-to-t1w-step.Errored ||
-          bold-to-t1w-step.Skipped
+          bold-to-t1w-step.Errored
+        templateRef:
+          name: outcome-recorder
+          template: record-step-outcome
+        arguments:
+          parameters:
+            - name: step
+              value: bold-to-t1w
+            - name: status
+              value: '{{tasks.bold-to-t1w-step.status}}'
+            # 137 classifies as `infrastructure` rather than `unknown`. It does not
+            # separate an OOMKill from a node eviction — both are SIGKILL, and Argo
+            # exposes no task-message variable to tell them apart — but the two are
+            # separable after the fact: a reclaim is retried on the message arm and
+            # normally succeeds, so a bold-to-t1w that EXHAUSTS its retries and ends
+            # at 137 is the OOM population to re-run at higher memory.
+            - name: exit-code
+              value: '{{tasks.bold-to-t1w-step.exitCode}}'
+            - name: subject
+              value: '{{workflow.parameters.subjID}}'
+            - name: session
+              value: '{{inputs.parameters.session}}'
+            - name: bucket
+              value: '{{workflow.parameters.bucket}}'
+            - name: metrics-bucket
+              value: '{{workflow.parameters.metrics-bucket}}'
+
+      # Skip arm: no exitCode reference, for the reason above. A skipped step is
+      # classified `dependency` from its status alone, so it needs no detail.
+      - name: record-outcome-bold-to-t1w-skipped-step
+        depends: bold-to-t1w-step.Skipped
         templateRef:
           name: outcome-recorder
           template: record-step-outcome
@@ -145,6 +194,26 @@ spec:
         - name: t1w-to-mni-status
           valueFrom:
             expression: "tasks['t1w-to-mni-step'].status"
+
+        # Same absorption, same fix, for the other prerequisite. Without this the
+        # master DAG has no way to see a bold-to-t1w failure: record-outcome-bold-to
+        # -t1w-step's `depends: ... || bold-to-t1w-step.Failed` swallows it, so
+        # registration-dagtask reports Succeeded and functional-preprocessing runs
+        # against transforms that were never uploaded.
+        #
+        # Observed on sub-KVPCDMNK ses-00A, 2026-08-18: func-preproc ran 1m instead
+        # of the ~35m its sibling sessions took, produced nothing, and the session's
+        # surface-resample then failed (exit 1, 10s) on the missing input. Two pods
+        # scheduled to accomplish nothing, and six runs recorded `skipped` plus
+        # seven recorded `failed` — a QC-shaped taxonomy for what is really one
+        # upstream outage.
+        #
+        # Note `Skipped` must pass the gate: bold-to-t1w is legitimately skipped
+        # when inventory found an _itk.txt for every run, and func-preproc must
+        # still run in that case.
+        - name: bold-to-t1w-status
+          valueFrom:
+            expression: "tasks['bold-to-t1w-step'].status"
 
   ###########################################################################
   # T1w → MNI152NLin2009cAsym
@@ -178,13 +247,48 @@ spec:
         - name: session
 
       artifacts:
-        - name: fastsurfer-output
-          path: /fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}
+        # SELECTIVE FETCH (ADR 017). This step reads exactly two files out of the
+        # 268 in a FastSurfer session tree — see the --t1w / --brainmask flags
+        # below — so it now names them individually instead of downloading a
+        # ~184 MB tarball to use ~4 MB of it. That is the single biggest transfer
+        # saving in the change, and it costs the fireANTs image nothing: neither
+        # file is a symlink, so no manifest replay runs here and the image needs
+        # no new dependency.
+        #
+        # Keep these two keys in sync with the flags in the args block. A file
+        # this step opens but does not stage fails at open time with a clear
+        # ENOENT; tests/argo/test_derivative_staging.py asserts the pairing.
+        #
+        # `archive: none` IS LOAD-BEARING ON A SINGLE COMPRESSED FILE (#274) —
+        # this is not the same "intent marker" case as the directory artifacts
+        # further down. `.mgz` is gzip, and argoexec's LoadArtifacts falls
+        # through to isTarball() whenever an input declares no archive strategy:
+        # gzip magic, then one tar.Next(). Every `.mgz` therefore reaches the tar
+        # parse and the verdict depends on the IMAGE DATA. 3 of 2511 staged
+        # objects were accepted as tarballs; sub-D646F8XA died in all 3 sessions
+        # on `illegal file path: ` (untar's path-escape guard firing on an empty
+        # member name). The hard failure was the lucky outcome — a plausible
+        # member name would silently untar garbage over the artifact path and the
+        # step would run on wrong data. `archive: none` short-circuits the sniff.
+        - name: fastsurfer-orig
+          path: /fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/orig.mgz
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/orig.mgz'
+
+        - name: fastsurfer-brainmask
+          path: /fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/brainmask.mgz
+          archive:
+            none: {}   # required, not decorative — see fastsurfer-orig (#274)
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/brainmask.mgz'
 
         - name: mni-template
           # Register T1w against the 1mm template (matched to the 1mm ABCD moving
@@ -301,7 +405,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants:sha-34fd35825a707887639dd303103b80d978a04ae9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:4730e00580ea1dd4622e73341ba4c35ad6257b2fe682816baa507290ae46d21c"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -429,6 +533,68 @@ spec:
   ###########################################################################
 
   - name: bold-to-t1w-session-template
+    # OVERRIDES the workflow-level retryStrategy, for one reason: this is the only
+    # step where an OOMKill is NOT deterministic, so the spec-level exclusion of 137
+    # is wrong here and right everywhere else.
+    #
+    # Measured on sub-KVPCDMNK, 2026-08-18 batch. One session OOMed; the same
+    # subject's three other sessions succeeded, in the same workflow, at the same
+    # 12G limit:
+    #
+    #   ses-00A  nback 362 / rest 375 frames   OOMKilled  ip-10-0-17-33
+    #   ses-02A  nback 370 / rest 383 frames   ok         ip-10-0-17-192
+    #   ses-04A  nback 370 / rest 383 frames   ok         ip-10-0-19-65
+    #   ses-06A  nback 370 / rest 383 frames   ok         ip-10-0-32-33
+    #
+    # The session that died had the FEWEST frames of the four. Run length was the
+    # obvious suspect and it is refuted: across the batch's 8,235 runs, p50 is 383
+    # and 74% are >= 375, so the "long run" was below median. The failure tracks the
+    # NODE, not the data — as the pre-mitigation OOM did (c6i 31/31 vs 0/40
+    # elsewhere, §9.9), which is exactly the shape a retry fixes.
+    #
+    # So `137` is admitted here, and ONLY here. Do not lift this to the spec level:
+    # a fastsurfer parcellation OOM really is deterministic (it is a per-k request
+    # tier, #235), and retrying that burns the spot budget on an identical failure.
+    retryStrategy:
+      limit: "8"
+      retryPolicy: Always
+      # Same infrastructure arms as the workflow-level expression (64/75/143 plus
+      # the message forms, minus the missing-key exclusion), with one added arm:
+      # an OOMKill, matched on the MESSAGE rather than the code. 137 alone cannot
+      # be used — a spot SIGKILL also surfaces as 137, and the two need different
+      # treatment on the escalation below. Argo writes "OOMKilled" into the node
+      # message for a cgroup kill and "imminent node shutdown" for a reclaim.
+      # Kept on ONE line, byte-identical to the canonical expression except for the
+      # inserted `OOMKilled|`. tests/argo/test_retry_expression.py asserts exactly
+      # that relationship, so a future edit to the canonical string cannot silently
+      # leave this copy behind — the divergence that cost #269.
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|OOMKilled|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+
+    # NO memory escalation on retry, and this is a measured dead end rather than an
+    # omission — do not re-attempt it. `{{retries}}` DOES NOT RESOLVE inside
+    # podSpecPatch on this Argo version. It renders empty, the quantity becomes
+    # "G", and every attempt dies on "Error applying PodSpecPatch" before the pod
+    # is created — so the step fails 100% of the time, not just on retry.
+    #
+    # `argo lint` accepts it. Proven instead by an A/B probe, two templates
+    # identical but for the ternary's input (2026-08-18):
+    #
+    #   requests: '{{=1 == 1 ? 3 : 12}}G'        Succeeded, memory.max = 12000000000
+    #   requests: '{{=retries == 0 ? 3 : 12}}G'  Error applying PodSpecPatch (0 and 1)
+    #
+    # So podSpecPatch expressions are fine in general (the fastsurfer per-k tiers
+    # rely on them) — `retries` specifically is not in scope there, whatever the
+    # variables doc implies by listing it under script templates. Escalation would
+    # need the attempt count to arrive as an input parameter, which a self-retrying
+    # template cannot do for itself.
+    #
+    # Not a loss here: the failure is host variance, so a fresh pod at the SAME 12G
+    # is the fix, and that is exactly what a plain retry provides.
+
     metadata:
       labels:
         cloudpipe.io/phase: registration
@@ -489,14 +655,43 @@ spec:
             region: <YOUR_AWS_REGION>
             key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func'
 
-        # Downloaded and decompressed ONCE per session instead of once per run.
+        # Downloaded ONCE per session instead of once per run.
+        #
+        # WHOLE TREE (ADR 017), unlike t1w-to-mni above: this step is handed
+        # `--subjects-dir` and treats the tree as an opaque SUBJECTS_DIR, so it is
+        # staged in full rather than by named file. Narrowing it to the handful of
+        # files mri_coreg/bbregister actually touch is a follow-up, not a blocker.
+        #
+        # The key names a PREFIX and must NOT carry a trailing slash: an input
+        # artifact key ending in `/` silently downloads nothing (an output key is
+        # the opposite — it must keep it).
+        #
+        # `archive: none` on a DIRECTORY input is an explicit intent marker: a
+        # prefix key is walked and downloaded per object, so argoexec never
+        # reaches the isTarball() sniff and removing it would not change the
+        # download. It is spelled out anyway so the exploded inputs are
+        # greppable.
+        #
+        # Do NOT generalise that to single-file inputs. On a single COMPRESSED
+        # file `archive: none` is the whole mechanism — without it argoexec
+        # sniffs gzip+tar and may untar the file over its own path (#274, see the
+        # note on fastsurfer-orig above). An earlier version of this comment
+        # claimed `archive` was output-side only; that is wrong, and it is how
+        # the three `.mgz` inputs shipped without it.
+        #
+        # What DOES need code is the symlinks: Argo cannot recreate the tree's
+        # 14 aliases, so the args block runs /app/restore_links.py before the
+        # step. That is the one real gap this arrangement leaves, and it is
+        # stdlib-only so the image needs no S3 client.
         - name: fastsurfer-output
           path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}'
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}'
 
         - name: fslicense
           path: '/opt/freesurfer/.license'
@@ -554,7 +749,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer:sha-34fd35825a707887639dd303103b80d978a04ae9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:1ee2554075b40c90659b82faaa1113f542fb936d8015dc2529326ce9c707f91d"
       imagePullPolicy: IfNotPresent
 
       # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the
@@ -645,20 +840,27 @@ spec:
           #   c6a.4xlarge / c5.2xlarge / m5.2xlarge     2.90-4.57 G
           #
           # `cpu-heavy-nodepool` pins no instance family, so any pod can land on
-          # Ice Lake and must fit 8.67 G. 12G is that peak plus ~38%.
+          # Ice Lake. 12G was set as that 8.67 G peak plus ~38%.
           #
           # Do NOT re-derive this from `ram_efficiency` (still ~0.4 and healthy
           # looking), and do NOT size it from `memory.current` — current
           # includes reclaimable page cache and reads up to 7.10 G on hosts that
           # never OOM. Size from `anon`.
           #
-          # The REQUEST is deliberately left at 3G: requests drive bin-packing,
-          # limits do not, so this costs nothing in scheduling or node size.
-          # KNOWN GAP: on Ice Lake the step really uses 8.67 G against that 3G
-          # request, so the scheduler under-counts it ~2.9x — a co-tenant
-          # eviction risk, tracked in §9.8.1 of the investigation.
+          # THE 8.67 G ABOVE IS PRE-MITIGATION. It was measured with oneDNN on;
+          # `TF_ENABLE_ONEDNN_OPTS=0` is now set in this template's env and cuts
+          # the Ice Lake peak to 3.87 G — making it the LOWEST-peak host measured,
+          # below c5.4xlarge's 4.25 G — with byte-identical output. Do not quote
+          # 8.67 G as this step's memory demand; nothing has used that since.
           #
-          # See docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.8.
+          # The REQUEST stays at 3G. An earlier version of this comment called the
+          # 3G-vs-8.67 G gap a "KNOWN GAP ... ~2.9x ... co-tenant eviction risk";
+          # §9.9.1 of the investigation RETIRES that risk explicitly — against the
+          # real 3.87 G peak the gap is ~1.3x, and two concurrent pods (the measured
+          # maximum) fit any permitted node. The 12G limit stays as defence in depth,
+          # now well above peak; it costs nothing because requests drive bin-packing.
+          #
+          # See docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.8-§9.9.
           memory: 12G
           ephemeral-storage: 30G
 
@@ -771,6 +973,18 @@ spec:
         JOBS_REQUESTED = max(1, int("{{inputs.parameters.jobs}}"))
         RUNS = json.loads(r"""{{inputs.parameters.runs}}""")
         WORKFLOW_NAME = "{{workflow.name}}"
+
+        # ADR 017: the fastsurfer-output artifact above is now an exploded prefix,
+        # not a tarball. Argo downloaded every object, but it cannot recreate a
+        # symlink — so the tree arrives with its 14 FreeSurfer-compatibility
+        # aliases missing (mri/aparc+aseg.mgz, surf/lh.pial, ...) until they are
+        # replayed from _links.json. Do it before anything touches the
+        # SUBJECTS_DIR, and let a failure be fatal: a half-aliased SUBJECTS_DIR
+        # fails later, deeper inside FreeSurfer, with a much worse error.
+        sys.path.insert(0, "/app")
+        from restore_links import restore as _restore_links
+
+        _restore_links(Path("/tmp/fastsurfer") / f"{SUBJ}_{SES}")
 
         # The four thread-pool vars are projected from requests.cpu by the
         # downward API, so they are sized for the WHOLE container. Each run is a
