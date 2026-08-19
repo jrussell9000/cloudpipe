@@ -3,12 +3,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# Hand-kept in sync with the IMAGE env in
+# .github/workflows/build-prefect-flow-runner.yaml and the four job_variables.image
+# refs in prefect/prefect.yaml. Nothing enforces that.
 IMAGE="<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest"
-# Transitional dual-push, mirroring .github/workflows/build-prefect-flow-runner.yaml.
-# prefect.yaml still pins the public :latest and deployments only re-register on a
-# manual `prefect deploy --all`, so dropping this would leave the running
-# flow-runner on a stale image. Remove at Step 6 of the ECR migration.
-LEGACY_IMAGE="public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest"
 
 docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
@@ -18,7 +16,6 @@ docker buildx build \
   --push \
   -f "$REPO_ROOT/images/prefect-flow-runner/Dockerfile" \
   -t "$IMAGE" \
-  -t "$LEGACY_IMAGE" \
   "$REPO_ROOT"
 
 cd "$REPO_ROOT/prefect"

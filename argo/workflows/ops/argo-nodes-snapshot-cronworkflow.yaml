@@ -39,13 +39,24 @@ metadata:
   namespace: argo-workflows
 
 spec:
-  # Every 4h. The TTL is 24h, so this tolerates five consecutive missed runs
-  # before data is actually lost — #237 asks for "comfortably inside the 24h
-  # TTL", and the issue also notes reaping is NOT reliably on schedule in
-  # either direction, so neither "it will still be there" nor "it will be
-  # gone" is a safe assumption to schedule against.
+  # Hourly. This cadence is derived from the master template's
+  # `ttlStrategy.secondsAfterCompletion` and MUST be re-derived whenever that
+  # changes — the two settings are one mechanism, not two.
+  #
+  # #237 asks for "comfortably inside the TTL", and notes that reaping is NOT
+  # reliably on schedule in either direction, so neither "it will still be there"
+  # nor "it will be gone" is safe to schedule against. That rules out running at
+  # the TTL boundary: at the previous 4h cadence against the 4h TTL adopted on
+  # 2026-08-19, a workflow completing one minute after a snapshot would have to
+  # survive exactly one full TTL to be caught by the next one, and
+  # `startingDeadlineSeconds: 3600` below permits a run to start an hour late —
+  # past the TTL outright. The margin was not thin, it was negative.
+  #
+  # Hourly against a 4h TTL restores a tolerance of three consecutive missed runs
+  # (the old pairing tolerated five). A run is a paged LIST plus a projection and
+  # takes seconds, so the extra frequency is close to free.
   schedules:
-    - "0 */4 * * *"
+    - "0 * * * *"
   timezone: UTC
 
   # A snapshot is a point-in-time read; two overlapping runs would write two
@@ -99,7 +110,7 @@ spec:
           karpenter.sh/nodepool: cpu-light-nodepool
 
         script:
-          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
           imagePullPolicy: IfNotPresent
           command: [python]
 

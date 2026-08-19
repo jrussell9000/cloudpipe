@@ -23,7 +23,37 @@ kube-prometheus-stack:
   prometheus:
     prometheusSpec:
       retention: 30d
-      retentionSize: "18GB"
+      # 14GB, not 18GB, on the 20Gi (19.5G usable) PVC. Compaction merges blocks
+      # by writing the output *alongside* its inputs and deleting them only on
+      # success, so the headroom above retentionSize has to fit the largest merge
+      # in flight — plus the WAL, which is not counted against retentionSize at
+      # all. At 18GB the disk sat at 80% full with ~1.5G spare, which is not
+      # enough for either.
+      retentionSize: "14GB"
+
+      # Without these the pod is BestEffort, and the kubelet's eviction ranking
+      # is QoS class first: EVERY BestEffort pod goes before ANY Burstable one,
+      # regardless of which pod actually consumed the memory. On 2026-08-18 that
+      # evicted Prometheus in a loop off the sole `backend` node while
+      # kubecost-aggregator sat at 3,979Mi with no limit and was never touched.
+      # Eviction then taints the node `node.kubernetes.io/memory-pressure`,
+      # which this pod does not tolerate, and Karpenter cannot substitute a node
+      # (it does not manage `eks.amazonaws.com/nodegroup`), so the pod stays
+      # Pending for the kubelet's 5m pressure-transition period, reschedules
+      # onto the same starved node, replays its WAL, and is evicted again. The
+      # startup probe reports only `503` throughout, because a WAL replay that
+      # never finishes and a WAL replay that is progressing look identical.
+      #
+      # A memory LIMIT is set deliberately: an OOMKill is a loud, attributable
+      # failure with a restart count, whereas eviction of a BestEffort pod is
+      # silent and blames the node. No CPU limit — throttling WAL replay is the
+      # one thing that would genuinely wedge startup.
+      resources:
+        requests:
+          cpu: 250m
+          memory: 2Gi
+        limits:
+          memory: 3Gi
 
       storageSpec:
         volumeClaimTemplate:
@@ -48,12 +78,187 @@ kube-prometheus-stack:
           value: "true"
           effect: NoSchedule
 
+  # ── Scrape scope ──────────────────────────────────────────────────────────
+  # This Prometheus is deliberately narrow: it exists for scheduling
+  # observability, and everything it ingests is something a dashboard in
+  # gitops/apps/grafana actually queries. It is an ALLOW-list, not a deny-list,
+  # because a deny-list loses by default — every chart upgrade and every new
+  # kubelet release adds families nobody asked for, and the cost only shows up
+  # later as an OOMKill.
+  #
+  # Sizing context (measured 2026-08-19 during the leg-1 cohort run, 300
+  # concurrent workflows, m7g.xlarge backend node with 13.78Gi allocatable):
+  # 236,757 active series, using ~2.9Gi against a 3Gi limit, OOMKilling every
+  # ~60s during compaction. By job: kubelet 78,156 / apiserver 71,324 /
+  # karpenter 35,581 / kube-state-metrics 34,899 / kube-proxy 14,600. Roughly
+  # two thirds of that scales directly with live pod count, so it grows with
+  # concurrency, and Karpenter spot churn (~20 node replacements per 3 min)
+  # keeps minting series that die with the node.
+  #
+  # TRADE-OFF, stated plainly: ad-hoc PromQL for anything not listed below will
+  # return no data. Adding a panel may mean widening a keep-list here first.
+  # Kubecost is unaffected either way — its v3 finopsagent collects its own
+  # data and never reads this Prometheus.
+  #
+  # MEASURE HEAD SERIES, NOT ACTIVE SERIES. The two answer different questions
+  # and on this cluster they differ by more than 10x:
+  #
+  #   count({__name__!=""})        the 5-minute lookback — the steady-state floor
+  #   prometheus_tsdb_head_series  cumulative DISTINCT series over the ~2h head
+  #                                window — the memory ceiling, i.e. what OOMs
+  #
+  # The first pass at this allow-list cut active series 236,757 -> 66,059 (-72%)
+  # and start-up memory to 374Mi, yet head series were back to 262,011 within 31
+  # minutes and on track for ~900k — essentially the 979,838 that had been
+  # OOMKilling the pod. The families that pass had been chosen for SIZE, and the
+  # big ones were static (Karpenter's EC2 price catalog, node-scoped families);
+  # cutting them moved the floor and left the CHURN untouched. Head growth is
+  # churn, and churn here is pod turnover: 300 concurrent workflows retire ~3,200
+  # pods every 30 minutes, and kube-state-metrics minted ~30 series per pod, so
+  # it alone was 191,872 of those 262,011 head series (73%).
+  #
+  # So when judging a rule, ask how often the series' labels CHANGE IDENTITY, not
+  # how many exist right now. A per-pod family is expensive at any size.
+  kubelet:
+    serviceMonitor:
+      # /metrics/probes exists only for probe counters no dashboard reads.
+      probes: false
+      # cAdvisor stays: infra-health.json reads container_cpu_usage_seconds_total
+      # and container_memory_working_set_bytes for the Argo and Karpenter
+      # controllers. It is also the single largest source here, because it emits
+      # ~40 families per container and there are 300 workflow pods at a time.
+      cAdvisor: true
+      # NOTE: both keys below REPLACE the chart's own lists rather than merging
+      # with them. That is intended: a `keep` of two families is strictly
+      # narrower than the chart's default drop rules, so nothing is lost.
+      cAdvisorMetricRelabelings:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: container_cpu_usage_seconds_total|container_memory_working_set_bytes
+        # Scoped to long-lived singleton containers. `controller` is the only
+        # selector either infra-health.json panel uses (the Argo workflow
+        # controller, the Karpenter controller); `prometheus` is this pod itself.
+        # All three have stable series identity and so contribute ~0 churn, while
+        # every OTHER container these two families covered was a workflow pod,
+        # i.e. pure churn — 22,262 head series and rising. Sequential `keep`
+        # rules AND together.
+        #
+        # `prometheus` is here deliberately, at a cost of 2 series. This pod's
+        # cgroup working set is the quantity its own memory limit is enforced
+        # against, so it is the series you need to answer "was the limit about to
+        # be hit" after the fact. process_resident_memory_bytes comes free from
+        # the self-scrape but is NOT a substitute: it is process RSS, measured
+        # simultaneously at 1484MiB against a 1226MiB working set — 258MiB high,
+        # or ~8% of the 3072MiB limit, in the OPTIMISTIC direction. The gap is not
+        # stable either (a snapshot minutes earlier put it at ~17MiB), so RSS
+        # cannot be offset-corrected into a headroom figure. Losing history for
+        # the exact quantity that OOMKilled this pod 32 times on 2026-08-18 is not
+        # worth saving two series.
+        #
+        # This DOES mean per-workflow-pod CPU/memory is no longer queryable in
+        # Prometheus — the earlier "any pod can still be inspected" is no longer
+        # true. It is not a regression in any dashboard: per-pod cost and memory
+        # come from Kubecost's finopsagent and from the Athena
+        # `container_peak_memory_gb` column, neither of which reads cAdvisor.
+        # Widen this rule before writing a panel that needs workflow-pod cgroups.
+        - action: keep
+          sourceLabels: [container]
+          regex: controller|prometheus
+      # The kubelet's own /metrics endpoint: no dashboard reads any kubelet_*
+      # metric, but keep a small low-cardinality set that is genuinely load
+      # bearing during a cohort run — volume_stats is how you see a PVC filling
+      # up, which is exactly the failure this Prometheus hit on 2026-08-18.
+      metricRelabelings:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: kubelet_running_pods|kubelet_running_containers|kubelet_node_config_error|kubelet_volume_stats_(used|capacity|available)_bytes
+
+  # 14,600 series, one set per node, and not one kubeproxy_* metric is read by
+  # any dashboard. kubeproxy_sync_proxy_rules_duration_seconds_bucket was among
+  # the fastest-growing families measured above.
+  kubeProxy:
+    enabled: false
+
+  kubeApiServer:
+    serviceMonitor:
+      # 71,324 series, second largest job, and it scales with API traffic — so
+      # it grows with workflow concurrency, not with cluster size.
+      # infra-health.json reads apiserver_request_total and
+      # apiserver_request_duration_seconds_bucket; inflight is kept because it
+      # is the one signal that says "the apiserver itself is the bottleneck".
+      metricRelabelings:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: apiserver_request_total|apiserver_request_duration_seconds_(bucket|sum|count)|apiserver_current_inflight_requests
+        # Chart default, preserved: trims the noisiest buckets WITHIN the family
+        # kept above. Restated verbatim because setting this key replaces the
+        # chart's list.
+        - action: drop
+          sourceLabels: [__name__, le]
+          regex: (etcd_request|apiserver_request_slo|apiserver_request_sli|apiserver_request)_duration_seconds_bucket;(0\.15|0\.2|0\.3|0\.35|0\.4|0\.45|0\.6|0\.7|0\.8|0\.9|1\.25|1\.5|1\.75|2|3|3\.5|4|4\.5|6|7|8|9|15|20|40|45|50)(\.0)?
+
   # ── kube-state-metrics ────────────────────────────────────────────────────
   # Expose Argo template labels and the karpenter nodepool node label so
   # PromQL can group pending time by step name and nodepool.
   kube-state-metrics:
+    # `workflows.argoproj.io/workflow` is deliberately NOT in this list: its value
+    # is unique per workflow, so at cohort scale it is unbounded. It does not add
+    # series to kube_pod_labels (that is one series per pod either way) but it does
+    # put a ~40-byte unique value on every one of them, and nothing reads it —
+    # Kubecost's product_label maps `workflow-template`, not `workflow`.
     extraArgs:
-      - --metric-labels-allowlist=pods=[workflows.argoproj.io/workflow-template,workflows.argoproj.io/template-name,workflows.argoproj.io/workflow],nodes=[karpenter.sh/nodepool]
+      - --metric-labels-allowlist=pods=[workflows.argoproj.io/workflow-template,workflows.argoproj.io/template-name],nodes=[karpenter.sh/nodepool]
+    # Chart default is ~28 resource types, rendered into a single --resources
+    # flag. Only pods and nodes are read here (kube_pod_status_phase,
+    # kube_pod_info, kube_pod_container_status_restarts_total, kube_node_labels,
+    # plus the label allowlist above); the other 26 — secrets, configmaps,
+    # endpoints, replicasets, leases and the rest — were ~half this exporter's
+    # 34,899 series. Argo workflows are CRDs, so they were never in this list.
+    #
+    # This MUST be `collectors`, not an extraArgs `--resources=...`: the chart
+    # already renders that flag from this list, and passing it twice leaves which
+    # one wins up to flag-parser order.
+    collectors:
+      - pods
+      - nodes
+    prometheus:
+      monitor:
+        metricRelabelings:
+          # An ALLOW-list, for the same reason as every other job here. This was a
+          # single `drop` of kube_pod_tolerations until 2026-08-19, and that
+          # inconsistency is precisely why this exporter grew to 73% of head
+          # series: `collectors: [pods, nodes]` above bounds which OBJECTS are
+          # watched, but pods still emit ~30 families each, and pod identity turns
+          # over ~3,200 times per 30 minutes during a cohort run.
+          #
+          # The five families below are every kube_* metric any dashboard in
+          # gitops/apps/grafana queries. Verified before narrowing: 0
+          # PrometheusRule objects exist in the cluster (defaultRules.create is
+          # false and none are hand-written), and the nine families this drops —
+          # kube_pod_status_reason, kube_pod_container_resource_requests,
+          # kube_pod_status_{qos_class,scheduled,ready},
+          # kube_pod_container_info, kube_pod_container_status_{ready,waiting,
+          # terminated} — have zero references anywhere in the repo while
+          # accounting for ~97k of 262,011 head series.
+          #
+          # kube_pod_status_phase is kept despite being the single largest of the
+          # five (5 series per pod, one per phase) because pod-phase counts are the
+          # primary scheduling signal this Prometheus exists to provide.
+          - action: keep
+            sourceLabels: [__name__]
+            regex: kube_pod_status_phase|kube_pod_info|kube_pod_labels|kube_pod_container_status_restarts_total|kube_node_labels
+    # Also BestEffort until now, so it was next in the eviction queue behind
+    # Prometheus. Sized well above the 48Mi observed at ~160 active workflows:
+    # this exporter's footprint scales with the number of live objects it labels,
+    # which during a cohort run means every pod of every concurrent workflow.
+    # Headroom kept as-is rather than trimmed alongside the label drop above —
+    # the ceiling here is pod count, which the drop does not change.
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
     nodeSelector:
       eks.amazonaws.com/nodegroup: backend
     tolerations:
@@ -63,6 +268,15 @@ kube-prometheus-stack:
 
   # ── Prometheus Operator ───────────────────────────────────────────────────
   prometheusOperator:
+    # BestEffort until now as well. Losing the operator is worse than losing a
+    # scrape: it is what reconciles the Prometheus CR into the StatefulSet, so
+    # an evicted operator means a Prometheus that never gets rebuilt.
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
     nodeSelector:
       eks.amazonaws.com/nodegroup: backend
     tolerations:

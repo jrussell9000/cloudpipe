@@ -29,6 +29,17 @@ parsing is the only part that can be wrong, so it must never be able to take
 the validated workflow-grain scrape down with it. The Prefect flow runs it
 best-effort for that reason.
 
+NO-SPOT COUNTERFACTUAL
+    The pod pass makes a third call, to the Assets API (filterTypes=Node), to
+    learn each node's own hourly rate — the Allocation API prices pod SHARES
+    and never exposes it. That rate, paired with the instance type's on-demand
+    list price from ec2_pricing, lands on every PodCost row as
+    node_effective_usd_per_hour / node_ondemand_usd_per_hour, which is what
+    makes "what would this batch have cost without spot" answerable at all:
+    every nodepool is spot-only (ADR 007), so no on-demand pipeline cost is
+    ever observed directly. This third call is best-effort — it can only ever
+    NULL three columns, never fail the scrape.
+
 SETTLED RE-SCRAPE
     The nightly pass reads each report-date at day+1, before Kubecost has
     finished reconciling it against the AWS CUR, so it overstates settled cost
@@ -50,10 +61,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
 import requests
+from ec2_pricing import ondemand_hourly_usd  # type: ignore[import-not-found]
 from schemas import CostAllocation, PodCost  # type: ignore[import-not-found]
 from writer import emit_jsonl_to_s3, emit_to_s3  # type: ignore[import-not-found]
 
@@ -61,6 +74,13 @@ log = logging.getLogger(__name__)
 
 KUBECOST_BASE = "http://kubecost-frontend.kubecost.svc.cluster.local:9090"
 ALLOCATION_PATH = "/model/allocation"
+
+# Node-grain costs live on a different endpoint than pod-grain ones: the
+# Allocation API prices POD SHARES of a node and never exposes the node's own
+# rate, so the no-spot counterfactual is unanswerable from it. The Assets API
+# is where `totalCost` for the node itself, its `minutes`, and its
+# `preemptible` flag come from.
+ASSETS_PATH = "/model/assets"
 
 # Kubecost has no per-allocation "reconciled yet?" flag (checked against the
 # current Allocation API docs — the UI's "unreconciled" highlighting is a
@@ -93,6 +113,12 @@ LABEL_STEP = "cloudpipe_io_step"
 LABEL_PHASE = "cloudpipe_io_phase"
 LABEL_SESSION = "session"
 LABEL_SUBJECT = "subjectid"
+
+# Karpenter stamps this on every node it provisions; Kubecost propagates node
+# labels onto both allocations and assets. It is absent (not "on-demand") on
+# the EKS managed nodegroup nodes, which Karpenter did not create — see
+# _capacity_type, which falls back to the `preemptible` field for those.
+LABEL_CAPACITY_TYPE = "karpenter_sh_capacity_type"
 
 _BYTES_PER_GB = 1024**3
 
@@ -205,11 +231,102 @@ def _label(alloc: dict[str, Any], key: str) -> str:
     return alloc.get("properties", {}).get("labels", {}).get(key, "") or ""
 
 
+def fetch_node_assets(
+    window: str = "yesterday",
+    base_url: str = KUBECOST_BASE,
+    timeout: int = 60,
+    verify_ssl: bool = True,
+) -> dict[str, Any]:
+    """Call the Kubecost Assets API for Node assets and return the raw dict."""
+    url = f"{base_url}{ASSETS_PATH}"
+    params = {"window": window, "accumulate": "true", "filterTypes": "Node"}
+    resp = requests.get(url, params=params, timeout=timeout, verify=verify_ssl)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 200:
+        raise RuntimeError(f"Kubecost assets API error: {data.get('message', data)}")
+    return data
+
+
+@dataclass(frozen=True)
+class NodeRate:
+    """What one node cost per hour, and what it would have cost on demand."""
+
+    capacity_type: str  # "spot" | "on-demand" | ""
+    effective_usd_per_hour: float | None
+    ondemand_usd_per_hour: float | None
+
+
+def _capacity_type(asset: dict[str, Any]) -> str:
+    """Classify a node asset as spot or on-demand.
+
+    Prefers Karpenter's own label. Falls back to Kubecost's `preemptible`
+    field (1.0 = spot) for nodes Karpenter did not provision — the EKS managed
+    nodegroups carry no capacity-type label at all, and calling those "" would
+    lose the one genuinely on-demand thing in the cluster.
+    """
+    labelled = (asset.get("labels") or {}).get(LABEL_CAPACITY_TYPE, "") or ""
+    if labelled:
+        return labelled
+
+    preemptible = asset.get("preemptible")
+    if preemptible is None:
+        return ""
+    return "spot" if float(preemptible) > 0 else "on-demand"
+
+
+def parse_node_assets(
+    assets_response: dict[str, Any],
+    region: str = "<YOUR_AWS_REGION>",
+) -> dict[str, NodeRate]:
+    """Build {node_hostname: NodeRate} from an Assets API response.
+
+    The effective rate is the node's reconciled cost divided by the node-hours
+    it was actually up for, which is the rate Kubecost priced this window's pod
+    shares from. It is NOT the spot price at launch: it moves with
+    reconciliation, so a node read at day+1 and again at day+3 gives two
+    different effective rates, and the settled one is the one to trust.
+
+    Nodes with zero recorded minutes are skipped rather than divided by zero.
+
+    Keyed on `properties.name` (the hostname), not on the response's own key —
+    that key is a compound
+    `AWS/<account>/Compute/<cluster>/Node/Kubernetes/<instance-id>/<hostname>`
+    path, while the pod side only ever has the bare hostname from its
+    kubernetes.io/hostname label.
+    """
+    sets = assets_response.get("data", [])
+    asset_set = sets[0] if isinstance(sets, list) else sets
+    if not asset_set:
+        log.warning("Kubecost returned no node assets for window")
+        return {}
+
+    rates: dict[str, NodeRate] = {}
+    for asset in asset_set.values():
+        name = (asset.get("properties") or {}).get("name", "")
+        if not name:
+            continue
+
+        minutes = float(asset.get("minutes", 0.0) or 0.0)
+        total_cost = float(asset.get("totalCost", 0.0) or 0.0)
+        effective = round(total_cost / (minutes / 60.0), 6) if minutes > 0 else None
+
+        instance_type = asset.get("nodeType") or ""
+        rates[name] = NodeRate(
+            capacity_type=_capacity_type(asset),
+            effective_usd_per_hour=effective,
+            ondemand_usd_per_hour=ondemand_hourly_usd(instance_type, region=region),
+        )
+
+    return rates
+
+
 def parse_pod_allocations(
     api_response: dict[str, Any],
     report_date: date,
     pipeline: str = "cloudpipe_minproc",
     scrape_date: date | None = None,
+    node_rates: dict[str, NodeRate] | None = None,
 ) -> list[PodCost]:
     """Convert an `aggregate=pod` allocation response to PodCost records.
 
@@ -222,6 +339,11 @@ def parse_pod_allocations(
     Kubecost reports ram as byte-hours and gpu/cpu as hours; ram is converted
     to GB-hours here so the column is directly comparable to a pod's memory
     request without a 2**30 in every query.
+
+    node_rates, when given, is the parse_node_assets() lookup that fills the
+    capacity-type and rate columns. Omitting it leaves those NULL rather than
+    failing — the counterfactual is an addition to this table, not a
+    precondition for it.
     """
     sets: list[dict] = api_response.get("data", [])
     if not sets:
@@ -245,6 +367,9 @@ def parse_pod_allocations(
         props = alloc.get("properties", {})
         adjustment = sum(alloc.get(f, 0) or 0 for f in ADJUSTMENT_FIELDS)
         ram_byte_hours = alloc.get("ramByteHours", 0.0) or 0.0
+
+        node_name = _label(alloc, "kubernetes_io_hostname")
+        rate = (node_rates or {}).get(node_name)
 
         records.append(
             PodCost(
@@ -276,8 +401,16 @@ def parse_pod_allocations(
                 # count. The node NAME does arrive, as the standard kubernetes.io/hostname
                 # node label that Kubecost propagates onto the allocation (same mechanism
                 # node_instance_type below already relies on).
-                node=_label(alloc, "kubernetes_io_hostname"),
+                node=node_name,
                 node_instance_type=_label(alloc, "node_kubernetes_io_instance_type"),
+                # Node-grain facts, denormalized onto the pod row from the
+                # Assets pass so the no-spot counterfactual is a single-table
+                # query. They repeat across every pod on a node, which Parquet
+                # compresses to nothing — cheaper than making every consumer
+                # join a node table.
+                node_capacity_type=rate.capacity_type if rate else "",
+                node_effective_usd_per_hour=rate.effective_usd_per_hour if rate else None,
+                node_ondemand_usd_per_hour=rate.ondemand_usd_per_hour if rate else None,
                 scrape_age_days=scrape_age_days,
                 pipeline=pipeline,
             )
@@ -422,8 +555,27 @@ def scrape_pod_costs_and_upload(
     api_resp = fetch_allocations(
         base_url=base_url, window=window, aggregate="pod", verify_ssl=verify_ssl
     )
+
+    # Best-effort, for the same reason the whole pod pass is best-effort to the
+    # flow: the counterfactual columns are an enrichment. A failing Assets call
+    # or a missing pricing:GetProducts grant must cost us three NULL columns,
+    # not the pod-cost table for that night.
+    node_rates: dict[str, NodeRate] = {}
+    try:
+        node_rates = parse_node_assets(
+            fetch_node_assets(base_url=base_url, window=window, verify_ssl=verify_ssl),
+            region=region,
+        )
+        log.info("Resolved rates for %d node(s)", len(node_rates))
+    except Exception as exc:  # noqa: BLE001 — enrichment must not fail the scrape
+        log.warning("Node asset pass failed (%s); rate columns will be NULL", exc)
+
     records = parse_pod_allocations(
-        api_resp, report_date=report_date, pipeline=pipeline, scrape_date=scrape_date
+        api_resp,
+        report_date=report_date,
+        pipeline=pipeline,
+        scrape_date=scrape_date,
+        node_rates=node_rates,
     )
 
     grouped = _group_by_workflow(records)
@@ -462,6 +614,21 @@ def scrape_pod_costs_and_upload(
         # `cloudpipe.io/step` pod label and its cost will land in a "" bucket
         # that no per-component query will attribute.
         log.warning("%d pod(s) carry a workflow label but no cloudpipe.io/step", unlabeled)
+
+    # Coverage of the counterfactual columns. Partial coverage is the failure
+    # mode that hides: a no-spot total summed over rows where only some carry
+    # rates is an understatement that looks like a normal number, so the gap is
+    # logged at scrape time rather than left for a query to notice.
+    unpriced = sum(
+        1 for r in records if not (r.node_effective_usd_per_hour and r.node_ondemand_usd_per_hour)
+    )
+    if unpriced:
+        log.warning(
+            "%d/%d pod(s) have no on-demand counterfactual rate — they will be excluded "
+            "from spot_savings() and lower its coverage_frac",
+            unpriced,
+            len(records),
+        )
 
     for workflow_name, pods in grouped.items():
         key = PodCost.s3_key(report_date.isoformat(), workflow_name)

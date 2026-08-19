@@ -241,6 +241,82 @@ class CloudpipeMetrics:
         """
         return self._con.execute(sql).df()
 
+    def spot_savings(
+        self,
+        subjects: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        group_by: str | None = None,
+    ):
+        """Return what this scope cost vs. what it would have cost on demand.
+
+        DuckDB twin of athena.CloudpipeMetrics.spot_savings — same columns,
+        same caveats, and the full rationale lives there. In short: every
+        nodepool is spot-only (ADR 007), so this rebuilds the missing
+        on-demand figure by scaling each pod's compute cost by its node's
+        `node_ondemand_usd_per_hour / node_effective_usd_per_hour`, leaving
+        pv/network unscaled.
+
+        Read `coverage_frac` before `savings_usd`. Rows without rates — schema
+        1.0 records and any node whose instance type the Pricing API would not
+        price — are excluded from the counterfactual, so `ondemand_cost_usd`
+        is comparable against `priced_cost_usd`, not against
+        `actual_cost_usd`.
+
+        And note that day+1 drift cancels out of `ondemand_cost_usd` but not
+        out of `savings_usd` or the ratio, which understate at that age — the
+        full argument is on the Athena twin.
+        """
+        allowed = {"step", "phase", "subject", "node_instance_type", "date"}
+        if group_by is not None and group_by not in allowed:
+            raise ValueError(f"group_by must be one of {sorted(allowed)}, got {group_by!r}")
+
+        select_group = f"{group_by}," if group_by else ""
+        group_clause = f"GROUP BY {group_by} ORDER BY {group_by}" if group_by else ""
+        clause = cost_scope_clause(subjects, date_from, date_to)
+
+        # union_by_name is what lets schema-1.0 rows (written before the rate
+        # columns existed) read back at all — they get NULL rates, which the
+        # multiplier guard then excludes.
+        sql = f"""
+        WITH scoped AS (
+            SELECT
+                *,
+                CASE
+                    WHEN node_effective_usd_per_hour > 0
+                     AND node_ondemand_usd_per_hour > 0
+                    THEN node_ondemand_usd_per_hour / node_effective_usd_per_hour
+                END AS multiplier
+            FROM read_json('{self._s3_glob("pod_costs")}', auto_detect=true, union_by_name=true,
+                           hive_partitioning=true)
+            {clause}
+        )
+        SELECT
+            {select_group}
+            COUNT(*)                                   AS n_pods,
+            SUM(total_cost_usd)                        AS actual_cost_usd,
+            SUM(CASE WHEN multiplier IS NOT NULL
+                     THEN total_cost_usd END)          AS priced_cost_usd,
+            SUM(CASE WHEN multiplier IS NOT NULL
+                     THEN (cpu_cost_usd + memory_cost_usd + gpu_cost_usd) * multiplier
+                          + pv_cost_usd + network_cost_usd END)
+                                                       AS ondemand_cost_usd,
+            SUM(CASE WHEN multiplier IS NOT NULL
+                     THEN (cpu_cost_usd + memory_cost_usd + gpu_cost_usd) * multiplier
+                          + pv_cost_usd + network_cost_usd END)
+                - SUM(CASE WHEN multiplier IS NOT NULL
+                           THEN total_cost_usd END)    AS savings_usd,
+            -- COALESCE so zero-coverage reads 0.0, not NULL/NaN — see the
+            -- Athena twin for why that distinction matters to callers.
+            COALESCE(SUM(CASE WHEN multiplier IS NOT NULL
+                              THEN total_cost_usd END), 0)
+                / NULLIF(SUM(total_cost_usd), 0)       AS coverage_frac,
+            AVG(multiplier)                            AS mean_multiplier
+        FROM scoped
+        {group_clause}
+        """
+        return self._con.execute(sql).df()
+
     def subject_costs(
         self,
         subjects: list[str] | None = None,

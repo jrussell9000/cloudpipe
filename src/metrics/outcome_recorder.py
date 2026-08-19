@@ -224,6 +224,14 @@ def default_expected_keys(step: str, subject: str, session: str, task: str, run:
         ],
         # Produced inside the func-preproc pod, but gated by its own marker so
         # that a run can have one derivative and not the other.
+        #
+        # This key is TRANSIENT: surface-resample deletes each run's components
+        # once the dtseries assembled from them is intact. That is correct for
+        # live recording, which runs in-pod at extraction time while the tarball
+        # is still there. It does mean a *retrospective* re-verification of an
+        # old session will report surface-sample as Failed — the step succeeded,
+        # its output was reclaimed. Use the surface-resample record, or
+        # inventory's surf_exists (components OR dtseries), to judge that.
         "surface-sample": [
             f"derivatives/func_surf/{subject}/{session}/components/"
             f"{prefix}_desc-grayordcomponents_bold.tar.gz",

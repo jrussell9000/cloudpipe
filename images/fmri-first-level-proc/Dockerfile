@@ -12,6 +12,12 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # 2. Install System Dependencies
 # Added libfontconfig1 and libxrender1 for AFNI GUI/Core stability
+#
+# `apt-get upgrade` at the end is the same-release security upgrade (NIST SP 800-171
+# SI-2, finding N1) — not `dist-upgrade`, so it only moves already-installed packages to
+# a newer revision of Ubuntu 24.04 and never installs or removes one. It applies to the
+# apt set only; the AFNI tarball and the micromamba environment fetched below are
+# vendored and invisible to apt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bzip2 \
     curl \
@@ -35,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libfontconfig1 \
     libxrender1 \
+    && apt-get upgrade -y \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 

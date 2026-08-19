@@ -119,9 +119,12 @@ resource "kubernetes_ingress_v1" "this" {
       "alb.ingress.kubernetes.io/healthcheck-protocol" = "HTTP"
       "alb.ingress.kubernetes.io/healthcheck-path"     = "/ping"
 
+      # ALB access logging (H3) — delivered to the SSE-S3 access-log bucket, not the SSE-KMS
+      # master log bucket, which ALB cannot write to. See logging.tf.
+      #
       # idle_timeout raised to the ALB maximum (4000s) so the UI's live-update streams survive
       # quiet periods; the 60s default tears them down and the page silently shows stale state.
-      "alb.ingress.kubernetes.io/load-balancer-attributes" = "access_logs.s3.enabled=false,idle_timeout.timeout_seconds=4000"
+      "alb.ingress.kubernetes.io/load-balancer-attributes" = "access_logs.s3.enabled=true,access_logs.s3.bucket=${var.access_log_bucket},access_logs.s3.prefix=alb-prefect,idle_timeout.timeout_seconds=4000"
     }
   }
 

@@ -108,7 +108,7 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
 
 Input: ABCD minimally preprocessed data already on DAIRC MMPS Globus endpoint. Upstream preprocessing already applied (motion correction, B0/SDC, gradient nonlinearity correction, between-scan motion correction, fMRI-T1w registration matrix) — do not re-implement these.
 
-Each workflow processes one subject. The master DAG (`cloudpipe-long-master-workflow-template.yaml`) fans out per-session work using `withParam` over the inventory result.
+Each workflow processes one subject. The master DAG (`cloudpipe-long-master-workflow-template.yaml`) fans out per-session work using `withParam` over the sessions whose FastSurfer derivatives were actually published — a post-anatomical re-check of the completion markers, not the inventory result (#270).
 
 ### Phase 1 — Transfer
 
@@ -126,7 +126,9 @@ Node pool: `cpu-light-nodepool`
 
 Template: `inventory` → `subject-data-inventory-template`
 
-Scans S3 `mmps_mproc/{subj}/` to discover sessions and BOLD runs (task-rest, task-nback only). For each run, checks whether `b2t_exists` and `func_exists` in `derivatives/`. Checks `t1w_to_mni.tar.gz` per session. Checks FastSurfer templated derivatives for all sessions. Attaches `nss_frames` from `config/nss_volumes.csv`. Outputs a JSON array that drives the per-session fan-out.
+Scans S3 `mmps_mproc/{subj}/` to discover sessions and BOLD runs (task-rest, task-nback only). For each run, checks whether `b2t_exists` and `func_exists` in `derivatives/`. Checks `t1w_to_mni.tar.gz` per session. Checks FastSurfer templated derivatives for all sessions. Attaches `nss_frames` from `config/nss_volumes.csv`. Outputs a JSON array describing the subject's **inputs**.
+
+A second template in the same WorkflowTemplate, `published-sessions-template`, narrows that array to the sessions the anatomical phase actually published, and it is that narrowed list the per-session fan-out iterates. The two are not interchangeable: the first is about inputs, the second about outputs, and they diverge whenever the completion guard rejects one timepoint.
 
 Node pool: `cpu-light-nodepool`
 
@@ -145,7 +147,7 @@ fastsurfer-template-parcellation     fastsurfer-long-segmentation
 
 Templates: `fast-tmpl` and `fast-long` WorkflowTemplates.
 
-No shared volume — each pod uses a private `emptyDir` and passes `SUBJECTS_DIR` through `scratch/{workflow.name}/anat/` in S3. Final outputs uploaded to `derivatives/fastsurfer/{subj}/` as per-session `_templated.tar.gz` archives.
+No shared volume — each pod uses a private `emptyDir` and passes `SUBJECTS_DIR` through `scratch/{workflow.name}/anat/` in S3 (still tarballs: write-once, read-once, invisible outside the owning workflow). Final outputs are published **in-pod** to `derivatives/fastsurfer/{subj}/{ses}/` as one object per file, with a `_links.json` symlink manifest and a `_complete.json` marker written last ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)).
 
 ### Phase 4 — Per-session (parallel across sessions, `failFast: false`)
 
@@ -200,7 +202,7 @@ All infrastructure is in `terraform/`. Run commands from that directory.
 | S3 — `cloudpipe-logging` | Log archive (incl. archived Argo pod logs) |
 | S3 — `cloudpipe-terraform-state` | Terraform remote backend |
 | ECR (private, primary) | `{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/` — layer blobs served via VPC S3 gateway endpoint, no NAT traversal on pull |
-| ECR Public (secondary) | `public.ecr.aws/l9e7l1h1/cloudpipe/` — images are dual-pushed here during the NAT-cost migration; kept as a one-line rollback target (`local.ecr_public_registry` in `terraform/ecr.tf`) |
+| ECR Public (secondary, being retired) | `public.ecr.aws/l9e7l1h1/cloudpipe/` — most images are dual-pushed here, kept as a one-line rollback target (`local.ecr_public_registry` in `terraform/ecr.tf`). Repos are retired image by image via `local.ecr_images_public_retired`; `fmri-first-level-proc` is already gone |
 | Route53 | `<YOUR_DOMAIN>` — Argo UI, Prefect UI, ArgoCD |
 | SSM Parameter Store | Globus instance ID, collection UUIDs, base paths (see below) |
 
@@ -227,7 +229,7 @@ The separate `workflow-templates` Application (`gitops/apps/pipelines/workflow-t
 
 ## Docker images
 
-Images are dual-pushed to both the private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`) and ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`) during the NAT-cost migration. Production WorkflowTemplates resolve the `ecr-registry` parameter from Terraform's `local.ecr_registry`, which now points at the private registry (`terraform/argowf.tf`); rollback to ECR Public is a one-line change (`local.ecr_public_registry`). Every production template pins images by SHA digest — there are no `:latest` refs left anywhere in `argo/workflows/`. The only `:latest` tags are the flow-runner build tag (`.github/workflows/build-prefect-flow-runner.yaml`) and the placeholder a brand-new image carries until its first `ci: pin workflow images to sha-...` commit lands.
+Most images are dual-pushed to both the private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`) and ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`), a holdover from the NAT-cost migration; `fmri-first-level-proc` is private-only as of 2026-08-17. Production WorkflowTemplates resolve the `ecr-registry` parameter from Terraform's `local.ecr_registry`, which now points at the private registry (`terraform/argowf.tf`); rollback to ECR Public is a one-line change (`local.ecr_public_registry`). Every production template pins images by SHA digest — there are no `:latest` refs left anywhere in `argo/workflows/`. The only `:latest` tags are the flow-runner build tag (`.github/workflows/build-prefect-flow-runner.yaml`) and the placeholder a brand-new image carries until its first `ci: pin workflow images to sha-...` commit lands.
 
 | Image | Used by | Purpose |
 |---|---|---|
@@ -256,7 +258,7 @@ Prefect API is at `https://prefect.<YOUR_DOMAIN>/api`.
 
 | Control | Value | Location |
 |---|---|---|
-| Max concurrent Argo workflows (namespace-wide, **enforced**) | 100 | `namespaceParallelism`, `terraform/modules/argo-workflows/main.tf` |
+| Max concurrent Argo workflows (namespace-wide, **enforced**) | 400 | `namespaceParallelism`, `terraform/modules/argo-workflows/main.tf` |
 | Max concurrent Argo workflows (cloudpipe) | 50 (fallback when Variable unset, overridable live) | Prefect Variable `cloudpipe-max-concurrent` |
 | Max concurrent Argo workflows (first-level) | 25 (fallback when Variable unset, overridable live) | Prefect Variable `first-level-max-concurrent` |
 | Max pod creates per second | 50, burst 90 | `resourceRateLimit`, `terraform/modules/argo-workflows/main.tf` |
@@ -265,7 +267,7 @@ Prefect API is at `https://prefect.<YOUR_DOMAIN>/api`.
 | Argo workflow max runtime | 12 hours | `activeDeadlineSeconds: 43200` |
 | Argo workflow TTL after completion | 24 hours | `ttlStrategy.secondsAfterCompletion: 86400` |
 
-The Prefect Variables are the working caps; `namespaceParallelism` is the backstop that cannot be raced by a submission burst. It is deliberately set above the sum of both Variables (50 + 25) because it applies namespace-wide across pipelines — see [ADR 008](decisions/008-prefect-as-queue-manager.md). Note that the two Argo controller settings above are set in **Terraform**, not in the Helm chart's `values.yaml`: the chart renders them only into the controller ConfigMap, which Terraform owns (`controller.configMap.create: false`), so values placed in the chart are silently inert (#206).
+The Prefect Variables are the working caps; `namespaceParallelism` is the backstop that cannot be raced by a submission burst. It is deliberately set above the sum of the *live* Variables, not their code fallbacks — `400` = cloudpipe's 300 target + first-level's 25 + headroom — because it applies namespace-wide across pipelines, so setting it to either pipeline's cap would silently hold the *other* pipeline's workflows `Pending` whenever the first was at capacity. See [ADR 008](decisions/008-prefect-as-queue-manager.md). Note that the two Argo controller settings above are set in **Terraform**, not in the Helm chart's `values.yaml`: the chart renders them only into the controller ConfigMap, which Terraform owns (`controller.configMap.create: false`), so values placed in the chart are silently inert (#206).
 
 ---
 

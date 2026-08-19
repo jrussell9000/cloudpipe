@@ -139,6 +139,27 @@ variable "db_backup_retention_days" {
   default     = 7
 }
 
+variable "db_deletion_protection" {
+  description = "Enable RDS deletion protection. AWS refuses DeleteDBInstance while true; set to false in a separate apply before an intentional teardown."
+  type        = bool
+  default     = true
+}
+
+variable "db_skip_final_snapshot" {
+  description = "Skip the final snapshot on RDS destroy. Leave false so a destroy is recoverable."
+  type        = bool
+  default     = false
+}
+
+################################################################################
+# Logging
+################################################################################
+
+variable "access_log_bucket" {
+  description = "SSE-S3 bucket receiving this module's ALB access logs. The master log bucket is SSE-KMS and ALB cannot deliver to it."
+  type        = string
+}
+
 ################################################################################
 # Gates
 ################################################################################

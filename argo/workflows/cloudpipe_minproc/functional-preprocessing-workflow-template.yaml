@@ -17,7 +17,12 @@ spec:
     # deliberately absent: a real OOMKill here is deterministic (#120, #129, #134
     # each needed a config change, not a retry), so retrying it only burns the
     # enlarged budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    # The codes are matched in the message too: a pod that dies in its init or wait
+    # container never populates exitCode, so that arm alone is dead for the whole
+    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
+    # its producer was skipped or failed, and a consumer retry cannot re-run the
+    # producer — the same reasoning that keeps exit 66 out. See the master template.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -125,8 +130,12 @@ spec:
   #   mmps_mproc/{subj}/{ses}/func/     → /data/func   every run's BOLD + sidecar + motion
   #   derivatives/registration/{subj}/{ses}/ → /tmp/registration
   #                                     t1w_to_mni/ and bold_to_t1w_{task}_{run}/
-  #   derivatives/fastsurfer/…_templated.tar.gz → /tmp/fastsurfer/{subj}_{ses}
-  #                                     (mri/aseg.auto.mgz for aCompCor WM/CSF masks)
+  #   derivatives/fastsurfer/{subj}/{ses}/mri/aseg.auto.mgz + surf/ + _links.json
+  #                                     → /tmp/fastsurfer/{subj}_{ses}
+  #                                     (aseg.auto.mgz for aCompCor WM/CSF masks;
+  #                                      surf/ for the ribbon. Two named pieces of
+  #                                      the exploded tree, not the whole 268-file
+  #                                      session — ADR 017)
   #   config/MNI152NLin2009cAsym…       reference template
   #
   #   derivatives/func/{subjID}/{session}/ → /tmp/existing_func  (optional)
@@ -164,8 +173,10 @@ spec:
       # retries; the policy just has to be permissive enough to let it run.
       retryPolicy: Always
       # Infrastructure codes only — see the spec-level block above for why 137 is
-      # deliberately absent and what 75 is reserved for.
-      expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+      # deliberately absent and what 75 is reserved for, and #277 for why the codes
+      # are matched in the message as well as in exitCode, and why a missing
+      # artifact key is excluded from that.
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
       backoff:
         duration: "1m"
         factor: "2"
@@ -236,14 +247,65 @@ spec:
         # FastSurfer outputs. Supplies mri/aseg.auto.mgz (WM/CSF masks for
         # aCompCor, and the subcortical labels for the CIFTI volume block) and
         # surf/?h.white + ?h.pial (the cortical ribbon).
-        # Downloaded and decompressed ONCE per session instead of once per run.
-        - name: fastsurfer-output
-          path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}'
+        # Downloaded ONCE per session instead of once per run.
+        #
+        # SELECTIVE FETCH (ADR 017): two artifacts instead of the whole 268-file
+        # tree — the driver builds exactly two roots from it, ASEG and SURF_DIR.
+        #
+        # `?h.pial` IS ONE OF THE SYMLINKS (lh.pial -> lh.pial.T1), which is why
+        # surf/ must be staged as a directory and why /app/restore_links.py runs
+        # before the driver reads it. Staging surf/ without the replay would give
+        # this step a ribbon with no pial surface — the aliases are not
+        # decoration here, they are the filenames the code opens.
+        #
+        # Prefix keys on an INPUT artifact must not end in `/` (with one, Argo
+        # silently downloads nothing).
+        # `archive: none` is REQUIRED on this one, not decorative (#274): a
+        # single `.mgz` is gzip, and an input artifact with no archive strategy
+        # goes through argoexec's isTarball() sniff (gzip magic + one tar.Next()),
+        # so whether it gets untarred over its own path depends on the image
+        # data. Measured 3 hits in 2511 objects; the failure mode is either
+        # `illegal file path: ` or, worse, silent garbage. Directory artifacts
+        # never reach the sniff — see the note in registration-workflow-template.
+        - name: fastsurfer-aseg
+          path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/aseg.auto.mgz'
+          archive:
+            none: {}
           s3:
             endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
             bucket: "{{workflow.parameters.bucket}}"
             region: <YOUR_AWS_REGION>
-            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_templated.tar.gz'
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/aseg.auto.mgz'
+
+        - name: fastsurfer-surf
+          path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/surf'
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/surf'
+
+        # The link manifest itself: ~1 KB, and restore_links.py needs it to
+        # recreate surf/?h.pial. It lives at the tree root, so it is fetched as
+        # its own single-key artifact rather than coming along with surf/.
+        #
+        # NOT `optional: true`, deliberately. Every FastSurfer session tree
+        # carries 14 aliases (measured in all 81 sampled trees), so an absent
+        # _links.json does not mean "a tree without links" — it means a tree that
+        # is wrong. Marked optional, the replay below would silently no-op and
+        # the run would die ~40 minutes later inside nibabel, opening a
+        # surf/?h.pial that was never created. Failing here instead is the whole
+        # point of D4's selective-staging contract: a missing input fails at
+        # stage time with a name attached, not mid-run.
+        - name: fastsurfer-links
+          path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/_links.json'
+          s3:
+            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            bucket: "{{workflow.parameters.bucket}}"
+            region: <YOUR_AWS_REGION>
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/_links.json'
 
         # Existing volumetric derivatives, for the grayordinate-only short
         # path: it skips the warp chain, so the CIFTI subcortical block needs
@@ -365,7 +427,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:e2a886f3628d82661c194cdc3fb48e877d408f77ad619985e3ea56fe696e8f0d"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -423,7 +485,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:e2a886f3628d82661c194cdc3fb48e877d408f77ad619985e3ea56fe696e8f0d"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather
@@ -616,6 +678,48 @@ spec:
         FS_ROOT = Path(f"/tmp/fastsurfer/{SUBJ}_{SES}")
         ASEG = FS_ROOT / "mri" / "aseg.auto.mgz"
         SURF_DIR = FS_ROOT / "surf"
+
+        # ADR 017: FS_ROOT is now assembled by Argo from exploded objects, and
+        # Argo cannot recreate symlinks. Replay them from _links.json before
+        # anything reads SURF_DIR — `?h.pial` is itself an alias
+        # (lh.pial -> lh.pial.T1), so without this the ribbon has no pial
+        # surface. Links whose targets were not staged (everything under mri/ and
+        # label/, which this step does not fetch) are skipped, not dangled.
+        sys.path.insert(0, "/app")
+        from restore_links import restore as _restore_links
+
+        _links = _restore_links(FS_ROOT)
+
+        # Verify the replay actually happened, rather than trusting that it did.
+        # restore_links raises if a link it CREATES fails to resolve, but it is
+        # silent about links it never attempted: an absent manifest is a
+        # documented no-op (subregion trees have none), and a link whose target
+        # was not staged is skipped by design. Neither is true for this tree —
+        # surf/ is staged in full and a FastSurfer tree always has a manifest —
+        # so either outcome here means the staged input is wrong, and the next
+        # thing to notice would be nibabel failing ~40 minutes in.
+        #
+        # Checked by name rather than by count: `?h.pial` is what
+        # preproc.py::_sample_ribbon and surf_geometry.py actually open, and it
+        # is the alias among them (`?h.white` and `?h.sphere.reg` are real
+        # files). Asserting the files the code opens survives a FastSurfer
+        # upgrade that changes the alias set; asserting "created == 6" would not.
+        if not _links["manifest"]:
+            raise SystemExit(
+                f"FATAL: no _links.json in {FS_ROOT}. Every FastSurfer session tree has one "
+                "(14 aliases in all 81 sampled); its absence means the staged tree is wrong, "
+                "not that it has no links."
+            )
+        _missing_aliases = [
+            str(p) for p in (SURF_DIR / "lh.pial", SURF_DIR / "rh.pial") if not p.exists()
+        ]
+        if _missing_aliases:
+            raise SystemExit(
+                f"FATAL: link replay left {_missing_aliases} absent "
+                f"({_links['created']} created, {_links['skipped']} skipped of "
+                f"{_links['links']}). The cortical ribbon cannot be sampled without a pial "
+                "surface; failing here rather than inside nibabel 40 minutes from now."
+            )
 
         # Grayordinate components are named for the CIFTI files Stage 2 builds
         # from them, not for the surface alone — the tarball carries the

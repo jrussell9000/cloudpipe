@@ -40,6 +40,11 @@ variable "hostname" {
   description = "AWS Route53 zone hostname"
 }
 
+variable "access_log_bucket" {
+  description = "SSE-S3 bucket receiving the Kubecost ALB's access logs. The master log bucket is SSE-KMS and ALB cannot deliver to it."
+  type        = string
+}
+
 variable "certificate_arn" {
   type        = string
   description = "AWS Certificate ARN"

@@ -16,3 +16,15 @@ spec:
     - port: http-metrics
       interval: 30s
       path: /metrics
+      metricRelabelings:
+        # karpenter_cloudprovider_instance_type_offering_{available,price_estimate}
+        # alone were 10,743 series each — a full EC2 catalog crossed with zone and
+        # capacity type, re-exported on every scrape. It is a static price list, so
+        # it never churns, but it was ~21.5k of this job's 35,581 series and all of
+        # that sits in the head block permanently.
+        #
+        # Scoped to `instance_type` on purpose: karpenter_cloudprovider_errors_total
+        # is read by karpenter.json and must survive this rule.
+        - action: drop
+          sourceLabels: [__name__]
+          regex: karpenter_cloudprovider_instance_type_.*

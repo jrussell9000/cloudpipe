@@ -144,6 +144,18 @@ variable "db_backup_retention_days" {
   default     = 7
 }
 
+variable "db_deletion_protection" {
+  description = "Enable RDS deletion protection. AWS refuses DeleteDBInstance while true; set to false in a separate apply before an intentional teardown."
+  type        = bool
+  default     = true
+}
+
+variable "db_skip_final_snapshot" {
+  description = "Skip the final snapshot on RDS destroy/replace. Leave false so a destroy or a replace_triggered_by replacement is recoverable."
+  type        = bool
+  default     = false
+}
+
 variable "db_table_name" {
   description = "Table name within the database used by Argo Workflows."
   type        = string
@@ -162,6 +174,11 @@ variable "crds_available" {
 
 variable "log_bucket" {
   description = "Name of the S3 bucket used for logging."
+  type        = string
+}
+
+variable "access_log_bucket" {
+  description = "SSE-S3 bucket receiving this module's ALB access logs. Must not be log_bucket — that bucket is SSE-KMS and ALB cannot deliver to it."
   type        = string
 }
 

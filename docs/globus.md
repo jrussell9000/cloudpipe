@@ -130,9 +130,9 @@ Transfer paths: each file is added as `{source-base-path}/{subject-id}/{session}
 The ABCD source collection is Globus High Assurance (HA). The cloudpipe destination collection must also be HA for Globus to allow transfers between them. The cloudpipe endpoint is subscribed to the UW-Madison HA subscription (`<YOUR_GLOBUS_SUBSCRIPTION_UUID>`).
 
 HA implications:
-- `--authentication-timeout-mins` is set to 1 week (max 30 days for HA)
+- `--authentication-timeout-mins` is set to 1 week (max 30 days for HA). **The cadence is 7 days, not 30** — 30 is the HA ceiling, and the gateway is created well under it (`docs/globus-setup.md` Step 3). Reauthenticate weekly, and never start a batch on a token older than 7 days.
 - `setup_auth.py` uses `prompt=login` to force a fresh auth event — reusing an existing browser session can produce a `No effective ACL rules` 403
-- When the refresh token expires, transfers fail and `setup_auth.py` must be re-run
+- When the session times out, transfers fail and `setup_auth.py` must be re-run
 
 ---
 
@@ -171,9 +171,47 @@ The IAM user key registered with the S3 gateway is a long-lived credential store
    ```
 5. Delete the old IAM access key in the AWS console once the new key is confirmed working.
 
+### Recognising an expired session
+
+The failure is **not** reported as an expired token. `transfer.py`'s destination pre-flight
+`operation_ls` comes back `502 ExternalError.DirListingFailed.LoginFailed` wrapping a GridFTP
+`530 LOGIN_DENIED`, and the payload reads as an authorization problem rather than a timeout:
+
+```json
+{"code": "permission_denied",
+ "detail": {"DATA_TYPE": "not_from_allowed_domain#1.0.0", "allowed_domains": ["<YOUR_INSTITUTION_DOMAIN>"]},
+ "authorization_parameters": {"session_message": "Session reauthentication required (Globus Transfer)",
+                              "session_required_single_domain": ["<YOUR_INSTITUTION_DOMAIN>"]}}
+```
+
+`not_from_allowed_domain` invites the wrong diagnosis — it looks like the `--domain <YOUR_INSTITUTION_DOMAIN>`
+gateway policy rejecting a non-<YOUR_INSTITUTION_DOMAIN> identity, i.e. a misconfiguration. It is not. The
+identity is correct; its **session** has aged past `--authentication-timeout-mins`, so the HA
+gateway stops counting it and is left with no <YOUR_INSTITUTION_DOMAIN> identity in the session. The
+`session_required_single_domain` key in `authorization_parameters` is what distinguishes the two:
+a genuine wrong-domain identity has a policy problem and no session requirement to satisfy.
+The preceding `Token not valid for 'openid' scope` warning from `userinfo()` is unrelated
+and benign — the token is deliberately transfer-scoped only.
+
+A refresh token cannot fix this. Globus Auth sessions are extended by *authentication events*,
+not by token refresh, so the only remedy is an interactive login — see below.
+
+Observed 2026-08-17: token stored 2026-08-09T02:04Z, 1-week gateway timeout, so the session
+lapsed 2026-08-16T02:04Z and every `globus-transfer` pod in the batch submitted at
+2026-08-17T01:43Z failed pre-flight. The 2026-08-14 batch, day 5 of the same token, was clean.
+**Check the token's age before submitting a batch** — it is one call and it is not
+otherwise visible:
+
+```bash
+aws secretsmanager list-secrets --filters Key=name,Values=globus \
+  --query 'SecretList[].LastChangedDate' --output text
+```
+
 ### Rotating the Globus refresh token
 
-HA collections require periodic reauthentication (token expires after up to 30 days). When expired, `transfer.py` fails with an auth error.
+HA collections require periodic reauthentication — the gateway's session timeout is 1 week
+(see [High Assurance](#high-assurance)). When it lapses, `transfer.py` fails with the
+misleading authorization error above.
 
 ```bash
 export GLOBUS_NATIVE_APP_CLIENT_ID=<YOUR_GLOBUS_NATIVE_APP_CLIENT_ID>

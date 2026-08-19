@@ -228,7 +228,20 @@ def main() -> None:
             work=work,
             metric_out=work / f"{prefix}_hemi-{hemi}_space-fsLR32k_bold.func.gii",
         )
-        rois[hemi] = args.meshes / args.target_roi.format(hemi=hemi) if args.target_roi else None
+        # Existence-checked like target_area above: --target-roi is the other
+        # staged-mesh path, and a typo in it otherwise surfaces as a wb_command
+        # failure two calls later with no mention of which flag was wrong.
+        # Empty (the default) still means "no ROI", not "a missing file".
+        if args.target_roi:
+            roi = args.meshes / args.target_roi.format(hemi=hemi)
+            if not roi.exists():
+                sys.exit(
+                    f"missing staged mesh: {roi}. Check --target-roi against "
+                    f"what is actually in config/fsLR/."
+                )
+            rois[hemi] = roi
+        else:
+            rois[hemi] = None
 
     labels_wb = work / f"{prefix}_desc-subcort_labels_wb.nii.gz"
     run(

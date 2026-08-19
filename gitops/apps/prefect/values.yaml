@@ -32,6 +32,55 @@ prefect-server:
         cpu: 100m
         memory: 256Mi
 
+    # The chart ships BOTH probes disabled. With no readinessProbe a pod counts
+    # as Ready the moment its container starts, so the Service began routing to
+    # a server whose API was not up yet and every client got 500s until it
+    # finished booting. That is the whole failure of 2026-08-19: the `argo-db`
+    # sibling secret `prefect-db-credentials` rotated on its 7-day schedule,
+    # Reloader restarted this deployment (see commonAnnotations above), and the
+    # rollout gap crash-looped prefect-worker 10 times on
+    #   GET /api/work_pools/... -> 500
+    # because `prefect worker start` calls _check_work_pool_paused() at startup
+    # with no retry and exits 1 on error. The in-flight queue-manager Job was
+    # lost and its flow run was left RUNNING forever, silently stalling a
+    # 3000-subject cohort leg for ~4h before anyone looked.
+    #
+    # Endpoints verified against the live server before enabling: /api/ready
+    # returns 200 {"message":"OK"} and /api/health returns 200 true. Enabling a
+    # probe against a path that 404s would keep the pod permanently NotReady,
+    # which is a worse outage than the one being fixed.
+    readinessProbe:
+      enabled: true
+    livenessProbe:
+      enabled: true
+
+    # maxUnavailable 0 + maxSurge 1 makes the rollout gapless WITHOUT paying for
+    # a second steady-state replica: Kubernetes starts the replacement, waits
+    # for it to pass the readinessProbe above, and only then terminates the old
+    # pod. The probe and this strategy only work as a pair — either alone still
+    # leaves a window. Extra memory is borrowed for the duration of a rollout
+    # (256Mi request), not permanently, which matters on the backend node.
+    # PERCENTAGES, not counts, because two validators disagree and only percent
+    # strings satisfy both:
+    #   - the chart's values.schema.json types these as strings and rejects a
+    #     bare integer at template time (`got number, want string`)
+    #   - the Kubernetes API treats a STRING IntOrString as a percentage and
+    #     rejects anything not matching [0-9]+%, so "0"/"1" fail at apply time
+    #     with `a valid percent string must be a numeric string followed by an
+    #     ending '%'`
+    # "0" passes helm and fails the apiserver, which is how this reached ArgoCD
+    # as a retrying sync failure rather than a render error.
+    #
+    # At replicas: 1 these round to exactly the intended counts — maxSurge 100%
+    # rounds up to 1 extra pod, maxUnavailable 0% rounds down to 0 — so the
+    # replacement must pass its readinessProbe before the old pod is terminated.
+    # Revisit both values if replicaCount ever changes.
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: "0%"
+        maxSurge: "100%"
+
     nodeSelector:
       eks.amazonaws.com/nodegroup: backend
 

@@ -25,13 +25,38 @@ variable "karpenter_version" {
 }
 
 variable "fastsurfer_ami_tag" {
-  description = "Fastsurfer image tag (e.g. sha-abc123) used to select the pre-baked GPU AMI via Karpenter amiSelectorTerms. Update when a new AMI is built."
+  description = "Fastsurfer git-sha tag baked into the GPU AMI. Informational only — AMI selection is keyed on fastsurfer_ami_digest. Kept so the pinned image is traceable back to a source commit."
   type        = string
 }
 
 variable "fireants_ami_tag" {
-  description = "FireANTs image tag (e.g. sha-abc123) used to select the pre-baked GPU AMI via Karpenter amiSelectorTerms. Update when a new AMI is built."
+  description = "FireANTs git-sha tag baked into the GPU AMI. Informational only — AMI selection is keyed on fireants_ami_digest."
   type        = string
+}
+
+# Selection is keyed on the digest, not the tag. A rebuild at an unchanged
+# commit yields the same tag but a different image, so a tag-keyed selector
+# would keep matching the OLD AMI while the workflow templates pinned the new
+# digest — the pre-bake would silently become a cache miss and every GPU node
+# would re-pull ~16 GB at pod start (the #123 failure mode).
+variable "fastsurfer_ami_digest" {
+  description = "Fastsurfer image digest (sha256:...) pre-baked into the GPU AMI, used to select it via Karpenter amiSelectorTerms. MUST equal the digest pinned in the workflow templates."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sha256:[a-f0-9]{64}$", var.fastsurfer_ami_digest))
+    error_message = "The fastsurfer_ami_digest variable must be a full image digest of the form sha256:<64 hex chars>."
+  }
+}
+
+variable "fireants_ami_digest" {
+  description = "FireANTs image digest (sha256:...) pre-baked into the GPU AMI, used to select it via Karpenter amiSelectorTerms. MUST equal the digest pinned in registration-workflow-template.yaml."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sha256:[a-f0-9]{64}$", var.fireants_ami_digest))
+    error_message = "The fireants_ami_digest variable must be a full image digest of the form sha256:<64 hex chars>."
+  }
 }
 
 variable "eks_version" {
