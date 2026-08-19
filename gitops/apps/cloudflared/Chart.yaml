@@ -1,0 +1,5 @@
+apiVersion: v2
+name: cloudflared
+description: Cloudflare Tunnel connector for private access to the EKS API server (ADR 014 phase 1)
+type: application
+version: 0.1.0

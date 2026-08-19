@@ -140,7 +140,8 @@ Checked which declared `pixi.toml` deps are actually imported:
 
 Tooling wired into `pixi.toml` (`lint` feature/environment), `ruff.toml`,
 `.pre-commit-config.yaml`, and `.vulture-whitelist.py`. Run with
-`pixi run -e lint <task>`: `lint`, `fmt-check`, `deadcode`, `complexity`,
+`pixi run -e lint <task>`: `lint` (aggregate: `ruff-check` + `fmt-check`),
+`ruff-check`, `fmt-check`, `deadcode`, `complexity`,
 `health` (report-only); `format`, `lint-fix` (mutating). **No source code was
 changed** — this is a measurement baseline.
 

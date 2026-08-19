@@ -18,9 +18,10 @@ spec:
       labels:
         cloudpipe.io/phase: transfer
         cloudpipe.io/step: start-globus-instance
+    # `Always`, not `OnFailure` — see the note on globus-transfer-template below.
     retryStrategy:
       limit: "3"
-      retryPolicy: OnFailure
+      retryPolicy: Always
       backoff:
         duration: "30s"
         factor: "2"
@@ -29,7 +30,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -126,9 +127,30 @@ spec:
         - configMapKeyRef:
             name: cloudpipe-semaphores
             key: globus-transfer
+    # `Always`, not `OnFailure`. OnFailure retries phase=Failed only, and a
+    # throttled control plane produces phase=Error — `pod deleted`, or a wait
+    # container that cannot report status at all. So the retry budget was
+    # unreachable for exactly the failure class retries exist to absorb: in the
+    # 300-subject batch of 2026-08-14, four subjects died here inside a 41-second
+    # window on `etcdserver: throttle: too many requests`, each with one attempt
+    # and zero retries. See issue #269.
+    #
+    # No `expression` here, deliberately, unlike the workflow-level strategy in
+    # cloudpipe-long-master-workflow-template.yaml. That one exists to keep an
+    # 8-attempt budget away from deterministic failures on expensive GPU and
+    # cpu-heavy steps. This step is a 100m/256M cpu-light pod whose work is
+    # idempotent, and transfer.py exits 1 on transient Globus conditions
+    # (auth refresh, rate limiting) that OnFailure already retried — an
+    # infrastructure-codes-only expression would silently REDUCE coverage here
+    # rather than add the missing phase=Error case. `Always` with no expression
+    # is the strict superset of the behaviour being replaced.
+    #
+    # limit stays 3 rather than inheriting the workflow's 8: this step holds a
+    # semaphore (above), so its attempts are serialized against every other
+    # subject's transfer.
     retryStrategy:
       limit: "3"
-      retryPolicy: OnFailure
+      retryPolicy: Always
       backoff:
         duration: "60s"
         factor: "2"
@@ -146,7 +168,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus:sha-109059a71890468f33f9a445cd44c9443a694517"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:63b38e6c96552d9b273861999a2529cccfc77eb4ead7b66dc127b566f8ba59f9"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -199,9 +221,10 @@ spec:
       labels:
         cloudpipe.io/phase: transfer
         cloudpipe.io/step: globus-s3-sync
+    # `Always`, not `OnFailure` — see the note on globus-transfer-template above.
     retryStrategy:
       limit: "2"
-      retryPolicy: OnFailure
+      retryPolicy: Always
       backoff:
         duration: "30s"
         factor: "2"
@@ -217,7 +240,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-229e7240327b18c2efad1bc4da083870f7f379a8"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

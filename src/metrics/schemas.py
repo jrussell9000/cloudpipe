@@ -1011,6 +1011,21 @@ class PodCost:
     Cost fields inherit the day+1 scrape drift documented on
     kubecost_drift_probe.py: reliable for the RELATIVE distribution across
     components, not for absolute billed dollars.
+
+    NO-SPOT COUNTERFACTUAL (schema 1.1+)
+        Every Karpenter nodepool is spot-only (ADR 007), so every cost here is
+        a spot cost and "what would this batch have cost on demand" is not
+        answerable from the dollar columns alone. node_effective_usd_per_hour
+        and node_ondemand_usd_per_hour carry the two rates needed to answer it:
+
+            multiplier = node_ondemand_usd_per_hour / node_effective_usd_per_hour
+            on_demand  = (cpu + memory + gpu) * multiplier + pv + network
+
+        Only the compute components scale. pv_cost_usd is EBS and
+        network_cost_usd is data transfer; neither is priced by capacity type,
+        so multiplying them would inflate the answer. The rates are stored
+        rather than a precomputed dollar figure so the formula stays visible
+        and revisable without a backfill — see CloudpipeMetrics.spot_savings().
     """
 
     date: str  # YYYY-MM-DD (report date, matching CostAllocation.date)
@@ -1050,9 +1065,28 @@ class PodCost:
     node: str = ""
     node_instance_type: str = ""
 
+    # Schema 1.1+. The two rates that make the no-spot counterfactual
+    # computable: what the node actually cost per hour, and what the same
+    # instance type would have cost on demand. Both come from the Node Assets
+    # pass in kubecost_scraper, joined onto the pod by `node`.
+    #
+    # NULL, not 0.0, when unknown — an unpriced type must not silently read as
+    # a free node (0.0 would make the multiplier 0 and understate the
+    # counterfactual with no signal that it happened). Absent entirely on
+    # schema-1.0 records, which predate the fields.
+    #
+    # node_effective_usd_per_hour is Kubecost's post-reconciliation node cost
+    # divided by node-hours, so it inherits the same day+1 drift as every
+    # other cost field here and only settles at scrape_age_days=3.
+    # node_ondemand_usd_per_hour is AWS *list* price, which does not drift and
+    # is not discounted by any savings plan or RI the account may hold.
+    node_capacity_type: str = ""  # "spot" | "on-demand" | "" (unknown)
+    node_effective_usd_per_hour: float | None = None
+    node_ondemand_usd_per_hour: float | None = None
+
     scrape_age_days: int = 1
     pipeline: str = "cloudpipe_minproc"
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     completed_at: str = field(default_factory=_now_utc)
 
     def to_dict(self) -> dict[str, Any]:

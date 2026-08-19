@@ -18,6 +18,13 @@ Step 1). `--seed-from` therefore defaults to the previous batch's sample, making
 it a strict subset of the new draw so the two batches are directly comparable at
 different concurrencies. Pass `--exclude-prior` instead if you would rather not flush.
 
+`--exclude-prior` is a PROXY, and after a flush it is the wrong one: it excludes
+every subject ever SUBMITTED, while what actually changes pipeline behaviour is
+whether derivatives exist RIGHT NOW. Those two sets diverge the moment
+prep_test_batch.py runs — as of 2026-08-17 by 353 subjects, which were flushed and
+are therefore legitimately re-drawable. Prefer `--exclude-derivatives`, which reads
+the bucket instead of a hand-maintained tuple and so cannot go stale.
+
 Session counts come from nss_volumes.csv, which is one row per subject-session.
 That is the pipeline's own view of which sessions exist, so it is the right source
 for k, but note it is not a run count: BOLD runs per session vary and are not
@@ -41,12 +48,24 @@ NSS = REPO / "tools/nss_volumes.csv"
 ELIGIBLE = REPO / "tools/first-level-subjects.csv"
 # The previous batch, carried into the new draw by default so the two runs differ
 # only in concurrency. Requires a flush before submitting.
-SEED_DEFAULT = "tools/cloudpipe_test_sample_200.csv"
-# Every list that has been submitted to the cluster before. Subjects in any of
-# these have derivatives in S3 and skip the anatomical phase unless flushed.
+SEED_DEFAULT = "tools/cloudpipe_test_sample_300_fresh.csv"
+# Every list that has been SUBMITTED to the cluster before. This is a submission
+# record, NOT the set that holds derivatives: prep_test_batch.py flushes, and a
+# flushed subject runs the full pipeline again. Use --exclude-derivatives when the
+# question is "would this subject skip the anatomical phase"; this tuple only
+# answers "has it ever run", which is the conservative-but-blunt version.
+# Keep it in step with every new sample CSV anyway: an omission is silent, and it
+# defeats --exclude-prior precisely in the no-flush case that flag exists for.
+# (The 300 list ran twice -- the 08-12 and 08-14 batches -- and was missing here.)
+# The 08-17 batch ran _300_fresh, which is DISJOINT from _300 -- so omitting it hid
+# every subject that currently holds derivatives, not a subset of one. Enumerated
+# against tools/ by tests/test_make_test_sample.py so the next omission is loud.
 PRIOR_RUNS = (
     "tools/cloudpipe_test_sample.csv",
     "tools/cloudpipe_test_sample_200.csv",
+    "tools/cloudpipe_test_sample_300.csv",
+    "tools/cloudpipe_test_sample_300_fresh.csv",
+    "tools/cloudpipe_test_sample_550.csv",
     "tools/cloudpipe_test_sample_10.csv",
     "tools/subjectids_v611_50.csv",
     "tools/subjectids_v611_first9.csv",
@@ -60,6 +79,47 @@ COST_BY_K = {1: 0.096, 2: 0.154, 3: 0.235, 4: 0.305}
 def _read_ids(path: Path) -> set[str]:
     with path.open() as fh:
         return {r["subject_id"] for r in csv.DictReader(fh) if r.get("subject_id")}
+
+
+# Every derivative root the inventory step consults. All six, not just fastsurfer:
+# the inventory skips any step whose own output already exists, so a subject holding
+# only `func_surf/` still skips surface-resample. Those last two are exactly the
+# prefixes an earlier prep_test_batch.py forgot to flush, which silently zeroed the
+# surface stage on a batch an operator believed was a full reprocess.
+DERIVATIVE_ROOTS = (
+    "derivatives/fastsurfer/",
+    "derivatives/registration/",
+    "derivatives/func/",
+    "derivatives/subregions/",
+    "derivatives/func_surf/",
+    "derivatives/subregions_mni/",
+)
+
+
+def subjects_with_derivatives(bucket: str) -> set[str]:
+    """Subjects holding ANY derivative, so some pipeline step would SKIP for them.
+
+    Ground truth for --exclude-derivatives, and the whole reason it exists: this is
+    a live read, so unlike PRIOR_RUNS it cannot fall out of step with the bucket.
+
+    Prefix presence, deliberately NOT the ADR 017 `_complete.json` marker. That rule
+    is absolute where a half-uploaded tree must never be read as "done" because the
+    consequence is SKIPPING work. Here the consequence is only declining to draw a
+    subject into a sample, so a partial tree excluding itself is harmless — and a
+    delimited listing costs SIX calls against the ~1200 HEADs that per-session marker
+    checks would need. Do not "fix" this into a marker check; it is not the same
+    question that inventory.py asks.
+    """
+    import boto3  # local: keeps the offline draw importable without AWS deps
+
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    subjects: set[str] = set()
+    for root in DERIVATIVE_ROOTS:
+        for page in paginator.paginate(Bucket=bucket, Prefix=root, Delimiter="/"):
+            for entry in page.get("CommonPrefixes", []):
+                subjects.add(entry["Prefix"].split("/")[-2])
+    return subjects
 
 
 def sessions_by_subject() -> dict[str, int]:
@@ -107,7 +167,9 @@ def allocate_quota(
 def _resolve_prior(
     args: argparse.Namespace, k_by_subject: dict[str, int]
 ) -> tuple[set[str], list[str]]:
-    """Either exclude every prior-run subject, or seed the draw from the last batch."""
+    """Exclude by live derivatives, or by submission record, or seed from the last batch."""
+    if args.exclude_derivatives:
+        return subjects_with_derivatives(args.bucket), []
     if args.exclude_prior:
         excluded: set[str] = set()
         for rel in PRIOR_RUNS:
@@ -137,12 +199,20 @@ def main() -> int:
         help="CSV of subjects to carry into the draw as a subset (default: the "
         "previous batch's sample). Pass /dev/null to disable.",
     )
-    ap.add_argument(
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument(
         "--exclude-prior",
         action="store_true",
-        help="exclude every previously-run subject instead of seeding from them; "
-        "use when not flushing first",
+        help="exclude every previously-SUBMITTED subject (PRIOR_RUNS) instead of "
+        "seeding from them; blunt — prefer --exclude-derivatives",
     )
+    mode.add_argument(
+        "--exclude-derivatives",
+        action="store_true",
+        help="exclude only subjects that hold FastSurfer derivatives right now, "
+        "read live from the bucket; flushed subjects stay drawable",
+    )
+    ap.add_argument("--bucket", default="<YOUR_S3_BUCKET>", help="data bucket read by --exclude-derivatives")
     args = ap.parse_args()
 
     k_by_subject = sessions_by_subject()
@@ -199,7 +269,12 @@ def main() -> int:
     sessions = sum(k_by_subject[s] for s in sample)
     cost = sum(COST_BY_K[k_by_subject[s]] for s in sample)
     print(f"wrote {len(sample)} subjects to {args.output}")
-    print(f"pool {total} eligible ({len(excluded)} prior-run subjects excluded)")
+    source = (
+        f"hold derivatives in s3://{args.bucket}"
+        if args.exclude_derivatives
+        else "previously submitted"
+    )
+    print(f"pool {total} eligible ({len(excluded)} excluded: {source})")
     if seeded:
         print(f"seeded {len(seeded)} from {args.seed_from.name} (flush before submitting)")
     print(f"{'k':>3} {'sample':>7} {'share':>7} {'pool share':>11}")

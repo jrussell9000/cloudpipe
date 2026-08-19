@@ -16,6 +16,21 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "finops" {
   }
 }
 
+# Public Access Block, not just the private ACL below. The two are different
+# controls: the ACL governs the grants that exist now, while this makes a future
+# public grant impossible to create at all — including one added by hand in the
+# console, or via a bucket policy, neither of which the ACL constrains. This
+# bucket holds Cost and Usage Report data (account IDs and spend) under athena/,
+# Athena query results under query-results/, and the Kubecost federated store,
+# so "nothing grants public access today" is not a control.
+resource "aws_s3_bucket_public_access_block" "finops" {
+  bucket                  = aws_s3_bucket.finops.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
 resource "aws_s3_bucket_ownership_controls" "finops" {
   bucket = aws_s3_bucket.finops.id
   rule {
@@ -53,7 +68,12 @@ resource "aws_glue_crawler" "cur_report_crawler" {
   database_name = aws_athena_database.athena_cur_database.name
   schedule      = "cron(0 0/12 * * ? *)"
   name          = "cur_report_crawler"
-  role          = "crawler-service-role"
+  # Reference, not the literal "crawler-service-role". The role is declared in
+  # this same module (iam.tf, aws_iam_role.crawler-service-role), so a string
+  # literal builds no dependency edge — on a cold apply the crawler can be
+  # created before the role exists, and a rename would leave this pointing at a
+  # name that no longer does, with no plan diff to say so.
+  role = aws_iam_role.crawler-service-role.name
   configuration = jsonencode(
     {
       Grouping = {

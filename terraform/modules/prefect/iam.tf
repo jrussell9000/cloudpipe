@@ -47,6 +47,21 @@ data "aws_iam_policy_document" "worker" {
     resources = ["arn:aws:s3:::${var.metrics_bucket}/*"]
   }
 
+  # The pod-cost pass looks up on-demand LIST prices to build the no-spot
+  # counterfactual (src/metrics/ec2_pricing.py). Granted here in the same change
+  # that starts calling it: the lookup swallows its own failures by design, so
+  # without this the scraper would keep succeeding while writing NULL rate
+  # columns every night, and nothing downstream would say why.
+  #
+  # The Pricing API is global and has no resource-level ARNs — "*" is the only
+  # valid resource for it. Read-only, and it exposes public list prices, not
+  # this account's bill.
+  statement {
+    sid       = "PricingReadOnDemandRates"
+    actions   = ["pricing:GetProducts"]
+    resources = ["*"]
+  }
+
   # cloudpipe_queue_manager reads the Globus dest collection UUID at runtime
   # so instance replacements take effect without redeploying the flow.
   statement {

@@ -274,6 +274,9 @@ def resample_with_matrix(
     applied as-is, with no inversion:
       v_mov = A_mov⁻¹ @ T @ A_ref @ v_ref
 
+    The exception is mask_to_bold, which resamples in the opposite direction
+    (mask onto BOLD grid) and therefore passes the inverse matrix deliberately.
+
     Passing the identity for `T` yields the no-registration baseline: the same
     BOLD reference on the same grid, related only by the two images' affines.
     That is the reference point nmi_gain is measured against (see main()).
@@ -288,9 +291,19 @@ def resample_with_matrix(
 
     shape = ref_img.shape[:3]
     i, j, k = np.mgrid[: shape[0], : shape[1], : shape[2]]
-    vox = np.ones((4, i.size))
-    vox[0], vox[1], vox[2] = i.ravel(), j.ravel(), k.ravel()
+    n = i.size
+    vox = np.ones((4, n), dtype=np.float64)
+    vox[0] = i.ravel()
+    vox[1] = j.ravel()
+    vox[2] = k.ravel()
+    # On the 256^3 conformed grid these three int64 arrays are ~0.40 GB and are
+    # dead the moment vox is filled; without the del they stay live through
+    # map_coordinates. Same reason as the dels in images/afni/preproc.py.
+    del i, j, k
 
+    # mov_coords is a VIEW of the (4, N) product, so the full ~0.54 GB float64
+    # result stays alive until map_coordinates returns. Nothing to free here —
+    # noted so a future reader does not add a misleading `del`.
     mov_coords = (M @ vox)[:3]
     return ndimage.map_coordinates(
         mov_data.astype(np.float32),
@@ -319,33 +332,24 @@ def mask_to_bold(subjects_dir: Path, subject: str, ref: Path, lta: Path, out: Pa
 
     Pull-resampling from the BOLD grid needs BOLD_RAS → T1w_RAS to look up each
     BOLD voxel's location in the mask. That is the *inverse* of the SynthMorph
-    matrix, which runs T1w_RAS → BOLD_RAS (see parse_lta_matrix).
+    matrix, which runs T1w_RAS → BOLD_RAS (see parse_lta_matrix) — so unlike
+    every other call site this one passes the inverse, and that inversion is the
+    whole content of this function. It shipped inverted once (fixed cd33678),
+    which is why the resampling itself lives in resample_with_matrix and is not
+    re-implemented here: a second copy is a second place to get the direction
+    wrong.
+
+    Nearest-neighbour (order=0) because the input is a label volume — linear
+    interpolation would produce fractional mask values.
     """
     brainmask_mgz = subjects_dir / subject / "mri" / "brainmask.mgz"
     T_inv = np.linalg.inv(parse_lta_matrix(lta))
 
+    sampled = resample_with_matrix(brainmask_mgz, T_inv, ref, order=0)
+
     ref_img = nib.load(str(ref))
-    mask_img = nib.load(str(brainmask_mgz))
-    mask_data = np.asarray(mask_img.dataobj)
-
-    M = np.linalg.inv(mask_img.affine) @ T_inv @ ref_img.affine
-
-    shape = ref_img.shape[:3]
-    i, j, k = np.mgrid[: shape[0], : shape[1], : shape[2]]
-    vox = np.ones((4, i.size))
-    vox[0], vox[1], vox[2] = i.ravel(), j.ravel(), k.ravel()
-
-    mask_coords = (M @ vox)[:3]
-    sampled = ndimage.map_coordinates(
-        mask_data.astype(np.float32),
-        mask_coords,
-        order=0,
-        mode='constant',
-        cval=0,
-    ).reshape(shape)
-
     out_img = nib.Nifti1Image((sampled > 0).astype(np.uint8), ref_img.affine, ref_img.header)
-    out_img.header.set_data_shape(shape)
+    out_img.header.set_data_shape(sampled.shape)
     nib.save(out_img, str(out))
     log.info(f"BOLD brain mask written: {out}")
     return out

@@ -79,13 +79,16 @@ S3 key: `metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json`
 | `peak_memory_gb` | float | Peak RSS for **this run only** (`RUSAGE_SELF`/`RUSAGE_CHILDREN` max) — resets per run |
 | `container_peak_memory_gb` | float | Peak RSS over the **container's lifetime** — climbs across a multi-run session even when runs are identically sized; size pod memory limits against this one, not `peak_memory_gb` |
 | `pipeline`, `image_tag` | str | Provenance: pipeline name and image SHA |
-| `schema_version` | str | `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that [#119] showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the conda-forge `afni` package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
+| `schema_version` | str | `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that [#119] showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
 
 **`gcor`/`aor`/`aqi` are computed in-process in `preproc.py`, at the same definitions as AFNI's
 `@compute_gcor`, `3dToutcount -fraction` and `3dTqual`** — the tools MRIQC wraps for the same
 three metrics, so the values stay comparable with published MRIQC norms. They were originally
-shelled out to those binaries, but none of the three ship in the conda-forge `afni` package the
-image installs (71 of AFNI's ~600 programs), so the calls never ran ([#119]). `tests/images/afni/
+shelled out to those binaries, but the calls never ran ([#119]): the image took AFNI from
+conda-forge then, whose package ships 71 of AFNI's ~600 programs, and none of these three were
+among them. The image now installs AFNI from upstream, where all three exist, but ships only an
+allow-listed set of binaries (`AFNI_PROGRAMS` in `images/afni/Dockerfile`), so they remain absent
+by choice — the in-process versions are kept on their own merits. `tests/images/afni/
 test_bold_iqms.py` pins all three against values the real AFNI binaries produced; agreement is
 exact for `gcor`/`aor` and within ~1e-5 for `aqi`, where AFNI's own sequential float32
 accumulation is the limiting error.
@@ -574,8 +577,11 @@ auto-detects it, so only `compactor.read_raw_records` needed to learn about the 
 | `cpu_core_hours`, `ram_gb_hours`, `gpu_hours` | float | Resource consumption. RAM is converted from Kubecost's byte-hours to GB-hours so it is directly comparable to a pod's memory request |
 | `cpu_efficiency`, `ram_efficiency` | float | Kubecost's usage/request ratio in [0, 1], averaged over the pod's whole allocation window. Low efficiency on an expensive step *suggests* the cost is reducible by lowering requests rather than by making the code faster — but **do not size a request from this number alone on a step with input artifacts** (see below), and never size a hard memory *limit* from it, because a lifetime average cannot see the peak that OOMs |
 | `node`, `node_instance_type` | str | Where the pod landed. Instance type drives the rate, so a step whose cost moves without its resource-hours moving is a placement effect, not a workload change. Both come from node labels Kubecost propagates onto the allocation (`kubernetes.io/hostname`, `node.kubernetes.io/instance-type`) — under `aggregate=pod` the API returns no top-level `node` property. **`node` was empty on every row written before 2026-07-31**; rows older than that cannot answer co-tenancy questions |
+| `node_capacity_type` | str | **Schema 1.1+.** `"spot"` on every Karpenter-provisioned node — which is all pipeline compute, since all four nodepools are spot-only ([ADR 007](decisions/007-karpenter-for-pipeline-pods.md)) — and `"on-demand"` on the EKS managed-nodegroup nodes that carry system pods. Taken from the `karpenter.sh/capacity-type` node label, falling back to Kubecost's `preemptible` flag for nodes Karpenter did not create. `""` on rows written before schema 1.1 |
+| `node_effective_usd_per_hour` | float | **Schema 1.1+.** What the node actually cost per hour: its Kubecost **Assets** `totalCost` divided by its node-hours. This is the rate the pod's own cost columns were derived from, so it inherits the same day+1 drift and only settles at `scrape_age_days = 3`. **NULL, not 0**, when Kubecost had no asset for the node |
+| `node_ondemand_usd_per_hour` | float | **Schema 1.1+.** AWS **list** price for `node_instance_type` in-region, from the Pricing API at scrape time (`src/metrics/ec2_pricing.py`). Does not drift, and is *not* reduced by any savings plan or RI the account holds. **NULL, not 0**, when the Pricing API returned no rate for the type |
 | `scrape_age_days` | int | Same meaning as on `CostAllocation` |
-| `schema_version` | str | `"1.0"` |
+| `schema_version` | str | `"1.1"` (`"1.0"` on rows predating the three `node_capacity_type`/rate columns) |
 
 **Grain is one row per pod per report date — one below `costs`.** Summing `total_cost_usd` over
 a `(date, workflow_name)` reproduces that workflow's `costs` row; the two passes share
@@ -583,6 +589,53 @@ a `(date, workflow_name)` reproduces that workflow's `costs` row; the two passes
 runs contributes eight `bold-to-t1w` pods, so `n_pods` in `step_costs()` is a count of work
 units, not of subjects — which is what makes its `mean_cost_usd` the figure that scales when the
 batch grows.
+
+### What a batch would have cost without spot
+
+Every nodepool is spot-only, so every dollar in this table is a spot dollar and no on-demand
+figure is observed anywhere in the corpus. The two rate columns exist to reconstruct one.
+`CloudpipeMetrics.spot_savings()` (both the Athena and DuckDB clients) is the supported way to
+read it:
+
+```python
+m.spot_savings(subjects=batch, date_from="2026-08-13", date_to="2026-08-16")
+m.spot_savings(subjects=batch, date_from="...", group_by="step")   # per component
+```
+
+The arithmetic it applies, per pod:
+
+```
+multiplier = node_ondemand_usd_per_hour / node_effective_usd_per_hour
+on_demand  = (cpu + memory + gpu) * multiplier + pv + network
+```
+
+Only the compute components scale. `pv_cost_usd` is EBS and `network_cost_usd` is data transfer;
+neither is priced by capacity type, so scaling them would invent a storage discount that never
+existed.
+
+Three things to hold onto when reading the result:
+
+- **It is on-demand *at list price*.** Savings plans or RIs would make real on-demand spend
+  lower, so this is the conservative upper bound on what abandoning spot would cost, not a quote.
+- **`coverage_frac` is part of the answer.** Rows with NULL rates — anything written before
+  schema 1.1, plus any instance type the Pricing API would not price — cannot be scaled and are
+  excluded. `ondemand_cost_usd` is comparable against `priced_cost_usd`, **not** against
+  `actual_cost_usd`. A coverage well under 1.0 makes the figure a sample of the batch. When
+  *nothing* in the scope could be priced, `coverage_frac` is `0.0` while the dollar columns are
+  NULL — the fraction stays a comparable number so a `< threshold` guard fires, whereas a `0` in
+  `savings_usd` would read as a measured "no savings" instead of "not computable".
+- **Drift runs backwards from every other column here.** A day+1 read inflates the pod's cost
+  *and* its node's effective rate by the same factor k (median ~1.5) — both come from the same
+  unreconciled pass — while the list price does not move. In
+  `ondemand = cost × (list / effective)` the k cancels exactly, making `ondemand_cost_usd` the
+  most drift-resistant figure in this table. `savings_usd` and the multiple are not: only their
+  actual-cost side carries the inflation, so **at day+1 both understate the real gap by roughly
+  k**. Wait for `scrape_age_days = 3` before quoting a savings multiple.
+
+Measured on `dt=2026-08-11` (a day+1 read, so the multiple is a floor): 2,511 pods, coverage
+1.000, **$21.79 actual vs $68.71 on demand — 3.15×**. Per-instance-type multipliers ran 2.0–3.9,
+with the GPU pool (`g4dn.2xlarge`) at 3.28× and the cpu-heavy workhorses (`c8i-flex.4xlarge`) at
+3.35×.
 
 **The same reconciliation timing as `CostAllocation` applies to every cost column here** — this
 grain is re-scraped in the same settled pass, so rows for a date older than 3 days carry

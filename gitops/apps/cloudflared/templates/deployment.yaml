@@ -1,0 +1,90 @@
+# cloudflared connector for the cloudpipe-eks tunnel (ADR 014 phase 1).
+#
+# Two replicas because tunnel availability gates ALL kubectl access once the
+# Client VPN is retired — a single connector would make a pod eviction an
+# access outage. cloudflared registers multiple connections per replica and
+# Cloudflare load-balances across them.
+#
+# There is no Service and no ingress: the connector dials OUT to Cloudflare's
+# edge over QUIC/443. Nothing needs to reach it inbound, which is the entire
+# security argument for a tunnel over an open ALB.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      # Spread across nodes so a single node loss cannot take out both
+      # connectors. Preferred rather than required: on a small or heavily
+      # packed cluster a hard constraint would leave a replica unschedulable,
+      # which is worse than co-location.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: cloudflared
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.8.2
+          args:
+            - tunnel
+            - --no-autoupdate
+            # Bind the metrics server so the readiness probe below has
+            # something to talk to; /ready reports registered connections.
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+            - --token
+            - $(TUNNEL_TOKEN)
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-token
+                  key: token
+          ports:
+            - name: metrics
+              containerPort: 2000
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

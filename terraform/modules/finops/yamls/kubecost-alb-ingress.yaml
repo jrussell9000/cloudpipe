@@ -24,9 +24,12 @@ metadata:
     alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
     alb.ingress.kubernetes.io/security-groups: ${security_group}
     alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+    # ALB access logging (H3) — the SSE-S3 access-log bucket, not the SSE-KMS master log
+    # bucket, which ALB cannot deliver to. See terraform/logging.tf.
+    #
     # Raise the idle timeout to the ALB maximum (4000s) so live-updating views survive quiet
     # periods; the 60s default tears the connection down and the page shows stale state.
-    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=4000
+    alb.ingress.kubernetes.io/load-balancer-attributes: access_logs.s3.enabled=true,access_logs.s3.bucket=${access_log_bucket},access_logs.s3.prefix=alb-kubecost,idle_timeout.timeout_seconds=4000
 
 spec:
   ingressClassName: alb

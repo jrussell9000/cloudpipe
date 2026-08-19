@@ -987,9 +987,15 @@ def compute_confounds(
 # ---------------------------------------------------------------------------
 #
 # These three were originally shelled out to AFNI's 3dToutcount, 3dTqual and
-# @compute_gcor.  None of the three exist in this image — the conda-forge `afni`
-# package ships 71 of AFNI's ~600 programs — so the calls could never have run
-# (#119).  Reimplemented here at AFNI's default settings so the values stay
+# @compute_gcor.  None of the three could ever have run (#119): at the time the
+# image took AFNI from conda-forge, whose package ships 71 of AFNI's ~600
+# programs, and none of these were among them.  The image now installs AFNI from
+# upstream, where all three DO exist, but ships only an allow-list of binaries
+# (AFNI_PROGRAMS in the Dockerfile, currently just 3dcalc) — so they are still
+# absent, now by choice rather than by accident.  Adding them back would be a
+# one-word Dockerfile edit; the numpy implementations below are kept because they
+# are exact and avoid three subprocess round-trips per run, not because AFNI's
+# are unavailable.  Reimplemented at AFNI's default settings so the values stay
 # comparable with AFNI's own and with MRIQC's aor/aqi/gcor, which wrap the same
 # programs.  All three take the in-mask voxel x time matrix, loaded once.
 

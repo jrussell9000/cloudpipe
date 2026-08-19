@@ -48,7 +48,7 @@
     {
       "id": 1,
       "type": "stat",
-      "title": "Participants with incomplete output",
+      "title": "Participants with lost output",
       "gridPos": {
         "x": 10,
         "y": 0,
@@ -69,7 +69,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT COUNT(DISTINCT subject) AS incomplete_subjects FROM cloudpipe_metrics.subject_manifests WHERE overall_status <> 'succeeded' AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+          "rawSQL": "SELECT COUNT(DISTINCT subject) AS damaged_subjects FROM cloudpipe_metrics.subject_manifests WHERE overall_status <> 'succeeded' AND (cardinality(failed_steps) > 0 OR overall_status = 'failed') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
         }
       ],
       "fieldConfig": {
@@ -81,7 +81,7 @@
           }
         }
       },
-      "description": "The true blast radius, from subject_manifests.overall_status. This is the number to trust — Pipeline Throughput's workflow status does NOT reflect it: a workflow whose per-run steps failed still finishes 'Succeeded', so subject-level damage is invisible there.",
+      "description": "The true blast radius: participants where a step actually failed, or where the workflow died before recording anything. This is the number to trust — Pipeline Throughput's workflow status does NOT reflect it, because a workflow whose per-run steps failed still finishes 'Succeeded', so subject-level damage is invisible there.\n\nDeliberately NOT `overall_status <> 'succeeded'`. That reads `partial` for a participant whose only event was a skipped branch, and skipping is routine — an anatomical that already exists, or a session with no usable BOLD. Counting those as damage overstated this number by roughly 2x (199 vs 101 over one measured fortnight). Those participants are listed separately in the 'Skipped only' table at the bottom of the Blast radius row.\n\nThe predicate is `failed_steps` non-empty OR `overall_status = 'failed'`. The second half is load-bearing: a workflow killed before any step recorded has an EMPTY `failed_steps`, so testing only the array would drop the most severe participants of all.",
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -835,7 +835,7 @@
     {
       "id": 500,
       "type": "row",
-      "title": "👥 Blast radius — which participants lost output",
+      "title": "👥 Blast radius — who lost output, and who only skipped",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -848,7 +848,7 @@
     {
       "id": 50,
       "type": "table",
-      "title": "Participants with incomplete output, worst first",
+      "title": "Participants that lost output, worst first",
       "gridPos": {
         "x": 0,
         "y": 57,
@@ -869,7 +869,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT completed_at, subject, overall_status, cardinality(failed_steps) AS n_failed_units, cardinality(skipped_steps) AS n_skipped_units, array_join(array_distinct(failed_steps), ', ') AS which_steps_failed, array_join(array_distinct(skipped_steps), ', ') AS which_steps_skipped, cardinality(outputs_available) AS n_outputs_available, workflow_name FROM cloudpipe_metrics.subject_manifests WHERE overall_status <> 'succeeded' AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) ORDER BY n_failed_units DESC, n_skipped_units DESC"
+          "rawSQL": "SELECT completed_at, subject, overall_status, cardinality(failed_steps) AS n_failed_units, cardinality(skipped_steps) AS n_skipped_units, CASE WHEN cardinality(failed_steps) > 0 THEN array_join(array_distinct(failed_steps), ', ') WHEN cardinality(steps) = 0 THEN '— no step records — died before recording —' ELSE '— failed, but no step marked failed —' END AS which_steps_failed, CASE WHEN cardinality(skipped_steps) > 0 THEN array_join(array_distinct(skipped_steps), ', ') WHEN cardinality(steps) = 0 THEN '— no step records — died before recording —' ELSE '— nothing skipped —' END AS which_steps_skipped, cardinality(outputs_available) AS n_outputs_available, workflow_name FROM cloudpipe_metrics.subject_manifests WHERE overall_status <> 'succeeded' AND (cardinality(failed_steps) > 0 OR overall_status = 'failed') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) ORDER BY n_failed_units DESC, n_skipped_units DESC"
         }
       ],
       "options": {
@@ -945,9 +945,42 @@
             },
             "properties": [
               {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "— failed, but no step marked failed —": {
+                        "text": "— failed, but no step marked failed —",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "— nothing skipped —": {
+                        "text": "— nothing skipped —",
+                        "color": "green",
+                        "index": 1
+                      },
+                      "— no step records — died before recording —": {
+                        "text": "— no step records — died before recording —",
+                        "color": "red",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
                 "id": "custom.cellOptions",
                 "value": {
+                  "type": "color-text",
                   "wrapText": true
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
                 }
               },
               {
@@ -958,7 +991,72 @@
           }
         ]
       },
-      "description": "From subject_manifests, the per-participant rollup written at workflow exit. `partial` means some outputs landed and some did not — the workflow itself may still have finished 'Succeeded', which is why this row exists and Pipeline Throughput cannot answer the question. The unit counts are of failed/skipped step records (one per session, or per BOLD run downstream of registration), so a participant with four bad runs scores 4 per affected step; `which_steps_*` de-duplicates to the step names."
+      "description": "From subject_manifests, the per-participant rollup written at workflow exit. Scoped to participants that actually lost something: `failed_steps` non-empty, OR `overall_status = 'failed'`. Participants whose only event was a skipped branch are NOT here — they are in the table below, because skipping is routine and counting it as damage overstated this population by roughly 2x.\n\n`partial` here means some outputs landed and some did not — the workflow itself may still have finished 'Succeeded', which is why this row exists and Pipeline Throughput cannot answer the question. The unit counts are of failed/skipped step records (one per session, or per BOLD run downstream of registration), so a participant with four bad runs scores 4 per affected step; `which_steps_*` de-duplicates to the step names.\n\n**Red, `— no step records — died before recording —`**: the manifest carries *zero* step outcomes, so the workflow was killed before any step could record (workflow deadline, controller eviction). Nothing can be attributed to a step because nothing was ever written; go to the workflow itself, not to a step. These are the most severe rows here despite naming no step, and they are exactly why the scope test is not `failed_steps` alone — that array is empty for them.\n\n**Red, `— failed, but no step marked failed —`**: should not occur. A manifest that recorded steps and ended `failed` without any of them being `failed` means the rollup and the step records disagree; treat it as a bug in the recording, not as a participant to re-run.\n\nNote `n_outputs_available` counts outputs verified by steps that RAN. A step skipped because its output already existed contributes nothing, so a low number here is not evidence of loss."
+    },
+    {
+      "id": 51,
+      "type": "table",
+      "title": "Skipped only — nothing failed, most-skipped first",
+      "gridPos": {
+        "x": 0,
+        "y": 67,
+        "w": 24,
+        "h": 9
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT completed_at, subject, cardinality(skipped_steps) AS n_skipped_units, array_join(array_sort(array_distinct(skipped_steps)), ', ') AS which_steps_skipped, cardinality(outputs_available) AS n_outputs_available, workflow_name FROM cloudpipe_metrics.subject_manifests WHERE overall_status <> 'succeeded' AND cardinality(failed_steps) = 0 AND overall_status <> 'failed' AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE) ORDER BY n_skipped_units DESC, completed_at DESC"
+        }
+      ],
+      "options": {
+        "cellHeight": "auto",
+        "sortBy": [
+          {
+            "displayName": "n_skipped_units",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "which_steps_skipped"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "wrapText": true
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 420
+              }
+            ]
+          }
+        ]
+      },
+      "description": "The other half of `overall_status <> 'succeeded'`: participants that are `partial` because a branch was SKIPPED, with nothing failed anywhere. These used to sit in the table above and made it read as twice the damage it was. They are almost never a work queue — check them, do not chase them.\n\nThe manifest cannot say WHICH kind of skip this was; all three look identical in the record. In practice: every phase skipped usually means the participant was already fully processed and the re-run was a no-op; `anatomical-phase` alone means the FastSurfer derivatives already existed; the four-step functional set (`bold-to-t1w`, `func-preproc`, `surface-sample`, `surface-resample`) usually means that session had no usable BOLD run, so there was nothing to process.\n\n`n_outputs_available` counts only what steps that RAN verified, so it reads 0 for a complete no-op re-run of a finished participant. It is not a loss signal — do not read a 0 here as an empty participant. Confirm against S3, or against an earlier workflow for the same subject, before re-submitting anything from this table."
     }
   ]
 }

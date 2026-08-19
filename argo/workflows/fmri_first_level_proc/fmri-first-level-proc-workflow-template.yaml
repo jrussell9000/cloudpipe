@@ -48,7 +48,12 @@ spec:
     # deliberately absent: a real OOMKill is deterministic (#120, #129, #134 each
     # needed a config change, not a retry), so retrying it only burns the enlarged
     # budget on an identical failure.
-    expression: 'lastRetry.message matches "pod deleted|imminent node shutdown" || lastRetry.exitCode in ["64", "75", "143"]'
+    # The codes are matched in the message too: a pod that dies in its init or wait
+    # container never populates exitCode, so that arm alone is dead for the whole
+    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
+    # its producer was skipped or failed, and a consumer retry cannot re-run the
+    # producer. See the cloudpipe master template for the detail.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -79,7 +84,7 @@ spec:
       karpenter.sh/nodepool: first-level-nodepool
 
     container:
-      image: "public.ecr.aws/l9e7l1h1/cloudpipe/fmri-first-level-proc:sha-61de8f3d65ad4547b3021e0e6d8f04a5bd5aa1b9"
+      image: "<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/fmri-first-level-proc@sha256:1423bedb9da05e9acea28b547f952037629f54ac7bd125280d17bd2a9a7d4bd5"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

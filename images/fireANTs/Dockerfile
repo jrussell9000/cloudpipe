@@ -11,17 +11,38 @@
 # See handoffs/fireants-fused-ops.md for the measured baseline this must be
 # validated against, and images/fireANTs/scripts/fst1w_to_mni.py for the USE_FFO
 # runtime switch that selects the fused / non-fused arm.
-ARG CUDA_TAG=12.1.1-cudnn8
+#
+# Was 12.1.1-cudnn8 + torch 2.5.1 (cu121) until #255. `torch==2.5.1` carries a hard
+# `nvidia-cudnn-cu12==9.1.0.70` requirement and NVIDIA garbage-collected that patch
+# release from both pypi.nvidia.com and download.pytorch.org, so every cold-cache
+# build of this image failed. The dead pin spans torch 2.4.0–2.6.0 on BOTH the cu121
+# and cu124 wheel lines, so there is no sideways escape; cu126 + torch 2.6.0 is the
+# nearest live combination going forward, pinning cudnn 9.5.1.17 (present).
+#
+# Going BACKWARD also resolves and was rejected on merit, not availability: cu121
+# torch 2.3.0/2.3.1 pin cudnn 8.9.2.26, which is still published, and would have kept
+# this base tag byte-identical. It buys nothing durable — 2.3.x is a two-minor
+# downgrade of the whole stack, is further from upstream FireANTs' own pin, and its
+# CUDA-12.1 wheel line is closer to the next round of NVIDIA garbage collection, not
+# further from it. `fireants==1.5.0` itself only asks for `torch>=2.3.0`.
+#
+# CUDA 12.6 base tags drop the cudnn major from the name ("-cudnn", not "-cudnn9");
+# 12.6.3 is the last 12.6 patch (no 12.6.4 exists on Docker Hub).
+ARG CUDA_TAG=12.6.3-cudnn
 # Pinned together, deliberately. The extension compiled below links against this
 # exact libtorch ABI, and it only builds from the matching `fireants` checkout, so
-# these versions are one unit — bump them together or not at all.
-ARG TORCH_VERSION=2.5.1
-ARG TORCHVISION_VERSION=0.20.1
+# these versions are one unit — bump them together or not at all. TORCH_INDEX must
+# track CUDA_TAG's major.minor: a cu126 wheel on a 12.1 base loads the wrong
+# libcudart at import time.
+ARG TORCH_VERSION=2.6.0
+ARG TORCHVISION_VERSION=0.21.0
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
 ARG FIREANTS_VERSION=1.5.0
 
 # ── Stage 1: compile the fused CUDA extension ───────────────────────────────────
 FROM nvidia/cuda:${CUDA_TAG}-devel-ubuntu22.04 AS ffo-builder
 ARG TORCH_VERSION
+ARG TORCH_INDEX
 ARG FIREANTS_VERSION
 
 # sm_75 = g4dn (T4), sm_86 = g5 (A10G), sm_89 = g6/g6e (L4/L40S) — every family
@@ -36,7 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir torch==${TORCH_VERSION} \
-        --index-url https://download.pytorch.org/whl/cu121
+        --index-url ${TORCH_INDEX}
 
 RUN git clone --depth 1 --branch v${FIREANTS_VERSION} \
         https://github.com/rohitrango/FireANTs.git /src/fireants
@@ -44,7 +65,7 @@ RUN git clone --depth 1 --branch v${FIREANTS_VERSION} \
 # --no-build-isolation is load-bearing: fused_ops/pyproject.toml declares
 # `requires = [..., "torch>=2.3.0"]`, and an isolated build env would fetch a fresh
 # CPU-only torch from PyPI and compile against the wrong libtorch instead of using
-# the cu121 wheel above.
+# the CUDA wheel above.
 #
 # MAX_JOBS caps ninja, which otherwise fans out to every core: nine translation
 # units, each compiled for three archs, and the largest (FusedGridSampler.cu, 93 KB
@@ -75,15 +96,38 @@ RUN set -eu; \
 FROM nvidia/cuda:${CUDA_TAG}-runtime-ubuntu22.04
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
+ARG TORCH_INDEX
 ARG FIREANTS_VERSION
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip \
-    && ln -sf python3 /usr/bin/python \
-    && rm -rf /var/lib/apt/lists/*
+# Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). `upgrade`, not
+# `dist-upgrade`: it only moves already-installed packages to a newer revision of the
+# SAME Ubuntu release and never installs or removes one, so it picks up backported CVE
+# fixes (libc6 2.35 → 2.35-0ubuntu3.14) without a version jump. This image carried the
+# largest single share of the fleet's OS-class critical findings.
+#
+# NVIDIA's apt repo is moved aside for the upgrade, and only for it. That repo is the
+# only source of the CUDA runtime libraries, so with its list file gone those packages
+# have no upgrade candidate and cannot move — while everything from the Ubuntu archive
+# still does. Left in place, an unrestricted `upgrade` would happily walk
+# libcudart/libcudnn off the ${CUDA_TAG} that stage 1's fused-ops wheel was linked
+# against, which is precisely the coupling the file header warns about. Restored
+# afterwards so a later editor who adds an apt install here is not silently missing it.
+RUN set -eu; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends python3 python3-pip; \
+    ln -sf python3 /usr/bin/python; \
+    mkdir -p /tmp/nvrepo; \
+    for f in /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/nvidia*.list; do \
+        { [ -e "$f" ] && mv "$f" /tmp/nvrepo/; } || true; \
+    done; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; \
+    mv /tmp/nvrepo/* /etc/apt/sources.list.d/ 2>/dev/null || true; \
+    rmdir /tmp/nvrepo; \
+    rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir \
         torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} \
-        --index-url https://download.pytorch.org/whl/cu121 \
+        --index-url ${TORCH_INDEX} \
     && pip install --no-cache-dir fireants==${FIREANTS_VERSION} nibabel numpy scipy
 
 # --no-deps: the wheel declares `torch>=2.3.0`, which pip would happily satisfy by

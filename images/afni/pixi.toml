@@ -8,7 +8,11 @@ version = "0.1.0"
 [tasks]
 
 [dependencies]
-afni = ">=25.0.0,<26"
+# afni is deliberately NOT here. conda-forge's feedstock has stalled at 25.0.00
+# (build _3, uploaded 2025-09-07) while upstream ships 26.2.x, so this channel
+# cannot supply a current AFNI at any version spec. The Dockerfile installs
+# AFNI from NIMH's official precompiled tarball instead — see the block there
+# for the checksum pin, the program allow-list, and the parity evidence.
 ants = ">=2.5.0,<3"
 pandas = ">=3.0.0,<4"
 git = ">=2.53.0,<3"

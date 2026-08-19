@@ -20,3 +20,4 @@ Key design choices that are not obvious from reading the code. Each record captu
 | [014](014-cloudflare-tunnel-over-vpn.md) | Cloudflare Tunnel + Access to replace AWS Client VPN | Proposed |
 | [015](015-s3-backend-after-state-loss.md) | S3 remote backend for Terraform state, adopted after a state-loss incident | Accepted |
 | [016](016-skipped-producer-deadlock-in-dag-recording.md) | Never let a DAG task reference a skipped producer's outputs or exit code | Accepted |
+| [017](017-exploded-derivatives-over-tarballs.md) | Exploded S3 objects with a symlink manifest, not tarballs, for FastSurfer and subregion derivatives | Accepted |

@@ -57,7 +57,7 @@ prefect variable get cloudpipe-max-concurrent
 
 The 2026-08-10 batch ran at `100` while every doc said `50` (#206). The Variable persists across runs, so whatever the last batch set is what the next one inherits.
 
-The Variable is capped server-side by the controller's `namespaceParallelism` (`100`, namespace-wide across both pipelines — see [ADR 008](decisions/008-prefect-as-queue-manager.md)). Raising a Variable above that does **not** raise the effective cap: the surplus workflows are still submitted, then held `Pending` by the controller, which presents as a stalled batch rather than a submission error. To go above 100 concurrent, raise `namespaceParallelism` in `terraform/modules/argo-workflows/main.tf` and apply first.
+The Variable is capped server-side by the controller's `namespaceParallelism` (`400`, namespace-wide across both pipelines — see [ADR 008](decisions/008-prefect-as-queue-manager.md)). Raising a Variable above that does **not** raise the effective cap: the surplus workflows are still submitted, then held `Pending` by the controller, which presents as a stalled batch rather than a submission error. To go above 400 concurrent, raise `namespaceParallelism` in `terraform/modules/argo-workflows/main.tf` and apply first.
 
 Globus destination collection UUID is always read from SSM (`/cloudpipe/globus/collection-id`) at runtime, so instance replacements take effect automatically.
 
@@ -97,7 +97,7 @@ Like `cloudpipe-queue-manager`, `max_concurrent` is not a flow parameter. Concur
 prefect variable set first-level-max-concurrent 15
 ```
 
-The gate counts all active Argo workflows across both pipelines. If running cloudpipe and first-level simultaneously, set each Variable so the two caps sum to your desired total, and keep that total at or below the controller's `namespaceParallelism` (`100`).
+The gate counts all active Argo workflows across both pipelines. If running cloudpipe and first-level simultaneously, set each Variable so the two caps sum to your desired total, and keep that total at or below the controller's `namespaceParallelism` (`400`).
 
 The count is namespace-wide **by design**, not by oversight. `list_active_names()` filters only on `workflows.argoproj.io/completed!=true`, deliberately avoiding the `pipeline` label and `workflows.argoproj.io/phase` — the controller writes both *after* the create call returns, so any positive selector silently misses workflows submitted in the last few seconds. `ConcurrencyGate` additionally counts names it submitted itself until a list response confirms them, closing the informer-cache window ([#206](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/206)).
 
@@ -126,6 +126,10 @@ argo logs -n argo-workflows <workflow-name> <pod-name>
 
 Pod logs are **not** forwarded to CloudWatch. Use the Argo UI or `argo logs` — there is no CloudWatch log group for pipeline pod output.
 
+**Do not read `status.nodes` through `kubectl`.** `nodeStatusOffLoad: true` is set in the controller's `persistence` config (`terraform/modules/argo-workflows/main.tf`), so once a workflow's packed node status exceeds the controller's size threshold it is written to Postgres and *stripped from the CR*, leaving only `status.offloadNodeStatusVersion` behind. `kubectl get workflow <name> -o json` then reports `status.nodes` as absent — not empty-because-nothing-ran, absent-because-it-moved — and a running workflow with 30 live nodes looks idle. Observed on 2026-08-17 with the controller logging `"Workflow to be dehydrated" "Workflow Size"=168553` for the same workflow whose pods were visibly running.
+
+`argo get` and `argo list -o json` go through the Argo server, which rehydrates from Postgres and drops `offloadNodeStatusVersion`, so they are the only correct readers (this is also why the server's service account is granted read on the `argo-db` secret — without it both fail with `offload node status is not supported`, [#81](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/81)) (verified the same day: 294 of 306 live workflows carried full `status.nodes`, 0 reported as offloaded). `kubectl get workflows` is still the right tool for **phase** across many workflows — that field stays on the CR — just never for per-node detail. Note the volume: that rehydrated listing was ~86 MB for 306 workflows, so redirect it to a file rather than piping it through a terminal.
+
 ### Counting active workflows
 
 ```bash
@@ -138,6 +142,49 @@ kubectl -n argo-workflows get wf \
 ```
 
 `argo list --running` is **not** equivalent: it filters on the controller-stamped phase, so it under-reports during a submission burst. Use it to see what is actually executing, not to verify a concurrency cap.
+
+### Verifying the gate held (after a batch)
+
+The live count above only tells you about *now*. To confirm the gate actually held for a completed batch, reconstruct the concurrency timeline from each workflow's `startedAt`/`finishedAt` as ±1 events. This needs no Prometheus and no port-forward — the workflows carry their own timestamps, so this is the same ground truth the controller acted on. Run it within `ttlStrategy.secondsAfterCompletion` (24h) of the batch finishing, before the objects are reaped.
+
+```bash
+kubectl -n argo-workflows get workflows -o json > /tmp/wfs.json
+
+python3 - <<'PY'
+import collections, datetime as dt, json
+P = lambda s: dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+wfs = [w for w in json.load(open("/tmp/wfs.json"))["items"]
+       if w["metadata"]["name"].startswith("cloudpipe-")]
+
+events = []
+for w in wfs:
+    s = w["status"]
+    if s.get("startedAt") and s.get("finishedAt"):
+        events += [(P(s["startedAt"]), 1), (P(s["finishedAt"]), -1)]
+events.sort()
+
+# Time-weight the histogram: "touched the cap once" and "sat pinned at the cap
+# for hours" both report the same peak, but only the latter means it was binding.
+hist, cur, prev = collections.Counter(), 0, events[0][0]
+peak = 0
+for t, delta in events:
+    hist[cur] += (t - prev).total_seconds()
+    prev, cur = t, cur + delta
+    peak = max(peak, cur)
+
+span = sum(hist.values())
+submits = sorted(P(w["metadata"]["creationTimestamp"]) for w in wfs)
+print(f"submitted:  {len(wfs)} over {(submits[-1] - submits[0]).total_seconds() / 3600:.1f}h")
+print(f"peak:       {peak}")
+saturated = sum(v for k, v in hist.items() if k >= peak - 1)
+print(f"saturated:  {saturated / 3600:.2f}h at >={peak - 1} ({100 * saturated / span:.1f}% of {span / 3600:.1f}h)")
+PY
+```
+
+Two readings matter, and one is a trap:
+
+- **`peak` never exceeds the cap.** This also recovers the effective cap when the Prefect API is unreachable — the 2026-08-17 run reads back a clean `300`.
+- **`submitted` must exceed the cap for this to prove anything.** A batch sized at or below the cap never blocks the gate at all, so `peak == cap` is a tautology on a 300-subject batch at a cap of 300. The 08-17 run submitted **407** over 13.0h and sat saturated for **2.60h (15.6%)** — the plateau is the gate visibly holding, not grazing the cap once.
 
 ### Checking S3 outputs for a subject
 
@@ -296,6 +343,27 @@ run. The canonical subject list is `tools/cloudpipe_test_sample.csv` (100 subjec
 `tools/cloudpipe_test_sample_200.csv` (200 subjects) is the concurrency-scaling batch.
 
 **Prerequisites:** VPN connected, AWS SSO active, `kubectl` context set to `cloudpipe`.
+
+**Also check the age of the Globus refresh token, before Step 1 and not after Step 2:**
+
+```bash
+aws secretsmanager list-secrets --filters Key=name,Values=globus \
+  --query 'SecretList[].LastChangedDate' --output text
+```
+
+The destination collection's storage gateway is High Assurance with a **1-week**
+`--authentication-timeout-mins`, so a token older than 7 days fails every single
+`globus-transfer` pod and takes the whole batch with it. Nothing warns you: the token is
+still valid, the secret is still synced, and the error Globus returns is
+`not_from_allowed_domain`, which reads as a gateway misconfiguration rather than an expiry.
+If the token is anywhere near 7 days old, re-run `setup_auth.py` first
+([globus.md → Recognising an expired session](globus.md#recognising-an-expired-session)).
+
+This is not hypothetical: the batch submitted 2026-08-17T01:43Z lost 300/300 subjects to a
+session that had lapsed 23 hours earlier, and had to be terminated and resubmitted.
+After reauthenticating, prove it with a **single-subject** submit
+([above](#cloudpipe_minproc-single-subject-direct-argo-submit)) and wait for
+`Destination collection pre-flight check passed` before releasing 300.
 
 ### Generating a subject list
 
@@ -654,6 +722,45 @@ earlier runs of the same subjects.
 
 ---
 
+### Step 7 — Snapshot the derived numbers
+
+**Do this before the next batch's Step 1.** `metrics/` is a scratchpad: the next
+`prep_test_batch.py --flush-qc` deletes the records these numbers are derived from, and some of
+them cannot be re-derived by re-running — a re-run produces a *different* batch's cost. The
+2026-08-05 pilot's settled cost was lost exactly this way.
+
+```bash
+pixi run python scripts/snapshot_batch_numbers.py \
+  --batch-id 2026-08-12-300 \
+  --subjects tools/cloudpipe_test_sample_300.csv \
+  --since 2026-08-12T03:28:04Z \
+  --until 2026-08-12T16:30:00Z \
+  --notes "what this batch was testing; template revision; image pin"
+```
+
+Writes `s3://cloudpipe-metrics/snapshots/batches/{batch-id}.json` — outside `metrics/`, so no
+flush path reaches it, alongside the per-attempt telemetry the `argo-nodes-snapshot` CronWorkflow
+lands under `snapshots/argo-nodes/`. It reads the newest of those snapshots rather than live Argo,
+so it still works after the 24h `ttlStrategy` has reaped the workflows.
+
+**Pass `--until` whenever any subject was resubmitted after the batch.** Reruns are created after
+`--since`, so a lower bound alone silently counts the repair as a batch member.
+
+Cost is a **second pass**, because reconciliation freezes at scrape age 3 and a day+1 read
+overstates settled by a median ~51%:
+
+```bash
+# >= 3 days after the batch
+pixi run python scripts/snapshot_batch_numbers.py --batch-id 2026-08-12-300 --amend-cost \
+  --window-start 2026-08-12T03:28:04Z --window-end 2026-08-12T16:00:52Z
+```
+
+`--amend-cost` refuses to write an unsettled read, and refuses to replace a cost block with one
+covering fewer subjects — a partial re-scrape once landed $0.222 where the real figure was ~$37.
+`--force` overrides both, and should be rare enough to need a reason.
+
+---
+
 ### Pass/fail criteria
 
 | Check | Expected | Fail — first thing to check |
@@ -678,7 +785,21 @@ All spot-exposed workflow templates retry automatically on spot interruption (`p
 
 **The budget is sized for infrastructure, not for the workload.** Every nodepool is spot-only, so consecutive reclaims on a single long step are routine and 8 attempts exist to absorb them. Exit **137 is deliberately not retried**: a genuine OOMKill in this pipeline has always been deterministic (#120, #129, #134 each needed a memory or partitioning change, and no number of retries would have helped), so retrying it would burn the budget re-running an identical failure. If you find yourself wanting 137 back in the expression, the real fix is almost certainly a memory request or a step split. See issue #115.
 
-The short `cpu-light` steps (`globus-transfer`, `inventory`) are the exception — they still use `retryPolicy: OnFailure` with no expression and a limit of 3, which means a reclaimed pod (phase `Error`, not `Failed`) is not retried there.
+The short `cpu-light` steps (`globus-transfer`, `inventory`) are the exception — they have no expression at all and a limit of 2–3, so they retry on *any* failure. They used `retryPolicy: OnFailure`, which silently dropped every reclaimed pod (phase `Error`, not `Failed`) and cost 4 subjects zero retries; [#269](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/269) moved them to `Always`.
+
+**The codes are matched in the node message as well as in `exitCode`, and that is not belt-and-braces — it is load-bearing.** Argo populates `outputs.exitCode` from the **main** container only. A pod that dies in its **init** container (where argoexec's artifact loader runs) has no `exitCode` at all, and one that dies in its `wait` container records `"0"`. Neither is in `["64","75","143"]`, so before [#277](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/277) every artifact-staging failure got exactly one attempt regardless of `limit: "8"` — which is how [#274](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/274) turned a transient staging fault into the permanent loss of all three sessions of one subject. The tell in `status.nodes` is a message reading `init: Error (exit code 64): …` next to an absent `exitCode`; the plain-text `64` in the message is exactly what made the dead arm look live.
+
+**One staging failure is excluded from that widening**: `The specified key does not exist`. An artifact key is absent because its *producer* was skipped or failed, S3 is read-after-write consistent, and retrying the *consumer* never re-runs the producer — so those 8 attempts are ~32 minutes of backoff spent re-failing identically. This is the same rule that keeps 137 out, and the same rule as the exit-66 case in [pipelines.md](pipelines.md). Note the guard is keyed on `key`, not on `does not exist`: a wrong *bucket* is a config fault and still retries.
+
+Verified against the live controller on 2026-08-15 with probe workflows whose input artifact pointed at a bad S3 key or a bad S3 bucket, `limit: "2"`:
+
+| expression | probe | attempts |
+|---|---|---|
+| old | bad key | **1** (the bug: no retry on any staging failure) |
+| new | bad key | **1** (the guard, deliberately) |
+| new | bad bucket | **3** (initial + 2 — the retry path works) |
+
+When editing the expression, keep the code alternation explicit — a looser `matches "exit code"` re-admits the 137 above, since a real OOMKill surfaces as `main: Error (exit code 137)` — and keep the parentheses around the `||` group, or the missing-key guard binds to the `exitCode` arm alone and stops applying. `tests/argo/test_retry_expression.py` pins all 10 copies to one canonical string and classifies 15 failure shapes captured from real payloads, translating the YAML expression to Python so operands *and* boolean structure come from the file; a reworded Argo message breaks the test rather than the retry path.
 
 Failed workflows are not auto-resubmitted. Resubmit a failed workflow manually:
 ```bash
@@ -697,6 +818,30 @@ argo submit --from workflowtemplate/cloudpipe \
 ```
 
 The inventory step will set `b2t_exists`, `func_exists`, and `fastsurfer-exists` flags, so only incomplete steps run.
+
+### Sweeping a whole batch for resubmittable failures
+
+Doing the above by hand is fine for one subject. For a batch, `src/resubmit_failed.py` ([#234](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/234)) finds every terminally-failed workflow, classifies each one, and re-drives only the ones that can plausibly succeed:
+
+```bash
+# Always dry-run first — it prints the plan and exits.
+PYTHONPATH=src pixi run python -m resubmit_failed --since 2026-08-17T01:43:43Z \
+  --subjects tools/cloudpipe_test_sample_300_fresh.csv
+
+# Then apply. --max-active gates submission against the live concurrency ceiling.
+PYTHONPATH=src pixi run python -m resubmit_failed --since ... --apply --max-active 300
+```
+
+`PYTHONPATH=src` is required — the `pythonpath` in `pytest.ini` applies under pytest only.
+
+Two things about it are worth knowing before you trust the plan:
+
+- **It classifies on repetition, not on the exit code.** Nine `exit 75`s are deterministic and get skipped; one `exit 75` is the `EX_TEMPFAIL` guard working and gets retried. Keying off the code alone gets both wrong, in opposite directions. Spot kills (`143`, `pod deleted`, `imminent node shutdown`) are exempt from the repetition rule entirely, because on spot-only nodepools they repeat *without* being deterministic — that exemption exists because the classifier called a healthy subject deterministic on two SIGTERMs on its first live run.
+- **`The specified key does not exist` is retryable here even though the WorkflowTemplates' retry expression excludes it.** The two operate at different layers: an in-workflow retry of a consumer does not re-run its producer, so the key stays absent, but a *resubmission* re-runs the producer from the top. That was the real shape of [#274](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/274) — a spot kill orphaned a FastSurfer tree and the staging failures downstream were the symptom.
+
+Resubmitting is cheap because every expensive stage gates on a `_complete.json` marker ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)), so a re-driven subject skips whatever already published. Use `--exclude-subjects` for determinism the classifier cannot see, such as a session the [#248](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/248) guard rejects on every run.
+
+The sweep reads node status via `argo list -o json`, not `kubectl` — see the warning under [Workflow status](#workflow-status).
 
 ### Diagnosing a failure
 
@@ -722,7 +867,7 @@ argo get -n argo-workflows <workflow-name> -o json | jq '.status.nodes[] | selec
 - **`python_lint`** — `ruff check .` and `ruff format --check .` over the **whole repo**.
 - **`pytest`** — installs the [pixi](https://pixi.sh) environment (`pixi.toml`/`pixi.lock`) and runs the full `tests/` suite via `pytest.ini`.
 - **`docs_build`** — `mkdocs build --strict` in the `docs` pixi environment. The only check that reads `docs/` as a *linked graph* rather than as prose, so it catches the drift a human reviewer misses: a renamed doc or reworded heading leaving live links pointing nowhere.
-- **`terraform_lint`** — `terraform fmt -check -recursive`, `terraform init -backend=false` + `terraform validate`, then `tflint --recursive` using `terraform/.tflint.hcl`.
+- **`terraform_lint`** — `terraform fmt -check -recursive`, `terraform init -backend=false -lockfile=readonly` + `terraform validate`, then `tflint --recursive` using `terraform/.tflint.hcl`. Provider binaries come from a cached `TF_PLUGIN_CACHE_DIR` keyed on `terraform/.terraform.lock.hcl`; see [Terraform provider pinning](#terraform-provider-pinning) for why that lock file is committed.
 - **`argo-lint`** — `argo lint --offline argo/workflows/`, catching WorkflowTemplate schema errors before ArgoCD syncs them.
 
 The `**.py` trigger is load-bearing for `python_lint`: because that job lints the whole repo, the trigger has to match any `.py` file anywhere. When it was a directory list instead, an unformatted file under an unfiltered path merged green and then failed the *next* PR that happened to touch a filtered path — blaming an innocent change for a break it never went near.
@@ -730,7 +875,11 @@ The `**.py` trigger is load-bearing for `python_lint`: because that job lints th
 Run the same checks locally before pushing:
 
 ```bash
-# Python lint + format
+# Python lint — runs BOTH `ruff check .` and `ruff format --check .`, matching
+# the two steps in CI's python_lint job. (It used to be `ruff check` alone, which
+# is how 14 of the 18 CI failures in the five weeks to 2026-08-13 happened: all
+# of them were the format check, with `ruff check` passing.) The granular tasks
+# `ruff-check` and `fmt-check` still exist if you want one without the other.
 pixi run lint
 
 # Python test suite
@@ -760,6 +909,33 @@ Two consequences worth knowing before you edit a doc:
 - **Links out of `docs/` must be absolute GitHub URLs.** A relative `../terraform/...` link resolves on GitHub but 404s on the published site, which is rooted at `docs/`. Point at `https://github.com/jrussell9000/cloudpipe/blob/main/...` (or `/tree/main/` for a directory) instead. The same applies to the internal-only docs listed in `exclude_docs` — they are still synced to the public repo, so a published page linking to one needs the absolute form.
 
 Neither job installs pip/conda dependencies outside `pixi.toml` — if a test needs a new package, add it to `pixi.toml` (and regenerate `pixi.lock` with `pixi install`) rather than installing ad hoc.
+
+### Terraform provider pinning
+
+`terraform/.terraform.lock.hcl` **is committed**, and CI runs `terraform init -lockfile=readonly` so a stale lock fails the build instead of being silently rewritten inside the runner.
+
+It was previously gitignored ("don't need terraform locks"). The cost of that showed up on 2026-08-12, when `terraform_lint` went red on `main` with:
+
+```
+Error while installing gavinbunney/kubectl v1.19.0: could not query provider registry
+  ... failed to retrieve authentication checksums for provider:
+  Get ".../terraform-provider-kubectl_1.19.0_SHA256SUMS": context deadline exceeded
+```
+
+With no lock file, every `init` re-resolves versions from the registry and re-fetches each provider's `SHA256SUMS` to establish trust — a live network dependency on ten providers' release hosting. `gavinbunney/kubectl` is the fragile one: it is a community provider served from **GitHub Releases** rather than the HashiCorp CDN, so it adds GitHub's availability to the critical path. With the lock committed, `init` verifies cached binaries against recorded hashes and never makes that call.
+
+A plugin cache alone would not have fixed this — the cache saves the provider *zip*, not the metadata round-trip. Both halves are needed.
+
+**Bumping a provider** is now explicit. From `terraform/`:
+
+```bash
+terraform init -upgrade
+terraform providers lock \
+  -platform=linux_amd64 -platform=linux_arm64 \
+  -platform=darwin_arm64 -platform=darwin_amd64
+```
+
+Then commit the updated `.terraform.lock.hcl`. The four platforms matter: a lock generated for only your machine makes `init` fail for everyone on a different OS/arch, CI included.
 
 ### Editing preproc.py (AFNI functional preprocessing)
 

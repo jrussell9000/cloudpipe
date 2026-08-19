@@ -282,6 +282,9 @@ _UNION_COLUMNS = {
         "ram_efficiency",
         "node",
         "node_instance_type",
+        "node_capacity_type",
+        "node_effective_usd_per_hour",
+        "node_ondemand_usd_per_hour",
         "scrape_age_days",
         "pipeline",
         "completed_at",
@@ -871,6 +874,118 @@ class CloudpipeMetrics:
             {cost_scope_clause(subjects, date_from, date_to)}
             GROUP BY step, phase
             ORDER BY total_cost_usd DESC
+        """)
+
+    def spot_savings(
+        self,
+        subjects: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        group_by: str | None = None,
+    ):
+        """Return what this scope actually cost vs. what it would have cost on demand.
+
+        Every Karpenter nodepool is spot-only (ADR 007), so the dollar columns
+        in `pod_costs` are spot dollars end to end and there is no on-demand
+        figure anywhere to compare them against. This rebuilds one by scaling
+        each pod's COMPUTE cost by its node's
+        `node_ondemand_usd_per_hour / node_effective_usd_per_hour`.
+
+        pv_cost_usd and network_cost_usd pass through unscaled: EBS and data
+        transfer are not priced by capacity type, and multiplying them would
+        inflate the counterfactual by the spot discount on storage that never
+        existed.
+
+        THE ANSWER IS 'ON DEMAND AT LIST PRICE'. node_ondemand_usd_per_hour is
+        AWS's public rate; any savings plan or RI the account holds would make
+        real on-demand spend lower, so read this as the conservative upper
+        bound on what abandoning spot would cost.
+
+        COVERAGE IS PART OF THE ANSWER, NOT A FOOTNOTE. Rows whose rates are
+        NULL — nodes Kubecost had no asset for, instance types the Pricing API
+        would not price, and every row written before schema 1.1 — cannot be
+        scaled and are excluded from `ondemand_cost_usd`. Summing an
+        unrestricted total against them would silently understate. So
+        `priced_cost_usd` (the actual cost of only the rows that COULD be
+        scaled) is what `ondemand_cost_usd` is comparable against, and
+        `coverage_frac` says how much of the scope that is. A coverage_frac
+        well below 1.0 makes the savings figure a sample, not a total.
+
+        When NOTHING in the scope could be priced, `coverage_frac` is 0.0 while
+        the dollar columns are NULL. That asymmetry is deliberate: the fraction
+        has to stay comparable so a `< threshold` guard fires, whereas a 0 in
+        `savings_usd` would read as a measured "no savings" instead of "not
+        computable".
+
+        DRIFT BEHAVES BACKWARDS FROM EVERY OTHER COLUMN HERE, so read it
+        carefully. Reconciliation inflates a day+1 read by some factor k
+        (median ~1.5) — and it inflates the pod's cost and the NODE's effective
+        rate by the same k, because both come from the same unreconciled
+        Kubecost pass. The list price does not move. So in
+
+            ondemand = cost * (list / effective) = (k*cost_s) * (mult_s / k)
+
+        the k cancels: `ondemand_cost_usd` is the most drift-resistant number in
+        this table, usable at day+1. `savings_usd` and the ratio are NOT — only
+        their actual-cost side carries the inflation, so at day+1 both
+        UNDERSTATE the real gap by roughly k. Wait for scrape_age_days = 3
+        before quoting a savings multiple.
+
+        group_by, when given, breaks the result out by one of `step`, `phase`,
+        `subject`, `node_instance_type`, or `date` — e.g. to see which
+        component leans hardest on the spot discount.
+        """
+        allowed = {"step", "phase", "subject", "node_instance_type", "date"}
+        if group_by is not None and group_by not in allowed:
+            raise ValueError(f"group_by must be one of {sorted(allowed)}, got {group_by!r}")
+
+        select_group = f"{group_by}," if group_by else ""
+        group_clause = f"GROUP BY {group_by} ORDER BY {group_by}" if group_by else ""
+
+        return self._run_sql(f"""
+            WITH scoped AS (
+                SELECT
+                    *,
+                    -- Guarded against 0 as well as NULL: a zero effective rate
+                    -- would divide by zero, and a zero on-demand rate is a
+                    -- pricing miss that got stored rather than a free instance.
+                    CASE
+                        WHEN node_effective_usd_per_hour > 0
+                         AND node_ondemand_usd_per_hour > 0
+                        THEN node_ondemand_usd_per_hour / node_effective_usd_per_hour
+                    END AS multiplier
+                FROM cloudpipe_metrics.pod_costs
+                {cost_scope_clause(subjects, date_from, date_to)}
+            )
+            SELECT
+                {select_group}
+                COUNT(*)                                       AS n_pods,
+                SUM(total_cost_usd)                            AS actual_cost_usd,
+                SUM(CASE WHEN multiplier IS NOT NULL
+                         THEN total_cost_usd END)              AS priced_cost_usd,
+                SUM(CASE WHEN multiplier IS NOT NULL
+                         THEN (cpu_cost_usd + memory_cost_usd + gpu_cost_usd) * multiplier
+                              + pv_cost_usd + network_cost_usd END)
+                                                               AS ondemand_cost_usd,
+                SUM(CASE WHEN multiplier IS NOT NULL
+                         THEN (cpu_cost_usd + memory_cost_usd + gpu_cost_usd) * multiplier
+                              + pv_cost_usd + network_cost_usd END)
+                    - SUM(CASE WHEN multiplier IS NOT NULL
+                               THEN total_cost_usd END)        AS savings_usd,
+                -- COALESCE, so a scope with NOTHING priced reads 0.0 rather
+                -- than NULL. SUM(CASE ...) over zero matching rows is NULL,
+                -- and NULL/x propagates to NaN in pandas — where every
+                -- comparison is False, so the obvious guard
+                -- `if coverage_frac < 0.9: warn` would silently NOT fire on
+                -- the worst possible coverage. The dollar columns above stay
+                -- NULL on purpose: a 0 there would read as a real "$0 saved"
+                -- rather than "not computable".
+                COALESCE(SUM(CASE WHEN multiplier IS NOT NULL
+                                  THEN total_cost_usd END), 0)
+                    / NULLIF(SUM(total_cost_usd), 0)           AS coverage_frac,
+                AVG(multiplier)                                AS mean_multiplier
+            FROM scoped
+            {group_clause}
         """)
 
     def run_costs(

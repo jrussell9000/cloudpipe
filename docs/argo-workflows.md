@@ -43,7 +43,7 @@ All files are synced from git by the `workflow-templates` ArgoCD Application. `s
 | Setting | Value | Effect |
 |---|---|---|
 | `parallelism` | `1000` | Global max concurrently running **workflows** (not pods — pod concurrency is unbounded, controlled only by `resourceRateLimit`) |
-| `namespaceParallelism` | `100` | Max active workflows in `argo-workflows`; the server-side backstop for the Prefect queue gate (#206) |
+| `namespaceParallelism` | `400` | Max active workflows in `argo-workflows`; the server-side backstop for the Prefect queue gate (#206). Raised from `100` for the 300-concurrent run — at `100` it was itself the binding cap |
 | `resourceRateLimit.limit` | `50` | Max pod create calls per second to the K8s API |
 | `resourceRateLimit.burst` | `90` | Burst ceiling above the rate limit |
 | Artifact repository | S3 bucket from `var.globus_s3_destination_bucket` | All artifacts stored in `<YOUR_S3_BUCKET>` |
@@ -82,7 +82,7 @@ These settings appear at the top level of the `cloudpipe` master WorkflowTemplat
 | `podGC.strategy` | `OnWorkflowCompletion` (pods deleted when workflow finishes) |
 | `podDisruptionBudget.minAvailable` | `100%` (prevents voluntary disruption of workflow pods) |
 | `securityContext` | `runAsUser/Group/fsGroup: 1000` (required for artifact file permissions across containers) |
-| `retryStrategy` | Limit 8, retry on spot interruption (`pod deleted`, `imminent node shutdown`) and exit codes 64/75/143, exponential backoff from 1 min capped at 5 min. Exit 137 is **not** retried — the budget is for infrastructure churn, not workload failures (see [operations.md](operations.md#retries)) |
+| `retryStrategy` | Limit 8, retry on spot interruption (`pod deleted`, `imminent node shutdown`) and exit codes 64/75/143, exponential backoff from 1 min capped at 5 min. The codes are matched in the node **message** as well as in `exitCode`, because an init- or wait-container death never populates `exitCode` ([#277](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/277)). Exit 137 is **not** retried — the budget is for infrastructure churn, not workload failures (see [operations.md](operations.md#retries)) |
 
 All pods get `karpenter.sh/do-not-disrupt: "true"` annotation to block Karpenter from draining nodes with active workflow pods.
 
@@ -108,7 +108,7 @@ There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregi
 | `master-pipeline-dag.parallelism` | `3` | Max pods running simultaneously within one workflow. This is the only `parallelism` setting in the whole template set — sessions fan out simultaneously but are throttled by it. |
 | `globus-transfer` semaphore | `8` | Max concurrent Globus transfers cluster-wide (ConfigMap `cloudpipe-semaphores`) |
 | Prefect Variable `cloudpipe-max-concurrent` / `first-level-max-concurrent` | `50` (cloudpipe) / `25` (first-level), when the Variable is unset | Max active Argo workflows submitted by Prefect; set live with `prefect variable set <name> <N>`, not a deployment-run parameter |
-| `namespaceParallelism` | `100` | Max active workflows in `argo-workflows`, **all pipelines combined**; enforced by the controller, excess workflows held `Pending` |
+| `namespaceParallelism` | `400` | Max active workflows in `argo-workflows`, **all pipelines combined**; enforced by the controller, excess workflows held `Pending` |
 | `parallelism` | `1000` | Max active workflows cluster-wide — a second, looser ceiling above `namespaceParallelism` |
 | `resourceRateLimit` | `50/s`, burst `90` | Rate at which the controller creates pods, cluster-wide |
 
@@ -128,17 +128,20 @@ The inventory step (`src/inventory.py`) drives which subsequent steps are skippe
 
 | Flag | Completion marker checked | Skips |
 |---|---|---|
-| `fastsurfer_exists` | All sessions have a valid `derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz` | Entire anatomical processing phase |
+| `fastsurfer_exists` | Every session has `derivatives/fastsurfer/{subj}/{ses}/_complete.json` | Entire anatomical processing phase |
 | `subregions_exists` | All four subregion output tarballs exist | `subregion-segmentation-dagtask` |
 | `t1w_to_mni_exists` (per session) | `…_desc-t1w2mni_affine.mat` — terminal output of `fst1w_to_mni.py` | `t1w-to-mni-step` for that session |
 | `b2t_exists` (per run) | `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_itk.txt` | `bold-to-t1w-step` for that run |
 | `func_exists` (per run) | `derivatives/func/{subj}/{ses}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz` | `functional-preprocessing-dagtask` for that run |
-| `surf_exists` (per run) | `derivatives/func_surf/{subj}/{ses}/components/{prefix}_desc-grayordcomponents_bold.tar.gz` | Grayordinate extraction for that run |
+| `components_exist` (per run) | `derivatives/func_surf/{subj}/{ses}/components/{prefix}_desc-grayordcomponents_bold.tar.gz` | — (reclaimed intermediate; see below) |
 | `surf_target_exists` (per run) | `derivatives/func_surf/{subj}/{ses}/fsLR32k/{prefix}_space-fsLR32k_bold.dtseries.nii` | `surface-resample` for that run |
+| `surf_exists` (per run) | *derived*: `components_exist OR surf_target_exists` | Grayordinate extraction for that run |
 
 **Markers, not size thresholds.** Each key above is the file its step writes *last*, so its presence proves the step ran to completion — there is no `size > 1 KB` guard anywhere in `inventory.py`. This replaced a size heuristic that existed to reject Argo's zero-byte failure artifacts; a terminal-file check needs no threshold and cannot be fooled by a large-but-truncated output.
 
 `func_exists` and `surf_exists` gate **independently** even though one pod produces both derivatives, because either can be missing on its own — `preproc.py` takes a short path when only the grayordinate output is wanted. `surf_target_exists` gates the separate `surface-resample` step, which consumes the grayordinate components and cannot run before `surf_exists` is true.
+
+**`surf_exists` is the one derived marker.** It means "grayordinate extraction finished for this run", not "its components tarball is still in S3" — the two stopped being the same thing when `surface-resample` began deleting each run's components after verifying the assembled dtseries (see [pipelines.md](pipelines.md), *Component reclaim*). The dtseries is strictly downstream of the components and 1:1 with them per run, so its presence is stronger evidence that extraction succeeded than the components' own. `components_exist` is kept separately so callers can still tell "never extracted" from "extracted and since reclaimed".
 
 Resubmitting a partially processed subject is safe: inventory runs fresh, finds what is already done, and only the incomplete steps execute.
 
@@ -151,7 +154,7 @@ Every pipeline pod is labelled for Kubecost cost attribution:
 | Label | Values | Set by |
 |---|---|---|
 | `cloudpipe.io/phase` | `transfer`, `inventory`, `anatomical`, `registration`, `functional`, `subregion-segmentation`, `observability`, `cleanup`, `first-level` | Template `metadata.labels` |
-| `cloudpipe.io/step` | `start-globus-instance`, `globus-transfer`, `globus-s3-sync`, `delete-globus-input`, `subject-data-inventory`, `template-build`, `template-parcellation`, `long-segmentation`, `long-parcellation`, `fsqc-metrics`, `t1w-to-mni`, `bold-to-t1w`, `bold-preprocessing`, `surface-resample`, `segment-gems`, `segment-dl`, `orchestrate`, `workflow-start-marker`, `workflow-run-metrics`, `record-step-outcome` | Template `metadata.labels` |
+| `cloudpipe.io/step` | `start-globus-instance`, `globus-transfer`, `globus-s3-sync`, `delete-globus-input`, `subject-data-inventory`, `published-sessions`, `template-build`, `template-parcellation`, `long-segmentation`, `long-parcellation`, `fsqc-metrics`, `t1w-to-mni`, `bold-to-t1w`, `bold-preprocessing`, `surface-resample`, `segment-gems`, `segment-dl`, `orchestrate`, `workflow-start-marker`, `workflow-run-metrics`, `record-step-outcome` | Template `metadata.labels` |
 | `subjectid` | `{subjID}` | `podMetadata.labels` in master WorkflowTemplate |
 | `app` | `cloudpipe` | `podMetadata.labels` in master WorkflowTemplate |
 
@@ -175,7 +178,7 @@ Parameters (all read from `cloudpipe-config` ConfigMap by default):
 | `subjID` | — | Subject ID (required) |
 | `bucket` | from ConfigMap | S3 data bucket (inputs and derivatives) |
 | `metrics-bucket` | from ConfigMap | Separate versioned QC-metrics bucket (`cloudpipe-metrics`). Distinct from `bucket` so metrics survive a derivative flush — see [observability.md](observability.md). |
-| `ecr-registry` | from ConfigMap | Container registry prefix. Now the **private** ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com`) — set from `local.ecr_registry` in `terraform/argowf.tf`. ECR Public remains a dual-push secondary kept for rollback; it is no longer what workflows pull from. |
+| `ecr-registry` | from ConfigMap | Container registry prefix. Now the **private** ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com`) — set from `local.ecr_registry` in `terraform/argowf.tf`. ECR Public remains a dual-push secondary kept for rollback for most images; it is no longer what workflows pull from, and its repos are being retired image by image (`fmri-first-level-proc` already is). |
 | `globus-source-collection-id` | — | Source Globus collection UUID |
 | `globus-source-base-path` | — | Root path on source collection |
 | `globus-dest-collection-id` | — | Destination GCS collection UUID |
@@ -189,11 +192,17 @@ start-globus-instance → globus-transfer → [globus-s3-sync (skipped with S3 g
                                         ↓
                               subject-data-inventory
                                         ↓
-                    ┌───────────────────┴────────────────────────┐
-          anatomical-processing                    session-level-pipeline (×N sessions)
-          (skipped if fs exists)                        ↓
-                                         registration + functional-preprocessing
+                              anatomical-processing
+                              (skipped if fs exists)
+                                        ↓
+                              published-sessions ─────────► record-outcome-rejected-sessions
+                                        ↓                    (only if a session was rejected)
+                    session-level-pipeline (×N published sessions)
+                                        ↓
+                    registration + functional-preprocessing
 ```
+
+`published-sessions` is what the per-session fan-out iterates, not the inventory result: a session whose FastSurfer derivatives were never published must not start a branch that will die staging them (#270). See [pipelines.md](pipelines.md#the-fan-out-gate-published-sessions-template).
 
 ### globus-transfer (`globus-transfer-workflow-template.yaml`)
 
@@ -207,12 +216,17 @@ Three templates, called in sequence by the master DAG:
 
 ### inventory (`inventory-workflow-template.yaml`)
 
-Single template `subject-data-inventory-template`. Scans S3 to discover sessions and BOLD runs, checks derivative existence for all skip flags, and attaches `nss_frames` from `config/nss_volumes.csv`. Outputs:
+Two templates, both `src/inventory.py` under a different `--mode`.
 
-- `result` (stdout JSON): array of session objects, each with `session`, `runs`, `t1w_to_mni_exists`, `nss_frames`; runs contains `task`, `run`, `b2t_exists`, `func_exists`
+**`subject-data-inventory-template`** (`--mode inventory`, the default) — scans S3 to discover sessions and BOLD runs, checks derivative existence for all skip flags, and attaches `nss_frames` from `config/nss_volumes.csv`. Outputs:
+
+- `result` (stdout JSON): array of session objects, each with `session`, `runs`, `t1w_to_mni_exists`, `t1w_available`, `nss_frames`; runs contains `task`, `run`, `b2t_exists`, `func_exists`
 - `fastsurfer-exists` (file parameter): `"True"` or `"False"`
+- `subregions-exist` (file parameter): `"True"` or `"False"`
 
-Node pool: `cpu-light`. Image: `python` (pinned SHA).
+**`published-sessions-template`** (`--mode published-sessions`) — runs after the anatomical gate and takes the array above as an input parameter. Re-reads each `t1w_available` session's `_complete.json` and outputs `session-items` (the fan-out list), `rejected-sessions`, and `rejected-count`. This exists because inventory describes the subject's *inputs* while the per-session fan-out needs the anatomical phase's *outputs* — see [pipelines.md](pipelines.md#the-fan-out-gate-published-sessions-template).
+
+Node pool: `cpu-light` for both. Image: `python` (pinned SHA).
 
 ### fast-tmpl (`fastsurfer-template-phase-workflow-template.yaml`)
 
@@ -230,7 +244,7 @@ Two templates for the longitudinal session-level phase:
 
 **`fastsurfer-long-parcellation-template`** — All sessions, surface reconstruction, `--long --parallel N` where N = number of sessions. Waits for both long segmentation and template parcellation to complete. Node pool: `cpu-heavy-nodepool`.
 
-**No shared volume.** Each step works in a private `emptyDir` at `/work` with `SUBJECTS_DIR=/work/subjects`, passing state through `scratch/{workflow.name}/anat/` in S3 (reaped by the `scratch-expiration` lifecycle rule). Final FastSurfer outputs are uploaded to `derivatives/fastsurfer/{subj}/` as per-session `_templated.tar.gz` archives — those keys are the contract with every downstream phase and are unchanged.
+**No shared volume.** Each step works in a private `emptyDir` at `/work` with `SUBJECTS_DIR=/work/subjects`, passing state through `scratch/{workflow.name}/anat/` in S3 (reaped by the `scratch-expiration` lifecycle rule). Final FastSurfer outputs are published in-pod to `derivatives/fastsurfer/{subj}/{ses}/` as one object per file, plus `_links.json` and a `_complete.json` written last ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)) — those prefixes are the contract with every downstream phase.
 
 ### registration (`registration-workflow-template.yaml`)
 
@@ -281,19 +295,23 @@ argo submit --from workflowtemplate/subregion-seg \
   -p T1w_sessions='["ses-00A","ses-02A"]'
 ```
 
-`T1w_sessions` is a JSON array of the session labels that have FastSurfer longitudinal outputs in S3. The template reads `base-tps` from the long-template tarball to discover actual timepoints at runtime; the parameter is used to declare the set of S3 artifact inputs.
+`T1w_sessions` is a JSON array of the session labels that have FastSurfer longitudinal outputs in S3. The template reads `base-tps` from the long-template tree to discover actual timepoints at runtime; the parameter is used to declare the set of S3 artifact inputs.
 
-**S3 inputs** (declared as template artifacts, downloaded before each pod starts):
-- `derivatives/fastsurfer/{subjID}/{subjID}_long-template.tar.gz`
-- `derivatives/fastsurfer/{subjID}/{subjID}_{session}_templated.tar.gz` — ses-00A is required; ses-02A through ses-10A are `optional: true`
+**S3 inputs** (declared as template artifacts with `archive: none`, downloaded per-object before each pod starts):
+- `derivatives/fastsurfer/{subjID}/long-template`
+- `derivatives/fastsurfer/{subjID}/{session}` — ses-00A is required; ses-02A through ses-10A are `optional: true`
 
-**Two templates: `gems` ∥ `dl`**, running concurrently under `failFast: false`, both on `cpu-heavy-nodepool`, both using the `freesurfer` image. No shared PVC and no hydrate step (GitHub #77) — each pod independently declares the FastSurfer S3 tarballs as input artifacts, extracted onto its own private `emptyDir`.
+Prefix keys on an **input** artifact must not carry a trailing `/` (with one, Argo silently downloads nothing); an output key must keep it.
 
-**`segment-subregions-gems-template`** — `segment_subregions {thalamus,brainstem,hippo-amygdala} --long-base`, GEMS/Bayesian, CPU-only, ~50 min at 4 threads. Symlinks FastSurfer bare session IDs (`ses-00A`) to the `{tp}.long.{base}` naming `--long-base` expects; `segment_subregions` writes through the symlinks into the real directories. Before each region runs, the script checks S3 for that region's final key (`derivatives/subregions/{subjID}/{subjID}_{region}.tar.gz`) and restores it instead of recomputing if present; after a region completes it uploads to that same key immediately, so a pod retry or workflow resubmit resumes per-region rather than redoing completed work. Outputs → `{subjID}_{thalamus,brainstem,hippoamyg}.tar.gz`. **4.5G/4CPU** (provisional — see pipelines.md).
+Each pod then runs `/app/restore_links.py` over every staged tree **before** reading anything, because Argo downloads objects but cannot recreate symlinks. That ordering is load-bearing rather than tidy: `base-tps` is itself one of FastSurfer's aliases (`base-tps -> base-tps.fastsurfer`), and both pods read it within a couple of lines of starting, so a later replay would abort the pod under `set -eu` before any segmentation ran.
+
+**Two templates: `gems` ∥ `dl`**, running concurrently under `failFast: false`, both on `cpu-heavy-nodepool`, both using the `freesurfer` image. No shared PVC and no hydrate step (GitHub #77) — each pod independently declares the FastSurfer S3 prefixes as input artifacts, staged onto its own private `emptyDir`.
+
+**`segment-subregions-gems-template`** — `segment_subregions {thalamus,brainstem,hippo-amygdala} --long-base`, GEMS/Bayesian, CPU-only, ~50 min at 4 threads. Symlinks FastSurfer bare session IDs (`ses-00A`) to the `{tp}.long.{base}` naming `--long-base` expects; `segment_subregions` writes through the symlinks into the real directories. Before each region runs, the script checks S3 for that region's final prefix (`derivatives/subregions/{subjID}/{region}/`) and stages it instead of recomputing if its `_complete.json` is present; after a region completes it publishes to that same prefix immediately, so a pod retry or workflow resubmit resumes per-region rather than redoing completed work. Outputs → `derivatives/subregions/{subjID}/{thalamus,brainstem,hippoamyg}/`. **4.5G/4CPU** (provisional — see pipelines.md).
 
 **`segment-subregions-dl-template`** — two TensorFlow tools, ~30 s total, reading model files from `$FREESURFER_HOME/models/`, with the same per-region S3 checkpoint/restore as the GEMS pod:
-1. `mri_segment_hypothalamic_subunits` — CNN, ~10 sec/session, 5 bilateral hypothalamic subregions → `{subjID}_hypothalamic.tar.gz`
-2. `mri_sclimbic_seg` — U-Net, <1 min/session, hypothalamus (coarse), mammillary bodies, basal forebrain, septal nuclei, NAcc, fornix → `{subjID}_sclimbic.tar.gz`
+1. `mri_segment_hypothalamic_subunits` — CNN, ~10 sec/session, 5 bilateral hypothalamic subregions → `derivatives/subregions/{subjID}/hypothalamic/`
+2. `mri_sclimbic_seg` — U-Net, <1 min/session, hypothalamus (coarse), mammillary bodies, basal forebrain, septal nuclei, NAcc, fornix → `derivatives/subregions/{subjID}/sclimbic/`
 
 **13G/4CPU** with `TF_ENABLE_ONEDNN_OPTS=0` — a measured 11.87 GB peak lasting ~30 s, which is why it is its own pod ([#129](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/129), [#134](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/134)). Needs no symlinks and no GEMS output: both tools read only `mri/nu.mgz` (plus an optional `talairach.xfm.lta`), which this pod has already staged for itself.
 
@@ -303,7 +321,7 @@ Separate pipeline for first-level GLM analysis. Submitted by `first-level-queue-
 
 - `activeDeadlineSeconds: 7200` (2 hour cap)
 - Scratch volume: 300 Gi emptyDir (no EFS PVC)
-- Retry: limit 8 with `retryPolicy: Always`, filtered to infrastructure causes by expression (spot reclaim, exit codes 64/75/143). `Always` is deliberate: a reclaimed pod lands in phase **Error**, not Failed, so the earlier `OnFailure` policy could never honour the spot clause it was paired with. The 2 h deadline is the real ceiling — retries cannot extend it, so the limit is an upper bound the cap may cut short ([#115](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/115)).
+- Retry: limit 8 with `retryPolicy: Always`, filtered to infrastructure causes by expression (spot reclaim, exit codes 64/75/143 in either `exitCode` or the node message — see [#277](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/277)). `Always` is deliberate: a reclaimed pod lands in phase **Error**, not Failed, so the earlier `OnFailure` policy could never honour the spot clause it was paired with. The 2 h deadline is the real ceiling — retries cannot extend it, so the limit is an upper bound the cap may cut short ([#115](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/115)).
 - Input: `subjID` parameter; reads its own config
 - Output: `derivatives/first_levels/{subj}/` in `<YOUR_S3_BUCKET>` bucket
 

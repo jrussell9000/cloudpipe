@@ -159,3 +159,4 @@ nav:
       - decisions/014-cloudflare-tunnel-over-vpn.md
       - decisions/015-s3-backend-after-state-loss.md
       - decisions/016-skipped-producer-deadlock-in-dag-recording.md
+      - decisions/017-exploded-derivatives-over-tarballs.md
