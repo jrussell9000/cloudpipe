@@ -169,9 +169,66 @@ Grafana is at **https://grafana.<YOUR_DOMAIN>**, deployed via ArgoCD (`gitops/ap
 | Infrastructure Health | `cloudpipe-infra-health` | Argo workflow phases + queue depth/latency; API server latency; Karpenter node provisioning + disruption summary |
 | Karpenter Autoscaler | `cloudpipe-karpenter` | Per-nodepool resource usage vs limits; node claim lifecycle latency; disruption counts; interruption messages |
 
-All dashboards use a 30-day (QC/Cost/Throughput) or 3-hour (Infra/Karpenter) default time range. Athena dashboards refresh every 5–60 minutes; Prometheus dashboards refresh every 1 minute.
+Default time ranges: 7-day (QC × 3, Throughput, Failure Triage), 30-day (Cost — the
+monthly view is the point of that dashboard), 3-hour/6-hour (Infra/Karpenter). Athena
+dashboards refresh every 5–60 minutes; Prometheus dashboards refresh every 1 minute.
+The QC dashboards were dropped from 30 days to 7 because first paint scans every
+partition in range and the raw tables are one small S3 object per record — widen the
+picker when you actually want the longer window.
 
 The three QC dashboards (Functional, Anatomical, Registration) have **Subject**, **Session**, and **Task** (Functional only) dropdown variables for drill-down to a specific scan. Setting any variable to "All" includes all values.
+
+### Shared query sources on the QC dashboards
+
+Most panels on the three QC dashboards **do not query Athena**. A handful of *source*
+panels run the query; every other panel reads that panel's result through Grafana's
+built-in `-- Dashboard --` data source and picks its own column out of the shared frame.
+This exists because Athena's latency here is dominated by S3 object count, not bytes
+(the raw tables are ~700 B per object, tens of thousands of objects per `dt=`), and
+because firing 20–30 concurrent queries made each one roughly 7× slower than the same
+query run alone.
+
+| Dashboard | Source panels | Athena queries | Was |
+|---|---|---|---|
+| Functional QC | 12 (scalars), 5 (distributions), 7 (its own table) | 3 | 20 |
+| Anatomical QC | 2 + 10 (scalars, one per table), 16 + 17 (distributions), 25/43/50 (tables) | 7 | 27 |
+| Registration QC | 1 (scalars, both `registration_type`s in one pass), 14 + 34 (distributions), 26/35/46/50/51/52/60 (tables) | 10 | 33 |
+
+Rules that keep this working — all three have bitten or nearly bitten:
+
+- **A source panel must live in an expanded row.** Grafana does not run queries for
+  panels inside a collapsed row, so a source panel there would leave every consumer
+  blank until someone expanded it. This is why `registration-qc`'s collapsed
+  Provenance panel (60) keeps its own query instead of feeding others.
+- **Removing a column from a source query silently blanks its consumers.** Consumers
+  select by field name (`options.reduceOptions.fields`, or a `filterFieldsByName`
+  transformation on histograms). A name that matches nothing renders as "No data",
+  not as an error. Run `scripts/validate_dashboard_queries.py` before deleting a column.
+- **Athena preserves the case of column aliases** (`aCompCor_WM` comes back
+  `aCompCor_WM`, not lowercased), and the field selectors are case-sensitive regexes.
+- Consumers set `withTransforms: false`, so they read the source panel's **raw** query
+  result. A source panel is therefore free to transform its own copy for display —
+  panel 5 on Functional QC does exactly that.
+- Merging per-panel filters into one query is only safe when the semantics survive:
+  `AND <col> IS NOT NULL` is redundant under `AVG`/`APPROX_PERCENTILE` (SQL aggregates
+  skip NULLs) and was dropped, but `AND <col> > 0` is a *value* filter and became
+  `AVG(CASE WHEN <col> > 0 THEN <col> END)`. Do not drop the latter.
+
+Because `gitops/**` is outside the `pull_request.paths` filter in
+`.github/workflows/ci.yaml`, **nothing validates these dashboards on a PR** — a
+dashboard-only PR reports no checks at all, which reads identically to "CI hasn't
+started yet". Run the wiring check by hand instead:
+
+```bash
+python scripts/validate_dashboard_queries.py
+```
+
+It resolves every consumer's `panelId`, confirms the target actually queries Athena,
+checks each selected field name against the source query's column aliases
+(case-sensitively), and flags a source panel buried in a collapsed row. It cannot tell
+you whether a *query* is right, so also load the real dashboard after a change, and run
+any changed `rawSQL` against Athena with the `$__timeFrom()`/`$__timeTo()` macros
+substituted before pushing.
 
 ---
 
@@ -264,6 +321,11 @@ the 2026-08-10 batch. Because both cost CSVs are scoped to the workflow names
 `workflow_runs` returned, a short `workflow_runs` truncates the cost totals too.
 `grain_asymmetry_warning()` now catches this by comparing each grain's *subject*
 coverage rather than its row count, which only ever saw a total split.
+
+**The export does not deduplicate.** A scan re-processed on another day keeps
+every earlier record, and a window spanning both days exports both. Run
+`scripts/purge_superseded_metrics.py` (see "How compaction works" below) before
+any export meant to describe the processed data.
 
 ### Athena SQL
 
@@ -470,6 +532,53 @@ silently destroys a day. Legitimate multi-version dates are unaffected — a
 `dt` whose raw data genuinely spans two versions (as `registration` does on 8
 dates, `2.1` alongside `2.4`/`2.6`, from a mid-stream bump with zero row-grain
 overlap) has both versions present in raw, so neither is an orphan.
+
+**A flush reaches compacted too, because the compactor cannot.** The nightly
+run rebuilds only its `lookback_days` window from raw, so a subject flushed by
+`prep_test_batch.py` from an older day used to vanish from raw and stay in
+`*_compacted` indefinitely
+([#382](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/382): 83
+failed step outcomes of reprocessed subjects, visible to
+`CloudpipeMetrics(compacted=True)` and invisible to every dashboard). The
+decision there was that **a flushed attempt no longer counts**: raw stays
+authoritative, and the flush filters the same subjects out of every compacted
+partition of each table it deletes raw records from — `drop_rows`, a
+conditional `PutObject` rewrite that keeps the file's schema, never a delete.
+So after any flush, re-running the compactor over any `dt` is a no-op for
+those subjects rather than a silent change. Flushed records are not gone:
+the bucket is versioned, and they survive as noncurrent versions. What flushes
+before the fix left behind is cleared by `scripts/reconcile_compacted_with_raw.py`,
+which keeps only the rows of workflows raw still holds — safe to re-run any time
+the two are suspected of drifting.
+
+**A re-processed scan keeps its old record; the purge removes it.** The per-scan
+QC tables (`registration`, `anat_qc`, `fsqc_qc`, `func_preproc`, `surface_sample`) key a record by
+scan and write *date* — `metrics/registration/dt={day}/{subj}_{ses}_t1w_to_mni_reg_qc.json`
+— not by workflow. So re-processing a scan on a later day **adds** a record
+instead of replacing it (on the same day, it overwrites raw). The census on
+2026-09-11 put ~2.5% of every per-scan table in this state: 826 of 31,965
+`t1w_to_mni` rows, 4,290 `bold_to_t1w`, 803 `anat_qc`, 932 `fsqc_qc`, 4,113
+`func_preproc`. Every `registration-qc` panel and the `athena.py` joins read
+only the latest record per scan, so the dashboards are right. But the export
+and ad-hoc SQL see every record, and an exported dataset has to describe the
+data that was actually processed. `scripts/purge_superseded_metrics.py` keeps
+each scan's final record (latest `completed_at` across raw and compacted) and
+removes the rest from both stores. It deletes raw first (the bucket must be
+versioned; the delete markers are recorded in the audit) and then applies
+`drop_rows` to compacted. It **holds** any scan whose final record is not
+compacted yet, whose final fail supersedes an earlier pass, or whose derivative
+contradicts the final verdict:
+
+```bash
+pixi run python scripts/purge_superseded_metrics.py --metrics-bucket cloudpipe-metrics \
+  --data-bucket <YOUR_S3_BUCKET> --registration-type t1w_to_mni            # dry run
+pixi run python scripts/purge_superseded_metrics.py --metrics-bucket cloudpipe-metrics \
+  --data-bucket <YOUR_S3_BUCKET> --registration-type t1w_to_mni --write
+```
+
+Only `registration` is wired up. Each other table needs its own scan key and
+derivative check before it can be added. **Step outcomes are never purged**:
+they are an event log (a failure *happened*), not a measurement.
 
 **Querying compacted + raw together.** `CloudpipeMetrics` methods that have a
 compacted counterpart (`func_qc`, `anat_qc`, `fsqc_qc`, `workflow_runs`,

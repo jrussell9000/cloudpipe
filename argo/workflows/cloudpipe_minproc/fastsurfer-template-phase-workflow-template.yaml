@@ -87,6 +87,11 @@ spec:
         - name: fastsurfer-command-string
         - name: seg-argstring
         - name: T1w_sessions
+        # "cuda" (default) or "cpu" — the GPU spot-drought fallback (#373). See
+        # the nodeSelector / podSpecPatch below and the master template's
+        # fastsurfer-device parameter, which is where this comes from.
+        - name: device
+          value: cuda
 
       artifacts:
       - name: fslicense
@@ -115,8 +120,62 @@ spec:
           region: <YOUR_AWS_REGION>
           key: 'scratch/{{workflow.name}}/anat/template-base.tar.gz'
 
+    # DEVICE SWITCH (#373). device=cuda runs on gpu-nodepool exactly as the static
+    # resources block below describes; the patch is a no-op there. device=cpu is
+    # the spot-drought fallback: the pod moves to cpu-heavy-nodepool, `main` is
+    # re-sized for CPU inference, and the GPU limit is ZEROED — a strategic-merge
+    # patch cannot delete the key, and a 0-quantity extended resource is skipped
+    # by the scheduler's fit check, so the pod lands on a node with no GPU at all
+    # (verified on the fastsurfer-cpu-probe workflow, 2026-09-10).
+    #
+    # The static requests/limits below stay the source of truth for the GPU path:
+    # gpu_templates() and every guard in tests/argo/test_gpu_step_resources.py
+    # read THEM, and the cuda branch of this patch is pinned equal to them by
+    # test. Values-only expressions on purpose: one JSON literal inside a single
+    # expression cannot work, because Argo closes the tag at the first `}}` and a
+    # nested JSON object ends in `}}`.
+    #
+    # cpu 7, not the 8 the issue sketched: cpu-heavy's cheapest instance (a
+    # 2xlarge) has ~7.21 usable cores after daemonsets, so 7 fills one whole and
+    # 8 would force a 4xlarge and hold it alone — the same stranding as the k=4
+    # long-parcellation wart. OMP_NUM_THREADS tracks this via the downward API,
+    # so `--threads` follows the reservation on both paths. Memory 8G: the model
+    # and activations that live in ~3.7 GiB of VRAM on the GPU path live in RAM
+    # here, on top of the ~0.9 GB host working set — cgroup memory.peak read
+    # 3.96G on the probe, so 8G is ~2x headroom.
+    #
+    # MEASURED (fastsurfer-cpu-probe-lmkgg, 2026-09-10, sub-X5TLCB96 ses-00A,
+    # long-segmentation of one session on a c8i-flex.4xlarge spot node at 7
+    # threads, against the same session's GPU output from cloudpipe-zztxz):
+    #   wall 396 s vs 357 s on a 3-way time-sliced T4 — only ~10% slower, because
+    #   inference is 172 s of it (35 s on the GPU) and the rest (bias field,
+    #   cereb/hypothalamus nets, stats) is CPU-bound on both paths;
+    #   Dice vs GPU: aparc.DKTatlas+aseg 0.9998 mean / 0.9979 min over 95 labels,
+    #   voxel agreement 99.9985%; aseg 0.9998; cerebellum 0.99995; hypothalamus
+    #   0.9992 — not bit-identical (CUDA vs CPU float kernels), far inside
+    #   inter-run variance. Per session it is ~1.4x the GPU cost ($0.012 on a
+    #   ~$0.11/hr 2xlarge vs $0.0085 on a $0.086/slice-hr T4 slice).
+    # Manifest: scripts/manifests/fastsurfer-cpu-fallback-probe.yaml.
     nodeSelector:
-      karpenter.sh/nodepool: gpu-nodepool
+      karpenter.sh/nodepool: "{{= inputs.parameters.device == 'cpu' ? 'cpu-heavy-nodepool' : 'gpu-nodepool' }}"
+    podSpecPatch: |
+      containers:
+        - name: main
+          resources:
+            requests:
+              cpu: "{{= inputs.parameters.device == 'cpu' ? '7' : '1' }}"
+              memory: "{{= inputs.parameters.device == 'cpu' ? '8G' : '2G' }}"
+            limits:
+              nvidia.com/gpu: "{{= inputs.parameters.device == 'cpu' ? '0' : '1' }}"
+
+    # Lowest of the three GPU ranks (#370). This step STARTS new GPU demand —
+    # every template it builds spawns a long-segmentation pod behind it — so
+    # under scarcity it yields to both steps that retire work in flight. That
+    # ordering is the whole lever: it caps work-in-progress instead of letting
+    # 47 template-builds win slices ahead of 35 long-segmentations, as happened
+    # on 2026-09-10. Like long-seg, it is not switched on `device`.
+    # See gitops/apps/cluster-config/templates/gpu-priority-classes.yaml.
+    priorityClassName: cloudpipe-gpu-template-build
 
     volumes:
       - name: work
@@ -126,7 +185,7 @@ spec:
 
     initContainers:
       - name: download-t1w-inputs
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -167,7 +226,7 @@ spec:
       # runs surface registration. It is not included in per-subject tarballs, so it
       # is fetched per pod from config/fsaverage/ in S3 (~480 MiB, 312 objects).
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -279,20 +338,35 @@ spec:
       command: [bash, -c]
       args:
         - |
-          nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
-            --format=csv -l 5 >&2 &
-          MONITOR=$!
+          # Device switch (#373). The argstrings carry `--threads 1` for the GPU
+          # path; long_prepare_template.sh, run_fastsurfer.sh and run_prediction.py
+          # all take the LAST --threads / --device they are given, so appending
+          # here overrides them without a second copy of either argstring.
+          # OMP_NUM_THREADS is this pod's cpu request via the downward API — 7
+          # after the cpu podSpecPatch, 1 on the GPU — so threads track the
+          # reservation on both paths. No nvidia-smi on the cpu path: the binary
+          # is absent on cpu-heavy nodes.
+          DEVICE_FLAGS=""
+          MONITOR=""
+          if [[ "{{inputs.parameters.device}}" == "cpu" ]]; then
+            DEVICE_FLAGS="--device cpu --threads ${OMP_NUM_THREADS}"
+            echo "[device] cpu: FastSurfer inference on ${OMP_NUM_THREADS} threads (cpu-heavy-nodepool drought fallback, #373)" >&2
+          else
+            nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
+              --format=csv -l 5 >&2 &
+            MONITOR=$!
+          fi
 
-          /fastsurfer/recon_surf/long_prepare_template.sh {{inputs.parameters.fastsurfer-command-string}}
+          /fastsurfer/recon_surf/long_prepare_template.sh {{inputs.parameters.fastsurfer-command-string}} ${DEVICE_FLAGS}
           PREP_EXIT=$?
           if [[ $PREP_EXIT -ne 0 ]]; then
             echo "ERROR: long_prepare_template.sh failed (exit ${PREP_EXIT}); not attempting segmentation." >&2
-            kill $MONITOR 2>/dev/null
+            [[ -n "$MONITOR" ]] && kill $MONITOR 2>/dev/null
             exit $PREP_EXIT
           fi
 
-          /fastsurfer/run_fastsurfer.sh {{inputs.parameters.seg-argstring}}
-          EXIT=$?; kill $MONITOR 2>/dev/null; exit $EXIT
+          /fastsurfer/run_fastsurfer.sh {{inputs.parameters.seg-argstring}} ${DEVICE_FLAGS}
+          EXIT=$?; [[ -n "$MONITOR" ]] && kill $MONITOR 2>/dev/null; exit $EXIT
 
   ##############################################
   # B. Template Parcellation (surf_only --base)
@@ -374,7 +448,7 @@ spec:
     initContainers:
       # recon-surf.sh registers to fsaverage, which is not in the template tarball.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
         imagePullPolicy: IfNotPresent
         resources:
           requests:

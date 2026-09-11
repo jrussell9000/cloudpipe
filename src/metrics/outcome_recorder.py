@@ -34,10 +34,13 @@ reference, which deadlocks the DAG when the step is skipped (a skipped task has
 no outputs, so the record task is never instantiated and the parent DAG waits
 on it forever — dagval-330e63gh-tarerr2, 2026-07-23).
 
---message and --exit-code are accepted but empty from a DAG (Argo exposes no
-task-message variable, and referencing exitCode of a skipped task has the same
-omission hazard as outputs). failure_category therefore falls back to the
-missing-output fact for DAG-recorded per-run failures.
+--message is always empty from a DAG (Argo exposes no task-message variable).
+--exit-code is passed only by a recorder task whose `depends` admits Failed
+and nothing that could be Skipped: referencing exitCode of a skipped task has
+the same omission hazard as outputs, so a step that can be skipped gets two
+recorder tasks, a failure arm that carries the code and a success/skip arm that
+does not. Without a code, failure_category falls back to the missing-output
+fact for DAG-recorded per-run failures.
 
 This module is invoked ONLY by the standalone outcome-recorder WorkflowTemplate
 now — the fallback path fired when a step is Skipped or its worker pod died
@@ -116,6 +119,14 @@ _TAXONOMY: list[tuple[str, list[str]]] = [
 ]
 
 
+# The exit code a registration step uses when its own quality gate rejects the
+# transform it just produced: fst1w_to_mni.py and bold_to_t1w.py exit 65, and
+# only for that, before promoting any output. The run did not break — it
+# worked and said no — so it gets its own category rather than falling through
+# to "unknown" alongside real crashes (issue #368). 65 is also excluded from
+# every retry expression, since a deterministic registration re-rejects.
+QC_REJECTED_EXIT_CODE = 65
+
 # Container exit codes carry the only failure signal a DAG task actually
 # exposes, since {{tasks.<name>.message}} does not exist. 128+N is the shell
 # convention for "killed by signal N".
@@ -124,6 +135,14 @@ _EXIT_CODE_CATEGORY: dict[int, str] = {
     143: "infrastructure",  # 128+15 SIGTERM — pod deleted / node drained
     139: "algorithm",  # 128+11 SIGSEGV
     134: "algorithm",  # 128+6  SIGABRT
+    QC_REJECTED_EXIT_CODE: "qc_rejected",
+}
+
+# What a known exit code means, spelled out in failure_reason. The panel a
+# human reads is failure_reason, not failure_category, and a bare "exit code 65"
+# there reads as a crash.
+_EXIT_CODE_REASON: dict[int, str] = {
+    QC_REJECTED_EXIT_CODE: "QC gate rejected the registration; no outputs promoted",
 }
 
 
@@ -380,12 +399,15 @@ def record_one_step(args: argparse.Namespace, step: str) -> None:
 
     # DAG-recorded failures carry no message (Argo has no task-message variable),
     # so fall back to the exit code, then to the fact that defines an
-    # output-derived per-run failure: the expected output never landed.
+    # output-derived per-run failure: the expected output never landed. The
+    # code is preferred because it is the cause; "expected output not found" is
+    # only the symptom, and for a QC rejection it pointed triage at S3 (#368).
     failure_reason = args.message
     if not failure_reason and run_status.lower() not in ("succeeded", "skipped"):
         code = (args.exit_code or "").strip()
         if code:
-            failure_reason = f"exit code {code}"
+            meaning = _EXIT_CODE_REASON.get(int(code)) if code.isdigit() else None
+            failure_reason = f"exit code {code}" + (f": {meaning}" if meaning else "")
         elif expected_keys and not outputs_verified:
             failure_reason = f"expected output not found: {expected_keys[0]}"
 

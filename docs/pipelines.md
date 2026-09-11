@@ -107,11 +107,13 @@ processing         (skipped if all five                   │
 | Where | `record-outcome-*` tasks |
 |---|---|
 | `master-pipeline-dag` (this diagram) | `record-outcome-anatomical-dagtask`, `record-outcome-session-dagtask` (phase-level aggregates), `record-outcome-subregion-seg-dagtask`, `record-outcome-fsqc-metrics-dagtask` |
-| Anatomical child DAG | `record-outcome-fastsurfer-dagtask` |
+| Anatomical child DAG | `record-outcome-fastsurfer-{template-build,template-parc,long-seg,long-parc}-{failed,other}-dagtask` (one failed/other pair per FastSurfer producer — see below) |
 | Session-level child DAG | `record-outcome-func-preproc-dagtask` (records both `func-preproc` and `surface-sample`), `record-outcome-surface-resample-dagtask` |
 | Registration child DAG | `record-outcome-t1w-to-mni-step`, `record-outcome-bold-to-t1w-step` |
 
-Phase-level `record-outcome-*` tasks depend on `<producer>.Succeeded || .Failed || .Skipped`, so they run on every terminal status. For a task that carries no `when:` clause of its own — `fsqc-metrics` is the example — `Skipped` means *an upstream branch failed*, not that the work was already done.
+Phase-level `record-outcome-*` tasks (`anatomical`, `session`, `subregion-seg`, `fsqc-metrics`) depend on `<producer>.Succeeded || .Failed || .Errored || .Skipped || .Omitted`, so they run on every terminal status, including a spot-preempted `Errored` producer and an `Omitted` one whose own upstream dependency failed. For a task that carries no `when:` clause of its own — `fsqc-metrics` is the example — `Skipped` means *an upstream branch failed*, not that the work was already done.
+
+The four FastSurfer producers are the one place a **single shared gate isn't enough**: they were originally one `withItems` loop with one combined `depends`, but Argo resolves a DAG task's `depends` statically before `withItems` expansion, so a shared gate cannot isolate which items are safe to pull `.exitCode` from. Each producer instead gets a `-failed-dagtask` (gated on `.Failed || .Errored`, carries `exit-code` for real classification) and an `-other-dagtask` (gated on `.Succeeded || .Skipped || .Omitted`, status only) — the same two-arm shape as the registration fallback recorders below, just per producer instead of per session/run.
 
 The per-run recorders whose producer writes its own outcomes in-pod are instead **fallbacks**, gated on `<producer>.Failed || .Errored || .Skipped` — never on bare success, so a healthy session pays for zero recorder pods. `.Errored` covers spot preemption (`pod deleted` / node shutdown), which is phase `Error`, not `Failed`, and is the case where the in-pod records never reach S3. See [ADR 016](decisions/016-skipped-producer-deadlock-in-dag-recording.md).
 
@@ -242,6 +244,8 @@ Failure modes:
 
 Four steps run as a DAG. All FastSurfer steps use image `cloudpipe/fastsurfer`. Steps A and C run on `gpu-nodepool`; B and D on `cpu-heavy-nodepool`.
 
+**GPU spot-drought fallback ([#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373)).** When the workflow parameter `fastsurfer-device` is `cpu` (default `cuda`), A and C run on `cpu-heavy-nodepool` too: each pod is re-sized to 7 CPU / 8G by `podSpecPatch`, its `nvidia.com/gpu` limit is zeroed, and `--device cpu --threads 7` is appended to every FastSurfer call. Measured on one session (probe `fastsurfer-cpu-probe-lmkgg`, 2026-09-10, manifest in `scripts/manifests/`): 396 s on CPU against 357 s on a 3-way time-sliced T4 — inference itself is 172 s vs 35 s, but the bias-field, sub-segmentation and stats work that follows is CPU-bound on both paths — with Dice 0.9998 against the GPU segmentation and a 3.96G memory peak. About 1.4x the per-session cost, and it cannot be stalled by a GPU pool that grants no nodes — which happened for hours on 2026-09-03 and 2026-09-10. The queue manager chooses the value per submission from how many GPU pods have been Pending 15+ minutes (Prefect variable `cloudpipe-fastsurfer-device` overrides it), and the workflow records it as the label `cloudpipe.io/fastsurfer-device`. `t1w-to-mni` stays GPU-only.
+
 **There is no shared volume.** Each step works in a private `emptyDir` at `/work`, with `SUBJECTS_DIR=/work/subjects`, and hands state to the next step through S3 per [ADR 004](decisions/004-s3-artifacts-for-inter-step-data.md). Intermediates go to `scratch/{workflow.name}/anat/` and are reaped by the `scratch-expiration` lifecycle rule (7 days) in `terraform/s3_lifecycle.tf`. They are not derivatives — nothing outside the owning workflow may read them.
 
 ```
@@ -286,7 +290,7 @@ Main container runs `long_prepare_template.sh`, then — only if that succeeded 
 
 `--threads 1` matches the 1-CPU request so two time-sliced GPU pods fit a g4dn.xlarge; see the inline comment for the full rationale. `--threads` only reaches FastSurfer's own argument parsing, so the GPU steps additionally project the CPU request into `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` via the downward API — without that, PyTorch and OpenMP size their pools from the host core count (measured `cpu_efficiency` 1.10–1.22 against a 1-core request, 2026-07-31 batch).
 
-Resources: 4G memory, 1 CPU, 20G ephemeral-storage, 1 GPU.
+Resources: 2G memory, 1 CPU, 20G ephemeral-storage, 1 GPU (7 CPU / 8G / no GPU with `device=cpu`).
 
 Outputs: `scratch/{workflow.name}/anat/template-base.tar.gz`.
 
@@ -320,7 +324,7 @@ Runs `brun_fastsurfer.sh` (batch variant). Takes `template-base.tar.gz` from A �
 
 Also runs the `download-fsaverage` init container (see Step A). `--seg_only` shouldn't need `fsaverage` — it's a surface-registration atlas, and this step never runs `--surf_only` — but under the old shared volume it was always present regardless, so removing it here is unverified. Costs ~480 MiB of S3 transfer and a few seconds of GPU node time per pod until a real run confirms it's safe to drop.
 
-Resources: 2G memory, 1 CPU, 20G ephemeral-storage, 1 GPU.
+Resources: 1G memory, 1 CPU, 20G ephemeral-storage, 1 GPU (7 CPU / 8G / no GPU with `device=cpu`).
 
 Outputs: `scratch/{workflow.name}/anat/sessions-seg/{ses}.tar.gz`, one per session. Declared one-per-possible-session (`ses-00A`…`ses-10A`) and all `optional: true`, because Argo resolves `outputs.artifacts` statically when the pod spec is built — a variable-length session list cannot be expressed any other way. Same pattern as `subregion-seg`'s segmentation templates' FastSurfer input artifacts.
 

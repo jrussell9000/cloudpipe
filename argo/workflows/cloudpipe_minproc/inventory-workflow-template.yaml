@@ -36,7 +36,7 @@ spec:
             path: /tmp/subregions_exists.txt
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -119,7 +119,7 @@ spec:
             path: /tmp/rejected_count.txt
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

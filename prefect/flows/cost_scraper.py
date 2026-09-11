@@ -221,12 +221,28 @@ def kubecost_cost_scraper(
     return value keeps its existing meaning for anything reading it.
     """
     report_date = _date.fromisoformat(date) if date else None
-    n = scrape_task(
+
+    # return_state=True so a failure here does NOT abort the rest of the flow.
+    #
+    # This task and the settled re-scrape below read DIFFERENT report-dates and
+    # have no data dependency on each other, but until 2026-09-07 a raise here
+    # took the whole run down with it. On 2026-09-06 that cost two days instead
+    # of one: Kubecost served `data: [null]` for 09-05 after the aggregator
+    # OOMKilled mid-batch, this task died on it at 02:00:00 before writing
+    # anything, and the age-3 re-scrape of 09-03 — which would have succeeded,
+    # its data being both present and settled — never ran. 09-03 is now pinned
+    # at scrape_age_days=1 permanently, because the flow schedules no third read.
+    #
+    # The outcome is still surfaced: the state is unwrapped at the end of the
+    # flow, after the independent work has had its chance, so a failed scrape
+    # still fails the run and still alerts.
+    main_state = scrape_task(
         bucket=bucket,
         region=region,
         base_url=base_url,
         pipeline=pipeline,
         report_date=report_date,
+        return_state=True,
     )
 
     if scrape_pod_costs:
@@ -263,4 +279,7 @@ def kubecost_cost_scraper(
             return_state=True,
         )
 
-    return n
+    # Unwrap last: raises the original exception if the main scrape failed, so
+    # the run is still marked Failed and still alerts — but only after the
+    # settled re-scrape and the probe have run independently of it.
+    return main_state.result(raise_on_failure=True)

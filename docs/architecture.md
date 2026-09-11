@@ -261,6 +261,7 @@ Prefect API is at `https://prefect.<YOUR_DOMAIN>/api`.
 | Max concurrent Argo workflows (namespace-wide, **enforced**) | 400 | `namespaceParallelism`, `terraform/modules/argo-workflows/main.tf` |
 | Max concurrent Argo workflows (cloudpipe) | 50 (fallback when Variable unset, overridable live) | Prefect Variable `cloudpipe-max-concurrent` |
 | Max concurrent Argo workflows (first-level) | 25 (fallback when Variable unset, overridable live) | Prefect Variable `first-level-max-concurrent` |
+| FastSurfer segmentation device for new workflows | `auto` (cpu during a GPU spot drought, else cuda; overridable live) | Prefect Variable `cloudpipe-fastsurfer-device` |
 | Max pod creates per second | 50, burst 90 | `resourceRateLimit`, `terraform/modules/argo-workflows/main.tf` |
 | Max concurrent Globus transfers | 8 | `cloudpipe-semaphores` ConfigMap |
 | Max parallel sessions per workflow | 3 (master DAG `parallelism`) | `cloudpipe-long-master-workflow-template.yaml` |

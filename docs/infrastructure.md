@@ -23,7 +23,7 @@ All infrastructure lives in `terraform/`. Run all Terraform commands from within
 | `metrics_bucket.tf` | The `cloudpipe-metrics` bucket (versioned) that holds all QC/cost records |
 | `abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix |
 | `grafana.tf` | Grafana Helm release, ALB ingress, OIDC |
-| `logging.tf` | S3 log bucket, CloudTrail, Container Insights log groups |
+| `logging.tf` | S3 log bucket, CloudTrail |
 | `dns.tf` | Route53 zone lookup, ACM certificates (us-east-1 + <YOUR_AWS_REGION>) |
 | `ecr.tf` | ECR private repositories (primary registry for pipeline images) |
 | `s3_lifecycle.tf` | S3 lifecycle rules for data bucket |
@@ -154,7 +154,8 @@ A replacement (Cloudflare Tunnel + Access, on a **new** UW-Madison OIDC client i
 | `kube-proxy` | Standard |
 | `metrics-server` | Runs on `backend` node group |
 | `eks-pod-identity-agent` | Installed `before_compute` so Pod Identity works from first node join |
-| `amazon-cloudwatch-observability` | Basic Container Insights **metrics** only (per-metric billing, not per-observation). Application Signals disabled. Container **logs** disabled (`containerLogs.enabled = false`), so no fluent-bit DaemonSet — pod logs go to S3 via Argo's log archive instead. Runs on `backend` node group. |
+
+`amazon-cloudwatch-observability` was **removed on 2026-09-08**. Container logs and Application Signals were already disabled, so ContainerInsights metrics were the addon's only remaining output — and nothing consumed them (0 CloudWatch alarms account-wide, no Grafana CloudWatch datasource, no reference to the namespace in this repo). Basic mode bills per unique metric, which is unbounded in pod count, so ephemeral Argo pods drove it to **$732 over the 2026-09-01..09-07 batch**. Cluster metrics come from Prometheus → Grafana. See the `addons` block in `terraform/eks.tf`.
 
 ### Managed node groups (always-on, fixed size)
 
@@ -273,7 +274,6 @@ All pod-level AWS permissions use EKS Pod Identity (not IRSA). Each service acco
 | `prefect-worker` | `prefect` | S3 read/write on `<YOUR_S3_BUCKET>`, SSM read on Globus params; K8s RBAC to create/manage Jobs in `prefect` ns and list/create Workflows in `argo-workflows` ns |
 | `ebs-csi-controller-sa` | `aws-ebs-csi-driver` | EBS CSI managed policy |
 | `external-dns` | `external-dns` | Route53 record management on `<YOUR_DOMAIN>` zone |
-| `cloudwatch-agent` | `amazon-cloudwatch` | CloudWatch agent policy |
 | `external-secrets` | `external-secrets` | Secrets Manager `GetSecretValue` (for ClusterSecretStore) |
 | `grafana` | `grafana` | Athena query on `cloudpipe_metrics_workgroup` + Glue read on the `cloudpipe_metrics` catalog/database/tables; S3 read on `cloudpipe-metrics/metrics/*`; S3 read+write on `cloudpipe-finops/grafana-query-results/*` |
 
@@ -327,7 +327,7 @@ External DNS (running in `external-dns` namespace, managed by ArgoCD) automatica
 | Log stream | Destination | Retention |
 |---|---|---|
 | EKS control plane (api, audit, authenticator) | CloudWatch log group `/aws/eks/cloudpipe/cluster` | 365 days, KMS encrypted |
-| Container Insights **metrics** (basic mode) | CloudWatch | Default (15 months) |
+| Container Insights **metrics** | *removed 2026-09-08* — cluster metrics come from Prometheus → Grafana | — |
 | Container **logs** (pod stdout/stderr) | S3 `<YOUR_S3_BUCKET>/logs/{workflow}/{pod}/main.log` — *not* CloudWatch | Bucket lifecycle |
 | VPC flow logs | `cloudpipe-logging/vpc-flow-logs/` | 90d → Glacier → 3y expiry |
 | CloudTrail (all regions, all mgmt events + S3 data events on `<YOUR_S3_BUCKET>`) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
@@ -337,7 +337,7 @@ Pipeline pod logs are **not** forwarded to CloudWatch. Use the Argo UI or `argo 
 
 Until 2026-08-11 the addon's fluent-bit DaemonSet *did* also ship every pod's stdout to `/aws/containerinsights/cloudpipe/{application,argo-workflows}`, a second copy of the same bytes that nothing in this repo read. Measured over a 200-subject batch window it ingested ~234 GB/month, ≈$139/month all-in, so `containerLogs.enabled = false` turned it off. If searchable workflow logs are wanted, build them over the S3 archive (Athena or an OpenSearch ingest) — do not re-enable the addon's log path. Note this is unrelated to the control-plane `audit`/`authenticator` streams above, which are a NIST 800-171 control and stay.
 
-Container Insights runs in basic mode (`kubernetes: {}` config only — per-metric billing). Enhanced mode and Application Signals are explicitly disabled to avoid ~$80/month in unnecessary APM charges for batch workloads.
+Container Insights was removed entirely on 2026-09-08, for the same reason fluent-bit went: nothing read it. The addon had already been trimmed to metrics only, and basic mode's per-metric billing turned out to be the worst possible fit for this workload — it bills per *unique* metric, so every ephemeral Argo pod name minted new billable metrics at $0.30 each. Metric-months/day tracked pod churn 32x across the 2026-09-01..09-07 batch (20.9 idle → 679 peak → 9.9 once drained), costing **$675.78 in metrics plus $56.55 ingesting the performance log group that backed them**. Enhanced (per-observation) mode would have been *cheaper*, being bounded by scrape rate rather than pod count — the earlier note claiming basic was "far cheaper" had this backwards. If ContainerInsights is ever wanted back, use enhanced mode and give it a consumer first.
 
 ---
 

@@ -435,13 +435,35 @@ def build_record(
     }
 
 
+# Written by the Dockerfile when it overlays the Deep-MI/fsqc#105 fix onto the
+# installed release (images/fsqc/patches/). Absent in an unpatched environment.
+FSQC_PATCH_REF_FILE = Path("/opt/fsqc-patch-ref")
+
+
 def _fsqc_version() -> str:
+    """Report the fsqc version, marking a patched install so rows are separable.
+
+    `fsqc.get_version()` reads the installed release's VERSION file and knows
+    nothing about modules swapped in underneath it, so a patched 2.1.7 and a
+    stock 2.1.7 would both report "2.1.7" and be told apart only by completed_at
+    — useless for confirming the fix actually changed anything. Append the patch
+    ref as a PEP 440 local version segment instead, giving e.g.
+    "2.1.7+p9fcd40cf", which Athena can filter on directly.
+
+    Deleting the patch directory removes the marker file and the suffix with it.
+    """
     try:
         import fsqc
 
-        return str(fsqc.get_version())
+        version = str(fsqc.get_version())
     except Exception:  # pragma: no cover - version reporting must never fail a run
         return "unknown"
+
+    try:
+        ref = FSQC_PATCH_REF_FILE.read_text().strip()
+    except OSError:  # unpatched image, or the marker was removed
+        return version
+    return f"{version}+p{ref[:8]}" if ref else version
 
 
 FSQC_VERSION = _fsqc_version()

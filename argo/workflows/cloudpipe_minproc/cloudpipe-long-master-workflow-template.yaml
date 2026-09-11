@@ -13,6 +13,9 @@ spec:
     labels:
       pipeline: cloudpipe
       subjectid: "{{workflow.parameters.subjID}}"
+      # Which device this workflow's FastSurfer segmentation ran on (#373), so a
+      # drought-era batch can be split by `argo list -l cloudpipe.io/fastsurfer-device=cpu`.
+      cloudpipe.io/fastsurfer-device: "{{workflow.parameters.fastsurfer-device}}"
 
   retryStrategy:
     # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
@@ -132,6 +135,18 @@ spec:
     parameters:
       - name: subjID
 
+      # Free-text era/batch label recorded on the WorkflowRun metrics record —
+      # "leg-2", "test-2026-09-05", and so on. Defaults to empty, so a one-off
+      # resubmission need not invent a label.
+      #
+      # Exists because era was otherwise only recoverable from a timestamp: the
+      # pre-leg-1 test batches finished on dates that overlap leg 1, so any
+      # dt-scoped query mixed them together, and telling them apart required
+      # knowing leg 1 began at 2026-08-18T16:54Z. Pass this and the distinction
+      # becomes a column.
+      - name: batch-label
+        value: ''
+
       # S3 bucket — defaults to the value set by Terraform in cloudpipe-config.
       # Override at submission time to target a different bucket without redeploying.
       - name: bucket
@@ -176,6 +191,23 @@ spec:
       # Set to "false" for the POSIX staging approach.
       - name: globus-use-s3-gateway
         value: "true"
+
+      # Where FastSurfer segmentation inference runs (#373). "cuda" is the normal
+      # path: template-build and long-segmentation on gpu-nodepool, time-sliced.
+      # "cpu" moves both onto cpu-heavy-nodepool with `--device cpu` — measured
+      # ~10% slower per session than a time-sliced T4 slice and ~1.4x its cost
+      # (see fast-tmpl), but immune to the GPU spot droughts that
+      # left 80+ GPU pods Pending for hours on 2026-09-03 and 2026-09-10
+      # (docs/investigations/2026-09-10-gpu-spot-acquisition-review.md §5.1).
+      # The queue manager sets this per submission from the Pending-GPU-pod
+      # signal (prefect/flows/lib/gpu_drought.py); force it with
+      # `prefect variable set cloudpipe-fastsurfer-device cpu|cuda|auto`.
+      # t1w-to-mni stays on the GPU either way — it is ~30 s of FireANTs.
+      # The value is stamped on the Workflow as the label
+      # cloudpipe.io/fastsurfer-device (workflowMetadata above), and FastSurfer
+      # records the device it ran on in each tree's scripts/deep-seg.log.
+      - name: fastsurfer-device
+        value: cuda
 
   # Which template (below) should we start with?
   entrypoint: master-pipeline-dag
@@ -438,11 +470,29 @@ spec:
 
         # Record anatomical phase outcome (phase-level: covers all FastSurfer steps).
         # Runs unconditionally — succeeds, fails, or was skipped (derivatives existed).
+        # `.Errored` and `.Omitted` added to the original Succeeded||Failed||
+        # Skipped gate (D2's lesson applied here too): a spot-preempted pod
+        # inside the sub-DAG surfaces as anatomical-processing-pipeline-dagtask
+        # Errored, not Failed, and it depends on
+        # subject-data-inventory-dagtask.Succeeded (line 275), so a failed
+        # inventory step leaves it Omitted, not Skipped (its `when` gate on
+        # existing derivatives is the only source of a true Skipped).
+        #
+        # No exit-code parameter: this task is a `template:` reference to a DAG
+        # (anatomical-processing-pipeline-dag-template), not a pod, and Argo
+        # does not populate `.exitCode` for a DAG-type task —
+        # `{{tasks.anatomical-processing-pipeline-dagtask.exitCode}}` fails
+        # `argo lint` outright ("failed to resolve"). Real failure detail for an
+        # anatomical-phase failure lives on whichever FastSurfer producer
+        # actually failed, recorded by the per-producer failed arms above; this
+        # row stays a status-only rollup, so it needs no failed/other split.
         - name: record-outcome-anatomical-dagtask
           depends: >-
             anatomical-processing-pipeline-dagtask.Succeeded ||
             anatomical-processing-pipeline-dagtask.Failed ||
-            anatomical-processing-pipeline-dagtask.Skipped
+            anatomical-processing-pipeline-dagtask.Errored ||
+            anatomical-processing-pipeline-dagtask.Skipped ||
+            anatomical-processing-pipeline-dagtask.Omitted
           templateRef:
             name: outcome-recorder
             template: record-step-outcome
@@ -538,6 +588,10 @@ spec:
       parameters:
         - name: T1w_sessions
     dag:
+      # failFast is per-DAG and does NOT inherit from the master DAG (line 197).
+      # Without this, a failing FastSurfer step halts scheduling before the
+      # outcome recorders below ever run, and the phase reports `unknown`.
+      failFast: false
       tasks:
         # Template creation + segmentation in one pod. Both are gpu-nodepool and
         # strictly sequential, so splitting them cost a second GPU node provision
@@ -564,6 +618,10 @@ spec:
                      "_template --sd /work/subjects --base --edits --seg_only --threads 1" }}
               - name: T1w_sessions
                 value: "{{inputs.parameters.T1w_sessions}}"
+              # cuda | cpu — see the workflow parameter. The step appends
+              # `--device cpu --threads <cpu request>` itself when cpu.
+              - name: device
+                value: "{{workflow.parameters.fastsurfer-device}}"
 
         # NOTE: no --threads here. The step appends it from its own cpu request via
         # the downward API, so the resources block is the single source of truth and
@@ -596,6 +654,8 @@ spec:
                      join(map(jsonpath(inputs.parameters.T1w_sessions, "$[*]"), {# + "=from-base"}), " ") +
                      " --sd /work/subjects --seg_only --edits --fsaparc --long " +
                      workflow.parameters.subjID + "_template --threads 1" }}
+              - name: device
+                value: "{{workflow.parameters.fastsurfer-device}}"
 
         # NOTE: no --threads here. It used to be a ternary (1 session → 6, 2 → 3,
         # 3+ → 2) that had to be kept equal to the fast-long cpu request by hand,
@@ -620,60 +680,201 @@ spec:
               - name: T1w_sessions
                 value: "{{inputs.parameters.T1w_sessions}}"
 
-        # Outcome recording — one data-driven loop over all four FastSurfer
-        # steps, non-fatal. Collapsed from four near-identical tasks (#73):
-        # Argo resolves a DAG task's `depends` statically before withItems
-        # expansion, so a single loop can only share ONE combined gate across
-        # its items, not a per-item dependency. That's fine here because the
-        # four producers are already a near-serial chain (build -> parc/long-seg
-        # -> long-parc), so waiting on all four before recording costs
-        # negligible extra latency. Do NOT apply this pattern to producers that
-        # run in parallel with independent finish times (see the top-level
-        # anatomical/subregion-seg/session recorders below, deliberately left
-        # unmerged) — that would delay early-failure visibility.
+        # Outcome recording for the four FastSurfer producers, non-fatal.
+        # Originally one data-driven loop over all four (#73), sharing a single
+        # combined gate across items — Argo resolves a DAG task's `depends`
+        # statically before withItems expansion, so one task can only share ONE
+        # gate across its items, not a per-item dependency.
+        #
+        # Split back into per-producer failed/other arms here: passing
+        # {{tasks.X.exitCode}} for real failure classification is only safe when
+        # X is guaranteed Failed or Errored. Referencing exitCode on a producer
+        # that is Skipped/Omitted hits the same unresolvable-variable hazard
+        # ADR 016 documents for outputs, and with four producers behind one
+        # shared gate there is no way to exclude just the omitted ones from a
+        # single item list. Per-producer split mirrors
+        # registration-workflow-template.yaml:134-162.
+        #
+        # "other" arm covers Succeeded || Skipped || Omitted: status alone is
+        # enough to classify these. Unlike the bold-to-t1w fallback recorder,
+        # nothing else records FastSurfer step outcomes, so success has to be
+        # recorded here too, not just failure/skip.
         #
         # Covers template creation AND segmentation, which now share a pod. The
         # step name stays `fastsurfer-template` so historical StepOutcome
         # records remain comparable; `fastsurfer-template-seg` is retired with
         # the split.
-        - name: record-outcome-fastsurfer-dagtask
+        - name: record-outcome-fastsurfer-template-build-failed-dagtask
           depends: >-
-            (fastsurfer-template-build-dagtask.Succeeded ||
-             fastsurfer-template-build-dagtask.Failed ||
-             fastsurfer-template-build-dagtask.Skipped) &&
-            (fastsurfer-template-parcellation-dagtask.Succeeded ||
-             fastsurfer-template-parcellation-dagtask.Failed ||
-             fastsurfer-template-parcellation-dagtask.Skipped) &&
-            (fastsurfer-long-segmentation-dagtask.Succeeded ||
-             fastsurfer-long-segmentation-dagtask.Failed ||
-             fastsurfer-long-segmentation-dagtask.Skipped) &&
-            (fastsurfer-long-parcellation-dagtask.Succeeded ||
-             fastsurfer-long-parcellation-dagtask.Failed ||
-             fastsurfer-long-parcellation-dagtask.Skipped)
+            fastsurfer-template-build-dagtask.Failed ||
+            fastsurfer-template-build-dagtask.Errored
           templateRef:
             name: outcome-recorder
             template: record-step-outcome
           arguments:
             parameters:
               - name: step
-                value: '{{item.step}}'
+                value: fastsurfer-template
               - name: status
-                value: '{{item.status}}'
+                value: '{{tasks.fastsurfer-template-build-dagtask.status}}'
+              - name: exit-code
+                value: '{{tasks.fastsurfer-template-build-dagtask.exitCode}}'
               - name: subject
                 value: '{{workflow.parameters.subjID}}'
               - name: bucket
                 value: '{{workflow.parameters.bucket}}'
               - name: metrics-bucket
                 value: '{{workflow.parameters.metrics-bucket}}'
-          withItems:
-            - step: fastsurfer-template
-              status: '{{tasks.fastsurfer-template-build-dagtask.status}}'
-            - step: fastsurfer-template-parc
-              status: '{{tasks.fastsurfer-template-parcellation-dagtask.status}}'
-            - step: fastsurfer-long-seg
-              status: '{{tasks.fastsurfer-long-segmentation-dagtask.status}}'
-            - step: fastsurfer-long-parc
-              status: '{{tasks.fastsurfer-long-parcellation-dagtask.status}}'
+
+        - name: record-outcome-fastsurfer-template-build-other-dagtask
+          depends: >-
+            fastsurfer-template-build-dagtask.Succeeded ||
+            fastsurfer-template-build-dagtask.Skipped ||
+            fastsurfer-template-build-dagtask.Omitted
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fastsurfer-template
+              - name: status
+                value: '{{tasks.fastsurfer-template-build-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        - name: record-outcome-fastsurfer-template-parc-failed-dagtask
+          depends: >-
+            fastsurfer-template-parcellation-dagtask.Failed ||
+            fastsurfer-template-parcellation-dagtask.Errored
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fastsurfer-template-parc
+              - name: status
+                value: '{{tasks.fastsurfer-template-parcellation-dagtask.status}}'
+              - name: exit-code
+                value: '{{tasks.fastsurfer-template-parcellation-dagtask.exitCode}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        - name: record-outcome-fastsurfer-template-parc-other-dagtask
+          depends: >-
+            fastsurfer-template-parcellation-dagtask.Succeeded ||
+            fastsurfer-template-parcellation-dagtask.Skipped ||
+            fastsurfer-template-parcellation-dagtask.Omitted
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fastsurfer-template-parc
+              - name: status
+                value: '{{tasks.fastsurfer-template-parcellation-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        - name: record-outcome-fastsurfer-long-seg-failed-dagtask
+          depends: >-
+            fastsurfer-long-segmentation-dagtask.Failed ||
+            fastsurfer-long-segmentation-dagtask.Errored
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fastsurfer-long-seg
+              - name: status
+                value: '{{tasks.fastsurfer-long-segmentation-dagtask.status}}'
+              - name: exit-code
+                value: '{{tasks.fastsurfer-long-segmentation-dagtask.exitCode}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        - name: record-outcome-fastsurfer-long-seg-other-dagtask
+          depends: >-
+            fastsurfer-long-segmentation-dagtask.Succeeded ||
+            fastsurfer-long-segmentation-dagtask.Skipped ||
+            fastsurfer-long-segmentation-dagtask.Omitted
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fastsurfer-long-seg
+              - name: status
+                value: '{{tasks.fastsurfer-long-segmentation-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        - name: record-outcome-fastsurfer-long-parc-failed-dagtask
+          depends: >-
+            fastsurfer-long-parcellation-dagtask.Failed ||
+            fastsurfer-long-parcellation-dagtask.Errored
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fastsurfer-long-parc
+              - name: status
+                value: '{{tasks.fastsurfer-long-parcellation-dagtask.status}}'
+              - name: exit-code
+                value: '{{tasks.fastsurfer-long-parcellation-dagtask.exitCode}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        - name: record-outcome-fastsurfer-long-parc-other-dagtask
+          depends: >-
+            fastsurfer-long-parcellation-dagtask.Succeeded ||
+            fastsurfer-long-parcellation-dagtask.Skipped ||
+            fastsurfer-long-parcellation-dagtask.Omitted
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: fastsurfer-long-parc
+              - name: status
+                value: '{{tasks.fastsurfer-long-parcellation-dagtask.status}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
 
 
 ##################################################
@@ -911,6 +1112,8 @@ spec:
               value: '{{workflow.parameters.metrics-bucket}}'
             - name: pipeline
               value: cloudpipe_minproc
+            - name: batch-label
+              value: '{{workflow.parameters.batch-label}}'
     - - name: delete-globus-input
         template: delete-globus-input-template
         when: '{{workflow.status}} == Succeeded'
@@ -929,7 +1132,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

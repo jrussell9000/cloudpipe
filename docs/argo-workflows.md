@@ -108,6 +108,7 @@ There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregi
 | `master-pipeline-dag.parallelism` | `3` | Max pods running simultaneously within one workflow. This is the only `parallelism` setting in the whole template set — sessions fan out simultaneously but are throttled by it. |
 | `globus-transfer` semaphore | `8` | Max concurrent Globus transfers cluster-wide (ConfigMap `cloudpipe-semaphores`) |
 | Prefect Variable `cloudpipe-max-concurrent` / `first-level-max-concurrent` | `50` (cloudpipe) / `25` (first-level), when the Variable is unset | Max active Argo workflows submitted by Prefect; set live with `prefect variable set <name> <N>`, not a deployment-run parameter |
+| Prefect Variable `cloudpipe-fastsurfer-device` | `auto` when unset | Where new workflows run FastSurfer segmentation (workflow parameter `fastsurfer-device`). `auto`: the queue manager submits `cpu` while ≥10 GPU pods have been Pending ≥15 min and returns to `cuda` at ≤3 (hysteresis). `cpu` / `cuda` force it. Re-read every submission; see [#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373) |
 | `namespaceParallelism` | `400` | Max active workflows in `argo-workflows`, **all pipelines combined**; enforced by the controller, excess workflows held `Pending` |
 | `parallelism` | `1000` | Max active workflows cluster-wide — a second, looser ceiling above `namespaceParallelism` |
 | `resourceRateLimit` | `50/s`, burst `90` | Rate at which the controller creates pods, cluster-wide |
@@ -234,13 +235,15 @@ Two templates for the longitudinal template phase:
 
 **`fastsurfer-template-build-template`** — Runs `long_prepare_template.sh` and then, only if that succeeded, `run_fastsurfer.sh --seg_only --base --threads 1`. Downloads T1w inputs and `fsaverage` from S3 via init containers (`cloudpipe/python`). Creation and segmentation share this pod because both are GPU-bound and strictly sequential. Node pool: `gpu-nodepool`. Image: `fastsurfer`.
 
+Both this template and `fastsurfer-long-segmentation-template` take a `device` input (`cuda`, the default, or `cpu`), fed from the workflow parameter `fastsurfer-device`. With `cpu` the pod moves to `cpu-heavy-nodepool`, a `podSpecPatch` re-sizes it to 7 CPU / 8G and **zeroes** `nvidia.com/gpu` (a strategic-merge patch cannot delete the key; the scheduler ignores a 0-quantity extended resource), and the script appends `--device cpu --threads <cpu request>` to every FastSurfer call. This is the GPU spot-drought fallback from [#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373); the queue manager sets it automatically (see [Concurrency controls](#concurrency-controls)). The static resources block remains the GPU truth, and the workflow carries the device as the label `cloudpipe.io/fastsurfer-device`.
+
 **`fastsurfer-template-parcellation-template`** — Surface reconstruction (`--surf_only --base --3T --fsaparc`). Node pool: `cpu-heavy-nodepool`, 3G/4CPU. `--threads` is **derived from the cpu request** via the downward API (`resourceFieldRef` on `requests.cpu`) rather than written into the master template, so the resources block is the single source of truth and the two cannot drift. Cut 6→4 threads from measured `cpu_efficiency` 0.577; do not cut below 2 — `recon-surf.sh` runs the hemispheres serially at `threads == 1`, which roughly *doubles* the surface stage.
 
 ### fast-long (`fastsurfer-long-phase-workflow-template.yaml`)
 
 Two templates for the longitudinal session-level phase:
 
-**`fastsurfer-long-segmentation-template`** — All sessions in parallel (`--subjects ses-00A=from-base ses-02A=from-base ...`), `--seg_only --long`. Node pool: `gpu-nodepool`.
+**`fastsurfer-long-segmentation-template`** — All sessions in parallel (`--subjects ses-00A=from-base ses-02A=from-base ...`), `--seg_only --long`. Node pool: `gpu-nodepool`, or `cpu-heavy-nodepool` when `device=cpu` (same mechanism as `fastsurfer-template-build-template` above).
 
 **`fastsurfer-long-parcellation-template`** — All sessions, surface reconstruction, `--long --parallel N` where N = number of sessions. Waits for both long segmentation and template parcellation to complete. Node pool: `cpu-heavy-nodepool`.
 

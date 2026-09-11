@@ -191,6 +191,7 @@ _UNION_COLUMNS = {
         "failed_step",
         "failure_category",
         "pipeline",
+        "batch_label",
         "completed_at",
     ],
     # The ONE table whose two Glue declarations are not raw+schema_version.
@@ -245,6 +246,15 @@ _UNION_COLUMNS = {
         "run",
         "pipeline",
         "completed_at",
+        # Schema 2.7, t1w_to_mni only: RANDOM-rescue provenance
+        # (fst1w_to_mni.py::rescue_provenance). NULL on earlier and bold_to_t1w rows.
+        "sampling_strategy",
+        "rescue_ticket",
+        "sampling_seed",
+        "itk_threads",
+        "attempts_run",
+        "none_lncc",
+        "none_jac_det_frac_negative",
     ],
     "costs": [
         "date",

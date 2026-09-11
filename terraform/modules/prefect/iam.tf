@@ -145,3 +145,44 @@ resource "kubernetes_role_binding_v1" "worker_jobs" {
     namespace = var.namespace
   }
 }
+
+################################################################################
+# RBAC — read Pending pods in the Argo namespace (#373)
+# The cloudpipe queue manager runs as the worker service account (prefect.yaml
+# job_variables.service_account_name) and, before each submission, lists Pending
+# pods in argo-workflows to decide whether gpu-nodepool is in a spot drought —
+# in which case the subject is submitted with fastsurfer-device=cpu. Read-only,
+# pods only, scoped to that one namespace. See prefect/flows/lib/gpu_drought.py.
+################################################################################
+
+resource "kubernetes_role_v1" "worker_argo_pods" {
+  metadata {
+    name      = "prefect-worker-argo-pods"
+    namespace = var.argo_namespace
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["pods"]
+    verbs      = ["get", "list"]
+  }
+}
+
+resource "kubernetes_role_binding_v1" "worker_argo_pods" {
+  metadata {
+    name      = "prefect-worker-argo-pods"
+    namespace = var.argo_namespace
+  }
+
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "Role"
+    name      = kubernetes_role_v1.worker_argo_pods.metadata[0].name
+  }
+
+  subject {
+    kind      = "ServiceAccount"
+    name      = var.worker_sa_name
+    namespace = var.namespace
+  }
+}

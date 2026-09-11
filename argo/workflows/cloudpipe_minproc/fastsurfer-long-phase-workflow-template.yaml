@@ -65,6 +65,11 @@ spec:
     inputs:
       parameters:
         - name: argstring
+        # "cuda" (default) or "cpu" — the GPU spot-drought fallback (#373). See
+        # the nodeSelector / podSpecPatch below and the master template's
+        # fastsurfer-device parameter, which is where this comes from.
+        - name: device
+          value: cuda
 
       artifacts:
       - name: template-base
@@ -149,8 +154,32 @@ spec:
           region: <YOUR_AWS_REGION>
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-10A.tar.gz'
 
+    # DEVICE SWITCH (#373) — same mechanism and the same reasoning as
+    # fastsurfer-template-build-template in fast-tmpl; read the comment there.
+    # cuda: no-op patch, gpu-nodepool, the static block below is the truth.
+    # cpu: cpu-heavy-nodepool, 7 cpu / 8G, GPU limit zeroed (not deleted — a
+    # strategic-merge patch cannot remove the key, and the scheduler skips a
+    # 0-quantity extended resource). Values-only expressions, because Argo
+    # closes a tag at the first `}}` and a JSON literal would end in one.
     nodeSelector:
-      karpenter.sh/nodepool: gpu-nodepool
+      karpenter.sh/nodepool: "{{= inputs.parameters.device == 'cpu' ? 'cpu-heavy-nodepool' : 'gpu-nodepool' }}"
+    podSpecPatch: |
+      containers:
+        - name: main
+          resources:
+            requests:
+              cpu: "{{= inputs.parameters.device == 'cpu' ? '7' : '1' }}"
+              memory: "{{= inputs.parameters.device == 'cpu' ? '8G' : '1G' }}"
+            limits:
+              nvidia.com/gpu: "{{= inputs.parameters.device == 'cpu' ? '0' : '1' }}"
+
+    # Middle of the three GPU ranks (#370): above template-build because this
+    # finishes a subject that already holds a built template, below t1w-to-mni.
+    # NOT switched on `device` — it deliberately stays set on the cpu branch, so
+    # a drought's fallback pods are also served ahead of func-preproc on
+    # cpu-heavy. `preemptionPolicy: Never` means nothing is evicted either way;
+    # see gitops/apps/cluster-config/templates/gpu-priority-classes.yaml.
+    priorityClassName: cloudpipe-gpu-long-segmentation
 
     volumes:
       - name: work
@@ -164,7 +193,7 @@ spec:
       # of GPU node time; discovering the assumption was wrong costs a failed
       # batch. TODO: drop this once a real run confirms seg_only never reads it.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -264,17 +293,29 @@ spec:
       command: [bash, -c]
       args:
         - |
-          nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
-            --format=csv -l 5 >&2 &
-          MONITOR=$!
+          # Device switch (#373) — see fast-tmpl for the full note. brun_fastsurfer.sh
+          # consumes `--device` itself (it skips its CUDA device-count probe on cpu)
+          # and forwards `--threads` to run_fastsurfer.sh, where the LAST one wins
+          # over the argstring's `--threads 1`. OMP_NUM_THREADS is the cpu request
+          # via the downward API: 7 after the cpu podSpecPatch, 1 on the GPU.
+          DEVICE_FLAGS=""
+          MONITOR=""
+          if [[ "{{inputs.parameters.device}}" == "cpu" ]]; then
+            DEVICE_FLAGS="--device cpu --threads ${OMP_NUM_THREADS}"
+            echo "[device] cpu: FastSurfer inference on ${OMP_NUM_THREADS} threads (cpu-heavy-nodepool drought fallback, #373)" >&2
+          else
+            nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
+              --format=csv -l 5 >&2 &
+            MONITOR=$!
+          fi
 
           # See the equivalent note in fast-tmpl: an interrupted upstream step can
           # exit 0 and publish a tarball carrying scripts/IsRunning.*, which would
           # wedge FastSurfer here even though this emptyDir is fresh.
           find /work/subjects -name '*IsRunning*' -delete
 
-          /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}}
-          EXIT=$?; kill $MONITOR 2>/dev/null; exit $EXIT
+          /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}} ${DEVICE_FLAGS}
+          EXIT=$?; [[ -n "$MONITOR" ]] && kill $MONITOR 2>/dev/null; exit $EXIT
 
   ##############################################
   # D. Long Parcellation (surf_only --long)
@@ -679,7 +720,7 @@ spec:
       # recon-surf.sh registers each timepoint to fsaverage, which is not carried
       # in either the template or the per-session scratch tarballs.
       - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
