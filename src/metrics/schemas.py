@@ -466,10 +466,25 @@ class WorkflowRun:
     message: str = ""  # Argo failure message, if any
 
     failed_step: str = ""  # canonical name of first failed step; "" on success
-    failure_category: str = ""  # taxonomy category of first failure; "" on success
+    # StepOutcome taxonomy category of the first failure (see that field); "" on success
+    failure_category: str = ""
 
     pipeline: str = "cloudpipe_minproc"
-    schema_version: str = "1.1"
+    # Free-text label for the submission that produced this run — "leg-2",
+    # "test-2026-08-17", and so on. Emitted as "" when a run is submitted without
+    # one — note that is NOT the same value readers see on older records, which
+    # predate the field entirely and so carry no key at all and read back NULL.
+    # `batch_label = ''` therefore selects only schema-1.2 unlabelled runs;
+    # `COALESCE(batch_label, '') = ''` selects every unlabelled run.
+    #
+    # Exists because era was previously recoverable only from a timestamp: the
+    # pre-leg-1 test batches finished on dates that overlap leg 1, so a dt-scoped
+    # query silently mixed 548 test rows into leg 1's Aug-18 partition, and
+    # separating them meant knowing that leg 1 began at 2026-08-18T16:54Z — a
+    # fact that lived in nobody's schema. Label the batch at submission and the
+    # question becomes a WHERE clause.
+    batch_label: str = ""
+    schema_version: str = "1.2"
     completed_at: str = field(default_factory=_now_utc)
 
     def to_dict(self) -> dict[str, Any]:
@@ -513,7 +528,11 @@ class StepOutcome:
     run: str  # "na" for session/subject-scoped steps
 
     status: str  # "succeeded" | "failed" | "skipped"
-    failure_category: str = ""  # "infrastructure"|"algorithm"|"data"|"dependency"|"unknown"|""
+    # "infrastructure"|"algorithm"|"data"|"dependency"|"qc_rejected"|"unknown"|""
+    # qc_rejected = the step's own QC gate refused its output (exit 65) — the
+    # step worked; it is not a defect. Rows before #368 carry "unknown" for
+    # this unless backfilled (scripts/backfill_qc_rejected_category.py).
+    failure_category: str = ""
     failure_reason: str = ""  # raw Argo message
     upstream_failed_step: str = ""  # step name that caused this skip (if skipped)
     outputs_verified: list = field(default_factory=list)  # S3 keys confirmed to exist
@@ -870,6 +889,37 @@ class RegistrationQC:
     pipeline: str = "cloudpipe_minproc"
     schema_version: str = "1.2"
     completed_at: str = field(default_factory=_now_utc)
+
+    # T1w→MNI only (schema 2.7): RANDOM-rescue provenance, from
+    # fst1w_to_mni.py::rescue_provenance. When the default NONE-sampling affine fails
+    # the QC gate, up to three RANDOM tickets (one ITK thread, seeds 42/43/44) are
+    # tried in order and the FIRST to pass is kept. These fields say which attempt
+    # this record describes and why a rescue was needed at all.
+    #
+    # The defaults below are what every record WITHOUT the fields deserializes to —
+    # all pre-2.7 t1w_to_mni rows and every bold_to_t1w row — and each is true for
+    # them: no rescue ladder existed, so one attempt ran and no sample was drawn.
+    # In Athena those rows read NULL instead (a missing JSON key), so filter on
+    # schema_version >= '2.7' before pooling.
+    sampling_strategy: str = ""  # "NONE" | "RANDOM" for the attempt recorded; "" = not recorded
+    # 0 = the NONE attempt (a first-attempt pass, OR a total failure — every attempt
+    # failed and the NONE one is recorded, with attempts_run telling the two apart);
+    # 1..3 = the RANDOM ticket that passed.
+    rescue_ticket: int = 0
+    # The RANDOM seed of the recorded attempt; -1 = no sample drawn (NONE). Together
+    # with itk_threads this regenerates a rescued transform's AFFINE bit-for-bit, and so
+    # its basin. The final warp also passes through GPU SyN, which is not
+    # bit-deterministic (median lncc spread 1.8e-4 between identical runs, up to ~0.02
+    # on rugged sessions; no verdict flips in validation) — true of NONE rows too.
+    sampling_seed: int = -1
+    itk_threads: int = 0  # ITK thread count of the recorded attempt; 0 = not recorded
+    attempts_run: int = 1  # registrations run this step: 1 (no rescue) up to 4
+    # The NONE attempt's values for the two GATED metrics — i.e. why it was rejected.
+    # `lncc - none_lncc` is the rescue jump: large on a rescue (NONE was stuck in a
+    # local minimum), and on a first-attempt pass the two are simply equal. 0.0 = not
+    # recorded; do not read it as a measurement.
+    none_lncc: float = 0.0
+    none_jac_det_frac_negative: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

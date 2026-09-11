@@ -48,6 +48,8 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 | I want to… | Go to |
 |---|---|
 | Understand how the system fits together | [architecture.md](architecture.md) |
+| Get ABCD data into the bucket, with or without Globus | [data-ingress.md](data-ingress.md) |
+| Find out whether I *can* reproduce the Globus ingress | [globus-prerequisites.md](globus-prerequisites.md) |
 | Run the pipeline or check on a subject | [operations.md](operations.md) |
 | Understand what each pipeline step does | [pipelines.md](pipelines.md) |
 | Investigate a failed workflow | [operations.md → Handling failures](operations.md#handling-failures) |
@@ -103,6 +105,12 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 - [**images.md**](images.md) — Docker image build system (three GitHub Actions workflows, SHA auto-pinning), per-image reference (platform, base, contents, node pool), inactive images, and how to add a new image.
 
 - [**pre-baked-amis.md**](pre-baked-amis.md) — GPU node AMI pre-baking with Packer: motivation, current state, rebuild procedure, how to deploy a new AMI via Terraform, planned GHA automation, and gotchas.
+
+### Data ingress
+
+- [**data-ingress.md**](data-ingress.md) — **Start here for anything ingress-related.** The S3 key contract every processing step actually depends on (exact keys, including the literally-matched T1w filename), where the seam sits in the DAG, and how to choose between Globus, POSIX staging, and pre-staged S3. Globus is one implementation of this contract, not a requirement.
+
+- [**globus-prerequisites.md**](globus-prerequisites.md) — What you must obtain *before* `globus-setup.md` can work: an NDA Data Use Certification, an institutional Globus High Assurance subscription, and a human Globus admin to attach your endpoint to it. Three of the four gates are granted by other organisations and cannot be automated. Includes the recurring manual credential burden and a four-question decision tree for whether to reproduce this at all.
 
 ### Globus
 

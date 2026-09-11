@@ -29,12 +29,18 @@ spec:
         - name: duration-s
         - name: metrics-bucket
         - name: pipeline
+        # Era/batch label. Defaulted here as well as at the workflow level so an
+        # older caller that does not pass it still resolves rather than failing
+        # the exit handler — which runs via onExit and would otherwise lose the
+        # run record for the very workflows most worth recording.
+        - name: batch-label
+          value: ''
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -58,6 +64,8 @@ spec:
         - '{{inputs.parameters.metrics-bucket}}'
         - --pipeline
         - '{{inputs.parameters.pipeline}}'
+        - --batch-label
+        - '{{inputs.parameters.batch-label}}'
 
   ###########################################################################
   # Records the wall-clock time the DAG began running, into
@@ -82,7 +90,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:8f59b3d1312894192dc4ca370ff463cded80ef9dcc7a95092844b4e5e324d98f"
       imagePullPolicy: IfNotPresent
 
       resources:

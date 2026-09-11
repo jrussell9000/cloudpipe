@@ -26,7 +26,7 @@
   "version": 1,
   "refresh": "5m",
   "time": {
-    "from": "now-30d",
+    "from": "now-7d",
     "to": "now"
   },
   "templating": {
@@ -145,7 +145,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_runs FROM d WHERE rn = 1"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_runs, ROUND(AVG(mean_fd), 3) AS mean_fd, ROUND(100.0 * SUM(CASE WHEN pct_fd_above_0p5 > 10 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_high_motion, ROUND(AVG(tsnr_median), 1) AS avg_tsnr, ROUND(AVG(max_fd), 3) AS avg_max_fd, ROUND(100.0 * SUM(n_fd_above_0p2) / NULLIF(SUM(n_frames), 0), 1) AS pct_frames_above_0p2, ROUND(AVG(mean_dvars), 2) AS mean_dvars, ROUND(AVG(gcor), 3) AS gcor, ROUND(AVG(aor), 4) AS aor, ROUND(AVG(aqi), 4) AS aqi, ROUND(AVG(total_runtime_s) / 60.0, 1) AS mean_min, ROUND(APPROX_PERCENTILE(peak_memory_gb, 0.95), 1) AS peak_mem_p95_gb, ROUND(APPROX_PERCENTILE(container_peak_memory_gb, 0.95), 1) AS container_peak_mem_p95_gb, ROUND(AVG(stage_timings_s.boldref) / 60, 2) AS boldref, ROUND(AVG(stage_timings_s.composite_warp) / 60, 2) AS composite_warp, ROUND(AVG(stage_timings_s.\"4d_warp\") / 60, 2) AS warp_4d, ROUND(AVG(stage_timings_s.mask_warp) / 60, 2) AS mask_warp, ROUND(AVG(stage_timings_s.masking) / 60, 2) AS masking, ROUND(AVG(stage_timings_s.confounds) / 60, 2) AS confounds, ROUND(AVG(stage_timings_s.grayordinates) / 60, 2) AS grayordinates, ROUND(AVG(n_acompcor_wm), 1) AS aCompCor_WM, ROUND(AVG(n_acompcor_csf), 1) AS aCompCor_CSF, ROUND(AVG(n_tcompcor), 1) AS tCompCor, ROUND(AVG(n_cosines), 1) AS Cosines FROM d WHERE rn = 1"
         }
       ],
       "fieldConfig": {
@@ -163,7 +163,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^n_runs$/"
+        }
       }
     },
     {
@@ -177,20 +184,18 @@
         "h": 5
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(mean_fd), 3) AS mean_fd FROM d WHERE rn = 1"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -220,7 +225,14 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^mean_fd$/"
+        }
       }
     },
     {
@@ -234,20 +246,18 @@
         "h": 5
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN pct_fd_above_0p5 > 10 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_high_motion FROM d WHERE rn = 1"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -276,7 +286,14 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^pct_high_motion$/"
+        }
       }
     },
     {
@@ -290,20 +307,18 @@
         "h": 5
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(tsnr_median), 1) AS avg_tsnr FROM d WHERE rn = 1"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -333,7 +348,14 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^avg_tsnr$/"
+        }
       }
     },
     {
@@ -360,20 +382,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(max_fd), 3) AS avg_max_fd FROM d WHERE rn = 1 AND max_fd IS NOT NULL"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -391,7 +411,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^avg_max_fd$/"
+        }
       }
     },
     {
@@ -405,20 +432,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(n_fd_above_0p2) / NULLIF(SUM(n_frames), 0), 1) AS pct_frames_above_0p2 FROM d WHERE rn = 1"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -436,7 +461,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^pct_frames_above_0p2$/"
+        }
       }
     },
     {
@@ -450,20 +482,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(mean_dvars), 2) AS mean_dvars FROM d WHERE rn = 1"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -481,7 +511,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^mean_dvars$/"
+        }
       }
     },
     {
@@ -508,7 +545,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_fd FROM d WHERE rn = 1 AND mean_fd IS NOT NULL"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_fd, mean_dvars, tsnr_median, mean_global_signal FROM d WHERE rn = 1"
         }
       ],
       "options": {
@@ -524,7 +561,19 @@
           "unit": "suffix: mm",
           "decimals": 3
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "mean_fd"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 15,
@@ -537,20 +586,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_dvars FROM d WHERE rn = 1 AND mean_dvars IS NOT NULL"
+          "panelId": 5,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -565,7 +612,19 @@
           "decimals": 2
         }
       },
-      "description": "Paired with the FD histogram to its left. The two tails should largely be the same runs — motion moves the head (FD) and that shows up as changed intensity (DVARS). A DVARS tail with no matching FD tail points at something other than motion: a spike artefact, a coil fault, or a scaling problem."
+      "description": "Paired with the FD histogram to its left. The two tails should largely be the same runs — motion moves the head (FD) and that shows up as changed intensity (DVARS). A DVARS tail with no matching FD tail points at something other than motion: a spike artefact, a coil fault, or a scaling problem.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "mean_dvars"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 200,
@@ -591,20 +650,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(gcor), 3) AS gcor FROM d WHERE rn = 1 AND gcor IS NOT NULL"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -622,7 +679,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^gcor$/"
+        }
       }
     },
     {
@@ -636,20 +700,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(aor), 4) AS aor FROM d WHERE rn = 1 AND aor IS NOT NULL"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -667,7 +729,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^aor$/"
+        }
       }
     },
     {
@@ -681,20 +750,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(aqi), 4) AS aqi FROM d WHERE rn = 1 AND aqi IS NOT NULL"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -712,7 +779,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^aqi$/"
+        }
       }
     },
     {
@@ -726,20 +800,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT tsnr_median FROM d WHERE rn = 1 AND tsnr_median IS NOT NULL"
+          "panelId": 5,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -754,7 +826,19 @@
           "decimals": 1
         }
       },
-      "description": "Median temporal SNR per run. Unlike motion, this is driven mostly by the acquisition itself — sequence, coil, and run length — so a batch from one site tends to form a tight cluster. A low-tSNR tail that does NOT coincide with the high-motion tail usually indicates an acquisition problem, not a restless participant."
+      "description": "Median temporal SNR per run. Unlike motion, this is driven mostly by the acquisition itself — sequence, coil, and run length — so a batch from one site tends to form a tight cluster. A low-tSNR tail that does NOT coincide with the high-motion tail usually indicates an acquisition problem, not a restless participant.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "tsnr_median"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 20,
@@ -767,20 +851,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_global_signal FROM d WHERE rn = 1 AND mean_global_signal IS NOT NULL"
+          "panelId": 5,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -795,7 +877,19 @@
           "decimals": 1
         }
       },
-      "description": "Mean in-brain BOLD intensity per run, in arbitrary scanner units. Its absolute value carries no quality information — what matters is the shape. One tight cluster is one consistent acquisition; distinct clumps mean the batch mixes scanners, coils, or intensity-scaling conventions, which makes raw DVARS non-comparable across those groups."
+      "description": "Mean in-brain BOLD intensity per run, in arbitrary scanner units. Its absolute value carries no quality information — what matters is the shape. One tight cluster is one consistent acquisition; distinct clumps mean the batch mixes scanners, coils, or intensity-scaling conventions, which makes raw DVARS non-comparable across those groups.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "mean_global_signal"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 300,
@@ -821,20 +915,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(total_runtime_s) / 60.0, 1) AS mean_min FROM d WHERE rn = 1"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -852,7 +944,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^mean_min$/"
+        }
       }
     },
     {
@@ -866,20 +965,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(APPROX_PERCENTILE(peak_memory_gb, 0.95), 1) AS peak_mem_p95_gb FROM d WHERE rn = 1 AND peak_memory_gb IS NOT NULL"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -897,7 +994,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^peak_mem_p95_gb$/"
+        }
       }
     },
     {
@@ -911,20 +1015,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(APPROX_PERCENTILE(container_peak_memory_gb, 0.95), 1) AS container_peak_mem_p95_gb FROM d WHERE rn = 1 AND container_peak_memory_gb IS NOT NULL"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -955,7 +1057,14 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^container_peak_mem_p95_gb$/"
+        }
       }
     },
     {
@@ -970,25 +1079,30 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(stage_timings_s.boldref) / 60, 2) AS boldref, ROUND(AVG(stage_timings_s.composite_warp) / 60, 2) AS composite_warp, ROUND(AVG(stage_timings_s.\"4d_warp\") / 60, 2) AS warp_4d, ROUND(AVG(stage_timings_s.mask_warp) / 60, 2) AS mask_warp, ROUND(AVG(stage_timings_s.masking) / 60, 2) AS masking, ROUND(AVG(stage_timings_s.confounds) / 60, 2) AS confounds, ROUND(AVG(stage_timings_s.grayordinates) / 60, 2) AS grayordinates FROM d WHERE rn = 1 AND stage_timings_s IS NOT NULL"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "options": {
         "orientation": "horizontal",
-        "displayMode": "basic"
+        "displayMode": "basic",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^(boldref|composite_warp|warp_4d|mask_warp|masking|confounds|grayordinates)$/"
+        }
       },
       "fieldConfig": {
         "defaults": {
@@ -1008,25 +1122,30 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(n_acompcor_wm), 1) AS aCompCor_WM, ROUND(AVG(n_acompcor_csf), 1) AS aCompCor_CSF, ROUND(AVG(n_tcompcor), 1) AS tCompCor, ROUND(AVG(n_cosines), 1) AS Cosines FROM d WHERE rn = 1"
+          "panelId": 12,
+          "withTransforms": false
         }
       ],
       "options": {
         "orientation": "horizontal",
-        "displayMode": "basic"
+        "displayMode": "basic",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^(aCompCor_WM|aCompCor_CSF|tCompCor|Cosines)$/"
+        }
       },
       "fieldConfig": {
         "defaults": {

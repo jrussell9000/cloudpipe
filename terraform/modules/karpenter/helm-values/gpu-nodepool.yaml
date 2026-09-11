@@ -15,9 +15,9 @@ spec:
     # stall on thin spot pools, so this is NOT cut aggressively — 10m matches cpu-light-nodepool
     # and sits at the conservative end of 4.2's 5-10m range.
     #
-    # Safe now because GPU time-slicing (2 pods/GPU) keeps nodes fuller, so they go empty less
+    # Safe now because GPU time-slicing (3 pods/GPU) keeps nodes fuller, so they go empty less
     # often. This also feeds back into packing: idle nodes lingering 30m gave newly-pending GPU
-    # pods somewhere to spread 1-per-node instead of packing 2 onto fewer nodes. Reclaiming empties
+    # pods somewhere to spread 1-per-node instead of packing 3 onto fewer nodes. Reclaiming empties
     # sooner means a burst is more likely to pack. Keep this >= a few minutes: within a subject the
     # GPU steps (creation -> template-seg -> long-seg) are near-contiguous (long-seg depends on
     # template-seg, NOT parcellation), so brief gaps should not churn nodes.
@@ -65,7 +65,7 @@ spec:
         operator: NotIn
         values: ["2", "4", "8"]
       # xlarge/2xlarge ONLY. Every size in these families carries the SAME single GPU, and the
-      # gpu-timeslice-2x overlay advertises 2 slices per node regardless of size — so a larger
+      # gpu-timeslice-3x overlay advertises 3 slices per node regardless of size — so a larger
       # instance buys zero extra GPU capacity for a workload whose pods request 1-2 cpu and
       # <= 4G. It only raises the hourly rate the whole node is billed at.
       #
@@ -78,15 +78,21 @@ spec:
       # Observed effective rate: $0.63/GPU-hour on g4dn.8xlarge vs $0.40 on g6.xlarge, against
       # a g4dn.xlarge spot price of ~$0.20 for the same one GPU.
       #
-      # Sizing floor: a g4dn.xlarge (4 vCPU / ~3920m allocatable, 16 GiB) must hold TWO
+      # Sizing floor: a g4dn.xlarge (4 vCPU / ~3920m allocatable, 16 GiB) must hold THREE
       # time-sliced GPU pods. ALL THREE GPU steps now request cpu 1 (t1w-to-mni was cut
-      # from cpu 2 / 4G, which packed only 1-per-node at xlarge and stranded the second
-      # slice — see registration-workflow-template.yaml), so every one of them packs 2 per
+      # from cpu 2 / 4G, which packed only 1-per-node at xlarge and stranded the other
+      # slices — see registration-workflow-template.yaml), so every one of them packs 3 per
       # xlarge. 2xlarge is retained for bursts that xlarge cannot absorb.
       #
       # This floor is what any increase to the time-slice replica count runs into first:
-      # at 3 slices a node needs 3 allocatable cores for GPU pods alone, which xlarge can
-      # still just carry, and at 4 it cannot. See tests/argo/test_gpu_step_resources.py.
+      # at 3 slices a node needs 3 allocatable cores for GPU pods alone, which xlarge just
+      # carries (3000m of 3920m), and at 4 it cannot — 4000m exceeds allocatable before any
+      # daemonset is counted. See tests/argo/test_gpu_step_resources.py. The replica count
+      # is also capped independently by T4 VRAM; see gitops/apps/nvidia-device-plugin/
+      # values.yaml. For why raising it further is not worth doing, read
+      # docs/investigations/2026-09-03-per-node-timeslicing-costing.md — NOT PR #346 alone,
+      # whose capacity claims were withdrawn by #347 and then partly reinstated and re-scoped.
+      # The recommendation has survived every revision; the reasoning under it has not.
       #
       # Keep BOTH sizes across all four families (8 spot pools). The 2026-07-17 spot-scarcity
       # investigation landed on exactly this xlarge/2xlarge set; do not narrow it further
@@ -105,15 +111,94 @@ spec:
       # not yet validated against this AMI's driver. Capacity is spot-only by design (cost).
       #
       # g6f DROPPED (Option A of the GPU time-slicing change): the cluster-wide device-plugin
-      # config advertises 2 nvidia.com/gpu per GPU via time-slicing (gitops/apps/
+      # config advertises 3 nvidia.com/gpu per GPU via time-slicing (gitops/apps/
       # nvidia-device-plugin/values.yaml). g6f exposes only a ~5.59 GiB 1/4-L4 slice, and
-      # 2 x 3.7 GiB working set = 7.4 GiB > 5.59 → the second FastSurfer pod OOMs. Because the
-      # time-slicing config is uniform, keeping g6f in the pool would let a g6f node advertise 2
-      # slices and OOM. Do NOT re-add g6f without first moving the device plugin to per-node
+      # 3 x 3.7 GiB working set = 11.1 GiB > 5.59 → the pods OOM (already at the second, which
+      # needs 7.4 GiB). Because the time-slicing config is uniform, keeping g6f in the pool
+      # would let a g6f node advertise 3 slices and OOM. Note the g6f-fractional-gpu NodeOverlay
+      # still exists and pins g6f to nvidia.com/gpu: 1; it matches nothing while g6f is excluded
+      # here, but it does NOT make re-adding g6f safe — the device plugin, not the overlay,
+      # decides what a node advertises. Do NOT re-add g6f without first moving it to per-node
       # configs (Option B). g6f was only overflow headroom price-capacity-optimized rarely picked.
+      # g7 (RTX PRO 4500, 32 GiB) added 2026-09-04 as DROUGHT OVERFLOW, on capacity
+      # grounds — not cost. It is the only GPU family with meaningful spot capacity left
+      # in <YOUR_AWS_REGION>: get-spot-placement-scores reads 3/10 for g7 against 1/10 for every
+      # family previously listed here. CloudTrail over 16 real CreateFleet calls
+      # (2026-09-04 00:50-01:19Z) shows g5/g6/g6e offered 16 times and granted ZERO, with
+      # per-override InsufficientInstanceCapacity/UnfulfillableCapacity on each — the
+      # overflow mechanism works, the pools are simply empty. Fill rate over that window
+      # was 18 of 309 units (5.8%). See
+      # docs/investigations/2026-09-03-per-node-timeslicing-costing.md §6.
+      #
+      # g7 is EXPENSIVE: $0.5691/hr for g7.2xlarge against $0.1737 for g4dn.xlarge, so
+      # $0.1897 vs $0.0579 per slice at 3 slices (3.3x). gpu-g7-price-nodeoverlay.yaml
+      # biases its perceived price so price-capacity-optimized only reaches for it when
+      # the cheap families are dry. That guard is NOT optional: PCO weights capacity, not
+      # price alone, and g7 currently has the best capacity score of anything here — the
+      # 2026-07-31 g4dn.8xlarge episode is the precedent for it winning at 2.8x the rate.
+      #
+      # Only g7.2xlarge is reachable under the instance-size cap below. g7.8xlarge is both
+      # cheaper ($0.4086) and deeper (3/3/3 vs 3/1/3), because g7 inverts the
+      # "larger = pricier" assumption the size cap was written on — but widening that cap
+      # applies to every family and overturns two deliberate tests, so it is left as a
+      # follow-up pending the driver validation below.
+      #
+      # DRIVER SUPPORT UNVALIDATED at merge time. The stock AL2023 NVIDIA AMI ships
+      # 580.159.03 / CUDA 13.0; RTX PRO 4500 (Blackwell-class) support has not been
+      # confirmed on a running node. If unsupported the node reaches Ready but never
+      # advertises nvidia.com/gpu, and GPU pods will not schedule onto it. Confirm the
+      # first g7 node reports allocatable nvidia.com/gpu before relying on this; drop g7
+      # from this list if it does not.
+      # g7 REVERTED 2026-09-04 15:00Z — the driver check above failed in production.
+      # The stock AL2023 NVIDIA AMI (580.159.03 / CUDA 13.0) does NOT support the RTX PRO
+      # 4500: all 63 g7.2xlarge nodes reached Ready and advertised NO nvidia.com/gpu at
+      # all, so no GPU pod could schedule on any of them. 361 pods sat Pending on
+      # "Insufficient nvidia.com/gpu" while ~$36/hr of g7 capacity ran empty.
+      #
+      # The price guard also failed to hold it in reserve: gpu-g7-last-resort-price set
+      # priceAdjustment +100%, and g7 still displaced the fleet almost completely
+      # (63 g7.2xlarge against 3 g4dn.xlarge). price-capacity-optimized weighted g7's
+      # capacity depth far more heavily than a doubled price — and because the nodes
+      # never became schedulable, the pods they were launched for stayed Pending, which
+      # drove Karpenter to launch *more* of them. Do not re-add g7 behind a price bias
+      # alone; that mechanism is not strong enough to make an unusable family safe.
+      #
+      # DO NOT RE-ADD g7 until a node is proven to advertise allocatable nvidia.com/gpu.
+      # That needs a newer NVIDIA driver than the stock AL2023 EKS AMI ships — verify on
+      # a single throwaway node before it goes anywhere near this list.
       - key: "karpenter.k8s.aws/instance-family"
         operator: In
         values: ["g4dn", "g5", "g6", "g6e"]
+        # minValues (ALPHA field, present in the karpenter.sh/v1 NodePool CRD) forces the
+        # scheduler to carry at least this many DISTINCT families into a launch request,
+        # widening the CreateFleet OverrideList instead of letting price-capacity-optimized
+        # collapse the whole ask onto a single pool.
+        #
+        # Targets the root cause in
+        # docs/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md §3:
+        # Karpenter batches pending GPU pods into ONE `Type: instant` CreateFleet call, which
+        # is ALL-OR-NOTHING. A request AWS cannot fully fulfil returns UnfulfillableCapacity
+        # and launches NOTHING — even when a sibling family had room. That report measured a
+        # 15-unit ask failing while a 1-unit ask against the same pools succeeded. Recurred
+        # 2026-09-02 and again 2026-09-03 (fleet 40 -> 11 nodes, 186 pods Pending, throughput
+        # ~110/hr -> ~19/hr).
+        #
+        # 3 of 4 rather than 4 of 4 deliberately leaves one family of slack. minValues
+        # constrains OFFERINGS (what the launch request may name), not live capacity, so it
+        # cannot by itself wedge provisioning during a real shortage — but the slack means
+        # dropping a family here later cannot silently make this unsatisfiable.
+        minValues: 3
+      # Same idea at the instance-type grain, the dimension AWS's own spot diversification
+      # guidance keys on. 8 types are reachable today (4 families x xlarge/2xlarge); a floor
+      # of 5 survives dropping a whole family without going unsatisfiable. operator: Exists
+      # restricts nothing on its own — it exists purely to carry the minValues anchor.
+      - key: "node.kubernetes.io/instance-type"
+        operator: Exists
+        minValues: 5
       - key: "topology.kubernetes.io/zone"
         operator: In
         values: ["<YOUR_AWS_REGION>a", "<YOUR_AWS_REGION>b", "<YOUR_AWS_REGION>c"]
+        # The 2026-09-03 crunch ran the entire surviving fleet into a single AZ (<YOUR_AWS_REGION>b,
+        # then 2b/2c). Requiring 2 AZs in the override list keeps a one-AZ shortage from
+        # presenting as a total one.
+        minValues: 2

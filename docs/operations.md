@@ -240,11 +240,26 @@ argo list -n argo-workflows --running -o json \
 Restart Prefect with `start_index` set to the first unprocessed subject:
 ```bash
 prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
-  -p subjects_file=s3://<YOUR_S3_BUCKET>/subjects.csv \
-  -p start_index=150
+  -p subjects_file=s3://<YOUR_S3_BUCKET>/subjects_v611.csv \
+  -p start_index=150 \
+  -p batch_label=leg-2
 ```
 
-The inventory step checks S3 for existing derivatives — already-completed steps are skipped automatically on resubmission.
+Always pass `subjects_file` explicitly. The deployment's stored default is
+`s3://<YOUR_S3_BUCKET>/subjects.csv`, which **404s — it has never existed**; the real cohort CSV is
+`subjects_v611.csv`.
+
+Pass `batch_label` on anything you will later want to isolate in the metrics. It is stamped onto
+every `WorkflowRun` record in the submission, and it is the only reliable way to separate one run
+from another: batches whose workflows straddle a UTC midnight cannot be told apart by `dt` at all,
+and before this field existed the pre-leg-1 test batches and leg 1 shared the `2026-08-18`
+partition. Records written before 2026-09-02 predate the field and read back **`NULL`**, not `''`
+— so `batch_label = ''` selects only unlabelled runs from schema 1.2 onward. Use
+`COALESCE(batch_label, '') = ''` for "unlabelled", and `started_at` for anything historical.
+
+Resume with the **complete ordered CSV** and a moved `start_index` — never a filtered remainder.
+The inventory step checks S3 for existing derivatives, so already-completed subjects cost one
+Globus transfer plus an inventory pod and then skip the rest.
 
 ---
 
@@ -416,7 +431,9 @@ The script:
 3. Deletes workflow-keyed metrics (`step-outcomes`, `workflow-runs`, `subject-manifests`)
    by matching the subject ID in the object key
 4. Deletes `metrics/costs/` records belonging to the batch subjects (see below)
-5. Prints cluster node pool status and Globus instance state
+5. Filters the same subjects' rows out of the compacted Parquet of every table it just
+   flushed raw records from (see below)
+6. Prints cluster node pool status and Globus instance state
 
 `metrics/workflow-runs/` and `metrics/subject-manifests/` filenames embed the subject ID
 (`{workflow-name}__{subject}_...json`), so they're flushed per-subject by key matching.
@@ -430,17 +447,26 @@ dashboards read the raw tables, so records from subjects processed by an earlier
 survive and mix into every panel. That is what `--flush-qc` is for:
 
 ```bash
-# fresh-start batch: also flush per-scan QC, pod-costs/workflow-starts, and ALL compacted Parquet
+# fresh-start batch: also flush per-scan QC and pod-costs/workflow-starts
 pixi run python scripts/prep_test_batch.py tools/cloudpipe_test_sample.csv \
   --metrics-bucket cloudpipe-metrics --flush-qc
 ```
 
 `--flush-qc` additionally removes `metrics/pod-costs/` and `metrics/workflow-starts/` (both
-workflow-keyed, resolved through the same workflow→subject index as costs) and **all** of
-`metrics/compacted/`. The compacted Parquet is not subject-scopable — one file packs many
-subjects — so it is all-or-nothing; the compactor rebuilds it from the raw records on its
-next run. Leaving it would keep the `*_compacted` Athena tables serving rows whose underlying
-raw records were just deleted.
+workflow-keyed, resolved through the same workflow→subject index as costs).
+
+**Both modes flush compacted too, per subject.** Every table whose raw records are deleted
+has its `*_compacted` twin filtered the same way: the batch subjects' rows are removed from
+each Parquet file in place (one file packs many subjects, so it is rewritten, never deleted),
+and every other subject's history stays. This is what makes a flushed attempt stop counting
+everywhere at once
+([#382](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/382)) — the nightly
+compactor rebuilds only its last four days, so without it an older day's compacted copy kept
+the flushed rows while raw and the dashboards did not. (`--flush-qc` used to delete **all**
+of `metrics/compacted/` on the theory that the compactor rebuilds it; it rebuilds four days,
+so that erased every older day for every subject.) The compacted pass runs last, and if any
+file fails it exits 1 and says so: re-run the same command before submitting — the raw and
+derivative deletes are already done, so a re-run only finishes the compacted pass.
 
 > **Ordering trap.** `pod-costs` and `workflow-starts` resolve their subject through
 > `metrics/workflow-runs/`. If that index is already gone (a prior default flush deleted it),

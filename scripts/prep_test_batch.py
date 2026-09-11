@@ -21,9 +21,17 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import boto3
+
+# src/metrics/ modules import each other flatly, so the package directory
+# itself has to be on the path (as in backfill_qc_rejected_category.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "metrics"))
+
+from compactor import RAW_PREFIXES, UnattributableRows, drop_rows  # noqa: E402
 
 # Subject-keyed derivative prefixes — one subject maps to exactly one prefix.
 #
@@ -120,12 +128,19 @@ WORKFLOW_KEYED_PREFIXES = {
     "metrics/workflow-starts/": ".json",
 }
 
-# Compacted Parquet aggregates, flushed wholesale under --flush-qc. Each file
-# packs many subjects' records into one object, so there is no subject-scoped
-# delete available: it is all or nothing. Deleting all of it is safe because the
-# compactor rebuilds it from the raw per-record prefixes, which is also why it
-# must be flushed at all — a stale aggregate would otherwise keep serving the
-# `*_compacted` Athena tables after the raw records behind it were deleted.
+# Compacted Parquet aggregates. Every raw prefix above with a `*_compacted` twin
+# (compactor.RAW_PREFIXES) has to be flushed in both forms, in BOTH modes. Raw is
+# the authority and a flushed attempt no longer counts (GitHub #382), but the
+# nightly compactor rebuilds only its lookback window from raw — so a subject
+# flushed from an older day used to stay in compacted after leaving raw, and
+# the dashboards (raw) and CloudpipeMetrics(compacted=True) disagreed about its
+# history with nothing to say which was right.
+#
+# One file packs many subjects, so the flush filters the batch's rows out of
+# each file in place (compactor.drop_rows) rather than deleting files.
+# It used to delete ALL of compacted under --flush-qc on the theory that the
+# compactor rebuilds it — it rebuilds four days, so that erased every older
+# day's compacted history for every subject, not just this batch's.
 COMPACTED_PREFIX = "metrics/compacted/"
 
 COST_PREFIX = "metrics/costs/"
@@ -358,20 +373,62 @@ def flush_workflow_keyed(s3, bucket, subjects, dry_run, workers, wf_to_subject) 
     return total
 
 
-def flush_compacted(s3, bucket, dry_run) -> int:
-    """Delete ALL compacted Parquet aggregates.
+def compacted_tables(raw_prefixes) -> list[str]:
+    """The `*_compacted` tables built from these raw prefixes, in RAW_PREFIXES order."""
+    wanted = set(raw_prefixes)
+    return [table for table, prefix in RAW_PREFIXES.items() if prefix in wanted]
 
-    Not subject-scoped, and cannot be: one Parquet file packs many subjects'
-    records, so there is no per-subject delete. Safe wholesale because the
-    compactor rebuilds these from the raw per-record prefixes on its next run;
-    leaving them would keep the `*_compacted` Athena tables serving rows whose
-    underlying raw records this flush just deleted.
+
+def flush_compacted(s3, bucket, subjects, tables, dry_run, workers) -> tuple[int, list[str]]:
+    """Filter the batch subjects' rows out of every compacted partition of `tables`.
+
+    Keyed on the subject list, not on the raw keys this run deleted, so it is
+    safe to re-run: after a partial failure raw is already gone, and a pass
+    derived from deleted keys would find nothing left to do. That is also why
+    every partition of each table is read rather than only the `dt`s just
+    flushed — the whole compacted tree is ~130 small files, one GET each.
+
+    Must run AFTER the raw flush: the nightly compactor rebuilds from raw, so a
+    run landing before the raw delete would put the rows straight back.
+
+    Returns (rows removed, keys that failed to read or write). A file with no
+    `subject` column is reported and left in place, not counted as a failure —
+    as with a workflow-starts orphan, there is nothing to attribute it by.
     """
-    keys = list_keys(s3, bucket, COMPACTED_PREFIX)
-    n = delete_keys(s3, bucket, keys, dry_run)
+    subject_set = set(subjects)
+    keys = [
+        key
+        for table in tables
+        for key in list_keys(s3, bucket, f"{COMPACTED_PREFIX}{table}/")
+        if key.endswith(".parquet")
+    ]
+
+    def filter_one(key: str):
+        try:
+            return key, drop_rows(s3, bucket, key, "subject", subject_set, write=not dry_run), None
+        except Exception as exc:
+            return key, 0, exc
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(filter_one, keys))
+
     tag = "dry-run" if dry_run else "done"
-    print(f"  [{tag}] {COMPACTED_PREFIX}: {n} objects (all subjects — aggregates are not scopable)")
-    return n
+    rows: Counter[str] = Counter()
+    files: Counter[str] = Counter()
+    failed: list[str] = []
+    for key, n, exc in results:
+        if isinstance(exc, UnattributableRows):
+            print(f"    [note] {key} left in place: {exc}")
+        elif exc is not None:
+            print(f"    [FAILED] {key}: {exc}")
+            failed.append(key)
+        elif n:
+            table = key[len(COMPACTED_PREFIX) :].split("/", 1)[0]
+            rows[table] += n
+            files[table] += 1
+    for table in tables:
+        print(f"  [{tag}] compacted/{table}: {rows[table]} rows from {files[table]} files")
+    return sum(rows.values()), failed
 
 
 def flush_costs(s3, bucket, subjects, dry_run, workers) -> int:
@@ -488,8 +545,8 @@ def main() -> None:
         action="store_true",
         help=(
             "Also flush per-scan QC (func-preproc, registration, anat-qc, fsqc-qc, "
-            "surface-sample), workflow-keyed pod-costs/workflow-starts, and ALL "
-            "compacted Parquet. Use for a fresh-start batch; omit for a subject rerun."
+            "surface-sample) and workflow-keyed pod-costs/workflow-starts, raw and "
+            "compacted. Use for a fresh-start batch; omit for a subject rerun."
         ),
     )
     args = p.parse_args()
@@ -507,12 +564,11 @@ def main() -> None:
         print("Mode         : DRY RUN (no changes will be made)")
 
     if args.flush_qc:
-        print("Mode         : --flush-qc (per-scan QC + ALL compacted aggregates will be deleted)")
+        print("Mode         : --flush-qc (per-scan QC will be deleted, raw and compacted)")
 
     if not args.dry_run and not args.yes:
         extra = (
-            "\n  WARNING: --flush-qc also deletes per-scan QC for these subjects and"
-            "\n  ALL compacted Parquet aggregates (every subject, not just this batch)."
+            "\n  WARNING: --flush-qc also deletes per-scan QC for these subjects."
             if args.flush_qc
             else ""
         )
@@ -560,24 +616,41 @@ def main() -> None:
     m = flush_metrics(s3, args.metrics_bucket, subjects, args.dry_run, args.workers)
 
     q = 0
+    flushed = [*METRIC_PREFIXES, COST_PREFIX]
     if args.flush_qc:
         print("\nFlushing per-scan QC (--flush-qc) ...")
         q = flush_metrics(
             s3, args.metrics_bucket, subjects, args.dry_run, args.workers, prefixes=QC_PREFIXES
         )
-        print("\nFlushing compacted aggregates (--flush-qc) ...")
-        q += flush_compacted(s3, args.metrics_bucket, args.dry_run)
+        flushed += [*QC_PREFIXES, *WORKFLOW_KEYED_PREFIXES]
+
+    # Last, after every raw delete it mirrors — see flush_compacted.
+    print("\nFlushing the same subjects from compacted aggregates ...")
+    rows, failed = flush_compacted(
+        s3, args.metrics_bucket, subjects, compacted_tables(flushed), args.dry_run, args.workers
+    )
 
     verb = "would delete" if args.dry_run else "deleted"
     total_metrics = m + c + wk + q
     print(
         f"\nFlush complete: {verb} {d} derivative + {total_metrics} metric objects "
-        f"(incl. {c} cost records) across {len(subjects)} subjects."
+        f"(incl. {c} cost records) and {rows} compacted rows across {len(subjects)} subjects."
     )
     if args.flush_qc:
-        print(f"  --flush-qc also removed {wk} workflow-keyed + {q} QC/compacted objects.")
+        print(f"  --flush-qc also removed {wk} workflow-keyed + {q} QC objects.")
     else:
-        print("  Per-scan QC and compacted aggregates were PRESERVED (pass --flush-qc to remove).")
+        print("  Per-scan QC was PRESERVED (pass --flush-qc to remove).")
+    if failed:
+        # Compacted now disagrees with raw for these subjects, so this must not
+        # pass as a clean prep. But raw is already flushed — the flush-to-submit
+        # gap is open — so point at the seconds-long fix, not at a halt.
+        print(
+            f"\nERROR: {len(failed)} compacted file(s) could not be filtered (listed above).\n"
+            "Re-run this same command BEFORE submitting: the raw and derivative deletes\n"
+            "are already done, so a re-run only completes the compacted pass.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     check_cluster()
     check_globus(args.region)

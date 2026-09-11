@@ -52,10 +52,18 @@ locals {
       "projection.enabled"   = "true"
       "projection.dt.type"   = "date"
       "projection.dt.format" = "yyyy-MM-dd"
-      # Conservative lower bound predating the earliest real metrics data;
-      # confirm against `aws s3 ls s3://<bucket>/metrics/<prefix>/` rather
-      # than assuming this is still correct as the corpus ages.
-      "projection.dt.range"         = "2026-01-01,NOW"
+      # Archive floor, NOT a conservative guess. Leg 1 of the full cohort run
+      # started 2026-08-18T16:54:42Z; everything under dt=2026-08-17 and earlier
+      # is pre-leg-1 test-batch data that we no longer want in dashboards.
+      # Projection is the only thing making a partition visible, so raising this
+      # floor retracts those days from every table at once without moving a byte
+      # — the objects stay in S3 and reverting this string brings them back.
+      #
+      # This does NOT clear dt=2026-08-18: that partition is mixed (the
+      # 550-subject batch ran until 12:56:35Z, leg 1 began at 16:54:42Z) and is
+      # separated at object grain instead. See the archive note at the bottom of
+      # this file.
+      "projection.dt.range"         = "2026-08-18,NOW"
       "projection.dt.interval"      = "1"
       "projection.dt.interval.unit" = "DAYS"
       "storage.location.template"   = "${path}dt=$${dt}/"
@@ -98,10 +106,13 @@ locals {
 
   compacted_partition_projection = {
     for name, path in local.compacted_targets : name => {
-      "projection.enabled"             = "true"
-      "projection.dt.type"             = "date"
-      "projection.dt.format"           = "yyyy-MM-dd"
-      "projection.dt.range"            = "2026-01-01,NOW"
+      "projection.enabled"   = "true"
+      "projection.dt.type"   = "date"
+      "projection.dt.format" = "yyyy-MM-dd"
+      # Same archive floor as the raw tables above — kept in lockstep on
+      # purpose. A compacted table that still projected 2026-01-01 would serve
+      # pre-leg-1 rows the raw table no longer has, and the two would disagree.
+      "projection.dt.range"            = "2026-08-18,NOW"
       "projection.dt.interval"         = "1"
       "projection.dt.interval.unit"    = "DAYS"
       "projection.schema_version.type" = "enum"
@@ -772,8 +783,12 @@ resource "aws_glue_catalog_table" "workflow_runs_compacted" {
   table_type = "EXTERNAL_TABLE"
 
   parameters = merge(local.compacted_partition_projection.workflow_runs, {
-    "classification"                   = "parquet"
-    "projection.schema_version.values" = "1.1"
+    "classification" = "parquet"
+    # 1.2 adds batch_label. Both versions stay listed: a value absent from this
+    # enum is not an error, it silently returns zero rows, so dropping 1.1 would
+    # make every record written before 2026-09-02 vanish from the compacted table
+    # with a SUCCEEDED query.
+    "projection.schema_version.values" = "1.1,1.2"
   })
 
   partition_keys {
@@ -836,6 +851,10 @@ resource "aws_glue_catalog_table" "workflow_runs_compacted" {
     }
     columns {
       name = "pipeline"
+      type = "string"
+    }
+    columns {
+      name = "batch_label"
       type = "string"
     }
     columns {
@@ -1255,7 +1274,10 @@ resource "aws_glue_catalog_table" "registration_compacted" {
     # projected partition range and simply did not appear in query results.
     # Adding a schema_version is a four-place change; all four are listed in
     # RegistrationQC's docstring in src/metrics/schemas.py.
-    "projection.schema_version.values" = "1.1,1.2,2.0,2.1,2.2,2.3,2.4,2.5,2.6"
+    # 2.7 is t1w_to_mni's RANDOM-rescue provenance (fst1w_to_mni.py). The number is
+    # table-wide, not per registration_type, so t1w_to_mni goes 2.1 -> 2.7 and no
+    # t1w record ever carries 2.2-2.6 (those are all bold_to_t1w).
+    "projection.schema_version.values" = "1.1,1.2,2.0,2.1,2.2,2.3,2.4,2.5,2.6,2.7"
   })
 
   partition_keys {
@@ -1276,7 +1298,7 @@ resource "aws_glue_catalog_table" "registration_compacted" {
       serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
     }
 
-    # Superset union across schema_versions 1.1-2.3 (RegistrationQC in
+    # Superset union across schema_versions 1.1-2.7 (RegistrationQC in
     # src/metrics/schemas.py). Each individual Parquet file only physically
     # contains the fields its own schema_version actually wrote; Athena
     # returns NULL for the rest via name-based column matching.
@@ -1469,6 +1491,40 @@ resource "aws_glue_catalog_table" "registration_compacted" {
     columns {
       name = "completed_at"
       type = "string"
+    }
+    # Schema 2.7, t1w_to_mni only: RANDOM-rescue provenance written by
+    # fst1w_to_mni.py::rescue_provenance. NULL on every earlier record and on all
+    # bold_to_t1w rows. Must stay in the same relative order as the raw table and
+    # athena.py's _UNION_COLUMNS["registration"] — the UNION ALL is positional.
+    # `int` over the pyarrow int64 the compactor infers is the established pattern
+    # here (func_preproc n_frames, fsqc_qc *_status) and reads fine in Athena.
+    columns {
+      name = "sampling_strategy"
+      type = "string"
+    }
+    columns {
+      name = "rescue_ticket"
+      type = "int"
+    }
+    columns {
+      name = "sampling_seed"
+      type = "int"
+    }
+    columns {
+      name = "itk_threads"
+      type = "int"
+    }
+    columns {
+      name = "attempts_run"
+      type = "int"
+    }
+    columns {
+      name = "none_lncc"
+      type = "double"
+    }
+    columns {
+      name = "none_jac_det_frac_negative"
+      type = "double"
     }
   }
 }
@@ -2221,7 +2277,7 @@ resource "aws_glue_catalog_table" "registration_qc" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "centroid_displacement_mm,completed_at,ice_max_mm,ice_mean_mm,ice_p95_mm,ice_p99_mm,jac_det_frac_negative,jac_det_max,jac_det_mean,jac_det_min,jac_det_std,lncc,log_jac_frac_beyond_1p5,log_jac_frac_beyond_3,log_jac_max,log_jac_mean,log_jac_min,log_jac_p01,log_jac_p99,log_jac_std,mask_dice,method,mhd_mm,mi,ngf,ngf_identity,nmi,nmi_gain,nmi_identity,pipeline,registration_type,rigid_disp_max_mm,rigid_disp_mean_mm,rigid_rot_deg,run,schema_version,seg_bbr_contrast,seg_bbr_contrast_identity,session,subject,task,verdict"
+        paths                   = "attempts_run,centroid_displacement_mm,completed_at,ice_max_mm,ice_mean_mm,ice_p95_mm,ice_p99_mm,itk_threads,jac_det_frac_negative,jac_det_max,jac_det_mean,jac_det_min,jac_det_std,lncc,log_jac_frac_beyond_1p5,log_jac_frac_beyond_3,log_jac_max,log_jac_mean,log_jac_min,log_jac_p01,log_jac_p99,log_jac_std,mask_dice,method,mhd_mm,mi,ngf,ngf_identity,nmi,nmi_gain,nmi_identity,none_jac_det_frac_negative,none_lncc,pipeline,registration_type,rescue_ticket,rigid_disp_max_mm,rigid_disp_mean_mm,rigid_rot_deg,run,sampling_seed,sampling_strategy,schema_version,seg_bbr_contrast,seg_bbr_contrast_identity,session,subject,task,verdict"
         "ignore.malformed.json" = "true"
       }
     }
@@ -2407,6 +2463,38 @@ resource "aws_glue_catalog_table" "registration_qc" {
     columns {
       name = "completed_at"
       type = "string"
+    }
+    # Schema 2.7, t1w_to_mni only: RANDOM-rescue provenance. Same names, types and
+    # relative order as registration_compacted and athena.py's
+    # _UNION_COLUMNS["registration"] (positional UNION ALL); also listed in `paths`
+    # above, since that SerDe list enumerates every JSON key this table reads.
+    columns {
+      name = "sampling_strategy"
+      type = "string"
+    }
+    columns {
+      name = "rescue_ticket"
+      type = "int"
+    }
+    columns {
+      name = "sampling_seed"
+      type = "int"
+    }
+    columns {
+      name = "itk_threads"
+      type = "int"
+    }
+    columns {
+      name = "attempts_run"
+      type = "int"
+    }
+    columns {
+      name = "none_lncc"
+      type = "double"
+    }
+    columns {
+      name = "none_jac_det_frac_negative"
+      type = "double"
     }
   }
 }
@@ -2850,7 +2938,7 @@ resource "aws_glue_catalog_table" "workflow_runs" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "completed_at,failed_step,failure_category,finished_at,message,pending_duration_s,pipeline,schema_version,started_at,status,subject,total_duration_s,workflow_name"
+        paths                   = "batch_label,completed_at,failed_step,failure_category,finished_at,message,pending_duration_s,pipeline,schema_version,started_at,status,subject,total_duration_s,workflow_name"
         "ignore.malformed.json" = "true"
       }
     }
@@ -2900,6 +2988,10 @@ resource "aws_glue_catalog_table" "workflow_runs" {
       type = "string"
     }
     columns {
+      name = "batch_label"
+      type = "string"
+    }
+    columns {
       name = "schema_version"
       type = "string"
     }
@@ -2939,3 +3031,54 @@ resource "aws_glue_catalog_table" "workflow_runs" {
 # The IAM role in iam.tf is retained deliberately: it is what a manual,
 # one-off `aws glue start-crawler` would assume if a future schema
 # investigation ever wants a throwaway crawl against a scratch database.
+
+# ---------------------------------------------------------------------------
+# Pre-leg-1 archive (2026-09-10)
+#
+# The full-cohort run's leg 1 started 2026-08-18T16:54:42Z. Everything the
+# metrics corpus held before that is test-batch data -- the 2026-08-17
+# 300-subject batch, the 550-subject batch that ran into 2026-08-18, and the
+# earlier 08-04 through 08-15 batches -- and it is no longer wanted in
+# dashboards. Nothing was deleted; the bucket is versioned with no lifecycle
+# configuration (see terraform/metrics_bucket.tf), so all of it stays on disk.
+#
+# Two mechanisms, because a whole-day partition cannot express the boundary:
+#
+#   1. dt <= 2026-08-17 is retired by the projection floors above. Athena
+#      simply stops projecting those partitions. Reverting the two
+#      "projection.dt.range" strings restores every row.
+#
+#   2. dt=2026-08-18 is MIXED and cannot be cut by date, so it was handled at
+#      object grain instead. The 550-subject batch's last write landed at
+#      12:56:35Z and leg 1's first at 16:54:42Z, with the window between them
+#      empty across all nine raw prefixes, so the two populations separate
+#      exactly on S3 LastModified at 14:00Z. 68,353 objects were moved to
+#      backup/pre-leg1-2026-08-18/<original key> on 2026-09-10; restoring them
+#      is a prefix strip. Each prefix matched its survey exactly -- most
+#      usefully, workflow-starts split at exactly 550, and subject-manifests
+#      kept exactly the 97 that workflow-runs keeps. Verified end to end:
+#      Athena anat_qc dt=2026-08-18 went 2,662 -> 1,101 rows.
+#
+# If you redo this: `aws s3 ls` renders LastModified in LOCAL time. Selecting
+# on what it prints cuts five hours off-target here, landing inside the
+# pre-leg-1 tail rather than in the empty window. Use s3api and compare UTC.
+#
+# The compacted Parquet for dt=2026-08-18 was rebuilt on 2026-09-10, closing
+# what would otherwise have been a lasting gap: those files bundle every
+# population for a date into one part-0000.parquet per schema_version, so
+# moving raw objects cannot split them.
+#
+# No bespoke Parquet surgery was needed, and none should be attempted if this
+# recurs. src/metrics/compactor.py treats raw JSON as authoritative and is
+# idempotent by construction -- its output key is fully determined by
+# (table, dt, schema_version) -- so re-running the production compactor over
+# the already-archived raw tree rebuilt each file from exactly the surviving
+# rows:
+#
+#     compact_date(s3, bucket, region, "2026-08-18", tables=[...])
+#
+# 116,319 rows -> 46,208, and every raw table now agrees with its _compacted
+# counterpart row-for-row for that date (checked in Athena, both directions).
+# costs and pod_costs were excluded on purpose: their raw objects were never
+# moved, since cost records are cluster-wide daily aggregates with no
+# per-batch attribution to split on.

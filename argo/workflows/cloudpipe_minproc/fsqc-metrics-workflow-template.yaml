@@ -190,7 +190,7 @@ spec:
       # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
       # rewrites this to sha-<commit> once the first build lands, and only after
       # confirming that tag actually reached the registry.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fsqc@sha256:4d48884786140721c63a00f6caddca4065093ea0b463f9c6173a49242b4ee6f2"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fsqc@sha256:bdc3369e120bcce5347220cb15e723e36b1e0c62e8042c0a36e748999e70ab91"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

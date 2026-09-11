@@ -77,6 +77,12 @@ variable "work_pool" {
   default     = "cloudpipe-k8s-pool"
 }
 
+variable "argo_namespace" {
+  description = "Namespace the Argo workflow pods run in. The cloudpipe queue manager lists Pending pods there to detect a GPU spot drought and switch new submissions to CPU segmentation (#373)."
+  type        = string
+  default     = "argo-workflows"
+}
+
 ################################################################################
 # Prefect — service account names
 ################################################################################

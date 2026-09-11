@@ -148,7 +148,8 @@ Implemented in `.github/workflows/build-gpu-nodeclass-ami.yaml`. Triggers automa
 2. Verifies each candidate image actually exists in ECR — an image not rebuilt in the triggering run falls back to its currently-baked tag, so the AMI always carries a real image for both
 3. Skips the build only if *both* tags already match `karpenter.tf` — a rebuild of either image alone still triggers a new AMI carrying both. This comparison is tag-string-only, not AMI-existence — if `karpenter.tf` was hand-edited to pin a tag before any AMI was baked with it, dispatch manually with `force_rebuild: true` to bypass the skip.
 4. Runs `packer build` on a `g4dn.2xlarge` using the `AWS_PACKER_ROLE_ARN` OIDC role
-5. Commits the updated `fastsurfer_ami_tag` and `fireants_ami_tag` in `terraform/karpenter.tf` with `[skip ci]`
+5. Sweeps up any builder instance, temporary key pair and temporary IAM profile/role that Packer did not delete (runs on cancel and failure too — see the gotcha below)
+6. Commits the updated `fastsurfer_ami_tag` and `fireants_ami_tag` in `terraform/karpenter.tf` with `[skip ci]`
 
 **The workflow does not roll the nodeclass.** It used to `kubectl apply` the
 rendered `gpu-nodeclass` directly, but the EKS API endpoint is private-only
@@ -180,6 +181,18 @@ AL2023 nodes (unlike Bottlerocket) do not bundle the NVIDIA device plugin in the
 ---
 
 ## Gotchas
+
+**An interrupted build can strand its builder, and the builder is expensive at rest.** Packer stops the instance before snapshotting it, so a build killed in that window leaves a *stopped* `g4dn.2xlarge`. That costs nothing for compute but still bills for its 60 GiB root volume at 16000 IOPS / 1000 MB/s, about $105/month. A run cancelled on 2026-08-17 left one behind for three weeks ([#357](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/357)). GitHub delivers a cancel's SIGINT only to the step's entry process, so the workflow `exec`s packer to receive it, and then runs an `always()` cleanup step keyed on the run's key-pair name, `packer_gpu-nodeclass_<run_id>-<attempt>`. Nothing sweeps up after a **local** build, so check by hand after interrupting one:
+
+```bash
+aws ec2 describe-instances --region <YOUR_AWS_REGION> \
+  --filters 'Name=key-name,Values=packer_*' 'Name=instance-state-name,Values=pending,running,stopping,stopped' \
+  --query 'Reservations[].Instances[].[InstanceId,State.Name,KeyName]' --output text
+aws ec2 describe-key-pairs --region <YOUR_AWS_REGION> --query 'KeyPairs[?starts_with(KeyName,`packer`)].KeyName' --output text
+aws iam list-roles --query 'Roles[?starts_with(RoleName,`packer-`)].RoleName' --output text
+```
+
+Terminate any instance first. Each temporary instance profile, its role, and the role's inline policy all share one `packer-<uuid>` name.
 
 **containerd is not started by default** on the EKS AL2023 NVIDIA AMI without the nodeadm bootstrap. `sudo systemctl start containerd` is required in the provisioner before any `ctr` command will work.
 

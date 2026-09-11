@@ -372,9 +372,27 @@ defaults, and its own field defaults (including `schema_version: "1.2"`) do not 
 either live emitter actually writes today. Always filter `registration_qc(registration_type=...)`
 and read the section below for the type you asked for, not the dataclass.
 
-### `t1w_to_mni` (schema 2.1) — from `images/fireANTs/scripts/fst1w_to_mni.py` (FireANTs SyN, GPU)
+### `t1w_to_mni` (schema 2.7) — from `images/fireANTs/scripts/fst1w_to_mni.py` (FireANTs SyN, GPU)
 
 S3 key: `metrics/registration/dt={dt}/{subject}_{session}_t1w_to_mni_reg_qc.json`
+
+**Some rows are rescued registrations (schema 2.7+).** The affine runs first with NONE metric
+sampling — deterministic, and what every pre-2.7 row used. If that attempt fails the QC gate,
+up to three RANDOM attempts (10% sampling, one ITK thread, seeds 42 / 43 / 44) run in order and
+the **first** to pass the same gate is kept; the rest never run. There is no "keep the better
+one": every accepted transform, first-attempt or rescued, cleared the same gate on its own. Each
+row describes one attempt — the accepted one, or on total failure the NONE attempt — and the
+provenance fields below say which. On a rescue, every metric in the row (`lncc`, the `jac_*` and
+`log_jac_*` families, `mask_dice`, `verdict`) belongs to the **accepted** ticket; the NONE
+attempt it replaced survives only as `none_lncc` / `none_jac_det_frac_negative`.
+
+Why this exists: NONE is thread-invariant, but a session whose affine NONE lands in a bad basin
+lands there identically on every run, so it fails forever. 776 cohort sessions (2.4%) did, and
+re-running recovered none of them (0/57 repeats). RANDOM rescued 29 of 30 in a probe, to the
+passing population's median `lncc`, with `mask_dice` rising and `jac_det_frac_negative` falling
+alongside — the RANDOM attempts agreed with each other (median spread 0.020 `lncc`) and sat far
+from NONE (median jump 0.363), i.e. an escape from a local minimum rather than selection among
+noisy draws. `lncc - none_lncc` is that jump for any rescued row.
 
 | Field | Type | Description |
 |---|---|---|
@@ -391,7 +409,18 @@ S3 key: `metrics/registration/dt={dt}/{subject}_{session}_t1w_to_mni_reg_qc.json
 | `ice_mean_mm`, `ice_p95_mm`, `ice_p99_mm`, `ice_max_mm` | float | Inverse consistency error (mm): displace a voxel by the forward warp then the inverse warp sampled there — the residual from the start point. Reads no image intensities, so it would catch a warp that matches intensities well but isn't globally invertible. **NEVER POPULATED — all four are absent (not zero).** Computing them needs the inverse of the SyN fit, and `fireants` 1.5.0 raises `NotImplementedError('Inverse warp not implemented for SyN registration')`, so the emitter no longer attempts it. Measured 2026-08-11: 0 of 582 records at schema 2.1 carry any `ice_*` value, and of 12 archived `t1w-to-mni` pod logs sampled across 2026-07-23..2026-08-11, 11 log that error and none emit a value. `ice_mean_mm` was gated (fail **above** 0.5 mm) from 2026-07-23 to 2026-08-11 and was evaluated on **zero** sessions in that window, because `verdict()` skips absent keys; the entry is withdrawn. Columns remain declared so no schema bump is needed if the inverse lands upstream. Treat any value here as missing data, never as a measurement |
 | `centroid_displacement_mm` | float | Brain-mask centroid displacement after alignment (mm) — recorded, **not** gated |
 | `verdict` | str | `"pass"` / `"fail"` against `registration_qc._T1W_MNI_THRESHOLDS`, which declares **two** fail bounds: `lncc < 0.65` and `jac_det_frac_negative > 0.005`. `mask_dice`, `centroid_displacement_mm` and the `ice_*` family are recorded but **not** gated (`ice_*` is not even measurable — see above). **There is no warn band** — both threshold tables dropped theirs on 2026-07-30 and `verdict()` can no longer emit one, because a warn exited 0 and promoted outputs exactly as a pass did. Records written before then still carry `"warn"`, so queries spanning historical partitions must handle the value |
-| `completed_at`, `schema_version` | str | `schema_version` is `"2.1"` |
+| `sampling_strategy` | str | Schema 2.7+. `"NONE"` or `"RANDOM"` — the affine metric sampling of the attempt this row describes |
+| `rescue_ticket` | int | Schema 2.7+. `0` = the NONE attempt; `1`–`3` = the RANDOM ticket that passed. **`0` covers two different outcomes** — a first-attempt pass *and* a total failure (every attempt failed, NONE recorded); tell them apart with `verdict` and `attempts_run` |
+| `sampling_seed` | int | Schema 2.7+. RANDOM seed of the recorded attempt; `-1` when NONE (no sample drawn — `-1` because `0` is a legal seed). With `itk_threads`, regenerates a rescued transform's **affine** bit-for-bit — and so its basin. The final warp is reproducible only up to GPU SyN, which is not bit-deterministic: identical runs on one card model differ by a median 1.8e-4 `lncc`, up to ~0.02 on a few rugged sessions, with no verdict flips across 30 validation sessions. That residual applies to NONE rows equally |
+| `itk_threads` | int | Schema 2.7+. ITK thread count of the recorded attempt. Always `1` for RANDOM, the only count at which RANDOM's affine is reproducible: above one thread Mattes MI merges per-thread partial sums in scheduling order and the affine endpoint wanders, even at a fixed seed |
+| `attempts_run` | int | Schema 2.7+. Registrations run this step: `1` (NONE passed, or the rescue was disabled) up to `4` |
+| `none_lncc`, `none_jac_det_frac_negative` | float | Schema 2.7+. The NONE attempt's values for the **two gated metrics** — i.e. why it was rejected, on a rescued row. On a first-attempt pass they equal `lncc` / `jac_det_frac_negative` |
+| `completed_at`, `schema_version` | str | `schema_version` is `"2.7"` (`"2.1"` before the rescue; the number is shared with `bold_to_t1w` across one table, so no `t1w_to_mni` row carries 2.2–2.6). `completed_at` is when the **step** finished — after every rescue ticket, not when the recorded attempt did |
+
+**Filter on `schema_version >= '2.7'`** before reading the provenance fields — pre-2.7 rows and
+every `bold_to_t1w` row return `NULL` for all seven in Athena (the dataclass's defaults apply
+only when deserializing in Python). Counting rescues: `rescue_ticket > 0`. Genuinely lost
+sessions: `verdict = 'fail'`, which on 2.7+ rows means all `attempts_run` attempts failed.
 
 ### `bold_to_t1w` (schema 2.6) — from `images/freesurfer/bold_to_t1w.py` (SynthMorph, rigid)
 
@@ -441,7 +470,8 @@ every current row.
 > to *both* halves of the `UNION ALL`, so the raw half referenced four columns that don't exist
 > and Athena rejected the whole query with `COLUMN_NOT_FOUND`.
 >
-> `_UNION_COLUMNS["registration"]` is now the **intersection** (41 columns) rather than the
+> `_UNION_COLUMNS["registration"]` is now the **intersection** (41 columns then; 48 since the
+> seven schema-2.7 provenance columns were added to both tables) rather than the
 > compacted table's list. The Glue declarations were left as they are: the compactor infers
 > Parquet columns from the records, so the extra four are inert, and leaving them declared keeps
 > historical values readable by querying `registration_compacted` directly. Do not "resync" the
@@ -476,8 +506,9 @@ S3 key: `metrics/workflow-runs/dt={dt}/{workflow_name}__{subject}_run_summary.js
 | `pending_duration_s` | float \| null | Seconds from workflow submission (`creationTimestamp`) to the wall-clock time a dedicated `record-workflow-start-dagtask` (no `depends`, starts immediately alongside the real first step) actually ran — queue + node-provision wait. That task writes its own start time to `metrics/workflow-starts/dt={dt}/{workflow_name}.json`, which the exit handler reads back; it isn't threaded through Argo's `workflow.outputs.parameters`, because `argo lint --offline` can't statically resolve that from an `onExit` template even though it works at runtime. **`null` means unmeasured, never a confident `0.0`** ([#147]): the two source timestamps are treated as equal/inverted whenever they can't be trusted, which is exactly what the pre-#147 wiring bug produced on every record |
 | `message` | str | Argo failure message; empty on success. In practice usually empty even on failure — Argo has no `{{tasks.<name>.message}}` DAG variable, see `docs/decisions/` — `failed_step`/`failure_category` are the reliable failure signal, not this field |
 | `failed_step` | str | Canonical name of the first failed step; `""` on success |
-| `failure_category` | str | `infrastructure` \| `algorithm` \| `data` \| `dependency` \| `unknown` \| `""`; see the `StepOutcome` taxonomy below — it's the same classifier |
-| `schema_version` | str | `"1.1"` |
+| `failure_category` | str | `infrastructure` \| `algorithm` \| `data` \| `dependency` \| `qc_rejected` \| `unknown` \| `""`; see the `StepOutcome` taxonomy below — it's the same classifier |
+| `batch_label` | str \| null | Free-text era/batch label set at submission (`batch_label` on the queue-manager flow → the `batch-label` workflow parameter), e.g. `"leg-2"`. **Unlabelled is two different values, and this distinction is a query trap:** a schema-1.2 record submitted without a label carries the key as `""`, while every schema-1.1 record — everything written before 2026-09-02 — has **no such key at all** and therefore reads **`NULL`**. So `WHERE batch_label = ''` does *not* mean "unlabelled": at the time of writing it matched 15 rows and missed 3,336. Use `COALESCE(batch_label, '') = ''`, or test `IS NULL` explicitly. Added in schema 1.2 because era was otherwise recoverable only from a timestamp: the pre-leg-1 test batches finished on dates that overlap leg 1, so a `dt`-scoped query silently mixed 548 test rows into leg 1's Aug-18 partition, and separating them required knowing leg 1 began at `2026-08-18T16:54Z`. Filter on this instead going forward — but it is **not** a substitute for `started_at` on historical records, which carry no label to filter on |
+| `schema_version` | str | `"1.2"` (was `"1.1"` before `batch_label`). Both values stay listed in the compacted table's `projection.schema_version.values`: a version absent from that enum returns **zero rows with a SUCCEEDED query**, so narrowing it would silently hide every pre-1.2 record |
 
 ---
 
@@ -762,7 +793,7 @@ S3 key: `metrics/step-outcomes/dt={dt}/{workflow_name}__{step}__{subject}__{sess
 | `subject` | str | Subject ID |
 | `session`, `task`, `run` | str | Scan-unit identity, or `"na"` if the step is scoped above that level |
 | `status` | str | `succeeded` \| `failed` \| `skipped`. A per-run `func-preproc`/`surface-sample` row is `skipped` when `bold-to-t1w` rejected that run on its QC floor and discarded the transform, so the step never computed anything (issue #222); the same event reads `failed` in records written before it |
-| `failure_category` | str | `infrastructure` \| `algorithm` \| `data` \| `dependency` \| `unknown` \| `""` (see classifier below) |
+| `failure_category` | str | `infrastructure` \| `algorithm` \| `data` \| `dependency` \| `qc_rejected` \| `unknown` \| `""` (see classifier below) |
 | `failure_reason` | str | Raw Argo failure message, when available |
 | `upstream_failed_step` | str | The step whose failure caused this one to be skipped, if `status="skipped"` — `bold-to-t1w` for a QC-gated run, or `registration` when `preproc.py`'s own pre-flight check found the missing input (exit 66) |
 | `outputs_verified` | list[str] | S3 keys the recorder confirmed actually exist, not just that the step reported success |
@@ -778,7 +809,19 @@ message, falling back to container exit code since `{{tasks.<name>.message}}` do
 | `data` | `NoSuchKey`/`NoSuchBucket`, missing/corrupt input, `nss_volumes` errors |
 | `algorithm` | `AssertionError`/`ValueError`/`RuntimeError`, segfault (incl. exit 139), `CalledProcessError` |
 | `dependency` | Upstream DAG task failed or was skipped |
+| `qc_rejected` | Exit 65: `t1w-to-mni` or `bold-to-t1w` evaluated its own output, its QC gate said `fail`, and it exited without promoting anything. **Not a defect** — the step worked; the session/run is still lost (no transform, so no `derivatives/func/`). The gated metric is in `registration` (`verdict = 'fail'`) |
 | `unknown` | Failed/skipped with no message and no recognized exit code |
+
+`qc_rejected` exists from #368. Rows written before it labelled every QC rejection
+`unknown` — 980 distinct step outcomes (802 `t1w-to-mni`, 178 `bold-to-t1w`) between
+2026-08-18 and the fix — and `scripts/backfill_qc_rejected_category.py` relabels them in
+place: raw and `_compacted`, in `step_outcomes`, `subject_manifests.steps[]` and
+`workflow_runs`. It leaves `failure_reason` as written, so a pre-#368 `t1w-to-mni`
+rejection still reads `expected output not found: ...affine.mat`, while one recorded
+after it reads `exit code 65: QC gate rejected the registration; no outputs promoted`.
+A per-run `bold-to-t1w` rejection reads `bold_to_t1w.py exited 65` in both eras —
+`validate_test_batch` matches on it. Rows in the pre-leg-1 archive (#369) are not
+relabelled.
 
 ---
 

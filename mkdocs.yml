@@ -135,6 +135,8 @@ nav:
       - infrastructure.md
       - gitops.md
       - pre-baked-amis.md
+      - data-ingress.md
+      - globus-prerequisites.md
       - globus.md
       - globus-setup.md
 
