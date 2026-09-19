@@ -125,21 +125,163 @@ aggregator:
   # ~25min: 4391Mi / 4870Mi / 4690Mi. It oscillates rather than climbs, so 4870Mi
   # is treated as the peak.
   #
-  # request 5Gi  — honest reservation, so the scheduler stops placing this pod as
-  #                if it needed 3Gi and then letting it take 4.9Gi.
-  # limit   7Gi  — ~44% headroom over the observed peak. The point is to bound a
-  #                runaway, not to trim normal operation; sized so the worst case
-  #                still leaves ~6.7Gi on the node for everything else.
+  # RAISED 2026-09-08 to request 6Gi / limit 14Gi, alongside moving the backend
+  # nodegroup to m7g.2xlarge (terraform/eks.tf).
   #
-  # If this starts OOMKilling (check `restartCount` on kubecost-aggregator-0),
-  # the cap is too low for the retention settings above — raise the limit rather
-  # than removing it, and re-measure the baseline first.
+  # The 5Gi/7Gi pair above was sized for a 13.78Gi node and its own advice fired:
+  # "If this starts OOMKilling (check restartCount on kubecost-aggregator-0), the
+  # cap is too low." It did, on 2026-09-05 at 10:38:58Z, exitCode 137, taking the
+  # in-flight ingestion of that day with it. Kubecost served `data: [null]` for
+  # 09-05 until this raise; every stalled rollup rebuilt once the aggregator had
+  # headroom, 09-05 included. Nothing was permanently lost — an earlier version
+  # of this comment said otherwise and sized a 2,848-subject rerun on it. See
+  # terraform/eks.tf for the correction and how to check reconciliation properly.
+  #
+  # 7Gi was not merely a bit low. The embedded store derives its own ceiling at
+  # ~90% of the container limit, so 7Gi meant a hard 6.28 GiB query cap, and the
+  # read copy hit it constantly:
+  #
+  #   error creating read copy: code: 241, would use 4.38 GiB
+  #   (chunk of 128.00 MiB), current RSS: 6.28 GiB, maximum: 6.28 GiB
+  #
+  # 14Gi lifts that internal cap to ~12.6Gi. Observed peak under the heaviest
+  # load yet seen (a 7-day hourly backfill) was 6.4Gi, so this is ~2.2x the worst
+  # measured case rather than a guess.
+  #
+  # It fits because the node changed: on ~28Gi allocatable, requests across the
+  # namespace land near 43% and limits near 100%, versus 140% limit overcommit on
+  # the old xlarge. That overcommit is what turned one pod's spike into another
+  # pod's eviction on 09-05.
+  #
+  # request 6Gi — honest reservation; the scheduler must see the real footprint.
+  # limit  14Gi — bounds a runaway without capping normal operation.
   resources:
     requests:
       cpu: 100m
-      memory: 5Gi
+      memory: 6Gi
     limits:
-      memory: 7Gi
+      memory: 14Gi
+
+  # The 7Gi limit above proved insufficient during cohort leg 2 (2026-09-02 →
+  # 2026-09-06, 8835 subjects). The aggregator OOMKilled at 2026-09-05T10:38:58Z
+  # (exitCode 137), which is the failure the comment above predicted. Its
+  # in-flight ingestion of the 09-05 window died with it, so Kubecost served
+  # `data: [null]` for that day until the 2026-09-08 raise — which in turn
+  # crashed the nightly cost-scraper (a non-empty list holding a nil set walks
+  # straight past an `if not sets` guard) and cost us both the 09-05 scrape and
+  # the settled re-scrape of 09-03 that shared that flow run.
+  #
+  # The embedded v3 database is ClickHouse. With dbMemoryLimit unset it derives
+  # its own ceiling from the cgroup limit — observed at 6.30 GiB against the 7Gi
+  # here — and then fails queries at that ceiling rather than growing:
+  #
+  #   code: 241, message: (total) memory limit exceeded: would use 4.48 GiB,
+  #   current RSS: 6.30 GiB, maximum: 6.30 GiB. OvercommitTracker decision:
+  #   Query was selected to stop by OvercommitTracker: While executing
+  #   JoiningTransform
+  #
+  # It has not recovered on its own: ~100 errors/hour, continuously, stuck in an
+  # `ingesting` -> `apply_pricing` loop on the 09-06 window. The two loudest
+  # variants are `error creating read copy` and `error executing copy` — that is
+  # the datastore copy this partition count governs, which is why the knob below
+  # is the first lever tried and not the instance type.
+  #
+  # Sizing evidence, from the daily Allocation bingen files the aggregator
+  # ingests out of the federated store
+  # (s3://cloudpipe-finops/federated/cloudpipe/etl/bingen/allocations/1d/):
+  #
+  #   pre-batch (08-27..09-01)   ~270 KB     idle cluster
+  #   1788307200-1788393600       30 MB      2026-09-02 (batch began 14:15Z)
+  #   1788393600-1788480000      131 MB      2026-09-03
+  #   1788480000-1788566400      133 MB      2026-09-04
+  #   1788566400-1788652800      186 MB      2026-09-05  <- peak, the OOM day
+  #   1788652800-1788739200      118 MB      2026-09-06
+  #
+  # 09-05 is 690x an idle day and 57% above its own neighbours, tracking that
+  # day's 2899 workflow completions against ~1880 on either side. Note the
+  # aggregator cannot currently ingest even the 118 MB window, so the 186 MB one
+  # will not re-ingest until this is fixed — recovering 09-05 is blocked on
+  # memory, not on the data, which is intact in S3 and retained by retention1d
+  # (91 days, so until ~2026-12-05).
+  #
+  # 25 is the chart 3.2.1 default, not a previous tuning pass. The chart's own
+  # guidance: "the higher this number, the lower the ram usage but the longer it
+  # takes for new data to show in the kubecost UI / set to 0 for max
+  # partitioning (minimum possible ram usage, but the slowest)".
+  #
+  # Do NOT take that comment's advice and set 0 here. The statefulset template
+  # gates the variable on being positive:
+  #
+  #   {{- if (gt (int .Values.aggregator.numDBCopyPartitions) 0) }}
+  #   - name: NUM_DB_COPY_CHUNKS
+  #     value: {{ .Values.aggregator.numDBCopyPartitions | quote }}
+  #   {{- end }}
+  #
+  # so 0 does not request max partitioning — it renders no NUM_DB_COPY_CHUNKS at
+  # all and drops the aggregator onto whatever its binary defaults to, which is
+  # undocumented and may well be *fewer* chunks than 25 (i.e. more RAM, the
+  # opposite of the intent). Verified empirically: with 0, the running pod has no
+  # NUM_DB_COPY_CHUNKS in its environment.
+  #
+  # 200 is therefore set explicitly — 8x the default, so the copy is split into
+  # materially smaller pieces, with no reliance on an unverifiable built-in. A
+  # gentler bump was rejected because the failing query needs 4.48 GiB of
+  # headroom it does not have, and the pod is currently making no ingestion
+  # progress at all, so slower-but-completing strictly dominates. Dial back
+  # toward 25 once 09-05 and 09-06 are ingested and the backlog is clear.
+  #
+  # The chart also notes this "should only be modified after consulting with
+  # Kubecost's support team". Accepted knowingly: it is free and reversible,
+  # and the alternative on the table is doubling the backend nodegroup to
+  # m7g.2xlarge at +$238/mo. If this does not clear it, that is the next lever
+  # (and is what values line 61 already nominated for the finops agent).
+  #
+  # Deliberately NOT changed in the same step, so this stays a single-variable
+  # experiment:
+  #   dbMemoryLimit / dbWriteMemoryLimit — both "0GB" (no limit). The chart
+  #     recommends setting these so their sum is under the pod's memory once a
+  #     baseline exists. Worth doing, but it partitions the same 7Gi rather than
+  #     adding any, and could fail the write path sooner.
+  #   dbConcurrentIngestionCount — 1. Raising it helps backfill but costs memory,
+  #     which is the resource we are short of.
+  #   stagingEmptyDirSizeLimit — 2Gi. The chart sizes this at ~8x the largest
+  #     bingen file; 8 x 186 MB is ~1.45Gi, so 2Gi still covers the peak day with
+  #     ~38% headroom. Revisit if a daily Allocation file exceeds ~256 MB.
+  # 200, not the chart default of 25. Raised on 2026-09-07 to stop the aggregator
+  # OOM-looping after the 09-05 incident: the two loudest failures were
+  # `error creating read copy` and `error executing copy`, which is the datastore
+  # copy this knob governs. More partitions means a smaller working set per copy
+  # chunk — lower RAM, slower to surface in the UI.
+  #
+  # Effect was immediate and held: code-241 memory errors went from ~100/hour to
+  # zero, peak memory 3247Mi -> ~1570Mi, no further restarts.
+  #
+  # It was briefly at 500 during the retention1h=168 hourly backfill, which
+  # re-tripped the ceiling at 200. Both are reverted together now that the
+  # backfill is done — 500 buys nothing at steady-state volume and only slows
+  # data appearing in the UI.
+  numDBCopyPartitions: 200
+
+  # retention1h is left at the chart default of 49 hours.
+  #
+  # It was raised to 168 on 2026-09-07 to backfill the 2026-09-05 cost hole: the
+  # daily rollups for 09-03 and 09-05 never rebuilt after that morning's OOM, and
+  # at 49 hours the aggregator does not ingest far enough back to see 09-05 at
+  # all. The hourly source was intact — 24 of 24 files, 256,940,171 bytes, no
+  # gaps — so summing hourly windows per workflow recovered the day's GROSS cost,
+  # taking complete-cost coverage of cohort leg 2 from 57.0% to 89.2%.
+  #
+  # Reverted because it is a recovery setting, not a steady state: 7 days of
+  # hourly data is ~3.5x the normal resident volume and it re-tripped the
+  # read-copy memory ceiling even at numDBCopyPartitions=500.
+  #
+  # Raise it again for a similar recovery, but know its limit first: hourly data
+  # reconstructs gross faithfully and CANNOT reconstruct reconciliation. The
+  # adjustment is a derived correction against cloud billing, not a measured
+  # per-hour quantity, so summing 24 windows over-applies it — measured at 3.27x
+  # on 2026-09-04, where the daily rollup still worked. See
+  # scripts/backfill_cost_from_hourly.py, which zeroes it rather than guessing.
+
   tolerations:
     - key: "CriticalAddonsOnly"
       value: "true"

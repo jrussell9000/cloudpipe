@@ -27,7 +27,7 @@
   "version": 1,
   "refresh": "5m",
   "time": {
-    "from": "now-30d",
+    "from": "now-7d",
     "to": "now"
   },
   "templating": {
@@ -123,7 +123,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT COUNT(DISTINCT subject || '|' || session) AS n_scans FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_scans, COUNT(DISTINCT subject) AS n_subjects, SUM(CASE WHEN (metrics_status <> 0 OR hippocampus_status <> 0 OR (hypothalamus_status <> 0 AND hypothalamus_whole_left_mm3 IS NOT NULL)) THEN 1 ELSE 0 END) AS n_degraded, ROUND(AVG(wm_snr_norm), 2) AS mean_wm_snr, ROUND(AVG(gm_snr_norm), 2) AS mean_gm_snr, ROUND(AVG((con_snr_lh + con_snr_rh) / 2.0), 2) AS mean_con_snr, ROUND(AVG(cc_size), 4) AS mean_cc_size, ROUND(COUNT(hypothalamus_whole_left_mm3) * 100.0 / NULLIF(COUNT(*), 0), 1) AS pct_covered, ROUND(AVG(degrees(sqrt(power(rot_tal_x, 2) + power(rot_tal_y, 2) + power(rot_tal_z, 2)))), 2) AS mean_rot_deg, ROUND(AVG(n_outlier_norms), 1) AS mean_outliers FROM d WHERE rn = 1"
         }
       ],
       "options": {
@@ -134,7 +134,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^n_scans$/"
         }
       },
       "fieldConfig": {
@@ -158,20 +160,18 @@
         "h": 5
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "SELECT COUNT(DISTINCT subject) AS n_subjects FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -182,7 +182,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^n_subjects$/"
         }
       },
       "fieldConfig": {
@@ -208,20 +210,18 @@
         "h": 5
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, hypothalamus_whole_left_mm3, metrics_status, hippocampus_status, hypothalamus_status, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_degraded FROM d WHERE rn = 1 AND (metrics_status <> 0 OR hippocampus_status <> 0 OR (hypothalamus_status <> 0 AND hypothalamus_whole_left_mm3 IS NOT NULL))"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -232,7 +232,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^n_degraded$/"
         }
       },
       "fieldConfig": {
@@ -295,7 +297,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, cnr, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(cnr), 3) AS mean_cnr FROM d WHERE rn = 1 AND cnr > 0"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(CASE WHEN cnr > 0 THEN cnr END), 3) AS mean_cnr, ROUND(AVG(CASE WHEN cjv > 0 THEN cjv END), 3) AS mean_cjv, ROUND(AVG(CASE WHEN fwhm_avg_mm > 0 THEN fwhm_avg_mm END), 3) AS mean_fwhm, ROUND(AVG(etiv_mm3)) AS mean_etiv, ROUND(AVG(CASE WHEN etiv_mm3 > 0 THEN total_brain_vol_mm3 / etiv_mm3 * 100 END), 2) AS mean_brain_pct_icv, ROUND(AVG(lh_mean_thickness_mm), 3) AS mean_lh_thick, ROUND(AVG(rh_mean_thickness_mm), 3) AS mean_rh_thick, ROUND(AVG(CASE WHEN lh_surface_area_mm2 > 0 THEN lh_surface_area_mm2 END)) AS mean_lh_area, ROUND(AVG(CASE WHEN rh_surface_area_mm2 > 0 THEN rh_surface_area_mm2 END)) AS mean_rh_area FROM d WHERE rn = 1"
         }
       ],
       "options": {
@@ -306,7 +308,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_cnr$/"
         }
       },
       "fieldConfig": {
@@ -332,20 +336,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, cjv, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(cjv), 3) AS mean_cjv FROM d WHERE rn = 1 AND cjv > 0"
+          "panelId": 10,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -356,7 +358,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_cjv$/"
         }
       },
       "fieldConfig": {
@@ -382,20 +386,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, wm_snr_norm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(wm_snr_norm), 2) AS mean_wm_snr FROM d WHERE rn = 1 AND wm_snr_norm IS NOT NULL"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -406,7 +408,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_wm_snr$/"
         }
       },
       "fieldConfig": {
@@ -432,20 +436,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, gm_snr_norm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(gm_snr_norm), 2) AS mean_gm_snr FROM d WHERE rn = 1 AND gm_snr_norm IS NOT NULL"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -456,7 +458,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_gm_snr$/"
         }
       },
       "fieldConfig": {
@@ -482,20 +486,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, con_snr_lh, con_snr_rh, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG((con_snr_lh + con_snr_rh) / 2.0), 2) AS mean_con_snr FROM d WHERE rn = 1 AND con_snr_lh IS NOT NULL AND con_snr_rh IS NOT NULL"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -506,7 +508,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_con_snr$/"
         }
       },
       "fieldConfig": {
@@ -532,20 +536,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, fwhm_avg_mm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(fwhm_avg_mm), 3) AS mean_fwhm FROM d WHERE rn = 1 AND fwhm_avg_mm > 0"
+          "panelId": 10,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -556,7 +558,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_fwhm$/"
         }
       },
       "fieldConfig": {
@@ -595,7 +599,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, wm_snr_norm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT wm_snr_norm FROM d WHERE rn = 1 AND wm_snr_norm IS NOT NULL"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT wm_snr_norm, degrees(sqrt(power(rot_tal_x, 2) + power(rot_tal_y, 2) + power(rot_tal_z, 2))) AS rot_tal_deg FROM d WHERE rn = 1"
         }
       ],
       "options": {
@@ -615,7 +619,19 @@
             "gradientMode": "hue"
           }
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "wm_snr_norm"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 17,
@@ -641,7 +657,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, cnr, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT cnr FROM d WHERE rn = 1 AND cnr > 0"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT CASE WHEN cnr > 0 THEN cnr END AS cnr, CASE WHEN total_brain_vol_mm3 > 0 THEN total_brain_vol_mm3 END AS total_brain_vol_mm3, CASE WHEN lh_mean_thickness_mm > 0 THEN (lh_mean_thickness_mm + rh_mean_thickness_mm) / 2.0 END AS mean_thickness FROM d WHERE rn = 1"
         }
       ],
       "options": {
@@ -662,7 +678,19 @@
           }
         }
       },
-      "description": "One bar per band of CNR values, one scan per observation. A single tight peak is a healthy batch. A second cluster at low CNR usually means a scanner or protocol difference rather than a processing fault — check whether those scans share a site."
+      "description": "One bar per band of CNR values, one scan per observation. A single tight peak is a healthy batch. A second cluster at low CNR usually means a scanner or protocol difference rather than a processing fault — check whether those scans share a site.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "cnr"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 200,
@@ -689,20 +717,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, etiv_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(etiv_mm3)) AS mean_etiv FROM d WHERE rn = 1"
+          "panelId": 10,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -713,7 +739,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_etiv$/"
         }
       },
       "fieldConfig": {
@@ -738,20 +766,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, etiv_mm3, total_brain_vol_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(total_brain_vol_mm3 / etiv_mm3 * 100), 2) AS mean_brain_pct_icv FROM d WHERE rn = 1 AND etiv_mm3 > 0"
+          "panelId": 10,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -760,7 +786,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_brain_pct_icv$/"
         }
       },
       "fieldConfig": {
@@ -804,20 +832,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, cc_size, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(cc_size), 4) AS mean_cc_size FROM d WHERE rn = 1 AND cc_size IS NOT NULL"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -828,7 +854,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_cc_size$/"
         }
       },
       "fieldConfig": {
@@ -854,20 +882,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, hypothalamus_whole_left_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(COUNT(hypothalamus_whole_left_mm3) * 100.0 / NULLIF(COUNT(*), 0), 1) AS pct_covered FROM d WHERE rn = 1"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -875,7 +901,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^pct_covered$/"
         }
       },
       "fieldConfig": {
@@ -902,20 +930,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, total_brain_vol_mm3, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT total_brain_vol_mm3 FROM d WHERE rn = 1 AND total_brain_vol_mm3 > 0"
+          "panelId": 17,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -936,7 +962,19 @@
           }
         }
       },
-      "description": "Absolute brain volume in mm³, before any head-size normalisation, so the natural spread here is wide and mostly reflects real anatomy. Use Brain as % of head size above for anything comparative; a genuinely suspicious value shows up there, not here."
+      "description": "Absolute brain volume in mm³, before any head-size normalisation, so the natural spread here is wide and mostly reflects real anatomy. Use Brain as % of head size above for anything comparative; a genuinely suspicious value shows up there, not here.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "total_brain_vol_mm3"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 25,
@@ -1006,20 +1044,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, lh_mean_thickness_mm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(lh_mean_thickness_mm), 3) AS mean_lh_thick FROM d WHERE rn = 1"
+          "panelId": 10,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -1030,7 +1066,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_lh_thick$/"
         }
       },
       "fieldConfig": {
@@ -1072,20 +1110,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, rh_mean_thickness_mm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(rh_mean_thickness_mm), 3) AS mean_rh_thick FROM d WHERE rn = 1"
+          "panelId": 10,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -1096,7 +1132,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_rh_thick$/"
         }
       },
       "fieldConfig": {
@@ -1137,20 +1175,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, lh_surface_area_mm2, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(lh_surface_area_mm2)) AS mean_lh_area FROM d WHERE rn = 1 AND lh_surface_area_mm2 > 0"
+          "panelId": 10,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -1161,7 +1197,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_lh_area$/"
         }
       },
       "fieldConfig": {
@@ -1186,20 +1224,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, rh_surface_area_mm2, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(rh_surface_area_mm2)) AS mean_rh_area FROM d WHERE rn = 1 AND rh_surface_area_mm2 > 0"
+          "panelId": 10,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -1210,7 +1246,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_rh_area$/"
         }
       },
       "fieldConfig": {
@@ -1236,20 +1274,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, lh_mean_thickness_mm, rh_mean_thickness_mm, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.anat_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT (lh_mean_thickness_mm + rh_mean_thickness_mm) / 2.0 AS mean_thickness FROM d WHERE rn = 1 AND lh_mean_thickness_mm > 0"
+          "panelId": 17,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -1270,7 +1306,19 @@
             "gradientMode": "hue"
           }
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "mean_thickness"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 400,
@@ -1297,20 +1345,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, rot_tal_x, rot_tal_y, rot_tal_z, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(degrees(sqrt(power(rot_tal_x, 2) + power(rot_tal_y, 2) + power(rot_tal_z, 2)))), 2) AS mean_rot_deg FROM d WHERE rn = 1 AND rot_tal_x IS NOT NULL AND rot_tal_y IS NOT NULL AND rot_tal_z IS NOT NULL"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -1321,7 +1367,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_rot_deg$/"
         }
       },
       "fieldConfig": {
@@ -1347,20 +1395,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, n_outlier_norms, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(n_outlier_norms), 1) AS mean_outliers FROM d WHERE rn = 1 AND n_outlier_norms IS NOT NULL"
+          "panelId": 2,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -1371,7 +1417,9 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "values": false,
+          "fields": "/^mean_outliers$/"
         }
       },
       "fieldConfig": {
@@ -1396,20 +1444,18 @@
         "h": 12
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT subject, session, rot_tal_x, rot_tal_y, rot_tal_z, completed_at, ROW_NUMBER() OVER (PARTITION BY subject, session ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.fsqc_qc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT degrees(sqrt(power(rot_tal_x, 2) + power(rot_tal_y, 2) + power(rot_tal_z, 2))) AS rot_tal_deg FROM d WHERE rn = 1 AND rot_tal_x IS NOT NULL AND rot_tal_y IS NOT NULL AND rot_tal_z IS NOT NULL"
+          "panelId": 16,
+          "withTransforms": false
         }
       ],
       "options": {
@@ -1431,7 +1477,19 @@
           }
         }
       },
-      "description": "How far each head was rotated away from the template orientation, in degrees. Expect a peak near zero with a modest tail. 0.0 is a legitimate measurement, so this filters on IS NOT NULL rather than > 0 — filtering on > 0 would silently drop perfectly aligned scans."
+      "description": "How far each head was rotated away from the template orientation, in degrees. Expect a peak near zero with a modest tail. 0.0 is a legitimate measurement, so this filters on IS NOT NULL rather than > 0 — filtering on > 0 would silently drop perfectly aligned scans.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "rot_tal_deg"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 43,

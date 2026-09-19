@@ -30,7 +30,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:6df3d28acabb21cbde45ca04806bc5e9f50c3a770fb73eb60186d9c2e79247a5"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -240,7 +240,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:6df3d28acabb21cbde45ca04806bc5e9f50c3a770fb73eb60186d9c2e79247a5"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

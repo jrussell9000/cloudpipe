@@ -207,15 +207,16 @@ Downloaded with `aria2c` (16 parallel connections) for speed; the 3 GB tarball i
 - `average/HippoSF/atlas/`, `average/ThalamicNuclei/atlas/`, `average/BrainstemSS/atlas/` — probabilistic atlases for the GEMS segmentation tools
 - `bin/segment_subregions`, `bin/fspython`, `bin/mri_convert`, `bin/mri_segment_hypothalamic_subunits`, `bin/mri_sclimbic_seg`
 - `models/` — model files for the deep-learning tools (`hypothalamic_subunits.h5`, `sclimbic.fsm+ad.t1.nstd00-50.nstd32-50.h5`, etc.)
+- **Dead weight since 2026-09-16:** `mri_segment_hypothalamic_subunits`, `mri_sclimbic_seg` and their two models are no longer run by any template (both regions retired). They can be excluded in a future image build. `models/` itself must stay — `mri_synthmorph` (BOLD→T1w, below) reads from it.
 - Setup scripts and color LUTs
 
 **Excluded** (to reduce image size): large recon-all GCA atlases (`average/*.gca`), legacy MATLAB-compiled binaries, GUI/GPU libraries (`lib/cuda`, `lib/qt`, `lib/vtk`), `matlab/`, `mni/`, `diffusion/`, `fsfast/`, `subjects/`, Python build headers (`python/include/`, `python/share/`).
 
-**Also carries `bold_to_t1w.py`** — this image, not a separate SynthMorph image, is where BOLD→T1w registration runs. (There is no `images/synthmorph/` and no `cloudpipe/synthmorph` ECR repo; earlier revisions of this doc described one.) The script uses `mri_synthmorph` for a contrast-agnostic rigid fit: a single neural-network forward pass (~5 s) instead of bbregister's iterative surface-based optimisation (~5–10 min), with no T1-weighted assumption. bbregister was removed outright in `61ccff7` — see [ADR 002](decisions/002-synthmorph-over-bbregister.md).
+**Also carries `bold_to_t1w.py`** — this image, not a separate SynthMorph image, is where BOLD→T1w registration runs. (There is no `images/synthmorph/` and no `cloudpipe/synthmorph` ECR repo; earlier revisions of this doc described one.) The script uses `mri_synthmorph` for a contrast-agnostic rigid fit: a neural-network forward pass (~45–50 s wall time per run at `cpu: 2`) instead of bbregister's iterative surface-based optimisation (~5–10 min), with no T1-weighted assumption. bbregister was removed outright in `61ccff7` — see [ADR 002](decisions/002-synthmorph-over-bbregister.md).
 
 It produces the LTA transform, an ANTs/ITK `.txt` affine (RAS→LPS coordinate flip for ANTs compatibility, hand-rolled in Python to avoid a `lta_convert --outitk` segfault), the BOLD reference volume, a warped QC image, and a brain mask in BOLD space. FreeSurfer CLI dependencies are replaced with Python equivalents (`nibabel`, `numpy`, `scipy`).
 
-Used by the `subregion-seg` WorkflowTemplate (`segment-subregions-gems-template`, `segment-subregions-dl-template`) and by `registration`'s BOLD→T1w step (`bold-to-t1w-session-template`, whose thread-pool env vars are pinned to the CPU request). All three pods run on `cpu-heavy-nodepool` — no GPU required.
+Used by the `subregion-seg` WorkflowTemplate (`segment-subregions-gems-template`) and by `registration`'s BOLD→T1w step (`bold-to-t1w-session-template`, whose thread-pool env vars are pinned to the CPU request). Both pods run on `cpu-heavy-nodepool` — no GPU required.
 
 ---
 

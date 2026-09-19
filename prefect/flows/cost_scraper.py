@@ -36,6 +36,8 @@ from datetime import date as _date
 from datetime import timedelta
 from pathlib import Path
 
+import boto3
+
 from prefect import flow, get_run_logger, task
 
 # In the flow-runner image, src/metrics/ is COPYed to /opt/prefect/metrics and
@@ -46,6 +48,14 @@ if _METRICS_PATH not in sys.path:
     sys.path.insert(0, _METRICS_PATH)
 
 # E402 is expected and required: these resolve only via the sys.path insert above.
+from cost_gaps import (  # type: ignore[import-not-found]  # noqa: E402
+    DEFAULT_MIN_CAPTURE,
+    DEFAULT_MIN_CORE_HOURS,
+    DEFAULT_SINCE_DAYS,
+    format_day,
+    has_gap,
+    scan_recent_days,
+)
 from kubecost_drift_probe import probe_and_upload  # type: ignore[import-not-found]  # noqa: E402
 from kubecost_scraper import (  # type: ignore[import-not-found]  # noqa: E402
     KUBECOST_BASE,
@@ -172,6 +182,48 @@ def probe_task(bucket: str, region: str, base_url: str, lookback_days: int) -> i
     return n
 
 
+class CostGapDetected(RuntimeError):
+    """A report-date has pod activity Kubecost did not bill, or billed far short of."""
+
+
+@task(name="detect-cost-gaps", retries=1, retry_delay_seconds=60)
+def detect_gaps_task(
+    bucket: str, region: str, since_days: int, min_capture: float, min_core_hours: float
+) -> list[dict]:
+    """Check recent report-dates against the cluster's own record of what ran.
+
+    The scraper's PARTIAL_READ_FRACTION guard compares a response to what is already
+    stored, so at day+1 — nothing stored yet — it cannot fire. This reads
+    snapshots/argo-nodes/ instead, which is independent of Kubecost entirely, and is
+    the only check that can catch a partial FIRST write while a re-scrape would still
+    work (Kubecost keeps ~2 weeks).
+
+    Reads S3 directly, not Athena: the flow-runner image has no pandas, and a Glue
+    projection missing a schema_version returns zero rows with no error, which would
+    look exactly like a lost day.
+    """
+    logger = get_run_logger()
+    s3 = boto3.client("s3", region_name=region)
+    results = scan_recent_days(
+        s3,
+        bucket,
+        since_days=since_days,
+        min_capture=min_capture,
+        min_core_hours=min_core_hours,
+    )
+    for g in results:
+        line = format_day(g)
+        if g["missing"] or g["shortfall"]:
+            logger.warning(line)
+            if g["missing"]:
+                logger.warning(
+                    "  %d unbilled, e.g. %s", len(g["missing"]), ", ".join(g["missing"][:5])
+                )
+        else:
+            logger.info(line)
+    return results
+
+
 @flow(name="kubecost-cost-scraper", log_prints=True)
 def kubecost_cost_scraper(
     bucket: str = "cloudpipe-metrics",
@@ -182,6 +234,11 @@ def kubecost_cost_scraper(
     drift_probe_lookback_days: int = 21,
     scrape_pod_costs: bool = True,
     settled_rescrape: bool = True,
+    detect_gaps: bool = True,
+    gap_since_days: int = DEFAULT_SINCE_DAYS,
+    gap_min_capture: float = DEFAULT_MIN_CAPTURE,
+    gap_min_core_hours: float = DEFAULT_MIN_CORE_HOURS,
+    fail_on_gap: bool = True,
 ) -> int:
     """Fetch Kubecost allocations and write to S3 metrics/costs/.
 
@@ -216,17 +273,47 @@ def kubecost_cost_scraper(
         Re-scrape the report-date SETTLED_AGE_DAYS ago with its reconciled
         values. Skipped when `date` is set: an explicit-date run is a backfill
         of that one date and must not also rewrite an unrelated one.
+    detect_gaps:
+        Check recent report-dates against snapshots/argo-nodes/ for workflow-days
+        that ran but were never billed, and for days billed far below the pods'
+        own resource-hours.
+    gap_since_days, gap_min_capture, gap_min_core_hours:
+        Window, capture threshold, and the cpu+gpu core-hours an unbilled workflow
+        must exceed to be reported. The argo-nodes-snapshot cron runs unbilled every
+        day at ~0.0003 core-h; without this floor the run would fail nightly over a
+        fraction of a cent.
+    fail_on_gap:
+        Mark the run Failed when a gap is found, so it alerts like any other
+        failure. The check itself still runs last and never aborts the scraping
+        passes; this only affects the run's final state. Set False to reduce it
+        to a logged warning.
 
     Returns the workflow-grain record count (not the pod count), so the flow's
     return value keeps its existing meaning for anything reading it.
     """
     report_date = _date.fromisoformat(date) if date else None
-    n = scrape_task(
+
+    # return_state=True so a failure here does NOT abort the rest of the flow.
+    #
+    # This task and the settled re-scrape below read DIFFERENT report-dates and
+    # have no data dependency on each other, but until 2026-09-07 a raise here
+    # took the whole run down with it. On 2026-09-06 that cost two days instead
+    # of one: Kubecost served `data: [null]` for 09-05 after the aggregator
+    # OOMKilled mid-batch, this task died on it at 02:00:00 before writing
+    # anything, and the age-3 re-scrape of 09-03 — which would have succeeded,
+    # its data being both present and settled — never ran. 09-03 is now pinned
+    # at scrape_age_days=1 permanently, because the flow schedules no third read.
+    #
+    # The outcome is still surfaced: the state is unwrapped at the end of the
+    # flow, after the independent work has had its chance, so a failed scrape
+    # still fails the run and still alerts.
+    main_state = scrape_task(
         bucket=bucket,
         region=region,
         base_url=base_url,
         pipeline=pipeline,
         report_date=report_date,
+        return_state=True,
     )
 
     if scrape_pod_costs:
@@ -262,5 +349,38 @@ def kubecost_cost_scraper(
             lookback_days=drift_probe_lookback_days,
             return_state=True,
         )
+
+    # Runs after the scraping passes so it sees what they just wrote, and
+    # best-effort like the others: a detector fault must not cost the night's
+    # scrape, which is the thing that cannot be redone later.
+    gap_state = (
+        detect_gaps_task(
+            bucket=bucket,
+            region=region,
+            since_days=gap_since_days,
+            min_capture=gap_min_capture,
+            min_core_hours=gap_min_core_hours,
+            return_state=True,
+        )
+        if detect_gaps
+        else None
+    )
+
+    # Unwrap last: raises the original exception if the main scrape failed, so
+    # the run is still marked Failed and still alerts — but only after the
+    # settled re-scrape and the probe have run independently of it.
+    n = main_state.result(raise_on_failure=True)
+
+    # A gap is escalated only once the scrape itself is known to have succeeded, so
+    # the run's failure reason is never the downstream symptom of an upstream failure.
+    if fail_on_gap and gap_state is not None and gap_state.is_completed():
+        results = gap_state.result(raise_on_failure=False)
+        if isinstance(results, list) and has_gap(results):
+            flagged = [g["date"] for g in results if g["missing"] or g["shortfall"]]
+            raise CostGapDetected(
+                f"Cost data incomplete for {', '.join(flagged)}. Re-scrape now "
+                "(kubecost_scraper.py --date <d>) — Kubecost keeps ~2 weeks, after which "
+                "the day can only be gap-filled by scripts/reconstruct_costs.py."
+            )
 
     return n

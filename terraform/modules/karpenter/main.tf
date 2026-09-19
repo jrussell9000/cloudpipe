@@ -96,6 +96,36 @@ resource "kubectl_manifest" "gpu-timeslice-nodeoverlay" {
   ]
 }
 
+# NodeOverlay (alpha) that makes Karpenter model 4 nvidia.com/gpu per node for the
+# gpu-dense-nodepool types (g5/g6/g6e 2xlarge), matching the device plugin's `dense`
+# profile (#374). Weight 10 so it wins over gpu-timeslice-3x, which matches the same
+# types by family.
+#
+# Ordering is gpu-nodepool -> this overlay -> gpu-dense-nodepool. The overlay must not
+# land while gpu-nodepool can still launch these types (it would model them at 4 but
+# they would advertise 3 there), and the dense pool should not exist before the overlay
+# (it would briefly be modelled at 3 and over-launch).
+resource "kubectl_manifest" "gpu-dense-timeslice-nodeoverlay" {
+  server_side_apply = true
+  force_conflicts   = true
+  yaml_body         = file("${path.module}/helm-values/gpu-dense-timeslice-nodeoverlay.yaml")
+  depends_on = [
+    kubectl_manifest.gpu-nodepool
+  ]
+}
+
+# Drought fallback pool at 4 slices per GPU (#374). No weight, so gpu-nodepool is
+# preferred; see the header of gpu-dense-nodepool.yaml.
+resource "kubectl_manifest" "gpu-dense-nodepool" {
+  server_side_apply = true
+  force_conflicts   = true
+  yaml_body         = file("${path.module}/helm-values/gpu-dense-nodepool.yaml")
+  depends_on = [
+    kubectl_manifest.gpu-nodeclass,
+    kubectl_manifest.gpu-dense-timeslice-nodeoverlay
+  ]
+}
+
 resource "kubectl_manifest" "cpu-light-nodepool" {
   server_side_apply = true
   force_conflicts   = true

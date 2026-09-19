@@ -270,6 +270,45 @@ resource "aws_ssm_parameter" "globus_source_base_path" {
   }
 }
 
+# When the Globus session behind the stored refresh token was established.
+#
+# Written by `globus login`, read by `globus doctor` and by the queue manager's
+# batch gate. Deliberately NOT derived from the secret's LastChangedDate: that
+# also moves when the secret is edited for an unrelated reason, which would
+# silently reset the clock a 300-subject batch depends on.
+#
+# Terraform creates it empty and never writes it again. An empty value reads as
+# "no login recorded", which the gate treats as unusable — the safe direction.
+resource "aws_ssm_parameter" "globus_session_established_at" {
+  name  = "/${var.name}/globus/session-established-at"
+  type  = "String"
+  value = "REPLACE_AFTER_GCS_SETUP"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  tags = {
+    Name = "${var.name}-globus-session-established-at"
+  }
+}
+
+resource "aws_ssm_parameter" "globus_staging_session_established_at" {
+  count = var.globus_staging_enabled ? 1 : 0
+
+  name  = "/${var.name}/globus/staging/session-established-at"
+  type  = "String"
+  value = "REPLACE_AFTER_GCS_SETUP"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  tags = {
+    Name = "${var.name}-globus-staging-session-established-at"
+  }
+}
+
 # Placeholder — overwritten by gcs-finalize-setup after the one-time interactive
 # Globus OAuth2 setup. Workflow submissions read this value at runtime.
 resource "aws_ssm_parameter" "globus_collection_id" {

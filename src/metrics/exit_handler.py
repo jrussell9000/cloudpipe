@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     # only one bucket and it is the versioned metrics bucket.
     p.add_argument("--metrics-bucket", required=True)
     p.add_argument("--pipeline", default="cloudpipe_minproc")
+    # Free-text era/batch label, threaded from the workflow parameter of the same
+    # name. Optional: an unlabelled submission emits "" rather than failing, so
+    # ad-hoc single-subject reruns need not invent one.
+    p.add_argument("--batch-label", default="")
     p.add_argument("--region", default="<YOUR_AWS_REGION>")
     return p.parse_args()
 
@@ -251,6 +255,7 @@ def main() -> None:
         failed_step=failed_step,
         failure_category=failure_category,
         pipeline=args.pipeline,
+        batch_label=args.batch_label,
         completed_at=now,
     )
     run_key = WorkflowRun.s3_key(args.workflow_name, args.subject, dt=now[:10])
