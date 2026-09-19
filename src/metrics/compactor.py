@@ -170,11 +170,15 @@ def build_table(records: list[dict]):
     return pa.Table.from_pylist(records)
 
 
-def write_parquet_to_s3(s3_client, table, bucket: str, key: str) -> None:
+def write_parquet_to_s3(
+    s3_client, table, bucket: str, key: str, if_match: str | None = None
+) -> None:
     """Serialize `table` to Parquet in memory and put_object it to S3.
 
     Deliberately reuses the plain put_object idiom from writer.py::emit_to_s3
     (no pyarrow.fs.S3FileSystem) so there's one S3-write path in src/metrics/.
+    `if_match` makes the write conditional on the object still carrying that
+    ETag, for a read-modify-write that must not clobber a concurrent rewrite.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -182,7 +186,10 @@ def write_parquet_to_s3(s3_client, table, bucket: str, key: str) -> None:
     sink = pa.BufferOutputStream()
     pq.write_table(table, sink)
     body = sink.getvalue().to_pybytes()
-    s3_client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/octet-stream")
+    conditional = {"IfMatch": if_match} if if_match else {}
+    s3_client.put_object(
+        Bucket=bucket, Key=key, Body=body, ContentType="application/octet-stream", **conditional
+    )
     log.info("Wrote compacted parquet: s3://%s/%s (%d rows)", bucket, key, table.num_rows)
 
 
@@ -274,6 +281,97 @@ def repair_orphan_partitions(
             dt,
         )
     return neutralized
+
+
+class UnattributableRows(Exception):
+    """A compacted file without the column to match on, so no row can be matched.
+
+    Its own class, not ValueError: pyarrow's ArrowInvalid (a corrupt file) IS
+    a ValueError, and a caller has to tell "nothing to match on" from "broken".
+    """
+
+
+_KEY_SEP = "\x1f"  # ASCII unit separator: cannot occur in an ID, a timestamp, or a task name
+
+
+def composite_key(parts) -> str:
+    """The string drop_rows compares a multi-column row identity by."""
+    return _KEY_SEP.join(parts)
+
+
+def drop_rows(
+    s3_client,
+    bucket: str,
+    key: str,
+    column: str | tuple[str, ...],
+    values,
+    write: bool = True,
+    *,
+    complement: bool = False,
+) -> int:
+    """Remove every row whose `column` is in `values` — or, with `complement`,
+    NOT in `values` — from one compacted Parquet object, in place. Returns the
+    rows removed (with `write=False`, the rows that would be). A null in
+    `column` is never removed: it matches nothing, either way round.
+
+    `column` may be a tuple of columns, for tables whose rows carry no single
+    identifying column (the per-scan QC tables: a record is a scan plus its
+    `completed_at`). `values` are then tuples in the same order, and a row
+    matches only when every part matches. A null in ANY part makes the row's
+    identity null, so it is never removed — the same rule as the single column.
+
+    This is how a raw flush reaches compacted (GitHub #382). The compactor
+    alone never gets there: it rebuilds only the last few `dt`s from raw, so a
+    record flushed from an older day stays in `*_compacted` while raw — the
+    authority, see the module docstring — no longer has it, and the two tables
+    disagree about that history indefinitely. prep_test_batch drops the flushed
+    subjects; reconcile_compacted_with_raw.py keeps only the workflows raw
+    still holds (`complement`).
+
+    Same stance as repair_orphan_partitions: a PutObject rewrite, never a
+    delete, and the file keeps its own schema even when every row goes, so an
+    emptied partition reads as "no rows". The rewrite is conditional on the
+    ETag read, so a compactor run that rewrote the object in between fails
+    this write instead of being clobbered by a filtered copy of the old file.
+
+    Raises UnattributableRows for a file without `column`: its rows cannot be
+    attributed, and guessing would be deleting.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    table = pq.read_table(pa.BufferReader(obj["Body"].read()))
+    columns = (column,) if isinstance(column, str) else tuple(column)
+    missing = [c for c in columns if c not in table.column_names]
+    if missing:
+        raise UnattributableRows(
+            f"{key} has no {', '.join(missing)} column, so its rows cannot be attributed"
+        )
+
+    # Cast first: a column that is null on every row infers the `null` type,
+    # which is_in cannot compare against strings. is_in answers False (not
+    # null) for a null input, so inverting it would sweep every null row into
+    # `complement`'s drop set — the explicit is_valid is what keeps them.
+    # binary_join_element_wise emits null when any part is null, so a composite
+    # identity inherits that rule unchanged.
+    parts = [table[c].cast(pa.string()) for c in columns]
+    if len(parts) == 1:
+        col, wanted = parts[0], sorted(values)
+    else:
+        col = pc.binary_join_element_wise(*parts, _KEY_SEP)
+        wanted = sorted(composite_key(v) for v in values)
+    hit = pc.is_in(col, value_set=pa.array(wanted, type=pa.string()))
+    if complement:
+        hit = pc.invert(hit)
+    hit = pc.and_(hit, pc.is_valid(col))
+    dropped = pc.sum(hit).as_py() or 0
+    if dropped and write:
+        write_parquet_to_s3(
+            s3_client, table.filter(pc.invert(hit)), bucket, key, if_match=obj["ETag"]
+        )
+    return dropped
 
 
 def compact_prefix_dt(

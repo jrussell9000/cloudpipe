@@ -40,9 +40,13 @@ spec:
         - name: status         # Argo task status: Succeeded | Failed | Skipped | Error
         - name: message        # Argo task message (may be empty); not available as a DAG task variable
           default: ""
-        # {{tasks.<name>.exitCode}} — the only failure detail a DAG task does
-        # expose. Without it every DAG-recorded failure classifies as "unknown",
-        # because the taxonomy has no message to match against.
+        # The task's exitCode — the only failure detail a DAG task does expose.
+        # Without it every DAG-recorded failure classifies as "unknown", because
+        # the taxonomy has no message to match against. Callers must pass
+        # `{{= tasks['<name>'].exitCode ?? '' }}`, not the bare simple tag: a
+        # node that failed before its main container ran has no exitCode, and
+        # the bare tag hangs the caller's DAG (see registration's bold-to-t1w
+        # failure arm). "" is treated as "no code".
         - name: exit-code
           default: ""
         - name: subject
@@ -60,7 +64,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:6df3d28acabb21cbde45ca04806bc5e9f50c3a770fb73eb60186d9c2e79247a5"
       imagePullPolicy: IfNotPresent
 
       resources:

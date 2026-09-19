@@ -24,6 +24,7 @@ Usage
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 _POLL_INTERVAL = 2.0  # seconds between Athena status polls
@@ -191,6 +192,7 @@ _UNION_COLUMNS = {
         "failed_step",
         "failure_category",
         "pipeline",
+        "batch_label",
         "completed_at",
     ],
     # The ONE table whose two Glue declarations are not raw+schema_version.
@@ -245,6 +247,15 @@ _UNION_COLUMNS = {
         "run",
         "pipeline",
         "completed_at",
+        # Schema 2.7, t1w_to_mni only: RANDOM-rescue provenance
+        # (fst1w_to_mni.py::rescue_provenance). NULL on earlier and bold_to_t1w rows.
+        "sampling_strategy",
+        "rescue_ticket",
+        "sampling_seed",
+        "itk_threads",
+        "attempts_run",
+        "none_lncc",
+        "none_jac_det_frac_negative",
     ],
     "costs": [
         "date",
@@ -256,6 +267,11 @@ _UNION_COLUMNS = {
         "gpu_cost_usd",
         "total_adjustment_usd",
         "scrape_age_days",
+        # Schema 1.3+: "kubecost" | "reconstructed", NULL on older rows (all
+        # scraped). scraped_total_cost_usd holds what a reconstructed row
+        # replaced. See CostAllocation.
+        "source",
+        "scraped_total_cost_usd",
         "pipeline",
         "completed_at",
     ],
@@ -593,6 +609,15 @@ class CloudpipeMetrics:
         self._workgroup = workgroup
         self._results_bucket = finops_bucket or bucket
         self._results_prefix = output_prefix
+        # Optional progress hook: fn(phase, info). Phases are "waiting" (Athena is still
+        # running the query), "fetching" (paginating results) and "done". A cohort export
+        # spends minutes per table with nothing on screen otherwise — result pagination
+        # alone is one API round-trip per 1,000 rows, so func_qc's 180k rows is ~180 calls.
+        self.progress: Callable[[str, dict], None] | None = None
+
+    def _emit(self, phase: str, **info: Any) -> None:
+        if self.progress is not None:
+            self.progress(phase, info)
 
     # ------------------------------------------------------------------
     # Public query methods
@@ -1201,6 +1226,7 @@ class CloudpipeMetrics:
     def _run_sql(self, sql: str):
         import pandas as pd
 
+        t0 = time.monotonic()
         output_location = f"s3://{self._results_bucket}/{self._results_prefix}/"
         resp = self._athena.start_query_execution(
             QueryString=sql,
@@ -1218,6 +1244,13 @@ class CloudpipeMetrics:
             if state in {"FAILED", "CANCELLED"}:
                 reason = status["QueryExecution"]["Status"].get("StateChangeReason", "")
                 raise RuntimeError(f"Athena query {qid} {state}: {reason}")
+            stats = status["QueryExecution"].get("Statistics") or {}
+            self._emit(
+                "waiting",
+                elapsed=time.monotonic() - t0,
+                state=state,
+                scanned_bytes=stats.get("DataScannedInBytes"),
+            )
             time.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
         else:
@@ -1241,7 +1274,11 @@ class CloudpipeMetrics:
                     # ever failed, a plain zip would silently drop trailing columns and
                     # hand back a DataFrame with missing values rather than an error.
                     rows.append(dict(zip(columns, values, strict=True)))
+            # Per page, not per row: Athena pages at 1,000 rows, which is the natural
+            # tick and keeps the hook off the hot path.
+            self._emit("fetching", rows=len(rows), elapsed=time.monotonic() - t0)
 
+        self._emit("done", rows=len(rows), elapsed=time.monotonic() - t0)
         df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=pd.Index(columns))
         # Cast first, rename second: col_types is keyed on the labels Athena
         # returned, so restoring the case before casting would leave the numeric

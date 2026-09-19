@@ -22,8 +22,8 @@ All infrastructure lives in `terraform/`. Run all Terraform commands from within
 | `metrics.tf` | Pipeline observability module (Glue database + hand-declared catalog tables, Athena workgroup, Grafana Pod Identity) |
 | `metrics_bucket.tf` | The `cloudpipe-metrics` bucket (versioned) that holds all QC/cost records |
 | `abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix |
-| `grafana.tf` | Grafana Helm release, ALB ingress, OIDC |
-| `logging.tf` | S3 log bucket, CloudTrail, Container Insights log groups |
+| `grafana.tf` | Grafana's Terraform-owned Secrets (Dex SSO client, local admin, image-renderer token) + OIDC ConfigMap. The release itself, its Ingress and the image renderer are GitOps (`gitops/apps/grafana/`) |
+| `logging.tf` | S3 log bucket, CloudTrail |
 | `dns.tf` | Route53 zone lookup, ACM certificates (us-east-1 + <YOUR_AWS_REGION>) |
 | `ecr.tf` | ECR private repositories (primary registry for pipeline images) |
 | `s3_lifecycle.tf` | S3 lifecycle rules for data bucket |
@@ -120,15 +120,23 @@ subnets via `tags: {karpenter.sh/discovery: cloudpipe}`, so node placement follo
 spot price and routinely piles ~70% of nodes into one AZ. Sizing headroom against an
 even three-way split will under-provision.
 
-### Client VPN
+### Remote access (Cloudflare WARP)
 
-AWS Client VPN provides private access to the EKS API (which has no public endpoint in steady state) and internal services. Required before using `kubectl`, `argo`, or the web UIs.
+The EKS API (no public endpoint in steady state) and all five web UIs are **private**: nothing is reachable from the internet. Operators connect the Cloudflare WARP client, enrolled with a UW-Madison NetID login (MFA required), before using `kubectl`, `argo`, the web UIs, `prefect deploy`, or the Kubecost scripts. See [ADR 014](decisions/014-cloudflare-tunnel-over-vpn.md) and plans 010/012.
+
+- **Path:** WARP → Cloudflare Gateway → tunnel `cloudpipe-eks` → `cloudflared` (two replicas, `gitops/apps/cloudflared/`) → the three private `/20`s, which the tunnel routes.
+- **Who:** one Access application, `private_services` (`terraform/cloudflare.tf`), covers TCP 443 and 80 on those subnets, gated by the `cluster_admins` policy. Adding a person there grants both `kubectl` reachability and the UIs; each UI still logs in separately through Dex.
+- **Which traffic:** the device profile's split tunnel is in **Include** mode for `var.vpc_cidr` only; everything else stays on the local network.
+- **Session:** the WARP identity lasts 24h. When it lapses, `kubectl` shows a *TLS handshake timeout* → `warp-cli debug access-reauth`.
+- **Web UIs:** served by one internal ALB — see [DNS and TLS](#dns-and-tls).
+
+### Client VPN (fallback, pending decommission)
+
+AWS Client VPN predates WARP and still works as a fallback: it source-NATs clients into the VPC CIDR, which the EKS API and the shared UI ALB's security groups trust. It is scheduled for removal after a soak with the VPN disconnected ([#359](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/359), plan 012 §6).
 
 - Client CIDR: `10.3.0.0/22`
-- **Full tunnel** (`var.split_tunnel` defaults to `false`) — *all* client traffic, including public internet, goes through the VPN. This is deliberate and load-bearing: with split tunnel, traffic to the web UIs' **public** ALB IPs never enters the tunnel, so it is never NAT'd into the client CIDR that the ALB security groups trust, and Grafana/ArgoCD/Argo become unreachable. See the comment on `variable "split_tunnel"` in `terraform/variables.tf` and the SG rules in `vpn.tf`, `grafana.tf`, `argocd.tf`.
+- **Full tunnel** (`var.split_tunnel` defaults to `false`). This was load-bearing while the web UIs had **public** ALBs: with split tunnel, traffic to their public IPs never entered the VPN, so it was never NAT'd into an address the ALB security groups trusted. With the UIs on an internal ALB, split tunnel would also work, but the setting is left alone until the VPN is removed.
 - Certificates: managed by Terraform (`certificate_validity_period_hours = 8760`, i.e. 1 year)
-
-A replacement (Cloudflare Tunnel + Access, on a **new** UW-Madison OIDC client independent of the one behind ArgoCD/Argo Workflows SSO) is **partially implemented** — [ADR 014](decisions/014-cloudflare-tunnel-over-vpn.md) phase 1. `terraform/cloudflare.tf` holds the tunnel and its private-subnet routes, and `gitops/apps/cloudflared/` deploys the connector (both landed in `dfc72fc`), and the Access identity provider federates UW-Madison NetID — verified end to end, MFA included, keyed on the `eduperson_principal_name` claim. The Access **application and policy** are the remaining gap, so nothing is reachable through the tunnel yet. Phase 1 is deliberately additive: **the VPN is still the only proven remote-access path** and stays up until `kubectl get nodes` succeeds through the tunnel with the VPN disconnected.
 
 ---
 
@@ -154,7 +162,8 @@ A replacement (Cloudflare Tunnel + Access, on a **new** UW-Madison OIDC client i
 | `kube-proxy` | Standard |
 | `metrics-server` | Runs on `backend` node group |
 | `eks-pod-identity-agent` | Installed `before_compute` so Pod Identity works from first node join |
-| `amazon-cloudwatch-observability` | Basic Container Insights **metrics** only (per-metric billing, not per-observation). Application Signals disabled. Container **logs** disabled (`containerLogs.enabled = false`), so no fluent-bit DaemonSet — pod logs go to S3 via Argo's log archive instead. Runs on `backend` node group. |
+
+`amazon-cloudwatch-observability` was **removed on 2026-09-08**. Container logs and Application Signals were already disabled, so ContainerInsights metrics were the addon's only remaining output — and nothing consumed them (0 CloudWatch alarms account-wide, no Grafana CloudWatch datasource, no reference to the namespace in this repo). Basic mode bills per unique metric, which is unbounded in pod count, so ephemeral Argo pods drove it to **$732 over the 2026-09-01..09-07 batch**. Cluster metrics come from Prometheus → Grafana. See the `addons` block in `terraform/eks.tf`.
 
 ### Managed node groups (always-on, fixed size)
 
@@ -170,20 +179,21 @@ The `backend` group is pinned to <YOUR_AWS_REGION>a so it is always co-located w
 
 ### Karpenter node pools (on-demand provisioning for pipeline workloads)
 
-There are **four** node pools. All are **spot-only** — no pool allows on-demand, and there is no on-demand fallback anywhere in the cluster.
+There are **five** node pools. All are **spot-only** — no pool allows on-demand, and there is no on-demand fallback anywhere in the cluster.
 
 | Node pool | Instance selection | Capacity type | Pool limits | Used by |
 |---|---|---|---|---|
 | `cpu-light-nodepool` | category `t` | spot | 160 CPU / 640 Gi | Globus control, inventory, S3 sync |
 | `cpu-heavy-nodepool` | category `c`,`m`; sizes 2xlarge, 4xlarge; nitro | spot | 2560 CPU / 10240 Gi | BOLD→T1w registration, functional preprocessing |
 | `first-level-nodepool` | families `m6gd`/`m7gd`/`r6gd`/`r7gd`/`c6gd`/`c7gd` (**Graviton/ARM64**, local NVMe); sizes xlarge–4xlarge | spot | 512 CPU / 4096 Gi | First-level (task-based) analysis |
-| `gpu-nodepool` | families `g4dn`/`g5`/`g6`/`g6e`; sizes xlarge, 2xlarge; nitro; zones <YOUR_AWS_REGION>a/b/c | spot | 512 CPU / 2048 Gi | T1w→MNI registration (FireANTs), FastSurfer template-build + long-segmentation |
+| `gpu-nodepool` | families `g4dn`/`g5`/`g6`/`g6e`; sizes xlarge, 2xlarge, **except** `g5`/`g6`/`g6e.2xlarge`; nitro; zones <YOUR_AWS_REGION>a/b/c; weight 10 (preferred) | spot | 512 CPU / 2048 Gi | T1w→MNI registration (FireANTs), FastSurfer template-build + long-segmentation |
+| `gpu-dense-nodepool` | types `g5.2xlarge`/`g6.2xlarge`/`g6e.2xlarge`; nitro; zones <YOUR_AWS_REGION>a/b/c; no weight (fallback) | spot | 512 CPU / 2048 Gi | The same three GPU steps, when every `gpu-nodepool` offering is out of capacity |
 
 The `Pool limits` column is the Karpenter `spec.limits` ceiling on aggregate provisioned capacity — a safety stop, not a reservation and not a statement of what a pool typically runs.
 
 `first-level-nodepool` is the only ARM64 pipeline pool; the `*gd` families are chosen for their local NVMe scratch. Images that run there must be built for ARM64 (see [images.md](images.md)).
 
-**GPU time-slicing.** A `NodeOverlay` (`gpu-timeslice-3x`) advertises **3** schedulable GPU slices per physical GPU, so up to 3 pods share one card. The count is capped by the smallest card in the pool — the g4dn's T4 has 15 GiB — not by the largest. A separate `g6f-fractional-gpu` overlay covers the fractional-GPU g6f family.
+**GPU time-slicing.** Slice counts are set per GPU pool. `gpu-nodepool` nodes carry **3** schedulable GPU slices per physical GPU: its smallest card, the g4dn's T4, has 15 GiB, and an xlarge has only ~3920m of CPU for `cpu: 1` pods. `gpu-dense-nodepool` nodes carry **4**. Those are 2xlarge nodes with a 22–45 GiB card, and 4 is the most that fits the largest per-pod VRAM: t1w-to-mni, measured at 4903 MiB per process. The pool shipped at 5, sized from an estimate of ~4.4 GiB, and was cut to 4 once the measurement showed four t1w-to-mni pods on one card would overflow. The count reaches Karpenter through a `NodeOverlay` per pool's types (`gpu-timeslice-3x`, and `gpu-dense-timeslice-4x` at weight 10). It reaches each node through the device-plugin profile selected by the `nvidia.com/device-plugin.config` label, which only the dense pool sets. Because overlays match instance types in every pool, the two pools must never admit the same type; `tests/argo/test_gpu_step_resources.py` enforces that and the other invariants. The GPU templates accept either pool through a `karpenter.sh/nodepool In` node affinity. A separate `g6f-fractional-gpu` overlay covers the fractional-GPU g6f family, which no pool currently admits.
 
 All Karpenter nodes consolidate to zero when empty (`consolidateAfter: 10m`). Disruption budgets allow removing up to 20% of nodes at a time.
 
@@ -273,7 +283,6 @@ All pod-level AWS permissions use EKS Pod Identity (not IRSA). Each service acco
 | `prefect-worker` | `prefect` | S3 read/write on `<YOUR_S3_BUCKET>`, SSM read on Globus params; K8s RBAC to create/manage Jobs in `prefect` ns and list/create Workflows in `argo-workflows` ns |
 | `ebs-csi-controller-sa` | `aws-ebs-csi-driver` | EBS CSI managed policy |
 | `external-dns` | `external-dns` | Route53 record management on `<YOUR_DOMAIN>` zone |
-| `cloudwatch-agent` | `amazon-cloudwatch` | CloudWatch agent policy |
 | `external-secrets` | `external-secrets` | Secrets Manager `GetSecretValue` (for ClusterSecretStore) |
 | `grafana` | `grafana` | Athena query on `cloudpipe_metrics_workgroup` + Glue read on the `cloudpipe_metrics` catalog/database/tables; S3 read on `cloudpipe-metrics/metrics/*`; S3 read+write on `cloudpipe-finops/grafana-query-results/*` |
 
@@ -316,9 +325,19 @@ Service hostnames are derived from `var.domain` in `locals.tf` — changing the 
 
 Two ACM certificates:
 - `us-east-1` — required by services that use CloudFront
-- `<YOUR_AWS_REGION>` — used by ALB listeners for all four services above
+- `<YOUR_AWS_REGION>` — the `*.<YOUR_DOMAIN>` wildcard, used by the web-UI ALB's HTTPS listener for all five hostnames above
 
 External DNS (running in `external-dns` namespace, managed by ArgoCD) automatically creates Route53 records for Kubernetes Ingress objects.
+
+### Web-UI load balancer
+
+All five hostnames are aliases for **one `internal` ALB**, shared through the AWS Load Balancer Controller IngressGroup `cloudpipe-ui` ([#360](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/360), plan 012). Each UI keeps its own Ingress (host rule, backend, health check); the ALB-level settings are shared.
+
+- **Group-level annotations must be byte-identical on every member**, or the controller stops reconciling the *whole* ALB. Four members are Terraform (`argocd.tf` and the `argo-workflows`, `prefect`, `finops` modules), which all merge `local.ui_alb_group_annotations` from `terraform/ui_alb.tf`. Grafana's Ingress is GitOps-managed (`gitops/apps/grafana/values.yaml`) and hardcodes the same values; a precondition on the ArgoCD Ingress **fails `terraform plan`** if they differ, so change both together.
+- **Security group** `cloudpipe-ui-alb-sg` (`ui_alb.tf`) admits 443/80 from `var.vpc_cidr` only. Members reference it by its Name tag, because Grafana's values cannot take a Terraform ID.
+- **DNS:** the records live in the public zone and resolve to the ALB's private IPs, both from the internet and from a WARP client — no split-horizon zone. In-cluster callers (Argo Workflows, Prefect and Grafana reaching Dex at `argocd.<domain>`) resolve the same way and reach the ALB directly inside the VPC.
+- **Access logs:** one prefix, `alb-ui/`, in `cloudpipe-logging-access`. Filter per UI on each log line's `domain_name` field.
+- **Teardown:** the ALB is deleted only once every member Ingress is gone. `terraform/cleanup.sh` stops the ArgoCD controllers first so the Grafana Ingress is not recreated, then waits on the `ingress.k8s.aws/stack=cloudpipe-ui` tag.
 
 ---
 
@@ -327,7 +346,7 @@ External DNS (running in `external-dns` namespace, managed by ArgoCD) automatica
 | Log stream | Destination | Retention |
 |---|---|---|
 | EKS control plane (api, audit, authenticator) | CloudWatch log group `/aws/eks/cloudpipe/cluster` | 365 days, KMS encrypted |
-| Container Insights **metrics** (basic mode) | CloudWatch | Default (15 months) |
+| Container Insights **metrics** | *removed 2026-09-08* — cluster metrics come from Prometheus → Grafana | — |
 | Container **logs** (pod stdout/stderr) | S3 `<YOUR_S3_BUCKET>/logs/{workflow}/{pod}/main.log` — *not* CloudWatch | Bucket lifecycle |
 | VPC flow logs | `cloudpipe-logging/vpc-flow-logs/` | 90d → Glacier → 3y expiry |
 | CloudTrail (all regions, all mgmt events + S3 data events on `<YOUR_S3_BUCKET>`) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
@@ -337,7 +356,7 @@ Pipeline pod logs are **not** forwarded to CloudWatch. Use the Argo UI or `argo 
 
 Until 2026-08-11 the addon's fluent-bit DaemonSet *did* also ship every pod's stdout to `/aws/containerinsights/cloudpipe/{application,argo-workflows}`, a second copy of the same bytes that nothing in this repo read. Measured over a 200-subject batch window it ingested ~234 GB/month, ≈$139/month all-in, so `containerLogs.enabled = false` turned it off. If searchable workflow logs are wanted, build them over the S3 archive (Athena or an OpenSearch ingest) — do not re-enable the addon's log path. Note this is unrelated to the control-plane `audit`/`authenticator` streams above, which are a NIST 800-171 control and stay.
 
-Container Insights runs in basic mode (`kubernetes: {}` config only — per-metric billing). Enhanced mode and Application Signals are explicitly disabled to avoid ~$80/month in unnecessary APM charges for batch workloads.
+Container Insights was removed entirely on 2026-09-08, for the same reason fluent-bit went: nothing read it. The addon had already been trimmed to metrics only, and basic mode's per-metric billing turned out to be the worst possible fit for this workload — it bills per *unique* metric, so every ephemeral Argo pod name minted new billable metrics at $0.30 each. Metric-months/day tracked pod churn 32x across the 2026-09-01..09-07 batch (20.9 idle → 679 peak → 9.9 once drained), costing **$675.78 in metrics plus $56.55 ingesting the performance log group that backed them**. Enhanced (per-observation) mode would have been *cheaper*, being bounded by scrape rate rather than pod count — the earlier note claiming basic was "far cheaper" had this backwards. If ContainerInsights is ever wanted back, use enhanced mode and give it a consumer first.
 
 ---
 

@@ -213,12 +213,22 @@ HA collections require periodic reauthentication — the gateway's session timeo
 (see [High Assurance](#high-assurance)). When it lapses, `transfer.py` fails with the
 misleading authorization error above.
 
+From the repo root, run:
 ```bash
 export GLOBUS_NATIVE_APP_CLIENT_ID=<YOUR_GLOBUS_NATIVE_APP_CLIENT_ID>
-python images/globus/setup_auth.py
+pixi run python images/globus/setup_auth.py
 ```
 
 `setup_auth.py` stores the new token in Secrets Manager and forces an immediate K8s secret sync by annotating the ExternalSecret. No `--dest-collection-id` is needed for HA collections.
+
+**Stopgap while the session is lapsed:** subjects whose input is *already* in S3 can keep
+processing with `ingress-mode=presynced`, which never touches Globus
+([data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced)). The
+scope is narrower than it sounds. `mmps_mproc/` is transient staging: a successful run deletes
+its subject's input, and a transfer that failed on the lapsed session staged nothing. So
+presynced only helps subjects whose input survived an *unsuccessful* earlier run. Guessing
+wrong is cheap — the staged-input validator fails in one cpu-light pod on an empty prefix — but
+it is not a substitute for re-authenticating.
 
 To force an immediate K8s secret sync manually (without waiting for the hourly ESO refresh):
 ```bash

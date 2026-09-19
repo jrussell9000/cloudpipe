@@ -2,7 +2,10 @@
 
 Day-2 reference for submitting pipelines, monitoring progress, handling failures, and updating code.
 
-**Prerequisite**: connect to the AWS Client VPN before using any CLI or web UI listed below. The EKS API endpoint is private. If VPN/web-app access is misbehaving (can't connect at all, connects but no internet, web apps unreachable from a Windows browser), see [docs/investigations/2026-07-16-vpn-remote-access-troubleshooting.md](https://github.com/jrussell9000/cloudpipe/blob/main/docs/investigations/2026-07-16-vpn-remote-access-troubleshooting.md) before re-diagnosing from scratch.
+**Prerequisite**: connect **Cloudflare WARP** before using any CLI or web UI listed below — `kubectl`, `argo`, every Service URL, `prefect deploy` / `PREFECT_API_URL=https://prefect.…`, and the Kubecost scripts (`scripts/kubecost_data_harvest.py`, `scripts/cloudpipe_minproc_costs.py`, `src/validate_test_batch.py`). The EKS API endpoint and the web-UI load balancer are both private; without WARP every hostname resolves but **times out**. See [infrastructure.md → Remote access](infrastructure.md#remote-access-cloudflare-warp).
+
+- WARP's session lasts 24h. A *TLS handshake timeout* (kubectl) or a hanging page usually means it lapsed: `warp-cli debug access-reauth` (PowerShell: `& "C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe" debug access-reauth`).
+- The AWS Client VPN still works as a fallback until it is decommissioned. For VPN-specific trouble, see [docs/investigations/2026-07-16-vpn-remote-access-troubleshooting.md](https://github.com/jrussell9000/cloudpipe/blob/main/docs/investigations/2026-07-16-vpn-remote-access-troubleshooting.md).
 
 ---
 
@@ -40,6 +43,9 @@ Common optional parameters:
 | `globus_source_collection_id` | (from SSM) | Override source Globus collection UUID |
 | `globus_source_base_path` | (from SSM) | Override source base path |
 | `globus_dest_base_path` | `/mmps_mproc` | Destination path within GCS collection |
+| `ingress_mode` | `globus` | `presynced` skips Globus and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else fails the flow at start |
+
+`ingress_mode` (like `batch_label`) exists only once the deployment has been re-registered with `prefect deploy --all`; until then `-p ingress_mode=…` fails with "parameters were specified but not found on the deployment".
 
 `max_concurrent` is **not** a flow parameter — `prefect deployment run -p max_concurrent=N` has no effect. Concurrency is controlled live via the Prefect Variable `cloudpipe-max-concurrent` (code default `50`), checked on every poll cycle:
 
@@ -58,6 +64,14 @@ prefect variable get cloudpipe-max-concurrent
 The 2026-08-10 batch ran at `100` while every doc said `50` (#206). The Variable persists across runs, so whatever the last batch set is what the next one inherits.
 
 The Variable is capped server-side by the controller's `namespaceParallelism` (`400`, namespace-wide across both pipelines — see [ADR 008](decisions/008-prefect-as-queue-manager.md)). Raising a Variable above that does **not** raise the effective cap: the surplus workflows are still submitted, then held `Pending` by the controller, which presents as a stalled batch rather than a submission error. To go above 400 concurrent, raise `namespaceParallelism` in `terraform/modules/argo-workflows/main.tf` and apply first.
+
+**Arrivals are paced separately** by the Prefect Variable `cloudpipe-max-submissions-per-minute` (code default `5`; `0` disables pacing), also re-read live:
+
+```bash
+prefect variable set cloudpipe-max-submissions-per-minute 5
+```
+
+The cap limits how many workflows stand at once, not how fast they arrive. Unpaced, a cold start admits the cap's whole width in minutes, and the resulting control-plane throttle leaked the `globus-transfer` semaphore and wedged workflows on 2026-09-14 ([#393](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/393)). So don't ramp `cloudpipe-max-concurrent` by hand to smooth a start; pacing already does it. The default is above the globus-transfer drain (~2.4 subjects/min), so pacing never becomes the bottleneck of a globus batch. It has not yet been calibrated against a cold start. Each `submitted` log line ends with `paced Ns`, how long pacing held that submission; waits on the cap are logged separately as `N active ≥ cap`.
 
 Globus destination collection UUID is always read from SSM (`/cloudpipe/globus/collection-id`) at runtime, so instance replacements take effect automatically.
 
@@ -83,6 +97,8 @@ argo submit --from workflowtemplate/cloudpipe \
 Always use `submit --from workflowtemplate/` — never `resubmit` (resubmit snapshots the template from the prior run and ignores any template updates).
 
 `bucket` and `ecr-registry` are read automatically from the `cloudpipe-config` ConfigMap and do not need to be specified. Globus collection UUIDs are read from SSM at submission time.
+
+For data already staged in S3, add `-p ingress-mode=presynced` and pass the `globus-*` parameters empty — the full command is in [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced).
 
 ### fmri-first-level-proc (via Prefect)
 
@@ -240,11 +256,26 @@ argo list -n argo-workflows --running -o json \
 Restart Prefect with `start_index` set to the first unprocessed subject:
 ```bash
 prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
-  -p subjects_file=s3://<YOUR_S3_BUCKET>/subjects.csv \
-  -p start_index=150
+  -p subjects_file=s3://<YOUR_S3_BUCKET>/subjects_v611.csv \
+  -p start_index=150 \
+  -p batch_label=leg-2
 ```
 
-The inventory step checks S3 for existing derivatives — already-completed steps are skipped automatically on resubmission.
+Always pass `subjects_file` explicitly. The deployment's stored default is
+`s3://<YOUR_S3_BUCKET>/subjects.csv`, which **404s — it has never existed**; the real cohort CSV is
+`subjects_v611.csv`.
+
+Pass `batch_label` on anything you will later want to isolate in the metrics. It is stamped onto
+every `WorkflowRun` record in the submission, and it is the only reliable way to separate one run
+from another: batches whose workflows straddle a UTC midnight cannot be told apart by `dt` at all,
+and before this field existed the pre-leg-1 test batches and leg 1 shared the `2026-08-18`
+partition. Records written before 2026-09-02 predate the field and read back **`NULL`**, not `''`
+— so `batch_label = ''` selects only unlabelled runs from schema 1.2 onward. Use
+`COALESCE(batch_label, '') = ''` for "unlabelled", and `started_at` for anything historical.
+
+Resume with the **complete ordered CSV** and a moved `start_index` — never a filtered remainder.
+The inventory step checks S3 for existing derivatives, so already-completed subjects cost one
+Globus transfer plus an inventory pod and then skip the rest.
 
 ---
 
@@ -416,7 +447,9 @@ The script:
 3. Deletes workflow-keyed metrics (`step-outcomes`, `workflow-runs`, `subject-manifests`)
    by matching the subject ID in the object key
 4. Deletes `metrics/costs/` records belonging to the batch subjects (see below)
-5. Prints cluster node pool status and Globus instance state
+5. Filters the same subjects' rows out of the compacted Parquet of every table it just
+   flushed raw records from (see below)
+6. Prints cluster node pool status and Globus instance state
 
 `metrics/workflow-runs/` and `metrics/subject-manifests/` filenames embed the subject ID
 (`{workflow-name}__{subject}_...json`), so they're flushed per-subject by key matching.
@@ -430,17 +463,26 @@ dashboards read the raw tables, so records from subjects processed by an earlier
 survive and mix into every panel. That is what `--flush-qc` is for:
 
 ```bash
-# fresh-start batch: also flush per-scan QC, pod-costs/workflow-starts, and ALL compacted Parquet
+# fresh-start batch: also flush per-scan QC and pod-costs/workflow-starts
 pixi run python scripts/prep_test_batch.py tools/cloudpipe_test_sample.csv \
   --metrics-bucket cloudpipe-metrics --flush-qc
 ```
 
 `--flush-qc` additionally removes `metrics/pod-costs/` and `metrics/workflow-starts/` (both
-workflow-keyed, resolved through the same workflow→subject index as costs) and **all** of
-`metrics/compacted/`. The compacted Parquet is not subject-scopable — one file packs many
-subjects — so it is all-or-nothing; the compactor rebuilds it from the raw records on its
-next run. Leaving it would keep the `*_compacted` Athena tables serving rows whose underlying
-raw records were just deleted.
+workflow-keyed, resolved through the same workflow→subject index as costs).
+
+**Both modes flush compacted too, per subject.** Every table whose raw records are deleted
+has its `*_compacted` twin filtered the same way: the batch subjects' rows are removed from
+each Parquet file in place (one file packs many subjects, so it is rewritten, never deleted),
+and every other subject's history stays. This is what makes a flushed attempt stop counting
+everywhere at once
+([#382](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/382)) — the nightly
+compactor rebuilds only its last four days, so without it an older day's compacted copy kept
+the flushed rows while raw and the dashboards did not. (`--flush-qc` used to delete **all**
+of `metrics/compacted/` on the theory that the compactor rebuilds it; it rebuilds four days,
+so that erased every older day for every subject.) The compacted pass runs last, and if any
+file fails it exits 1 and says so: re-run the same command before submitting — the raw and
+derivative deletes are already done, so a re-run only finishes the compacted pass.
 
 > **Ordering trap.** `pod-costs` and `workflow-starts` resolve their subject through
 > `metrics/workflow-runs/`. If that index is already gone (a prior default flush deleted it),
@@ -492,6 +534,7 @@ prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
 ```bash
 prefect variable get cloudpipe-max-concurrent   # confirm, then override if needed
 prefect variable set cloudpipe-max-concurrent <N>
+prefect variable get cloudpipe-max-submissions-per-minute   # arrival pacing; 0 = unpaced
 ```
 
 Record the value you confirmed alongside the submission timestamp: it is what the batch's cost and runtime baselines are conditioned on.

@@ -74,12 +74,20 @@ spec:
               value: '{{inputs.parameters.nss-frames}}'
         when: '{{= len(filter(jsonpath(inputs.parameters.runs, "$[*]"), {#.b2t_exists == false})) }} > 0'
 
-      # Record T1w→MNI outcome (per session, non-critical).
+      # Record T1w→MNI outcome (per session, non-critical). This step has no
+      # in-pod recording, so unlike bold-to-t1w the recorder fires on success too.
+      #
+      # SPLIT into a success/skip arm and a failure arm, for the same reason as
+      # the bold-to-t1w pair below: only the failure arm may reference exitCode,
+      # because it is the only one that can never fire for a SKIPPED producer
+      # (this step is skipped whenever inventory found the affine). Together the
+      # two `depends` cover exactly what the old single task did — a bare name is
+      # Succeeded||Skipped||Daemoned — so the set of absorbed outcomes, and
+      # therefore registration-dagtask's own phase, is unchanged.
+      #
+      # Success/skip arm: no exitCode reference.
       - name: record-outcome-t1w-to-mni-step
-        depends: >-
-          t1w-to-mni-step ||
-          t1w-to-mni-step.Failed ||
-          t1w-to-mni-step.Skipped
+        depends: t1w-to-mni-step
         templateRef:
           name: outcome-recorder
           template: record-step-outcome
@@ -89,6 +97,43 @@ spec:
               value: t1w-to-mni
             - name: status
               value: '{{tasks.t1w-to-mni-step.status}}'
+            - name: subject
+              value: '{{workflow.parameters.subjID}}'
+            - name: session
+              value: '{{inputs.parameters.session}}'
+            - name: bucket
+              value: '{{workflow.parameters.bucket}}'
+            - name: metrics-bucket
+              value: '{{workflow.parameters.metrics-bucket}}'
+
+      # Failure arm: carries the exit code (#368). Without it, a QC-gate
+      # rejection (fst1w_to_mni.py exits 65 BEFORE promoting outputs) reached the
+      # recorder as a bare Failed with an empty S3 prefix, and was written as
+      # `failure_category: unknown` / `failure_reason: expected output not found:
+      # ...affine.mat` — a crash-shaped record for a gate working as designed.
+      # 837 of the cohort's t1w-to-mni failures were that shape, every one a
+      # `verdict: fail` in the registration QC corpus.
+      #
+      # `.Errored` is deliberately NOT added here, although the bold-to-t1w arm
+      # has it: the old task did not absorb Errored, and absorbing it would turn
+      # a failed registration-dagtask into a succeeded one. The master DAG's
+      # whitelist gate on t1w-to-mni-status would still stop func-preproc, but
+      # that is a phase change to make on its own, not as a side effect.
+      - name: record-outcome-t1w-to-mni-failed-step
+        depends: t1w-to-mni-step.Failed
+        templateRef:
+          name: outcome-recorder
+          template: record-step-outcome
+        arguments:
+          parameters:
+            - name: step
+              value: t1w-to-mni
+            - name: status
+              value: '{{tasks.t1w-to-mni-step.status}}'
+            # 65 classifies as `qc_rejected`; 137/143 as `infrastructure`.
+            # `?? ''` is load-bearing, not style: see the bold-to-t1w failure arm.
+            - name: exit-code
+              value: "{{= tasks['t1w-to-mni-step'].exitCode ?? '' }}"
             - name: subject
               value: '{{workflow.parameters.subjID}}'
             - name: session
@@ -129,8 +174,21 @@ spec:
       # fallback recorder is the ONLY place the cause can be captured, which is
       # why it has to carry the code.
       #
-      # exitCode is safe on THIS arm because the arm cannot fire for a skipped
-      # task: it depends on Failed/Errored only.
+      # Gating on Failed/Errored keeps a SKIPPED producer away from this arm, but
+      # it does NOT guarantee an exit code exists. Argo records exitCode only
+      # when the main container terminated; a step that dies in its init
+      # container (artifact staging, `init: Error (exit code 64)` — the 64 is in
+      # the message, not in exitCode) or whose pod is deleted before main runs
+      # is Failed/Errored with no exitCode at all. A bare
+      # `{{tasks.bold-to-t1w-step.exitCode}}` then fails the controller's strict
+      # tasks.* resolution, which REQUEUES instead of erroring: this task is
+      # never instantiated, the DAG waits forever, and the workflow's
+      # activeDeadlineSeconds does not fire either (the requeue returns before
+      # deadline enforcement). Probed on v4.1.3, argo-4-1-3-probe-sb56d,
+      # 2026-09-15: bare form never instantiated and ran 4+ min past a 600s
+      # deadline until terminated; the `??` form below ran and passed ''.
+      # `??` needs Argo >= 4.0.7 (#16274); '' is what outcome_recorder treats as
+      # "no code".
       - name: record-outcome-bold-to-t1w-failed-step
         depends: >-
           bold-to-t1w-step.Failed ||
@@ -150,8 +208,12 @@ spec:
             # separable after the fact: a reclaim is retried on the message arm and
             # normally succeeds, so a bold-to-t1w that EXHAUSTS its retries and ends
             # at 137 is the OOM population to re-run at higher memory.
+            #
+            # 65 classifies as `qc_rejected`: the driver exits 65 when every run
+            # it attempted was a QC rejection and no run already had a transform
+            # (session_exit_code, #368, #388).
             - name: exit-code
-              value: '{{tasks.bold-to-t1w-step.exitCode}}'
+              value: "{{= tasks['bold-to-t1w-step'].exitCode ?? '' }}"
             - name: subject
               value: '{{workflow.parameters.subjID}}'
             - name: session
@@ -188,7 +250,7 @@ spec:
         # Exposed so the master DAG can gate functional-preprocessing on the
         # real t1w-to-mni-step outcome. registration-dagtask itself reports
         # Succeeded even when t1w-to-mni-step fails, because
-        # record-outcome-t1w-to-mni-step's `depends: ... || t1w-to-mni-step.Failed`
+        # record-outcome-t1w-to-mni-failed-step's `depends: t1w-to-mni-step.Failed`
         # absorbs the failure — so the aggregate status alone can't be used
         # to gate on this per-session, shared-across-all-runs prerequisite.
         - name: t1w-to-mni-status
@@ -219,12 +281,12 @@ spec:
   # T1w → MNI152NLin2009cAsym
   # Runs once per session.  Affine + SyN via FireANTs (GPU).
   #
-  # Coordinate space consistency: bbregister (bold_to_t1w.py) produces a
-  # BOLD→T1w transform referenced to FreeSurfer conformed space (orig.mgz,
+  # Coordinate space consistency: SynthMorph (bold_to_t1w.py) produces a
+  # BOLD→T1w transform referenced to FreeSurfer conformed space (T1.mgz,
   # 256³ 1mm isotropic).  To ensure the T1w→MNI transform shares the same
-  # source space, fst1w_to_mni.py receives orig.mgz converted to NIfTI
-  # rather than the BIDS T1w.nii.gz.  brainmask.mgz is already in the same
-  # conformed space as orig.mgz, so both are converted directly (no --like).
+  # source space, fst1w_to_mni.py receives orig.mgz (read via nibabel, no
+  # mri_convert) rather than the BIDS T1w.nii.gz.  brainmask.mgz is already in
+  # the same conformed space as orig.mgz, so both are read directly (no --like).
   #
   # Outputs uploaded individually to S3 (no tar — no symlinks):
   #   derivatives/registration/{subj}/{ses}/t1w_to_mni/
@@ -390,8 +452,28 @@ spec:
             region: <YOUR_AWS_REGION>
             key: 'metrics/registration/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
 
-    nodeSelector:
-      karpenter.sh/nodepool: gpu-nodepool
+    # Either GPU pool (#374): gpu-nodepool is preferred by weight, gpu-dense-nodepool
+    # is the drought fallback at 4 slices/GPU. This step's 4903 MiB (measured,
+    # scripts/manifests/gpu-t1w-vram-probe.yaml) is the largest per-pod VRAM of the
+    # three GPU steps and is what sets that 4 — see
+    # terraform/modules/karpenter/helm-values/gpu-dense-nodepool.yaml.
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: karpenter.sh/nodepool
+                  operator: In
+                  values:
+                    - gpu-nodepool
+                    - gpu-dense-nodepool
+
+    # Highest of the three GPU ranks (#370). ~30 s of GPU that unblocks a whole
+    # session's functional phase, so it is the cheapest step to let jump a
+    # scarce-slice queue. `preemptionPolicy: Never` on the class means this
+    # never displaces a running long-segmentation — see the class definitions in
+    # gitops/apps/cluster-config/templates/gpu-priority-classes.yaml.
+    priorityClassName: cloudpipe-gpu-t1w-to-mni
 
     # /work is local scratch, NOT the shared EFS volume (see the equivalent note
     # on bold-to-t1w-session-template). It must be a declared emptyDir: Argo
@@ -405,7 +487,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:4730e00580ea1dd4622e73341ba4c35ad6257b2fe682816baa507290ae46d21c"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:303225d3838713cdb8ae998915ea30ec0a3b17f06ab8ed51268e5a1e68436946"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -503,8 +585,8 @@ spec:
   ###########################################################################
   # BOLD reference → T1w — ONE pod per session, looping over that session's runs.
   #
-  # Uses SynthMorph (contrast-agnostic deep learning affine registration).
-  # Single forward pass ~5 s vs bbregister ~5-10 min.
+  # Uses SynthMorph (contrast-agnostic deep learning rigid registration, -m rigid).
+  # ~45-50 s per run at cpu: 2 (see resources below) vs bbregister ~5-10 min.
   #
   # The LTA output is converted to an ANTs/ITK .mat in Python (RAS→LPS flip)
   # for use in antsApplyTransforms.
@@ -660,7 +742,8 @@ spec:
         # WHOLE TREE (ADR 017), unlike t1w-to-mni above: this step is handed
         # `--subjects-dir` and treats the tree as an opaque SUBJECTS_DIR, so it is
         # staged in full rather than by named file. Narrowing it to the handful of
-        # files mri_coreg/bbregister actually touch is a follow-up, not a blocker.
+        # files bold_to_t1w.py actually reads (mri/T1.mgz, mri/brainmask.mgz,
+        # mri/aseg.auto.mgz) is a follow-up, not a blocker.
         #
         # The key names a PREFIX and must NOT carry a trailing slash: an input
         # artifact key ending in `/` silently downloads nothing (an output key is
@@ -749,7 +832,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:1ee2554075b40c90659b82faaa1113f542fb936d8015dc2529326ce9c707f91d"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:985e30bfc07718fe134762ab57b0708aaa2a0abc391773eb2045f0cdc987f49a"
       imagePullPolicy: IfNotPresent
 
       # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the
@@ -1114,7 +1197,23 @@ spec:
                         return category
             return "unknown"
 
-        def write_outcome(step, task, run, status, failure_reason=""):
+        # bold_to_t1w.py exits 65, and only 65, when its QC gate rejects the run
+        # (see QC_REJECTED_EXIT_CODE in src/metrics/outcome_recorder.py, which
+        # maps it to the same category — test_driver_gating asserts the two
+        # agree). The driver holds rc directly, so it sets the category from the
+        # code instead of pattern-matching its own reason string: that string
+        # ("bold_to_t1w.py exited 65") matched no taxonomy pattern, which is how
+        # 180 rejections were recorded `unknown` (#368). The string itself is
+        # unchanged, because validate_test_batch.B2T_QC_REJECTION_RE keys on it.
+        QC_REJECTED_EXIT_CODE = 65
+
+        def write_outcome(step, task, run, status, failure_reason="", exit_code=None):
+            if status == "succeeded":
+                category = ""
+            elif exit_code == QC_REJECTED_EXIT_CODE:
+                category = "qc_rejected"
+            else:
+                category = classify_failure(failure_reason)
             record = {
                 "workflow_name": WORKFLOW_NAME,
                 "step": step,
@@ -1123,7 +1222,7 @@ spec:
                 "task": task,
                 "run": run,
                 "status": status,
-                "failure_category": "" if status == "succeeded" else classify_failure(failure_reason),
+                "failure_category": category,
                 "failure_reason": failure_reason,
                 "upstream_failed_step": "",
                 "outputs_verified": [],
@@ -1204,6 +1303,7 @@ spec:
             for r in RUNS:
                 task, rid = r["task"], r["run"]
                 prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+                rc = None
                 if prefix in result_by_prefix:
                     rc = result_by_prefix[prefix]
                     status = "succeeded" if rc == 0 else "failed"
@@ -1214,16 +1314,52 @@ spec:
                 else:
                     status = "succeeded"
                     reason = ""
-                write_outcome("bold-to-t1w", task, rid, status, reason)
+                write_outcome("bold-to-t1w", task, rid, status, reason, exit_code=rc)
             failed = [p for p, rc in results if rc != 0]
 
         print(f"[driver] {len(results) - len(failed)} succeeded, {len(failed)} failed")
         if failed:
             print(f"[driver] failed runs: {' '.join(failed)}")
 
-        # Fail the step only when the session produced nothing. Note the
-        # rationale once given here — that Argo discards a failed pod's output
-        # artifacts — was measured false on 2026-07-22; see
-        # functional-preprocessing-workflow-template.yaml for what it does cost.
-        if results and len(failed) == len(results):
-            sys.exit(1)
+        def session_exit_code(results, runs):
+            """The pod's exit code, given every attempted run's (prefix, rc).
+
+            Fail the step only when the session has nothing: no run registered
+            now, and no run registered by an earlier workflow. Note the
+            rationale once given here — that Argo discards a failed pod's output
+            artifacts — was measured false on 2026-07-22; see
+            functional-preprocessing-workflow-template.yaml for what it does cost.
+
+            `results` covers only the runs this pod drove, so the session's full
+            state has to come from `runs` as well (#388). A non-zero exit here
+            fails the master DAG's bold-to-t1w-status gate, which omits
+            func-preproc for EVERY run in the session. Judged on `results` alone,
+            a resubmit whose one leftover run was QC-rejected exited 65, and the
+            runs that already had transforms never got MNI BOLD — with the
+            workflow Succeeded and no func-preproc record at all, since that
+            step records in-pod and its pod never ran. Rejections are
+            deterministic, so every later resubmit repeated it.
+
+            When every attempted run was a QC rejection and nothing was already
+            on disk, the session exits 65 rather than 1, so the rejection
+            survives to the fallback recorder (which maps 65 to `qc_rejected`)
+            and to resubmit_failed.py (which skips a 65 instead of re-driving a
+            deterministic outcome). It was a flat 1 until #368, which recorded 12
+            all-rejected sessions as `unknown`. A mix of rejections and real
+            failures stays 1: that session has a defect in it, and 65 would hide
+            it. Neither code is in any retry expression, so retry behaviour is
+            unchanged.
+            """
+            rcs = [rc for _, rc in results]
+            # inventory's b2t_exists: the _itk.txt landed in an earlier workflow.
+            # A rejected run never writes one, so this cannot count a rejection.
+            already_registered = any(r.get("b2t_exists") for r in runs)
+            if not rcs or already_registered or any(rc == 0 for rc in rcs):
+                return 0
+            if all(rc == QC_REJECTED_EXIT_CODE for rc in rcs):
+                return QC_REJECTED_EXIT_CODE
+            return 1
+
+        exit_code = session_exit_code(results, RUNS)
+        if exit_code:
+            sys.exit(exit_code)

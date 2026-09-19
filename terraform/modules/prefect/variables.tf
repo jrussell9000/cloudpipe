@@ -77,6 +77,12 @@ variable "work_pool" {
   default     = "cloudpipe-k8s-pool"
 }
 
+variable "argo_namespace" {
+  description = "Namespace the Argo workflow pods run in. The cloudpipe queue manager lists Pending pods there to detect a GPU spot drought and switch new submissions to CPU segmentation (#373)."
+  type        = string
+  default     = "argo-workflows"
+}
+
 ################################################################################
 # Prefect — service account names
 ################################################################################
@@ -155,9 +161,9 @@ variable "db_skip_final_snapshot" {
 # Logging
 ################################################################################
 
-variable "access_log_bucket" {
-  description = "SSE-S3 bucket receiving this module's ALB access logs. The master log bucket is SSE-KMS and ALB cannot deliver to it."
-  type        = string
+variable "alb_group_annotations" {
+  description = "ALB-level ingress annotations (group.name, scheme, security-groups, listen-ports, ssl-redirect, ssl-policy, load-balancer-attributes, ...) shared by every member of the ALB ingress group. Must be identical across members, so they are set by the caller, not here."
+  type        = map(string)
 }
 
 ################################################################################

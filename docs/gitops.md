@@ -73,7 +73,7 @@ The same `selfHeal: true` + `prune: true` policy applies. Deleting a WorkflowTem
 
 ### argo-workflows
 
-Umbrella chart with two dependencies: `argoproj/argo-workflows` v1.0.18 and `icoretech/pgbouncer` v4.1.9. PgBouncer was migrated from hand-written manifests in `templates/` to the subchart; `templates/pgbouncer.yaml` is now just a pointer comment.
+Umbrella chart with two dependencies: `argoproj/argo-workflows` v2.0.6 (app v4.1.3) and `icoretech/pgbouncer` v4.1.9. PgBouncer was migrated from hand-written manifests in `templates/` to the subchart; `templates/pgbouncer.yaml` is now just a pointer comment.
 
 Key overrides in `values.yaml`:
 
@@ -120,7 +120,37 @@ A plain Helm chart containing raw manifests (`templates/`). Not an upstream depe
 | `argo-server-rbac.yaml` | ClusterRoles and bindings for the Argo server and `argo-admin` SA (node reader, SSO RBAC, events reader cross-namespace) |
 | `cluster-secret-store.yaml` | `ClusterSecretStore` named `aws-secrets-manager` pointing to Secrets Manager in <YOUR_AWS_REGION> |
 | `external-secrets-patch.yaml` | Patch for External Secrets Operator — ClusterRole/ClusterRoleBinding also created by Terraform (`terraform/modules/addons/external-secrets.tf`); ArgoCD manages the live state |
+| `gpu-priority-classes.yaml` | Three `PriorityClass` objects ranking the GPU steps under spot scarcity (#370) — see below |
 | `storage-class.yaml` | `ebs-sc` StorageClass (gp3, encrypted, default) — also created by Terraform; ArgoCD manages the live state |
+
+**GPU priority classes.** Under spot scarcity pending GPU pods were served in
+roughly arrival order, so `template-build` pods — each of which spawns another GPU
+pod when it wins — competed equally with the `long-segmentation` pods that would
+have retired work. The three classes rank completion above starts:
+
+| PriorityClass | Value | Step |
+|---|---|---|
+| `cloudpipe-gpu-t1w-to-mni` | 300 | `t1w-to-mni` — ~30 s of GPU, unblocks a session's functional phase |
+| `cloudpipe-gpu-long-segmentation` | 200 | `long-segmentation` — finishes a subject that already holds a template |
+| `cloudpipe-gpu-template-build` | 100 | `template-build` — starts new GPU demand |
+
+All three are `preemptionPolicy: Never`: they reorder the pending queue only and
+never evict a running pod, which matters because each of these steps is 6–12 min
+of non-resumable inference. Values sit above the unclassed default (0) and below
+everything already on the cluster (`aws-guardduty-agent` 1000000,
+`system-cluster-critical` 2000000000).
+
+The `priorityClassName` references live on the three Argo templates. Because
+`gitops/**` is outside `ci.yaml`'s `paths` filter, the pairing is guarded from the
+other side, in `tests/argo/test_gpu_step_resources.py` — that test reads this
+manifest, so a class renamed here without the template (or vice versa) fails CI.
+
+**Rollout order matters.** `cluster-config` and `workflow-templates` are separate
+ArgoCD Applications, so a single commit does not sync them atomically. A pod whose
+template names a PriorityClass that does not exist yet is rejected by the Priority
+admission plugin, so the classes must reach the cluster before (or with) the
+template change. It self-heals once `cluster-config` syncs, but the window shows up
+as GPU pods failing to create. Background: `docs/investigations/2026-09-10-gpu-spot-acquisition-review.md` §4.1.
 
 ### reloader
 
@@ -160,9 +190,16 @@ SSO URLs and the admin email are single-sourced from Terraform via the `grafana-
 
 ### nvidia-device-plugin
 
-Helm chart: `nvidia/nvidia-device-plugin` v0.19.1. Advertises GPUs to the scheduler and configures **time-slicing at 3 replicas per physical GPU** (`failRequestsGreaterThanOne: false`), which is what lets 3 pods share one card.
+Helm chart: `nvidia/nvidia-device-plugin` v0.19.1. Advertises GPUs to the scheduler and configures time-slicing (`failRequestsGreaterThanOne: false`) through two **profiles**, chosen per node by the `nvidia.com/device-plugin.config` label:
 
-> **Keep this in sync with Karpenter.** The `replicas` count here and the `gpu-timeslice-3x` NodeOverlay in `terraform/modules/karpenter/helm-values/` describe the same fact in two places. The slice count is bounded by the *smallest* card in the GPU pool — the g4dn's T4 at 15 GiB — not the largest, so raising it based on an A10G's 23 GiB will OOM on T4 nodes. A pod also needs its CPU request low enough that N slices fit on one node's vCPUs.
+| Profile | Replicas per GPU | Nodes |
+|---|---|---|
+| `default` | 3 | unlabelled nodes, i.e. all of `gpu-nodepool` |
+| `dense` | 4 | `gpu-dense-nodepool`, whose NodePool template sets the label |
+
+The DaemonSet reaches both pools through a `karpenter.sh/nodepool In` affinity. **A GPU pool missing from that list gets nodes that come up Ready and advertise no GPU**, which is how the g7 nodes were stranded on 2026-09-04.
+
+> **Keep this in sync with Karpenter.** Each profile's `replicas` and the NodeOverlay covering that pool's instance types (`gpu-timeslice-3x`, `gpu-dense-timeslice-4x` in `terraform/modules/karpenter/helm-values/`) describe the same fact in two places. Size a slice count to the *smallest* card in the pool and the *largest* per-pod VRAM, never to the card a batch happened to land on. The largest is t1w-to-mni at a measured **4903 MiB** per process: `nvidia-smi` per-process usage, not PyTorch's own counter, which reads only 3698 MiB because it misses the CUDA context and allocator cache. Re-measure with `scripts/manifests/gpu-t1w-vram-probe.yaml` after any fireANTs image or torch change. The CPU request must also be low enough that N slices fit on one node's vCPUs. `tests/argo/test_gpu_step_resources.py` checks all of this, but CI does not run for a change under `gitops/` alone, so run it locally.
 
 ### aws-ebs-csi-driver / aws-load-balancer-controller
 
