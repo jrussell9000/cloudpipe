@@ -9,18 +9,25 @@ The S3 layout this reads (exploded per-file objects — see CLAUDE.md and ADR 01
 
   derivatives/fastsurfer/{subj}/{ses}/...          -> staged as {ses}/...
   derivatives/subregions/{subj}/hippoamyg/...      -> staged as hippoamyg/{ses}/mri/...
-  derivatives/subregions/{subj}/hypothalamic/...   -> staged as hypothalamic/{ses}/mri/...
 
-Deliberately NOT staged: the thalamus, brainstem and sclimbic trees. No enabled
-fsqc module reads their output.
+Deliberately NOT staged: the thalamus and brainstem trees. No enabled fsqc
+module reads their output. (The sclimbic region is retired, 2026-09-16.)
+
+NO LONGER STAGED (2026-09-16): the hypothalamic tree, and fsqc's hypothalamus
+module is no longer run. The pipeline dropped FreeSurfer's hypothalamic subunits
+for FastSurfer's HypVINN, and fsqc cannot QC HypVINN — both its hypothalamus
+module and its outlier module read only the FreeSurfer files
+(mri/hypothalamic_subunits_seg.v1.mgz, mri/hypothalamic_subunits_volumes.v1.csv),
+checked in the pinned 2.1.7 and on upstream main. The existing trees also covered
+only each subject's LAST session (a repeated-`--s` bug), so what fsqc reported
+from them was partial anyway. The record keeps its three hypothalamus fields,
+always null, so the Athena schema and historical rows are untouched.
 
 Where the numbers come from, which is not uniform: the core, contrast, rotation
-and outlier-count metrics land in fsqc-results.csv, but the subregion modules
-contribute NO columns there — the hippocampus module's only output is its two
-overlay PNGs, and the hypothalamic volumes appear solely in
-outliers/all.regions.stats. So a complete record needs both files plus each
-session's status.txt (which is the only thing distinguishing "module ran and
-found nothing" from "module never ran").
+and outlier-count metrics land in fsqc-results.csv, but the hippocampus module
+contributes NO columns there — its only output is its two overlay PNGs. So a
+complete record needs the CSV plus each session's status.txt (which is the only
+thing distinguishing "module ran and found nothing" from "module never ran").
 
 Also deliberately NOT staged: the long-template tree. Every file the enabled
 modules read is per-session and ships in the session tree (verified against real
@@ -41,6 +48,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -53,11 +61,12 @@ import fs_derivatives
 
 REGION = "<YOUR_AWS_REGION>"
 
-# The two subregion trees fsqc actually reads. Session directories are still
-# located after staging rather than assumed: the trees nest as
-# `{region}/{ses}/mri/...`, but merge_subregion tolerates either shape and the
-# cost of being wrong is a silently empty QC record.
-SUBREGION_REGIONS = ("hippoamyg", "hypothalamic")
+# The subregion tree fsqc actually reads. Session directories are still located
+# after staging rather than assumed: the trees nest as `{region}/{ses}/mri/...`,
+# but merge_subregion tolerates either shape and the cost of being wrong is a
+# silently empty QC record. `hypothalamic` was here until 2026-09-16 — see the
+# module docstring before adding it back.
+SUBREGION_REGIONS = ("hippoamyg",)
 
 SESSION_RE = re.compile(r"^ses-[0-9]+[A-Z]$")
 
@@ -147,11 +156,12 @@ def merge_subregion(scratch: Path, subjects_dir: Path, region: str) -> list[str]
     """Copy a subregion tree's per-session mri/ files into the merged tree.
 
     Returns the sessions that actually contributed at least one file. That is not
-    the same as "the tarball was present": the hypothalamic tarball is
-    subject-level and routinely ships empty mri/ directories for sessions the
-    segmentation didn't cover (confirmed on sub-086U18RD, where only ses-06A of
-    three has real output). Presence of the tarball therefore says nothing about
-    coverage of any given session.
+    the same as "the tree was present": a subject-level tree can carry sessions
+    with no files. The since-retired hypothalamic tree did exactly that on a
+    3-session subject where only ses-06A had real output — recorded here at
+    the time as tool behaviour, but it was the repeated-`--s` bug in the
+    segmentation pod, which segmented only each subject's last session. Presence
+    of a tree still says nothing about coverage of any given session.
     """
     contributed = []
     for ses, src_dir in _find_session_dirs(scratch).items():
@@ -246,9 +256,23 @@ def stage(s3, bucket: str, subj: str, subjects_dir: Path, scratch: Path, label: 
 
 
 def build_command(
-    subjects_dir: Path, output_dir: Path, sessions: list[str], coverage: dict, label: str
+    subjects_dir: Path,
+    output_dir: Path,
+    sessions: list[str],
+    coverage: dict,
+    label: str,
+    screenshots: bool = False,
 ) -> list[str]:
     """Assemble the run_fsqc invocation.
+
+    `screenshots` selects which of the two passes this is. The metrics pass
+    (False) produces fsqc-results.csv and every stored metric; the screenshot
+    pass (True) adds only the whole-brain render. They are separate invocations
+    because `createScreenshots()` can stall forever in matplotlib on a bad
+    surface overlay, and in one command that stall costs the QC record too —
+    fsqc writes the CSV only at the end. Nine subjects lost every session's
+    record that way (killed at the 30m pod deadline, last log line
+    "a problem occurred with the surface overlays"); see main().
 
     fsqc's module flags are global, not per-session, so "skip the module for a
     session that lacks its input" is not expressible on the command line. It does
@@ -264,16 +288,21 @@ def build_command(
     omitted; see openspec design.md.
 
     HTML flags: fsqc pairs several modules with a `*-html` variant that writes a
-    per-module summary page alongside the PNGs. Three are passed here, and three
+    per-module summary page alongside the PNGs. Two are passed here, and four
     are deliberately not:
 
-      --screenshots-html   ADDED. The whole-brain screenshot module; the only one
-                           of the six that isn't already implied by a flag above,
-                           so it also turns the module ON rather than just adding
-                           a page to it.
+      --screenshots-html   ADDED, in the screenshot pass only. The whole-brain
+                           screenshot module; the only one of the six that isn't
+                           already implied by a flag above, so it also turns the
+                           module ON rather than just adding a page to it.
       --hippocampus-html   ADDED, conditional on coverage alongside --hippocampus.
-      --hypothalamus-html  ADDED, conditional on coverage alongside --hypothalamus.
+                           Its overlays come out of the metrics pass, which is
+                           why they survive a wedged screenshot render.
 
+      --hypothalamus-html  NOT added, and neither is --hypothalamus (since
+                           2026-09-16). The module reads only FreeSurfer's
+                           hypothalamic subunits, which the pipeline no longer
+                           produces; see the module docstring.
       --surfaces-html      NOT added. Requires the OpenGL/Qt stack (whippersnappy,
                            pyopengl, glfw, pyrr, PyQt6) deliberately trimmed from
                            the image — see images/fsqc/Dockerfile. It would NOT
@@ -299,23 +328,47 @@ def build_command(
         str(output_dir),
         "--subjects",
         *sessions,
-        "--outlier",
-        "--screenshots-html",
     ]
+    if screenshots:
+        return cmd + ["--screenshots-html"]
+    cmd += ["--outlier"]
     if coverage.get("hippoamyg"):
         cmd += ["--hippocampus", "--hippocampus-html", "--hippocampus-label", label]
-    if coverage.get("hypothalamic"):
-        cmd += ["--hypothalamus", "--hypothalamus-html"]
     return cmd
 
 
-def run_fsqc(cmd: list[str]) -> None:
+# How long the best-effort screenshot pass may run before it is abandoned. The
+# pod's own activeDeadlineSeconds is 1800s and it kills the whole step, records
+# included, so this has to fire first. Sized against the metrics pass it follows:
+# fsqc pods run 4.5m median / 8.5m p99 over 24,616 production pods, so 10m is
+# ample for a render that is working, and metrics + a full stall still lands
+# ~20m inside the pod deadline.
+SCREENSHOT_TIMEOUT_S = int(os.environ.get("FSQC_SCREENSHOT_TIMEOUT_S", "600"))
+
+
+def run_fsqc(cmd: list[str], timeout: int | None = None, required: bool = True) -> bool:
+    """Run one fsqc invocation. Returns True when it produced a clean exit.
+
+    `required=False` downgrades a non-zero exit or a timeout to a warning, for
+    the screenshot pass: its output is a QC convenience, and losing it must not
+    cost the metrics records that are already on disk by then.
+    """
     log("Running: " + " ".join(cmd))
     # Let fsqc's own logging stream straight to the pod log rather than capturing
     # it — its per-module failure lines are the only record of why a field is NaN.
-    proc = subprocess.run(cmd, check=False)
+    try:
+        proc = subprocess.run(cmd, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if required:
+            raise SystemExit(f"run_fsqc exceeded {timeout}s") from None
+        log(f"WARNING: fsqc screenshot pass exceeded {timeout}s; abandoning it (records are safe)")
+        return False
     if proc.returncode != 0:
-        raise SystemExit(f"run_fsqc exited {proc.returncode}")
+        if required:
+            raise SystemExit(f"run_fsqc exited {proc.returncode}")
+        log(f"WARNING: fsqc screenshot pass exited {proc.returncode}; continuing")
+        return False
+    return True
 
 
 def parse_status(output_dir: Path, ses: str) -> dict[str, int]:
@@ -335,41 +388,17 @@ def parse_status(output_dir: Path, ses: str) -> dict[str, int]:
     return statuses
 
 
-# The subregion modules contribute NO columns to fsqc-results.csv — verified: its
-# 20 columns are core + rotation + outlier counts only. The hypothalamic volumes
-# surface solely in outliers/all.regions.stats (as `hypothalamus.whole left` /
-# `hypothalamus.whole right` plus ten per-subunit columns), because the outlier
-# module is what consumes them. Without reading that file the record would carry
-# no hypothalamic number at all, just a status flag — so the two whole-nucleus
-# volumes are lifted out here. The ten subunit columns are deliberately left
-# behind: they are what feeds n_outlier_norms, which the record already carries.
-REGIONS_STATS = "all.regions.stats"
-HYPOTHALAMUS_VOLUME_COLUMNS = {
-    "hypothalamus.whole left": "hypothalamus_whole_left_mm3",
-    "hypothalamus.whole right": "hypothalamus_whole_right_mm3",
-}
-
-
-def parse_region_volumes(output_dir: Path) -> dict[str, dict[str, float | None]]:
-    """Parse the hypothalamic whole-nucleus volumes out of the outlier module's stats.
-
-    Returns {session: {field: value}}. Absent file or absent columns yield empty
-    per-session dicts rather than raising: the outlier module can legitimately not
-    have run, and the hypothalamic columns are blank for any session the
-    segmentation didn't cover.
-    """
-    path = output_dir / "outliers" / REGIONS_STATS
-    if not path.is_file():
-        return {}
-    with path.open(newline="") as fh:
-        rows = list(csv.DictReader(fh))
-    out: dict[str, dict[str, float | None]] = {}
-    for row in rows:
-        ses = row.get("subject")
-        if not ses:
-            continue
-        out[ses] = {field: _num(row.get(col)) for col, field in HYPOTHALAMUS_VOLUME_COLUMNS.items()}
-    return out
+# Retired 2026-09-16 with the hypothalamus module (see the module docstring).
+# These used to be lifted from outliers/all.regions.stats. They are still emitted
+# — always null — rather than removed, because removing a field from FsqcQC is the
+# multi-place schema change in ADR 011 (dataclass, athena.py union columns, both
+# Terraform tables, the data dictionary) for no benefit: the columns hold history
+# that should stay queryable. Null here means "not measured by this pipeline",
+# which is what `hypothalamus_status: null` has always meant.
+RETIRED_HYPOTHALAMUS_FIELDS = (
+    "hypothalamus_whole_left_mm3",
+    "hypothalamus_whole_right_mm3",
+)
 
 
 def parse_results(output_dir: Path) -> dict[str, dict[str, str]]:
@@ -406,7 +435,6 @@ def build_record(
     row: dict,
     statuses: dict[str, int],
     pipeline: str,
-    volumes: dict[str, float | None] | None = None,
 ) -> dict:
     """Assemble one FsqcQC record.
 
@@ -415,33 +443,57 @@ def build_record(
     alphabetical).
     """
     metrics = {k: _num(v) for k, v in row.items() if k != "subject"}
-    volumes = volumes or dict.fromkeys(HYPOTHALAMUS_VOLUME_COLUMNS.values())
     return {
         "schema_version": "1.0",
         "pipeline": pipeline,
         "subject": subj,
         "session": ses,
         **metrics,
-        **volumes,
+        **dict.fromkeys(RETIRED_HYPOTHALAMUS_FIELDS),
         # Which modules actually produced numbers. Without these, an all-NaN
         # hippocampus row is indistinguishable from a module that was never asked
         # to run — the explicit flagging the spec's risk mitigation calls for.
         "metrics_status": statuses.get("metrics"),
         "outlier_status": statuses.get("outlier"),
         "hippocampus_status": statuses.get("hippocampus"),
-        "hypothalamus_status": statuses.get("hypothalamus"),
+        # Explicitly null, NOT statuses.get("hypothalamus"): the module is never
+        # requested any more, and a status.txt that listed it as 0 would make an
+        # unrun module read as "ran clean".
+        "hypothalamus_status": None,
         "fsqc_version": FSQC_VERSION,
         "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
+# Written by the Dockerfile when it overlays the Deep-MI/fsqc#105 fix onto the
+# installed release (images/fsqc/patches/). Absent in an unpatched environment.
+FSQC_PATCH_REF_FILE = Path("/opt/fsqc-patch-ref")
+
+
 def _fsqc_version() -> str:
+    """Report the fsqc version, marking a patched install so rows are separable.
+
+    `fsqc.get_version()` reads the installed release's VERSION file and knows
+    nothing about modules swapped in underneath it, so a patched 2.1.7 and a
+    stock 2.1.7 would both report "2.1.7" and be told apart only by completed_at
+    — useless for confirming the fix actually changed anything. Append the patch
+    ref as a PEP 440 local version segment instead, giving e.g.
+    "2.1.7+p9fcd40cf", which Athena can filter on directly.
+
+    Deleting the patch directory removes the marker file and the suffix with it.
+    """
     try:
         import fsqc
 
-        return str(fsqc.get_version())
+        version = str(fsqc.get_version())
     except Exception:  # pragma: no cover - version reporting must never fail a run
         return "unknown"
+
+    try:
+        ref = FSQC_PATCH_REF_FILE.read_text().strip()
+    except OSError:  # unpatched image, or the marker was removed
+        return version
+    return f"{version}+p{ref[:8]}" if ref else version
 
 
 FSQC_VERSION = _fsqc_version()
@@ -459,18 +511,17 @@ def upload_records(s3, metrics_bucket: str, records: dict[str, dict], dt: str) -
         log(f"  wrote s3://{metrics_bucket}/{key}")
 
 
-# Both subregion modules write overlay PNGs unconditionally — not only under
-# --hippocampus-html, as the flag naming suggests. The hypothalamus module writes
-# one (hypothalamus.png) and is easy to overlook because the design only mentions
-# the hippocampus pair.
+# The hippocampus module writes overlay PNGs unconditionally — not only under
+# --hippocampus-html, as the flag naming suggests. (So did the hypothalamus
+# module, retired 2026-09-16; its `hypothalamus` directory is no longer produced.)
 #
-# `screenshots` joins them once --screenshots-html is passed. Verified against
+# `screenshots` joins it once --screenshots-html is passed. Verified against
 # fsqcMain.py in the pinned 2.1.7 image rather than assumed: it writes
 # screenshots/{ses}/{ses}.png — the same per-session nesting the subregion
 # modules use (`os.path.join(output_dir, "screenshots", subject)`, then
 # `subject + ".png"`, where fsqc's "subject" is our session). So one walk handles
-# all three.
-OVERLAY_MODULE_DIRS = ("hippocampus", "hypothalamus", "screenshots")
+# both.
+OVERLAY_MODULE_DIRS = ("hippocampus", "screenshots")
 
 # Content types for the artifacts worth serving from S3 rather than downloading.
 # Without an explicit ContentType, boto3 stamps binary/octet-stream and a browser
@@ -478,7 +529,9 @@ OVERLAY_MODULE_DIRS = ("hippocampus", "hypothalamus", "screenshots")
 _CONTENT_TYPES = {".png": "image/png", ".html": "text/html"}
 
 
-def upload_overlays(s3, metrics_bucket: str, output_dir: Path, subj: str) -> int:
+def upload_overlays(
+    s3, metrics_bucket: str, output_dir: Path, subj: str, include_html: bool = True
+) -> int:
     """Upload the QC overlay PNGs and the per-module HTML summary pages.
 
     Only PNGs and HTML go up; each module's .mgz files are large intermediates.
@@ -506,6 +559,12 @@ def upload_overlays(s3, metrics_bucket: str, output_dir: Path, subj: str) -> int
     # --screenshots-html and friends write one shared summary page at the top
     # level of output_dir (verified: fsqcMain.py builds
     # os.path.join(output_dir, "fsqc-results.html")), not inside the module dirs.
+    #
+    # include_html=False for the screenshot pass: it writes its own
+    # fsqc-results.html covering only that module, which would land on the same
+    # S3 key as the metrics pass's page and replace the fuller one.
+    if not include_html:
+        return count
     for html in sorted(output_dir.glob("*.html")):
         rewritten = _rewrite_html_links(html)
         count += _put(s3, metrics_bucket, rewritten, f"fsqc/{subj}/{html.name}")
@@ -586,12 +645,17 @@ def main() -> None:
     subjects_dir = args.workdir / "subjects"
     scratch = args.workdir / "scratch"
     output_dir = args.workdir / "out"
-    for d in (subjects_dir, scratch, output_dir):
+    shots_dir = args.workdir / "out-screenshots"
+    for d in (subjects_dir, scratch, output_dir, shots_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     s3 = boto3.client("s3", region_name=REGION)
 
     coverage = stage(s3, args.bucket, args.subject, subjects_dir, scratch, args.hippocampus_label)
+    # Metrics first, screenshots second, in two invocations with two output dirs:
+    # the render is the one part of fsqc with no internal timeout, and a single
+    # combined run loses every session's record when it stalls, because fsqc
+    # writes fsqc-results.csv only after the last module. See build_command().
     run_fsqc(
         build_command(
             subjects_dir, output_dir, coverage["sessions"], coverage, args.hippocampus_label
@@ -606,7 +670,6 @@ def main() -> None:
         # short record set is the failure mode this step exists to prevent.
         raise SystemExit(f"fsqc produced no row for staged sessions: {missing}")
 
-    volumes = parse_region_volumes(output_dir)
     records = {
         ses: build_record(
             args.subject,
@@ -614,7 +677,6 @@ def main() -> None:
             rows[ses],
             parse_status(output_dir, ses),
             args.pipeline,
-            volumes.get(ses),
         )
         for ses in coverage["sessions"]
     }
@@ -628,16 +690,33 @@ def main() -> None:
     if args.skip_upload:
         log("--skip-upload set; not writing to the metrics bucket")
     else:
+        # Records go up BEFORE the screenshot pass runs, so a stalled render that
+        # burns the rest of the pod deadline cannot take them with it.
         upload_records(s3, args.metrics_bucket, records, dt)
         upload_overlays(s3, args.metrics_bucket, output_dir, args.subject)
+
+    shots_ok = run_fsqc(
+        build_command(
+            subjects_dir,
+            shots_dir,
+            coverage["sessions"],
+            coverage,
+            args.hippocampus_label,
+            screenshots=True,
+        ),
+        timeout=SCREENSHOT_TIMEOUT_S,
+        required=False,
+    )
+    if not args.skip_upload:
+        n = upload_overlays(s3, args.metrics_bucket, shots_dir, args.subject, include_html=False)
+        log(f"screenshot pass {'completed' if shots_ok else 'abandoned'}; {n} overlay(s) uploaded")
 
     for ses, record in records.items():
         log(
             f"  {ses}: wm_snr_norm={record.get('wm_snr_norm')} "
             f"gm_snr_norm={record.get('gm_snr_norm')} "
             f"cc_size={record.get('cc_size')} "
-            f"hippocampus={record.get('hippocampus_status')} "
-            f"hypothalamus={record.get('hypothalamus_status')}"
+            f"hippocampus={record.get('hippocampus_status')}"
         )
     log(f"fsqc complete for {args.subject}: {len(records)} session record(s)")
 

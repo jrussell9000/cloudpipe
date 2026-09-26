@@ -22,7 +22,7 @@ Outputs written to --out-dir:
   <prefix>_desc-bold2t1w.lta              SynthMorph transform (T1w_RAS → BOLD_RAS —
                                           note the direction is opposite to the
                                           filename; see parse_lta_matrix)
-  <prefix>_desc-bold2t1w_itk.txt          ANTs/ITK affine (via lta_convert)
+  <prefix>_desc-bold2t1w_itk.txt          ANTs/ITK affine (hand-rolled; see write_itk_from_lta)
   <prefix>_desc-bold2t1w_warped.nii.gz    BOLD ref warped to T1w space (QC)
   <prefix>_desc-bold2t1w_brainmask.nii.gz T1w brain mask in BOLD space
 
@@ -714,12 +714,15 @@ def main() -> None:
     ngf_identity = normalized_gradient_field(identity_data, t1w_data, mask=brain_mask)
     log.info(f"NGF (edge alignment): {ngf:.4f} (identity {ngf_identity:.4f})")
 
-    # QC gate (schema 2.3): only the transform-only magnitude metrics gate — they
-    # cannot be fooled the way nmi can (2655eea) or blunted by the soft EPI
-    # skull-strip that limits mhd_mm. Write the record (with the verdict) FIRST so
-    # it always uploads, then exit non-zero on a fail: the driver discards this
-    # run's outputs on any non-zero exit, so no completion marker reaches S3 and
-    # the expensive functional-preprocessing step never runs on a broken
+    # QC gate: only nmi_gain gates, and only as the structural floor nmi_gain <= 0
+    # (see _BOLD_T1W_THRESHOLDS). The schema 2.3 gate on the transform-only
+    # magnitude metrics was reverted in 2.4 — they track FOV prescription, not
+    # registration quality (module docstring).
+    #
+    # Write the record (with the verdict) FIRST so it always uploads, then exit
+    # 65 on a fail (the driver records 65 as qc_rejected). The driver discards
+    # this run's outputs on any non-zero exit, so no completion marker reaches S3
+    # and the expensive functional-preprocessing step never runs on a broken
     # registration. SynthMorph is deterministic, so a resubmit would re-register
     # to the identical fail — the gate drops the run, it does not enable a retry.
     # Build the measured record ONCE and hand the whole thing to verdict(), which

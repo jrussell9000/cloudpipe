@@ -48,12 +48,15 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 | I want to… | Go to |
 |---|---|
 | Understand how the system fits together | [architecture.md](architecture.md) |
+| Get ABCD data into the bucket, with or without Globus | [data-ingress.md](data-ingress.md) |
+| Find out whether I *can* reproduce the Globus ingress | [globus-prerequisites.md](globus-prerequisites.md) |
 | Run the pipeline or check on a subject | [operations.md](operations.md) |
 | Understand what each pipeline step does | [pipelines.md](pipelines.md) |
 | Investigate a failed workflow | [operations.md → Handling failures](operations.md#handling-failures) |
 | View QC metrics and cost dashboards | [observability.md](observability.md) |
 | Query pipeline metrics in Python or SQL | [observability.md → Querying](observability.md#querying-with-python) |
 | Look up what a metrics field means | [metrics_data_dictionary.md](metrics_data_dictionary.md) |
+| Get FastSurfer and subregion stats for the whole cohort as tables | [anatomical-stats.md](anatomical-stats.md) |
 | Understand why `bold_to_t1w` NMI is ~1.02 and not ~2.0 | [nmi-interpretation.md](nmi-interpretation.md) |
 | Update `preproc.py` | [operations.md → Updating code](operations.md#updating-code) |
 | Simplify / clean up the code and remove stale code | [code-health-plan.md](https://github.com/jrussell9000/cloudpipe/blob/main/docs/code-health-plan.md) |
@@ -88,6 +91,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 - [**observability.md**](observability.md) — Unified pipeline observability layer: data flow, S3 layout, Grafana dashboards, Python/SQL querying (Athena + DuckDB), Kubecost scraper, and how to add a new metric.
 - [**metrics_data_dictionary.md**](metrics_data_dictionary.md) — Field-by-field reference for every metrics table (9 schemas + 3 non-schema S3 prefixes): types, units, gating thresholds, and where the live emitted JSON has drifted from the `schemas.py` dataclasses.
 - [**how-to-timeframe-metrics-dataframe.md**](how-to-timeframe-metrics-dataframe.md) — Recipe for assembling a date-bounded DataFrame across metrics tables. Read the partition-key caveat: QC tables partition on workflow **start** date and `workflow_runs` on **finish** date, so a single-day window silently returns only one side of a batch that crossed midnight.
+- [**anatomical-stats.md**](anatomical-stats.md) — Aggregating every FastSurfer `.stats` file and subregion volume table across the cohort: the long-format shards, the per-file wide tables (one row per subject × session), the QC join, how to run the aggregation in-region, and why a missing row and a null cell mean different things.
 - [**nmi-interpretation.md**](nmi-interpretation.md) — Why `bold_to_t1w` NMI scores ~1.02 rather than approaching 2.0, what the Studholme `[1, 2]` scale actually measures (intensity-relationship determinism, not spatial overlap), how it differs from the other normalizations also called "NMI", and why `nmi_gain` gates instead of `nmi`.
 
 ### Infrastructure
@@ -103,6 +107,12 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 - [**images.md**](images.md) — Docker image build system (three GitHub Actions workflows, SHA auto-pinning), per-image reference (platform, base, contents, node pool), inactive images, and how to add a new image.
 
 - [**pre-baked-amis.md**](pre-baked-amis.md) — GPU node AMI pre-baking with Packer: motivation, current state, rebuild procedure, how to deploy a new AMI via Terraform, planned GHA automation, and gotchas.
+
+### Data ingress
+
+- [**data-ingress.md**](data-ingress.md) — **Start here for anything ingress-related.** The S3 key contract every processing step actually depends on (exact keys, including the literally-matched T1w filename), where the seam sits in the DAG, and how to choose between Globus, POSIX staging, and pre-staged S3. Globus is one implementation of this contract, not a requirement.
+
+- [**globus-prerequisites.md**](globus-prerequisites.md) — What you must obtain *before* `globus-setup.md` can work: an NDA Data Use Certification, an institutional Globus High Assurance subscription, and a human Globus admin to attach your endpoint to it. Three of the four gates are granted by other organisations and cannot be automated. Includes the recurring manual credential burden and a four-question decision tree for whether to reproduce this at all.
 
 ### Globus
 

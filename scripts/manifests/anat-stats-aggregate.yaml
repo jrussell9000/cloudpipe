@@ -1,0 +1,87 @@
+# One-off in-region run of scripts/aggregate_anat_stats.py.
+# See docs/anatomical-stats.md → "Running it inside AWS" for the full procedure.
+#
+# Why a Job and not a laptop run: the aggregation is ~650k small S3 GETs, so it
+# is bound by per-request latency. From a laptop it measured ~3.4 h; in-region,
+# ~69 min (2026-09-22, 11,808 subjects).
+#
+# No image build is needed. cloudpipe-flow-runner already carries boto3 and
+# pyarrow; the code is mounted from two ConfigMaps built from the checkout:
+#
+#   kubectl -n argo-workflows create configmap anat-stats-src \
+#     --from-file=src/anat_stats/__init__.py --from-file=src/anat_stats/aggregate.py \
+#     --from-file=src/anat_stats/discovery.py --from-file=src/anat_stats/parsers.py \
+#     --from-file=src/anat_stats/qc.py
+#   kubectl -n argo-workflows create configmap anat-stats-script \
+#     --from-file=scripts/aggregate_anat_stats.py
+#   kubectl apply -f scripts/manifests/anat-stats-aggregate.yaml
+#
+# Output lands in s3://<YOUR_S3_BUCKET>/scratch/anat-stats-aggregate/, which the bucket's
+# scratch/ lifecycle rule DELETES AFTER 7 DAYS. Copy it down (or elsewhere) when
+# the Job completes. QC (--with-qc) is deliberately not run here: it is an
+# Athena query, which runs in AWS wherever it is issued from.
+#
+# Clean up after: the Job removes itself a day after finishing
+# (ttlSecondsAfterFinished); delete the two ConfigMaps by hand.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: anat-stats-aggregate
+  namespace: argo-workflows
+  labels:
+    app: anat-stats-aggregate
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: anat-stats-aggregate
+    spec:
+      # Pod Identity role with read on the data bucket and write to scratch/.
+      serviceAccountName: argo-workflows-runner
+      restartPolicy: Never
+      # cloudpipe-flow-runner is built for linux/arm64 only.
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: aggregate
+          image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
+          imagePullPolicy: Always
+          workingDir: /work
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # ConfigMap files are symlinks into a hidden ..<timestamp>/ directory,
+            # so the script's own Path(__file__).resolve().parent.parent lands in
+            # the wrong place and `import anat_stats` fails. Set the path directly.
+            - name: PYTHONPATH
+              value: /work/src
+          command: ["bash", "-euo", "pipefail", "-c"]
+          args:
+            - |
+              python scripts/aggregate_anat_stats.py --out /out --workers 64
+              python - <<'EOF'
+              import boto3, pathlib
+              s3 = boto3.client("s3", region_name="<YOUR_AWS_REGION>")
+              files = sorted(pathlib.Path("/out").iterdir())
+              for f in files:
+                  s3.upload_file(str(f), "<YOUR_S3_BUCKET>", f"scratch/anat-stats-aggregate/{f.name}")
+              print(f"uploaded {len(files)} files to s3://<YOUR_S3_BUCKET>/scratch/anat-stats-aggregate/")
+              EOF
+          # Measured: ~1 core (the parse is GIL-bound) and ~725 MiB.
+          resources:
+            requests: {cpu: "2", memory: 3Gi}
+            limits: {memory: 6Gi}
+          volumeMounts:
+            - {name: src, mountPath: /work/src/anat_stats}
+            - {name: script, mountPath: /work/scripts}
+            - {name: out, mountPath: /out}
+      volumes:
+        - name: src
+          configMap: {name: anat-stats-src}
+        - name: script
+          configMap: {name: anat-stats-script}
+        - name: out
+          emptyDir: {sizeLimit: 4Gi}

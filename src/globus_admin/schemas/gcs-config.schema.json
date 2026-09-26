@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cloudpipe.invalid/schemas/gcs-config.schema.json",
+  "title": "GCS configuration document",
+  "description": "The storage gateways, collections and endpoint roles for one Globus Connect Server endpoint. Terraform renders this with `jsonencode` into /<prefix>/globus/config; the on-instance reconcile reads it; `globus doctor` checks it.\n\nTHIS SCHEMA IS NOT THE WHOLE CONTRACT. It states the structural rules only. The rule that actually catches mistakes is referential — a collection naming a gateway that is not declared, or a role scoped to a collection that is not declared — and JSON Schema cannot express it. `globus_admin.configdoc.validate()` is authoritative and checks both; it is stdlib-only so the reconcile can use it on the instance. This file exists so an editor, a CI job or a non-Python consumer can check the shape without reimplementing it, and tests/globus/test_configdoc_schema.py fails if the two ever disagree.",
+  "type": "object",
+  "required": ["storage_gateways"],
+  "properties": {
+    "storage_gateways": {
+      "type": "array",
+      "minItems": 1,
+      "description": "At least one; a document declaring none would reconcile an endpoint to nothing.",
+      "items": { "$ref": "#/$defs/storageGateway" }
+    },
+    "collections": {
+      "type": "array",
+      "description": "May be empty: a gateway can be declared before any collection is rooted on it.",
+      "items": { "$ref": "#/$defs/collection" }
+    },
+    "roles": {
+      "type": "array",
+      "description": "Endpoint and collection role assignments. Never removed by the reconcile.",
+      "items": { "$ref": "#/$defs/role" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "storageGateway": {
+      "type": "object",
+      "required": [
+        "display_name",
+        "type",
+        "bucket",
+        "domains",
+        "high_assurance",
+        "authentication_timeout_mins",
+        "credential_secret"
+      ],
+      "properties": {
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Identity for reconciliation. Objects are matched by display name within the endpoint, so changing this creates a second gateway rather than renaming one."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["s3"],
+          "description": "Only the S3 connector is supported. The POSIX path was removed (ADR 001)."
+        },
+        "bucket": { "type": "string", "minLength": 1 },
+        "domains": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Identity domains allowed to use the gateway. Empty would mean no identity could ever use it."
+        },
+        "high_assurance": {
+          "type": "boolean",
+          "description": "Immutable in Globus. The reconcile reports drift here as an error rather than recreating the gateway."
+        },
+        "authentication_timeout_mins": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "How long before a human must re-authenticate. There is no 30-day High Assurance ceiling — see ADR 010's Correction."
+        },
+        "credential_secret": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Secrets Manager secret id holding the S3 credential. The secret's VALUE never appears in this document, in Terraform state, or on disk."
+        },
+        "credential_identity": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Globus identity the S3 credential is registered for (`user-credentials s3-create`). Optional: a gateway may be declared before anyone has registered a key against it."
+        },
+        "s3_listener": {
+          "type": ["object", "null"],
+          "description": "The loopback signing listener this gateway is registered against. null for a gateway not yet cut over, which still signs with a static key — `globus doctor` reports that rather than failing. Replaced `iam_user` (retire-globus-s3-access-keys 4.4).",
+          "required": ["writer_role", "endpoint"],
+          "properties": {
+            "writer_role": {
+              "type": "string",
+              "minLength": 1,
+              "description": "IAM role NAME the listener signs as, confined to this gateway's prefix. A name rather than an ARN, so the document can be rendered without the account id."
+            },
+            "endpoint": {
+              "type": "string",
+              "pattern": "^https://",
+              "description": "The --s3-endpoint the gateway was registered with, e.g. https://127.0.0.1:8443. HTTPS only: TLS on loopback is a design decision (D5), not an accident."
+            }
+          },
+          "additionalProperties": false
+        },
+        "managed": {
+          "type": "boolean",
+          "default": true,
+          "description": "false means the reconcile reports drift but never applies it. Used to declare production read-only during a rollout."
+        }
+      },
+      "additionalProperties": false
+    },
+    "collection": {
+      "type": "object",
+      "required": ["display_name", "gateway", "base_path"],
+      "properties": {
+        "display_name": { "type": "string", "minLength": 1 },
+        "gateway": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Display name of a gateway declared in this document. THE REFERENTIAL RULE JSON SCHEMA CANNOT EXPRESS — configdoc.validate() checks it."
+        },
+        "base_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/",
+          "description": "Absolute path within the gateway. For S3 the first component is the bucket, which is why the IAM key prefix is this path minus that component."
+        },
+        "managed": { "type": "boolean", "default": true },
+        "public": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the collection is listed publicly in Globus. Defaults CLOSED, which is the opposite of GCS's own default: a declaration that forgets to say should produce the collection that can still be opened, not one already advertised. simplify-globus-ingress 8.8 rebuilt staging from config and got a public collection back."
+        },
+        "allow_guest_collections": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether users may create guest collections beneath this one. Production allows it; staging does not."
+        },
+        "force_encryption": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether every transfer on this collection must be encrypted. Staging is created with it; production is not."
+        }
+      },
+      "additionalProperties": false
+    },
+    "role": {
+      "type": "object",
+      "required": ["principal", "role"],
+      "properties": {
+        "principal": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Globus identity or group the role is granted to."
+        },
+        "role": { "type": "string", "minLength": 1 },
+        "collection": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Display name of a declared collection. Absent means the role is granted on the endpoint itself. Also referential — checked by configdoc.validate()."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

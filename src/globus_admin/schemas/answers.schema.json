@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cloudpipe.invalid/schemas/answers.schema.json",
+  "title": "Globus ingress answers document",
+  "description": "Every value a human supplies to set up the Globus ingress, and nothing else. `globus init --answers <file>` renders terraform.tfvars and the GCS configuration document from it.\n\nThe rule this file exists to enforce is that the list stays SHORT. A value belongs here only when no machine can work it out: gateway and collection names, SSM prefixes, secret names, IAM resource names, collection base paths and the session timeout are all derived from `deployment_name` and defaults, and asking for them would be asking a first-time investigator to invent answers they have no basis for. Fields marked `x-derived` are overrides for a deployment that needs one — a form generator must not present them as questions.\n\nThere is deliberately NO AWS credential, key, or profile field. Credentials come from the operator's environment through the AWS CLI v2 SSO profile, and `aws_account_id` is here only so a command can refuse to act against an account the operator did not name.\n\nEach field carries `title` (the prompt) and `description` (the help text) rather than invented keywords, so a generic JSON Schema form generator renders it without knowing anything about this deployment. `x-gate` names the human gate that produces the value where one applies; `$defs.gate` holds the vocabulary.",
+  "type": "object",
+  "required": [
+    "deployment_name",
+    "aws_account_id",
+    "aws_region",
+    "bucket",
+    "contact_email",
+    "owner_email",
+    "service_client_id",
+    "service_client_secret_ref",
+    "native_app_client_id",
+    "source_collection_id",
+    "source_base_path"
+  ],
+  "anyOf": [
+    { "required": ["identity_domain"] },
+    { "required": ["identity_domains"] }
+  ],
+  "properties": {
+    "deployment_name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$",
+      "title": "Deployment name",
+      "description": "A short lowercase name for this deployment, used to derive nearly everything else: the SSM prefix (/<name>/globus/...), the gateway and collection display names (<name>-s3), the SSM document names, and the AWS resource names. Pick it once; changing it later renames resources."
+    },
+    "aws_account_id": {
+      "type": "string",
+      "pattern": "^[0-9]{12}$",
+      "title": "AWS account ID",
+      "description": "The 12-digit account this deployment lives in. Used ONLY to verify that the credentials in your environment point at the account you meant: every mutating command refuses to run when they disagree. It is not a credential and grants nothing."
+    },
+    "aws_region": {
+      "type": "string",
+      "pattern": "^[a-z]{2}(-gov)?-[a-z]+-[0-9]$",
+      "title": "AWS region",
+      "description": "The region holding the S3 bucket and the Globus Connect Server instance, for example <YOUR_AWS_REGION>. The bucket must be in this region: the S3 storage gateway addresses one regional endpoint."
+    },
+    "bucket": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
+      "title": "Data bucket name",
+      "description": "The S3 bucket transfers are written into. The Globus collection is rooted at /<bucket>, so the bucket name becomes the first component of every Globus path. The bucket must already exist."
+    },
+    "identity_domain": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*\\.[a-z]{2,}$",
+      "title": "Institution identity domain",
+      "description": "The identity domain permitted to use the storage gateway, for example your university's domain. Only Globus identities in this domain can authenticate to the gateway. Use `identity_domains` instead if more than one applies."
+    },
+    "identity_domains": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9.-]*\\.[a-z]{2,}$"
+      },
+      "title": "Institution identity domains",
+      "description": "Every identity domain permitted to use the storage gateway, when one is not enough. Supply this or `identity_domain`, not both."
+    },
+    "contact_email": {
+      "type": "string",
+      "format": "email",
+      "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+      "title": "Contact email",
+      "description": "Shown on the Globus endpoint as the address users contact about it. A shared or role address is better than a personal one: it outlives the person who ran setup."
+    },
+    "owner_email": {
+      "type": "string",
+      "format": "email",
+      "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+      "title": "Endpoint owner email",
+      "description": "The Globus identity that owns the endpoint, typically an institutional Globus administrator rather than you. Passed as --owner when the endpoint is created."
+    },
+    "service_client_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "title": "Globus service client ID",
+      "description": "The UUID of the confidential client that owns the endpoint, printed by `globus register-service-client` (or registered in the Globus Developers Portal). The endpoint is created as this service account rather than as a person, which is what lets it be associated with an institutional subscription and outlive any individual's account.",
+      "x-gate": "globus_app_registration"
+    },
+    "service_client_secret_ref": {
+      "type": "string",
+      "pattern": "^(secretsmanager|ssm|env):[A-Za-z0-9/_+=.@:-]+$",
+      "title": "Reference to the service client secret",
+      "description": "WHERE the service client's secret lives, never the secret itself: `secretsmanager:<secret-name>`, `ssm:<parameter-name>` for an SSM SecureString, or `env:<VARIABLE>`. A literal secret is rejected. This document is expected to be committed, shared, and pasted into terminals, and a secret written here would have to be treated as compromised from then on.",
+      "x-gate": "globus_app_registration"
+    },
+    "native_app_client_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "title": "Globus native app client ID",
+      "description": "The UUID of the native app registered in the Globus Developers Portal, which is the one registration no command can make: a native app is what a person logs in through, and a browser flow cannot be scripted. `globus login` uses it for the browser flow that produces the refresh token the pipeline transfers with, and `register-service-client` uses it for its own `manage_projects` login. A native app has no secret, which is why it is separate from the service client.",
+      "x-gate": "globus_app_registration"
+    },
+    "source_collection_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "title": "Source collection UUID",
+      "description": "The Globus collection data is transferred FROM. You are granted access to it by the data provider, so this value and your access to it both come from that agreement.",
+      "x-gate": "nda_duc"
+    },
+    "source_base_path": {
+      "type": "string",
+      "pattern": "^/.*",
+      "title": "Source base path",
+      "description": "The path on the source collection under which subject directories live. A subject identifier is appended to it, so give the parent directory, not a subject.",
+      "x-gate": "nda_duc"
+    },
+    "subscription_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "title": "Globus subscription UUID",
+      "description": "The institutional Globus subscription the endpoint is added to. Optional, and expected to be absent at first: the endpoint has to exist before anyone can be asked to add it to a subscription. High Assurance features, including the S3 storage gateway, do not work until it is set.",
+      "x-gate": "globus_subscription"
+    },
+    "admin_prefix_list_id": {
+      "type": "string",
+      "pattern": "^pl-[0-9a-f]{8,17}$",
+      "title": "SSH admin prefix list ID",
+      "description": "An AWS managed prefix list of address ranges allowed to reach the instance on SSH. Optional: routine operation needs no SSH at all, since everything on the instance runs through SSM."
+    },
+    "collection_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$",
+      "title": "Collection display name",
+      "description": "Overrides the derived name (<deployment_name>-s3) for the production collection, and for its gateway unless gateway_name says otherwise. Staging derives from it with a -staging suffix.",
+      "x-derived": true
+    },
+    "gateway_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$",
+      "title": "Storage gateway display name",
+      "description": "The production storage gateway's display name, when it differs from the collection's. Needed only for a gateway created before this tool, which need not follow the derivation: objects are matched by display name, so a name that does not match declares a gateway that does not exist. Leave unset for a deployment this tool built.",
+      "x-derived": true
+    },
+    "iam_user_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+=,.@_-]{1,64}$",
+      "title": "Production S3 gateway IAM user",
+      "description": "Name of an existing IAM user with write access to the destination bucket, whose access key the production Globus S3 gateway registers. A prerequisite, not something this tool creates: an organization SCP denies iam:CreateUser. Terraform only names it — no policy is attached and no key is touched. Leave unset until one has been granted; `globus doctor` then reports the gap rather than anything failing."
+    },
+    "org_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "title": "Organization name",
+      "description": "The organization shown on the endpoint's public Globus listing. Defaults to the deployment name, which is rarely what a reader wants to see — set this to the name of the group or institution that runs the endpoint. Optional, and an override rather than a question: a wrong value here is cosmetic and can be corrected in the Globus web app at any time, so it is not worth stopping setup for.",
+      "x-derived": true
+    },
+    "session_timeout_days": {
+      "type": "integer",
+      "minimum": 1,
+      "title": "Session timeout (days)",
+      "description": "How long a High Assurance session lasts before a human must log in again. There is no 30-day ceiling: this is a choice about how often someone is willing to log in, not a Globus limit.",
+      "x-derived": true
+    },
+    "production_managed": {
+      "type": "boolean",
+      "title": "Let configure change production",
+      "description": "Whether `globus configure` may change the production gateway and collection to match this document, after showing the plan and asking. On unless set false. Set it false to hold production read-only: configure then reports differences and changes nothing, which is for a deployment whose production was configured by hand before this tool and has not yet been proved against it.",
+      "x-derived": true
+    },
+    "staging_enabled": {
+      "type": "boolean",
+      "title": "Add a staging gateway",
+      "description": "Whether to keep a staging gateway: a second gateway and collection on the same endpoint, under scratch/, where a Globus-side change such as a GCS upgrade can be tried before it reaches production. Off unless set true. A fresh deployment does not need one to set up. See docs/globus.md, Staging gateway.",
+      "x-derived": true
+    },
+    "staging_prefix": {
+      "type": "string",
+      "pattern": "^scratch/.+",
+      "title": "Staging key prefix",
+      "description": "The S3 key prefix the staging collection is rooted at. Kept under scratch/ so the bucket's lifecycle rule expires staging data without anyone remembering to.",
+      "x-derived": true
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gate": {
+      "title": "Human gate identifiers",
+      "description": "The steps no automation can perform. A field's `x-gate` names the gate that produces its value, so a wizard can show what is being waited on instead of an empty box.\n\nThis enum lists only the gates that produce an ANSWER. It is a subset of the full gate list — which also covers gates producing no answer at all, such as connecting Cloudflare WARP — and every value here must appear there. The full records (explanation, who grants it, the verification check, and any request text to send) live in `globus_admin.gates` and are published through `setup-status --json`.",
+      "enum": [
+        "nda_duc",
+        "globus_app_registration",
+        "globus_subscription",
+        "endpoint_subscription",
+        "globus_login"
+      ]
+    }
+  }
+}

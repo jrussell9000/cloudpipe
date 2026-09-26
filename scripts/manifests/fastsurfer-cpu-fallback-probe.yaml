@@ -1,0 +1,224 @@
+# Probe for #373: run fastsurfer-long-segmentation for ONE session on CPU
+# (cpu-heavy-nodepool) against a completed workflow's scratch template, and
+# compare the result to that workflow's GPU segmentation of the same session.
+#
+# Doubles as the mechanism check for the production change:
+#   - input parameter -> nodeSelector via an expression ternary
+#   - podSpecPatch that re-sizes main and zeroes nvidia.com/gpu when device=cpu
+#   - workflowMetadata.labelsFrom recording the device on the Workflow object
+#
+# Run (pick a source workflow whose scratch/ still holds template-base.tar.gz
+# and sessions-seg/<ses>.tar.gz — the 7-day lifecycle rule reaps them):
+#   argo -n argo-workflows submit scripts/manifests/fastsurfer-cpu-fallback-probe.yaml \
+#     -p subjID=sub-XXXX -p session=ses-00A -p source-workflow=cloudpipe-xxxxx
+#   argo -n argo-workflows logs <name> | grep -E '\[probe\]|\[dice\]'
+#
+# RESULT 2026-09-10 (fastsurfer-cpu-probe-lmkgg; sub-X5TLCB96 ses-00A vs
+# cloudpipe-zztxz; c8i-flex.4xlarge spot; 7 threads):
+#   pod landed on cpu-heavy with requests cpu 7 / 8G / nvidia.com/gpu 0
+#   wall 396 s (GPU, 3-way time-sliced T4: 357 s); inference 172 s vs 35 s
+#   memory.peak 3.96G
+#   Dice vs GPU: aparc.DKTatlas+aseg 0.9998 mean / 0.9979 min (95 labels),
+#   voxel agreement 99.9985%; aseg 0.9998; mask 0.99999; cerebellum 0.99995;
+#   hypothalamus 0.9992 (min 0.9915). Not bit-identical; well inside variance.
+#
+# The first attempt (fastsurfer-cpu-probe-vzwvx) failed at evaluation with
+# "literal not terminated": the whole patch was one expression holding a JSON
+# literal, and Argo closes a `{{= }}` tag at the first `}}`, which a nested JSON
+# object ends in. Hence the values-only patch below.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: fastsurfer-cpu-probe-
+  namespace: argo-workflows
+  labels:
+    probe: fastsurfer-cpu-fallback
+spec:
+  entrypoint: main
+  serviceAccountName: argo-workflows-runner
+  activeDeadlineSeconds: 7200
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+  podMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe-probe
+  workflowMetadata:
+    labelsFrom:
+      cloudpipe.io/fastsurfer-device:
+        expression: workflow.parameters['fastsurfer-device']
+
+  arguments:
+    parameters:
+      - name: fastsurfer-device
+        value: cpu
+      - name: subjID
+        value: SUBJ
+      - name: session
+        value: SES
+      - name: source-workflow
+        value: SRCWF
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  templates:
+    - name: main
+      steps:
+        - - name: seg
+            template: long-seg-probe
+            arguments:
+              parameters:
+                - name: fastsurfer-device
+                  value: "{{workflow.parameters.fastsurfer-device}}"
+
+    - name: long-seg-probe
+      metadata:
+        labels:
+          cloudpipe.io/step: long-segmentation-probe
+      inputs:
+        parameters:
+          - name: fastsurfer-device
+        artifacts:
+          - name: template-base
+            path: '/work/subjects/{{workflow.parameters.subjID}}_template'
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/{{workflow.parameters.source-workflow}}/anat/template-base.tar.gz'
+          - name: gpu-seg
+            path: '/work/gpu/{{workflow.parameters.session}}'
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: "{{workflow.parameters.bucket}}"
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/{{workflow.parameters.source-workflow}}/anat/sessions-seg/{{workflow.parameters.session}}.tar.gz'
+
+      nodeSelector:
+        karpenter.sh/nodepool: "{{= inputs.parameters['fastsurfer-device'] == 'cpu' ? 'cpu-heavy-nodepool' : 'gpu-nodepool' }}"
+
+      # Values-only expressions: a JSON literal inside ONE expression fails, because
+      # Argo closes the tag at the first `}}` and a nested JSON object ends in `}}`.
+      podSpecPatch: |
+        containers:
+          - name: main
+            resources:
+              requests:
+                cpu: "{{= inputs.parameters['fastsurfer-device'] == 'cpu' ? '7' : '1' }}"
+                memory: "{{= inputs.parameters['fastsurfer-device'] == 'cpu' ? '8G' : '1G' }}"
+              limits:
+                nvidia.com/gpu: "{{= inputs.parameters['fastsurfer-device'] == 'cpu' ? '0' : '1' }}"
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:6da3131b48d6d7ea417dae17498d2d8d95d61ece195aa57a2d73b395cab749dd"
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        env:
+          - name: SUBJECTS_DIR
+            value: /work/subjects
+          - name: SES
+            value: "{{workflow.parameters.session}}"
+          - name: DEVICE
+            value: "{{inputs.parameters.fastsurfer-device}}"
+          - name: OMP_NUM_THREADS
+            valueFrom: &cpuReq
+              resourceFieldRef:
+                containerName: main
+                resource: requests.cpu
+                divisor: "1"
+          - name: MKL_NUM_THREADS
+            valueFrom: *cpuReq
+          - name: OPENBLAS_NUM_THREADS
+            valueFrom: *cpuReq
+          - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+            valueFrom: *cpuReq
+        resources:
+          requests:
+            memory: 1G
+            cpu: '1'
+            ephemeral-storage: 20G
+          limits:
+            nvidia.com/gpu: '1'
+        command: [bash, -c]
+        args:
+          - |
+            echo "[probe] device=${DEVICE} host=$(hostname) OMP_NUM_THREADS=${OMP_NUM_THREADS} nproc=$(nproc)" >&2
+            echo "[probe] nvidia-smi: $(command -v nvidia-smi || echo absent)" >&2
+
+            DEVICE_FLAGS=""
+            if [[ "${DEVICE}" == "cpu" ]]; then
+              DEVICE_FLAGS="--device cpu --threads ${OMP_NUM_THREADS}"
+            fi
+
+            find /work/subjects -name '*IsRunning*' -delete
+
+            START=$(date +%s)
+            /fastsurfer/brun_fastsurfer.sh --subjects "${SES}=from-base" --sd /work/subjects \
+              --seg_only --edits --fsaparc --long "{{workflow.parameters.subjID}}_template" \
+              --threads 1 ${DEVICE_FLAGS}
+            EXIT=$?
+            END=$(date +%s)
+            echo "[probe] brun_fastsurfer exit=${EXIT} wall=$((END - START))s" >&2
+            echo "[probe] memory.peak=$(awk '{printf "%.2f", $1/1e9}' /sys/fs/cgroup/memory.peak 2>/dev/null || echo n/a)G" >&2
+
+            cat > /work/dice.py <<'PYEOF'
+            import os
+            import numpy as np
+            import nibabel as nib
+
+            ses = os.environ["SES"]
+            cpu_dir = f"/work/subjects/{ses}"
+            gpu_dir = f"/work/gpu/{ses}"
+            files = [
+                "mri/aparc.DKTatlas+aseg.deep.mgz",
+                "mri/aseg.auto_noCCseg.mgz",
+                "mri/mask.mgz",
+                "mri/cerebellum.CerebNet.nii.gz",
+                "mri/hypothalamus.HypVINN.nii.gz",
+            ]
+            for f in files:
+                a, b = f"{cpu_dir}/{f}", f"{gpu_dir}/{f}"
+                if not (os.path.exists(a) and os.path.exists(b)):
+                    print(f"[dice] {f}: missing cpu={os.path.exists(a)} gpu={os.path.exists(b)}")
+                    continue
+                A = np.asanyarray(nib.load(a).dataobj).astype(np.int64)
+                B = np.asanyarray(nib.load(b).dataobj).astype(np.int64)
+                if A.shape != B.shape:
+                    print(f"[dice] {f}: shape mismatch {A.shape} vs {B.shape}")
+                    continue
+                labels = np.union1d(np.unique(A), np.unique(B))
+                labels = labels[labels != 0]
+                ds = []
+                for lab in labels:
+                    am, bm = A == lab, B == lab
+                    s = am.sum() + bm.sum()
+                    if s:
+                        ds.append(2.0 * (am & bm).sum() / s)
+                ds = np.array(ds)
+                print(
+                    f"[dice] {f}: labels={len(ds)} mean={ds.mean():.5f} min={ds.min():.5f} "
+                    f"voxel_agreement={(A == B).mean():.6f} identical={np.array_equal(A, B)}"
+                )
+            PYEOF
+            python3 /work/dice.py >&2
+            ls -la "/work/subjects/${SES}/mri" >&2 | head -40
+            exit ${EXIT}
