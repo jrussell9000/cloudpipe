@@ -1,0 +1,423 @@
+# t1w-to-mni RESCUE SIZING probe — how many RANDOM tickets does a rescue pass need?
+#
+# QUESTION
+# --------
+# The n=9 recoverability probe (`t1w-mni-recover-j2gt6`, 2026-09-09) established
+# that gate-failed sessions ARE recoverable: 0 of 9 control (NONE) arms passed,
+# 16 of 18 RANDOM arms passed, and all 9 sessions recovered under at least one
+# arm — to lncc 0.73-0.80, inside the healthy distribution (mean 0.80, sd 0.017),
+# with jac_neg 0.0002-0.0018, so both gates clean.
+#
+# This probe sizes the production rescue pass. Three questions, one run:
+#
+#   1. RECOVERY RATE PER SEVERITY BAND. n=9 gives 9/9; the prize is 776 sessions.
+#      ~33 per band bounds the rate tightly enough to decide whether to build it.
+#
+#   2. HOW MANY TICKETS. THE key design parameter. RANDOM is a thread-partitioned
+#      lottery and it cuts BOTH ways — one n=9 session scored 0.7505 at itk=1 but
+#      0.1725 at itk=8. So one retry may not be enough. Three thread counts
+#      measure how much attempts 2 and 3 actually add, which sets the cost and
+#      complexity of the rescue pass.
+#
+#   3. THE CONTROL OFFSET. In the n=9 probe every control scored LOWER than the
+#      recorded production value (max |delta| 0.0732, all nine same direction) —
+#      larger than the ~0.0156 T4->A10G term expected from pinning g4dn.xlarge
+#      when production does not pin. This probe is deliberately UNPINNED and
+#      records the card model per pod, which turns that from inferred to measured.
+#
+# WHY UNPINNED IS SAFE HERE, having been wrong to unpin elsewhere: the
+# cross-card term is ~0.0156 lncc and the effect under measurement is +0.3 to
+# +0.6. It would NOT be safe for a fine-grained A/B (which is why
+# t1w-to-mni-fused-ops-ab.yaml and the repeatability probe both pin), but for a
+# pass/fail RECOVERY RATE it is noise, and unpinning is what makes the control
+# arm production-realistic — which is the whole point of question 3.
+#
+# DUA: the subject list is NOT embedded here. It is passed at submit time from
+# `data/` (gitignored), so this manifest carries no participant identifiers.
+#
+# HOW TO READ IT
+# --------------
+#   control passes anywhere        Something is wrong — production recorded these
+#                                  as verdict=fail. Investigate before trusting.
+#   recovery rate ~= 100%, 1 ticket enough
+#                                  Rescue pass is a single RANDOM retry. Cheap.
+#   recovery rate high but needs 2-3 tickets
+#                                  Rescue pass must try several tickets in turn and
+#                                  keep the FIRST that passes the gate — never "the
+#                                  best" of several. Still cheap, more logic.
+#   recovery rate band-dependent   Gate the rescue on recorded lncc; do not spend
+#                                  attempts on bands that never recover.
+#   controls match recorded lncc   The 0.0732 offset was the g4dn.xlarge pin.
+#                                  Question 3 closed.
+#
+# RESULT (tranche 1, t1w-mni-rescue-mbzr5, 2026-09-10; tranche 2 was not needed)
+# -----------------------------------------------------------------------------
+#   Q1  29/30 recovered, NOT band-dependent: catastrophic 10/10, mid 10/10, near-gate
+#       9/10. The miss is a session every strategy puts at lncc ~0.61 — no bad basin,
+#       just a brain that scores low.
+#   Q2  cumulative 25 -> 27 -> 29 over itk1 / itk4 / itk8; per-arm ~equal (25/30, 26/30,
+#       27/29). Three tickets needed; order does not matter.
+#   Q3  UNANSWERED BY THIS PROBE — Karpenter put all 30 controls on Tesla T4, and
+#       unpinned is not the same as varied. Closed instead from archived production pod
+#       logs: 7 of the 10 control outliers were A10G production runs (A10G->T4 mean
+#       -0.053 on failed sessions); T4->T4 median -0.0001.
+#   Analysed with scripts/investigations/summarize_rescue_sizing.py.
+#
+# WHAT SHIPPED DIFFERS: the production ladder varies the SEED at one thread (42/43/44),
+# not the thread count, because RANDOM above one thread is not reproducible — see
+# fst1w_to_mni.py::RESCUE_SEEDS and t1w-to-mni-rescue-validation.yaml, which re-ran these
+# 30 sessions with the seed ladder (29/30 again). This manifest is kept as the record of
+# how the rescue was sized. It is pinned to the PRE-rescue image digest on purpose: its
+# patch rewrites that script's single hardcoded NONE line, which the post-rescue script
+# no longer has in that form.
+#
+# DO NOT JUDGE AN ARM ON lncc ALONE — fused_ops improved lncc every time
+# (+0.078 +/- 0.002) while folding the warp into a jac_neg FAIL. A recovery is
+# verdict=pass, which requires jac_neg <= 0.005 too.
+#
+# SAFETY: writes nothing to derivatives/ and nothing to the metrics corpus. The
+# QC record is redirected to scratch/, so this cannot contaminate
+# registration_qc or make a rejected session look processed.
+#
+# RUN IT IN TWO TRANCHES, NOT ONE SHOT
+# ------------------------------------
+# gpu-nodepool is SPOT-ONLY with no on-demand fallback, so GPU capacity can go to
+# zero for long stretches (observed 2026-09-10: 0 nodes, 0 nodeclaims, 56 pending
+# production pods). Staging spends capacity only as the result demands, and
+# usually answers the question on tranche 1 alone.
+#
+#   TRANCHE 1 — 30 sessions (10/band) x 4 arms = 120 pods, ~40 min.
+#     If recovery is uniformly high AND one ticket suffices, STOP. Done.
+#
+#   TRANCHE 2 — only if tranche 1 is band-dependent or marginal. The remaining
+#     70 sessions, RANDOM arms ONLY (210 pods). Controls are dropped because 30
+#     of them already validate the harness and measure the control offset;
+#     repeating them 70 more times buys nothing.
+#
+# Worst case 330 pods, expected 120. At `parallelism: 10` with time-slicing at
+# 3 replicas/GPU that is ~4 concurrent g4dn.xlarge nodes, NOT 400 — the pod count
+# is total work drained through a 10-wide window, not simultaneous demand.
+#
+# USAGE
+#   # tranche 1 (all four arms — the default `arms` value)
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-rescue-sizing-probe.yaml \
+#     -p sessions="$(cat data/reprocess/rescue_tranche1.json)" \
+#     -p run-label=tranche1
+#
+#   # tranche 2 (RANDOM only — override `arms`)
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-rescue-sizing-probe.yaml \
+#     -p sessions="$(cat data/reprocess/rescue_tranche2.json)" \
+#     -p run-label=tranche2 \
+#     -p arms='[{"arm":"random-itk1","sampling":"RANDOM","threads":"1"},
+#               {"arm":"random-itk4","sampling":"RANDOM","threads":"4"},
+#               {"arm":"random-itk8","sampling":"RANDOM","threads":"8"}]'
+#
+#   # ALWAYS smoke-test first after any edit — the stamp step is the one path
+#   # that would fail every pod identically:
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-rescue-sizing-probe.yaml \
+#     -p sessions="$(python3 -c "import json;print(json.dumps(json.load(open('data/reprocess/rescue_tranche1.json'))[:1]))")" \
+#     -p run-label=smoke
+#
+#   # results
+#   aws s3 sync s3://<YOUR_S3_BUCKET>/scratch/rescue-sizing/tranche1/ /tmp/rescue/
+#   python3 scripts/investigations/summarize_rescue_sizing.py /tmp/rescue/
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: t1w-mni-rescue-
+  namespace: argo-workflows
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    labels:
+      app: cloudpipe
+    # NO `karpenter.sh/do-not-disrupt` here, unlike the other t1w-to-mni probes.
+    # Those measure TIMING, where losing a pod mid-run corrupts the number. This
+    # one measures a pass/fail VERDICT, so a preempted arm is a lost measurement,
+    # not a wrong one — just resubmit it. Leaving the annotation off lets
+    # Karpenter consolidate these nodes back between tranches instead of pinning
+    # ~4 GPU nodes that a production batch may need.
+
+  activeDeadlineSeconds: 86400
+
+  # ~100 sessions x 4 arms = ~400 pods. Held low so this cannot crowd out a
+  # production batch on gpu-nodepool; raise it if the cluster is idle.
+  parallelism: 10
+
+  entrypoint: rescue
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      # Digest-pinned to the image the live `registration` WorkflowTemplate is
+      # serving, so `control` is genuinely production.
+      - name: fireants-image
+        value: cloudpipe/fireants@sha256:4730e00580ea1dd4622e73341ba4c35ad6257b2fe682816baa507290ae46d21c
+      - name: run-label
+        value: run1
+      # JSON array of {subject, session, band, lncc}. Supplied at submit time so
+      # no participant identifier is committed to git. Default is empty: a
+      # submit without -p sessions does nothing rather than silently probing
+      # some stale hardcoded list.
+      - name: sessions
+        value: "[]"
+      # Arms as data, so tranche 2 can run RANDOM-only by overriding this rather
+      # than editing the template. `threads` is the ITK thread count, which is
+      # what repartitions the RANDOM metric sample set and therefore draws a
+      # different basin — it is the independent variable, not a perf knob.
+      - name: arms
+        value: |
+          [{"arm":"control","sampling":"NONE","threads":"1"},
+           {"arm":"random-itk1","sampling":"RANDOM","threads":"1"},
+           {"arm":"random-itk4","sampling":"RANDOM","threads":"4"},
+           {"arm":"random-itk8","sampling":"RANDOM","threads":"8"}]
+
+  templates:
+    - name: rescue
+      steps:
+        - - name: session
+            template: session-arms
+            arguments:
+              parameters:
+                - {name: subject, value: '{{item.subject}}'}
+                - {name: session, value: '{{item.session}}'}
+                - {name: band, value: '{{item.band}}'}
+                - {name: recorded-lncc, value: '{{item.lncc}}'}
+            withParam: '{{workflow.parameters.sessions}}'
+
+    - name: session-arms
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: band
+          - name: recorded-lncc
+      steps:
+        # Arms come from a PARAMETER, not a hardcoded list, so tranche 2 can drop
+        # the control arm without editing this file. Every arm for a session runs
+        # in parallel; workflow-level `parallelism` is the only throttle, and
+        # sequencing them here would serialise the whole probe for no gain.
+        - - name: arm
+            template: arm
+            arguments:
+              parameters:
+                - {name: subject, value: '{{inputs.parameters.subject}}'}
+                - {name: session, value: '{{inputs.parameters.session}}'}
+                - {name: band, value: '{{inputs.parameters.band}}'}
+                - {name: recorded-lncc, value: '{{inputs.parameters.recorded-lncc}}'}
+                - {name: arm, value: '{{item.arm}}'}
+                - {name: sampling, value: '{{item.sampling}}'}
+                - {name: itk-threads, value: '{{item.threads}}'}
+            withParam: '{{workflow.parameters.arms}}'
+
+    - name: arm
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: band
+          - name: recorded-lncc
+          - name: arm
+          - name: sampling
+          - name: itk-threads
+        artifacts:
+          # `.mgz` is gzip and argoexec's LoadArtifacts sniffs gzip and tries to
+          # untar it (#274), so both MUST carry `archive: none` — exactly as the
+          # production t1w-to-mni template does.
+          - name: fastsurfer-orig
+            path: /fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/orig.mgz
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{inputs.parameters.subject}}/{{inputs.parameters.session}}/mri/orig.mgz'
+
+          - name: fastsurfer-brainmask
+            path: /fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/brainmask.mgz
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{inputs.parameters.subject}}/{{inputs.parameters.session}}/mri/brainmask.mgz'
+
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
+      outputs:
+        artifacts:
+          - name: reg-qc
+            path: '/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/rescue-sizing/{{workflow.parameters.run-label}}/{{inputs.parameters.subject}}_{{inputs.parameters.session}}__{{inputs.parameters.arm}}_reg_qc.json'
+
+      # DELIBERATELY UNPINNED — see the header. gpu-nodepool spans g4dn/g5/g6/g6e
+      # and the card model is RECORDED per pod instead of controlled, which is
+      # what makes the control arm comparable to the unpinned production run.
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-nodepool
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: '{{workflow.parameters.ecr-registry}}/{{workflow.parameters.fireants-image}}'
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: work
+            mountPath: /work
+
+        env:
+          - name: USE_FFO
+            value: "False"
+          - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+            value: '{{inputs.parameters.itk-threads}}'
+          - name: OMP_NUM_THREADS
+            value: '{{inputs.parameters.itk-threads}}'
+          - name: MKL_NUM_THREADS
+            value: '{{inputs.parameters.itk-threads}}'
+          - name: OPENBLAS_NUM_THREADS
+            value: '{{inputs.parameters.itk-threads}}'
+          - name: SAMPLING
+            value: '{{inputs.parameters.sampling}}'
+          - name: PROBE_ARM
+            value: '{{inputs.parameters.arm}}'
+          - name: PROBE_BAND
+            value: '{{inputs.parameters.band}}'
+          - name: PROBE_RECORDED_LNCC
+            value: '{{inputs.parameters.recorded-lncc}}'
+          - name: PROBE_ITK_THREADS
+            value: '{{inputs.parameters.itk-threads}}'
+          # Consumed by the stamp step. Passed as an env var rather than inlined
+          # into the heredoc so that block stays free of Argo substitution.
+          - name: SUBJ_SES
+            value: '{{inputs.parameters.subject}}_{{inputs.parameters.session}}'
+          - name: PYTHONPATH
+            value: /app
+
+        resources:
+          requests:
+            # Matches the production t1w-to-mni step (cpu 1 / 2G) so `control`
+            # is production in resourcing as well as in code.
+            memory: 2G
+            cpu: '1'
+            ephemeral-storage: 10G
+          limits:
+            nvidia.com/gpu: '1'
+
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+
+            echo "=== {{inputs.parameters.subject}}/{{inputs.parameters.session}} arm={{inputs.parameters.arm}} band={{inputs.parameters.band}} recorded_lncc={{inputs.parameters.recorded-lncc}} ===" >&2
+            nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv >&2
+
+            # `reg.SetMetricSamplingStrategy(reg.NONE)` is hardcoded at
+            # fst1w_to_mni.py:185 with no env knob, so a RANDOM arm patches it.
+            # The match-count check is the whole point: a silently no-op patch
+            # would turn this arm into a SECOND CONTROL and manufacture a
+            # confident false "not recoverable". Fail the pod instead.
+            python3 - <<'PATCH'
+            import os, pathlib, sys
+            src = pathlib.Path('/app/fst1w_to_mni.py').read_text()
+            dst = pathlib.Path('/work/fst1w_to_mni.py')
+            if os.environ['SAMPLING'] == 'NONE':
+                dst.write_text(src)
+                print('[patch] control arm — script copied verbatim', file=sys.stderr)
+                sys.exit(0)
+            old = 'reg.SetMetricSamplingStrategy(reg.NONE)'
+            new = ('reg.SetMetricSamplingStrategy(reg.RANDOM)\n'
+                   '    reg.SetMetricSamplingPercentage(0.1, seed=42)')
+            n = src.count(old)
+            if n != 1:
+                print(f'[patch] FATAL: expected 1 occurrence of the NONE call, found {n}. '
+                      'Refusing to run — an unpatched arm would silently be a control.',
+                      file=sys.stderr)
+                sys.exit(1)
+            dst.write_text(src.replace(old, new))
+            print('[patch] RANDOM 0.1 seed=42 applied', file=sys.stderr)
+            PATCH
+            if [ $? -ne 0 ]; then echo "FATAL: patch step failed" >&2; exit 1; fi
+
+            # Self-describing log: proves which strategy this pod actually ran,
+            # so an arm can never be mislabelled after the fact.
+            grep -n 'SetMetricSampling' /work/fst1w_to_mni.py >&2
+
+            python /work/fst1w_to_mni.py \
+              --t1w '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/orig.mgz' \
+              --brainmask '/fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/brainmask.mgz' \
+              --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+              --out-dir '/work/registration/{{inputs.parameters.session}}/t1w_to_mni' \
+              --prefix '{{inputs.parameters.subject}}_{{inputs.parameters.session}}_desc-t1w2mni' \
+              --subj '{{inputs.parameters.subject}}' \
+              --ses '{{inputs.parameters.session}}' \
+              --pipeline cloudpipe_minproc
+            EXIT=$?
+
+            echo "=== arm={{inputs.parameters.arm}} exit=$EXIT (65 = QC fail, 0 = PASS/RECOVERED) ===" >&2
+
+            QC="/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json"
+            if [ ! -f "$QC" ]; then
+              echo "FATAL: no QC record written — arm produced no measurement" >&2
+              exit 1
+            fi
+
+            # Stamp the arm and the CARD MODEL into the record so the results are
+            # self-describing. Question 3 (the control offset) is unanswerable
+            # without the card model, and this probe is unpinned precisely so
+            # that it varies — an unrecorded confound would be worse than a
+            # pinned one. `probe_` prefix keeps these clearly distinct from the
+            # RegistrationQC schema; this file never reaches the metrics corpus.
+            python3 - <<'STAMP'
+            import json, os, subprocess
+            p = ('/tmp/' + os.environ['SUBJ_SES'] + '_t1w_to_mni_reg_qc.json')
+            d = json.load(open(p))
+            try:
+                gpu = subprocess.run(['nvidia-smi', '--query-gpu=name',
+                                      '--format=csv,noheader'],
+                                     capture_output=True, text=True,
+                                     timeout=30).stdout.strip().splitlines()[0]
+            except Exception as e:
+                gpu = f'unknown ({e.__class__.__name__})'
+            d['probe_arm'] = os.environ['PROBE_ARM']
+            d['probe_band'] = os.environ['PROBE_BAND']
+            d['probe_itk_threads'] = int(os.environ['PROBE_ITK_THREADS'])
+            d['probe_recorded_lncc'] = float(os.environ['PROBE_RECORDED_LNCC'])
+            d['probe_gpu_name'] = gpu
+            json.dump(d, open(p, 'w'))
+            print(f'[stamp] arm={d["probe_arm"]} gpu={gpu} verdict={d.get("verdict")} '
+                  f'lncc={d.get("lncc")}', file=__import__('sys').stderr)
+            STAMP
+            if [ $? -ne 0 ]; then echo "FATAL: stamp step failed" >&2; exit 1; fi
+
+            # Exit 0 even on a QC fail: a gate failure is an EXPECTED outcome
+            # here and must not abort the sibling arms.
+            exit 0

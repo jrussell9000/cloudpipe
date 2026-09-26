@@ -39,7 +39,7 @@ prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
   -p subjects_file=s3://<YOUR_S3_BUCKET>/config/subjects.csv
 ```
 
-The flow gates concurrency: `ConcurrencyGate.count()` counts active Argo workflows and waits until below `max_concurrent` before submitting the next subject. `max_concurrent` is **not** a flow parameter — it's read live from the Prefect Variable `cloudpipe-max-concurrent` (fallback `50` when unset) on every poll cycle, so it can be changed mid-run with `prefect variable set cloudpipe-max-concurrent <N>` without restarting the flow. Use `start_index`/`end_index` to resume after a pause. The controller's `namespaceParallelism` (`400`) is the server-side backstop — see [ADR 008](decisions/008-prefect-as-queue-manager.md) for why a client-side gate alone cannot enforce the cap (#206).
+The flow gates concurrency: `ConcurrencyGate.count()` counts active Argo workflows and waits until below `max_concurrent` before submitting the next subject. `max_concurrent` is **not** a flow parameter — it's read live from the Prefect Variable `cloudpipe-max-concurrent` (fallback `50` when unset) on every poll cycle, so it can be changed mid-run with `prefect variable set cloudpipe-max-concurrent <N>` without restarting the flow. Use `start_index`/`end_index` to resume after a pause. The controller's `namespaceParallelism` (`400`) is the server-side backstop — see [ADR 008](decisions/008-prefect-as-queue-manager.md) for why a client-side gate alone cannot enforce the cap (#206). Arrivals are also paced to at most `cloudpipe-max-submissions-per-minute` (fallback `5`, `0` disables, read live), so a cold start ramps up instead of creating the cap's whole width at once (#393).
 
 **Direct single-subject submission:**
 ```bash
@@ -74,16 +74,13 @@ start-globus-instance ──► record-workflow-start
         ▼
 globus-transfer
         │
-        ▼  (skipped when globus-use-s3-gateway == "true")
-globus-s3-sync
-        │
         ▼
 subject-data-inventory
         │
         ├──────────────────┬──────────────────────────────┐
         ▼                  ▼                              ▼
 anatomical-        subregion-segmentation      session-level-pipeline (×N sessions)
-processing         (skipped if all five                   │
+processing         (skipped if all three                  │
 (skipped if fs      region tarballs exist)                ├─ registration
  exists)                   │                              │    ├─ t1w-to-mni (if not exists)
         │                  │                              │    └─ bold-to-t1w ×runs (if not exists)
@@ -107,11 +104,13 @@ processing         (skipped if all five                   │
 | Where | `record-outcome-*` tasks |
 |---|---|
 | `master-pipeline-dag` (this diagram) | `record-outcome-anatomical-dagtask`, `record-outcome-session-dagtask` (phase-level aggregates), `record-outcome-subregion-seg-dagtask`, `record-outcome-fsqc-metrics-dagtask` |
-| Anatomical child DAG | `record-outcome-fastsurfer-dagtask` |
+| Anatomical child DAG | `record-outcome-fastsurfer-{template-build,template-parc,long-seg,long-parc}-{failed,other}-dagtask` (one failed/other pair per FastSurfer producer — see below) |
 | Session-level child DAG | `record-outcome-func-preproc-dagtask` (records both `func-preproc` and `surface-sample`), `record-outcome-surface-resample-dagtask` |
 | Registration child DAG | `record-outcome-t1w-to-mni-step`, `record-outcome-bold-to-t1w-step` |
 
-Phase-level `record-outcome-*` tasks depend on `<producer>.Succeeded || .Failed || .Skipped`, so they run on every terminal status. For a task that carries no `when:` clause of its own — `fsqc-metrics` is the example — `Skipped` means *an upstream branch failed*, not that the work was already done.
+Phase-level `record-outcome-*` tasks (`anatomical`, `session`, `subregion-seg`, `fsqc-metrics`) depend on `<producer>.Succeeded || .Failed || .Errored || .Skipped || .Omitted`, so they run on every terminal status, including a spot-preempted `Errored` producer and an `Omitted` one whose own upstream dependency failed. For a task that carries no `when:` clause of its own — `fsqc-metrics` is the example — `Skipped` means *an upstream branch failed*, not that the work was already done.
+
+The four FastSurfer producers are the one place a **single shared gate isn't enough**: they were originally one `withItems` loop with one combined `depends`, but Argo resolves a DAG task's `depends` statically before `withItems` expansion, so a shared gate cannot isolate which items are safe to pull `.exitCode` from. Each producer instead gets a `-failed-dagtask` (gated on `.Failed || .Errored`, carries `exit-code` for real classification) and an `-other-dagtask` (gated on `.Succeeded || .Skipped || .Omitted`, status only) — the same two-arm shape as the registration fallback recorders below, just per producer instead of per session/run.
 
 The per-run recorders whose producer writes its own outcomes in-pod are instead **fallbacks**, gated on `<producer>.Failed || .Errored || .Skipped` — never on bare success, so a healthy session pays for zero recorder pods. `.Errored` covers spot preemption (`pod deleted` / node shutdown), which is phase `Error`, not `Failed`, and is the case where the in-pod records never reach S3. See [ADR 016](decisions/016-skipped-producer-deadlock-in-dag-recording.md).
 
@@ -126,7 +125,7 @@ See [Phase 5 — Observability and cleanup](#phase-5--observability-and-cleanup)
 **`start-globus-instance-template`**
 (image: `cloudpipe/python`, node: `cpu-light-nodepool`)
 
-Reads the GCS EC2 instance ID from SSM (`/cloudpipe/globus/instance-id`), calls `ec2.start_instances()`, and waits for the EC2 status check to pass. Then polls port 443 on the instance's public IP directly — EC2 status checks pass before `gcs-auto-reregister.service` finishes restarting gridftp, so port polling is the correct readiness signal. Idempotent: safe to re-run when the instance is already running.
+Reads the GCS EC2 instance ID from SSM (`/cloudpipe/globus/instance-id`), calls `ec2.start_instances()`, and waits for the EC2 status check to pass. Then polls port 443 on the instance's public IP directly — EC2 status checks pass before the boot registration (`cloudpipe-gcs-boot.service`, or `gcs-auto-reregister.service` on an instance built before the Packer AMI) finishes restarting gridftp, so port polling is the correct readiness signal. Idempotent: safe to re-run when the instance is already running.
 
 Resources: 128M memory, 100m CPU.
 
@@ -154,22 +153,12 @@ S3 destination pattern: `s3://{bucket}/{dest-base-path}/{subjID}/{session}/{bids
 Resources: 256M memory, 100m CPU.
 
 Failure modes:
-- Auth error → refresh token expired; run `python images/globus/setup_auth.py` (see `docs/globus.md`)
+- Auth error → the Globus session has lapsed; run `pixi run globus login` (see `docs/globus.md`)
 - `FAILED` or `CANCELLED` transfer → check the Globus web app for the task error
 - Semaphore timeout → 8 concurrent transfers are running; the pod waits until a slot opens
 
 ---
 
-**`globus-s3-sync-template`**
-(image: `cloudpipe/python`, node: `cpu-light-nodepool`, `activeDeadlineSeconds: 7200`)
-
-**Skipped** when `globus-use-s3-gateway == "true"` (the current default). With the S3 gateway, GridFTP writes go directly to S3 and no local staging step is needed.
-
-When enabled (POSIX mode), runs `aws s3 sync` on the GCS instance via SSM `send-command`, polls for up to 2 hours (480 × 15s), then deletes the local staging directory after sync completes (`rm -rf /data/globus-staging/{dest-base-path}/{subjID}`).
-
-Resources: 128M memory, 100m CPU.
-
----
 
 ### Phase 2 — Inventory
 
@@ -193,7 +182,7 @@ The eight checks (executed in one pass):
 5. **Check T1w source availability** — `head_object` on `mmps_mproc/{subj}/{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz`, recorded as `t1w_available`
 6. **Load nss_volumes.csv** — downloads `config/nss_volumes.csv` once, looks up `nss_frames` per subject/session; exits 1 if the entry is missing
 7. **Check FastSurfer derivatives** — `head_object` on `derivatives/fastsurfer/{subj}/{ses}/_complete.json`, writing `"True"`/`"False"` to `/tmp/fastsurfer_exists.txt`
-8. **Check subregion derivatives** — `head_object` on `derivatives/subregions/{subj}/{region}/_complete.json` for all five regions, writing `/tmp/subregions_exists.txt`
+8. **Check subregion derivatives** — `head_object` on `derivatives/subregions/{subj}/{region}/_complete.json` for all three regions, writing `/tmp/subregions_exists.txt`
 
 Both gate on the **completion marker**, never on a prefix listing or an individual
 file ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)). Under the old
@@ -207,7 +196,7 @@ Two of those deserve a note:
 
 **Why `t1w_available` is checked separately (5).** ABCD collects T1w less often than functional runs, so a longitudinal session can have BOLD and no anatomical. `fastsurfer_exists` (7) is therefore judged **only against sessions that have a T1w source** — judging it against anat-less sessions would keep the anatomical phase re-running forever, since those sessions can never produce a templated tarball.
 
-**Why the subregion check requires all five (8).** The five regions are `thalamus`, `brainstem`, `hippoamyg`, `hypothalamic`, `sclimbic`, and the flag is `True` only if *every* tarball exists. Requiring all rather than any means a partial or failed prior run re-runs cleanly, with the phase's own per-region resume guards skipping whatever did complete. It also prevents a subject whose tarballs predate `hippo-amygdala` from silently persisting as a four-region outlier.
+**Why the subregion check requires all three (8).** The three regions are `thalamus`, `brainstem`, `hippoamyg`, and the flag is `True` only if *every* `_complete.json` exists. (`hypothalamic` and `sclimbic` were also gated until 2026-09-16, when both were retired; keeping either in the gate would make every later subject read as incomplete forever.) A marker is per region, so this check cannot see per-session coverage — see the subregion phase's coverage gate. Requiring all rather than any means a partial or failed prior run re-runs cleanly, with the phase's own per-region resume guards skipping whatever did complete. It also prevents a subject whose tarballs predate `hippo-amygdala` from silently persisting as a four-region outlier.
 
 Outputs:
 - `result` (stdout, consumed by Argo as the `result` output parameter): JSON array, one object per session:
@@ -242,6 +231,8 @@ Failure modes:
 
 Four steps run as a DAG. All FastSurfer steps use image `cloudpipe/fastsurfer`. Steps A and C run on `gpu-nodepool`; B and D on `cpu-heavy-nodepool`.
 
+**GPU spot-drought fallback ([#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373)).** When the workflow parameter `fastsurfer-device` is `cpu` (default `cuda`), A and C run on `cpu-heavy-nodepool` too: each pod is re-sized to 7 CPU / 8G by `podSpecPatch`, its `nvidia.com/gpu` limit is zeroed, and `--device cpu --threads 7` is appended to every FastSurfer call. Measured on one session (probe `fastsurfer-cpu-probe-lmkgg`, 2026-09-10, manifest in `scripts/manifests/`): 396 s on CPU against 357 s on a 3-way time-sliced T4 — inference itself is 172 s vs 35 s, but the bias-field, sub-segmentation and stats work that follows is CPU-bound on both paths — with Dice 0.9998 against the GPU segmentation and a 3.96G memory peak. About 1.4x the per-session cost, and it cannot be stalled by a GPU pool that grants no nodes — which happened for hours on 2026-09-03 and 2026-09-10. The queue manager chooses the value per submission from how many GPU pods have been Pending 15+ minutes (Prefect variable `cloudpipe-fastsurfer-device` overrides it), and the workflow records it as the label `cloudpipe.io/fastsurfer-device`. `t1w-to-mni` stays GPU-only.
+
 **There is no shared volume.** Each step works in a private `emptyDir` at `/work`, with `SUBJECTS_DIR=/work/subjects`, and hands state to the next step through S3 per [ADR 004](decisions/004-s3-artifacts-for-inter-step-data.md). Intermediates go to `scratch/{workflow.name}/anat/` and are reaped by the `scratch-expiration` lifecycle rule (7 days) in `terraform/s3_lifecycle.tf`. They are not derivatives — nothing outside the owning workflow may read them.
 
 ```
@@ -270,9 +261,12 @@ Template creation and segmentation share pod A because both are `gpu-nodepool` a
 
 **Step A — `fastsurfer-template-build-template`** (node: `gpu-nodepool`)
 
-Two init containers run before the main pod:
+One init container runs before the main pod:
 - `download-t1w-inputs` (image: `cloudpipe/python`) — downloads `mmps_mproc/{subj}/{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz` for every session into an `emptyDir` at `/home/nonroot/{subj}/{ses}/anat/`
-- `download-fsaverage` (image: `cloudpipe/python`) — downloads `config/fsaverage/` (~480 MiB, 312 objects) from S3 to `/work/subjects/fsaverage/`. Required before `long_prepare_template.sh` runs surface registration — `fsaverage` is not included in per-subject tarballs. B and D run the same init container for the same reason. C also runs it, precautionarily — `--seg_only` shouldn't need it, but the old shared volume guaranteed it was always present and that assumption is unverified against a real run; see C's section below.
+
+There is no `download-fsaverage` init container on any of the four FastSurfer steps any more (#372). It downloaded `config/fsaverage/` (~480 MiB, 312 objects, sequentially) into `/work/subjects/fsaverage/` on every pod, and nothing read it: FastSurfer resolves fsaverage under `$FREESURFER_HOME` at all three of its call sites — `recon-surf.sh`'s `rotate_sphere.py` (`--trgsphere`/`--trgaparc`), `recon-surfreg.sh`, and `fs_balabels.py`, which is invoked with `--sd`/`--sid` only and so falls back to `$FREESURFER_HOME/subjects/fsaverage`. The image ships that tree already: upstream's `tools/build/install_fs_pruned.sh` copies exactly those label/surf files out of FreeSurfer 7.4.1. Each step now symlinks it into `SUBJECTS_DIR` for any consumer that names `fsaverage` as a subject, and `images/fastsurfer/Dockerfile` fails the **image build** if the base image stops shipping the files — that assertion is the only thing standing between an upstream prune and a failed surface registration mid-cohort.
+
+This mattered most on the two GPU steps (A and C): a GPU time-slice is allocated at pod *admission*, so init containers hold it, and those 312 GETs were billed as slice time.
 
 There is no `clear-is-running` init container any more. It existed to delete `*IsRunning*` lock files so a retry could **restart over a dirty shared volume** — which is not resume, and is what produced the truncated-template bugs the exit-75 guards in B and D were added to catch. Every pod now starts from a clean `emptyDir` re-seeded from its input artifacts, so the dirty-state hazard is gone; the guards remain because an interrupted run still uploads nothing.
 
@@ -286,14 +280,14 @@ Main container runs `long_prepare_template.sh`, then — only if that succeeded 
 
 `--threads 1` matches the 1-CPU request so two time-sliced GPU pods fit a g4dn.xlarge; see the inline comment for the full rationale. `--threads` only reaches FastSurfer's own argument parsing, so the GPU steps additionally project the CPU request into `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` via the downward API — without that, PyTorch and OpenMP size their pools from the host core count (measured `cpu_efficiency` 1.10–1.22 against a 1-core request, 2026-07-31 batch).
 
-Resources: 4G memory, 1 CPU, 20G ephemeral-storage, 1 GPU.
+Resources: 2G memory, 1 CPU, 20G ephemeral-storage, 1 GPU (7 CPU / 8G / no GPU with `device=cpu`).
 
 Outputs: `scratch/{workflow.name}/anat/template-base.tar.gz`.
 
 Failure modes:
 - GPU OOM → check for other workflows sharing the node
 - T1w download fails → verify `mmps_mproc/` has the expected `run-01_T1w.nii.gz` for that session
-- `fsaverage` download fails → check that `config/fsaverage/` is populated in S3
+- surface registration cannot find `fsaverage` → this is an **image** problem, not an S3 one. Check `$FREESURFER_HOME/subjects/fsaverage` inside the fastsurfer image; the Dockerfile assertion should have caught it at build time. Do not "fix" it by restoring the S3 download — that wrote to a path FastSurfer does not read
 - `long_prepare_template.sh` non-zero → segmentation is skipped and the step exits with that code rather than segmenting an absent template
 
 ---
@@ -302,7 +296,7 @@ Failure modes:
 
 Surface reconstruction on the template: `--surf_only --base --edits --3T --fsaparc`, plus `--threads` derived from the pod's own `requests.cpu` via the downward API (`CPU_REQUEST`) rather than written into the master template's argstring.
 
-Inputs: `template-base.tar.gz` from A, landed directly at `/work/subjects/{subjID}_template`, plus `config/fslicense` and the `fsaverage` init container.
+Inputs: `template-base.tar.gz` from A, landed directly at `/work/subjects/{subjID}_template`, plus `config/fslicense`. `fsaverage` comes from the image (see Step A).
 
 On completion the step asserts `surf/{lh,rh}.white` and `mri/filled.mgz` exist and exits 75 (`EX_TEMPFAIL`, retryable) if not — `run_fastsurfer.sh` traps SIGTERM and exits 0 even when its `recon-all` child is killed mid-reconstruction by a spot reclaim, which would otherwise promote a truncated template that only detonates two steps later at `segment-subregions`.
 
@@ -318,9 +312,9 @@ Longitudinal segmentation for all sessions simultaneously: `--seg_only --long {s
 
 Runs `brun_fastsurfer.sh` (batch variant). Takes `template-base.tar.gz` from A — it does **not** wait for B.
 
-Also runs the `download-fsaverage` init container (see Step A). `--seg_only` shouldn't need `fsaverage` — it's a surface-registration atlas, and this step never runs `--surf_only` — but under the old shared volume it was always present regardless, so removing it here is unverified. Costs ~480 MiB of S3 transfer and a few seconds of GPU node time per pod until a real run confirms it's safe to drop.
+Runs no init container. The `download-fsaverage` one it used to carry was there precautionarily — `--seg_only` shouldn't need a surface-registration atlas, but the old shared volume had always supplied one — and #372 settled it: no FastSurfer step reads `fsaverage` from `SUBJECTS_DIR` at all, on any flag (see Step A). The symlink is kept here anyway, so all four steps present an identical `SUBJECTS_DIR`.
 
-Resources: 2G memory, 1 CPU, 20G ephemeral-storage, 1 GPU.
+Resources: 1G memory, 1 CPU, 20G ephemeral-storage, 1 GPU (7 CPU / 8G / no GPU with `device=cpu`).
 
 Outputs: `scratch/{workflow.name}/anat/sessions-seg/{ses}.tar.gz`, one per session. Declared one-per-possible-session (`ses-00A`…`ses-10A`) and all `optional: true`, because Argo resolves `outputs.artifacts` statically when the pod spec is built — a variable-length session list cannot be expressed any other way. Same pattern as `subregion-seg`'s segmentation templates' FastSurfer input artifacts.
 
@@ -346,7 +340,7 @@ Reassembles `SUBJECTS_DIR` from **B's parcellated template** (not A's — `long_
 
 Every k=4 pod exceeded its request, the median by 74%. A 2xlarge has only **14.82 G** allocatable, so a k≤3 pod at p95 held 77% of the whole node's `kubepods` limit while telling the scheduler it needed 6 G — the scheduler was free to pack 8.8 G of co-tenants into memory the pod was already using. `13G`/`18G` clears the observed max at both k and changes no instance class: 13 G + ~0.56 G of daemonset requests fits a 2xlarge, and k=4 is already on a 4xlarge for `cpu: 8`, where 18 G leaves ~11.9 G for the co-tenants its ~7.2 spare cores can hold.
 
-This is the #129 lesson applied to a second step: `ram_efficiency` is a **lifetime average** and is structurally blind to a peak. Across the whole pipeline, the only two steps whose max/request is below 1.0 (`segment-subregions-dl`, `fsqc-metrics`) are the two sized from cgroup `memory.peak`; every step sized from `ram_efficiency` is over.
+This is the #129 lesson applied to a second step: `ram_efficiency` is a **lifetime average** and is structurally blind to a peak. Across the whole pipeline (as measured then), the only two steps whose max/request was below 1.0 (`segment-subregions-dl`, since removed, and `fsqc-metrics`) were the two sized from cgroup `memory.peak`; every step sized from `ram_efficiency` was over.
 
 **No memory limit is set** — but not for the reason previously recorded ("an underestimate should degrade to burst, not to an OOM"; it degraded to an OOM anyway, at the `kubepods.slice` level). A memory limit cannot address what killed `cloudpipe-zkrmj` on 2026-08-11. The kernel's process table at the OOM instant (`rss_anon` is in 4 KB pages):
 
@@ -514,14 +508,14 @@ Runs [fsqc](https://github.com/Deep-MI/fsqc) over the finished anatomical deriva
 
 Reads from the derivatives bucket:
 - `derivatives/fastsurfer/{subj}/{ses}/` (all sessions)
-- `derivatives/subregions/{subj}/{hippoamyg,hypothalamic}/`
+- `derivatives/subregions/{subj}/hippoamyg/`
 
-Deliberately **not** read: the ~480 MB long-template tarball (nothing enabled reads it), nor the thalamus/brainstem/sclimbic tarballs.
+Deliberately **not** read: the ~480 MB long-template tree (nothing enabled reads it), nor the thalamus/brainstem trees. The `hypothalamic` tree and fsqc's hypothalamus module were retired on 2026-09-16 with the FreeSurfer segmentation itself; fsqc has no HypVINN support (both its hypothalamus and outlier modules read only the FreeSurfer files — checked in 2.1.7 and upstream `main`), so FastSurfer's HypVINN currently has **no automated QC**. The record keeps its hypothalamus fields, always null.
 
 Writes to the **metrics** bucket — this step produces QC records, not derivatives:
 ```
 metrics/fsqc-qc/dt={date}/{subj}_{ses}_fsqc_qc.json
-fsqc/{subj}/{ses}/*.png              (hippocampus + hypothalamus overlays, whole-brain screenshots)
+fsqc/{subj}/{ses}/*.png              (hippocampus overlays, whole-brain screenshots)
 fsqc/{subj}/fsqc-results.html        (browsable summary across the subject's sessions)
 ```
 
@@ -609,7 +603,7 @@ way.
 Failure modes:
 - GPU allocation failure → check `gpu-nodepool` capacity
 - Registration diverges → inspect QC image; may indicate a poor-quality T1w
-- FastSurfer tarball download fails → anatomical step may not have produced this session's file (check S3)
+- `orig.mgz` / `brainmask.mgz` artifact download fails → anatomical step may not have published this session's tree (check `derivatives/fastsurfer/{subj}/{ses}/_complete.json` in S3)
 
 ---
 
@@ -659,7 +653,7 @@ metrics/registration/dt={date}/{subj}_{ses}_{task}_{run}_bold_to_t1w_reg_qc.json
 
 Failure modes:
 - BOLD NIfTI not found → transfer missed this run; verify S3 key
-- Missing `mri/T1.mgz` or `mri/brainmask.mgz` → FastSurfer tarball incomplete
+- Missing `mri/T1.mgz` or `mri/brainmask.mgz` → FastSurfer tree incomplete; `_complete.json` is the only valid existence test ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md))
 - `mri_synthmorph` non-zero exit → check pod logs
 - Exit 137 → OOM; see the host-dependent peak above before raising the limit
 - `nmi: 0.0` in the QC record → early-exit failure path (NMI ≥ 1 for real tissue). Note `nmi ≈ 1.02` is a **good** score here, not a failure: identity scores ~1.011, so the theoretical 1.0–2.0 range is not the operating scale
@@ -681,9 +675,9 @@ Artifacts in (downloaded once per session, not once per run):
 - `mmps_mproc/{subj}/{ses}/func/` → `/data/func/` — whole-prefix directory artifact carrying every run's BOLD, BIDS sidecar and motion params
 - `derivatives/registration/{subj}/{ses}/` → `/tmp/registration/` — whole-prefix directory artifact carrying `t1w_to_mni/` (shared by every run) and each `bold_to_t1w_{task}_{run}/`
 - `config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii`
-- `derivatives/fastsurfer/{subj}/{ses}/` → `/tmp/fastsurfer/{subj}_{ses}/` (for `mri/aseg.auto.mgz`)
+- From `derivatives/fastsurfer/{subj}/{ses}/` → `/tmp/fastsurfer/{subj}_{ses}/`, only what the pod reads: `mri/aseg.auto.mgz` (aCompCor, subcortical block), `surf/` (grayordinate extraction) and `_links.json` (alias replay)
 
-Collapsing the fan-out is what makes the FastSurfer tarball, MNI template and
+Collapsing the fan-out is what makes the FastSurfer inputs, MNI template and
 t1w→MNI warp a single download per session rather than one per run — see
 [the cost deep-dive §3.2](https://github.com/jrussell9000/cloudpipe/blob/main/docs/investigations/2026-07-20-cloudpipe-cost-reduction-deep-dive.md).
 
@@ -706,7 +700,7 @@ Three things about that order are deliberate and easy to get wrong:
 
 **Float16 output rationale:** MNI BOLD is written as float16 NIfTI (`DT_FLOAT16`, datatype 512). This halves the in-memory allocation (~6.3 GB vs ~12.6 GB for a 400-frame run). FSL, AFNI, and FreeSurfer all upcast float16 to float32 on load. Confound regressors are derived entirely from native-space float32 data. Quantization error at typical BOLD baseline (~1000 units) is ~0.5 units, negligible for GLM/FC/ICA analyses. tSNR is computed with float32 accumulators before writing (required to avoid overflow when summing 300+ frames).
 
-Resources: 4G memory request, 6G limit (TODO(perf): validate limit empirically against observed peak usage — intermediate ANTs warp operations may exceed 6G on longer runs; check `metrics/func-preproc` QC JSONs for `peak_memory_gb` before adjusting), 2 CPU, 20G ephemeral-storage request, 30G limit. CPU was cut 6 → 3 in [#96](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/96) — mean `cpu_efficiency` across 26 pods was 0.347, ~2.1 of 6 cores — then 3 → 2 after a live re-measurement over 65 pods mid-batch at 200 concurrent (2026-08-11) showed median 1.15 CPU and p90 3.19, i.e. 38% of the request, the step being largely S3-I/O-bound. At 2 CPU three pods share a `c*.2xlarge` where only two fit at 3. The request must stay an integer: `resourceFieldRef` rounds a fractional CPU request up, which would decouple the thread count from the reservation. The driver derives `--threads` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` from the pod's own CPU request (downward API `resourceFieldRef`, env `CPU_REQUEST`) rather than a hardcoded constant, so the request is the single source of truth and cannot drift from the thread count. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`); ephemeral storage grew because the pod holds the session's whole `func/` and `registration/` prefixes plus the extracted FastSurfer tree. The driver deletes each run's working directory once it is tarred, so intermediates do not accumulate across runs.
+Resources: 4G memory request, 6G limit (TODO(perf): validate limit empirically against observed peak usage — intermediate ANTs warp operations may exceed 6G on longer runs; check `metrics/func-preproc` QC JSONs for `peak_memory_gb` before adjusting), 2 CPU, 20G ephemeral-storage request, 30G limit. CPU was cut 6 → 3 in [#96](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/96) — mean `cpu_efficiency` across 26 pods was 0.347, ~2.1 of 6 cores — then 3 → 2 after a live re-measurement over 65 pods mid-batch at 200 concurrent (2026-08-11) showed median 1.15 CPU and p90 3.19, i.e. 38% of the request, the step being largely S3-I/O-bound. At 2 CPU three pods share a `c*.2xlarge` where only two fit at 3. The request must stay an integer: `resourceFieldRef` rounds a fractional CPU request up, which would decouple the thread count from the reservation. The driver derives `--threads` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` from the pod's own CPU request (downward API `resourceFieldRef`, env `CPU_REQUEST`) rather than a hardcoded constant, so the request is the single source of truth and cannot drift from the thread count. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`); ephemeral storage grew because the pod holds the session's whole `func/` and `registration/` prefixes plus the staged FastSurfer `mri/aseg.auto.mgz` and `surf/`. The driver deletes each run's working directory once it is tarred, so intermediates do not accumulate across runs.
 
 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` is set by the driver per run (to `CPU_REQUEST // jobs`, floored at 1) rather than on the container, so raising `jobs` splits the CPU request across concurrent runs instead of letting each grab the whole request and over-subscribe the node. `jobs` is `1`, and with the CPU request now at 2, `jobs=2` already leaves one thread per run and anything above 2 floors at 1 while still multiplying peak memory.
 
@@ -743,7 +737,7 @@ The short path is why `derivatives/func/{subj}/{ses}` is an `optional: true` inp
 
 Outcome is recorded per run under the `surface-sample` step by a second `record-step-outcome` fan-out on the same DAG task — Stage 5b has no Argo task of its own, so the two recorders are distinguished by which S3 marker each verifies.
 
-The pod also exports the session's surface geometry once (`sphere.reg` and a derived midthickness, as GIFTI) to `derivatives/func_surf/{subj}/{ses}/anat/`. That is what lets the resample step below avoid downloading the ~2 GB FastSurfer tarball. Its failure is non-fatal: the per-run components stay valid, and the resample step simply does not run until the geometry exists.
+The pod also exports the session's surface geometry once (`sphere.reg` and a derived midthickness, as GIFTI) to `derivatives/func_surf/{subj}/{ses}/anat/`. That is what lets the resample step below avoid staging any FastSurfer derivatives. Its failure is non-fatal: the per-run components stay valid, and the resample step simply does not run until the geometry exists.
 
 ---
 
@@ -754,7 +748,7 @@ The pod also exports the session's surface geometry once (`sphere.reg` and a der
 
 **One pod per session**, looping over runs. Depends on the func-preproc task rather than on registration, since it consumes the grayordinate components that task produces. Skipped when every run already has its dtseries.
 
-This is the one stage that is genuinely cheap to isolate, because Stage 1 already reduced its inputs: it reads vertices × frames and the subcortical block, never the raw BOLD, the MNI BOLD, or the FastSurfer tarball.
+This is the one stage that is genuinely cheap to isolate, because Stage 1 already reduced its inputs: it reads vertices × frames and the subcortical block, never the raw BOLD, the MNI BOLD, or any FastSurfer derivatives.
 
 Artifacts in:
 - `derivatives/func_surf/{subj}/{ses}/components` → `/data/components`
@@ -912,7 +906,7 @@ Inventory runs fresh on every submission. Prior step outputs are checked via `he
 | `derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz` | `func-preproc` for that run |
 | `derivatives/func_surf/{subj}/{ses}/components/{subj}_{ses}_{task}_{run}_desc-grayordcomponents_bold.tar.gz` **or** the dtseries below | Grayordinate extraction (Stage 5b) for that run — the components are reclaimed after assembly, so either one proves it ran |
 | `derivatives/func_surf/{subj}/{ses}/fsLR32k/{subj}_{ses}_{task}_{run}_space-fsLR32k_bold.dtseries.nii` | `surface-resample` for that run |
-| `derivatives/subregions/{subj}/{region}/` for **all five** regions | Entire subregion-segmentation phase |
+| `derivatives/subregions/{subj}/{region}/` for **all three** regions | Entire subregion-segmentation phase |
 | `mmps_mproc/{subj}/{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz` (source, not a derivative) | Whether the session counts toward `fastsurfer_exists` at all |
 
 To force a step to re-run, delete the marker key, then resubmit:
@@ -947,7 +941,7 @@ Then resubmit with the standard `argo submit` command.
 
 The design: process raw ABCD DICOMs from scratch, applying preprocessing steps that are done upstream in cloudpipe_minproc: dcm2niix → despiking → STC → motion correction → SDC (FSL topup) → between-scan motion correction → then the same registration + func-preproc as cloudpipe_minproc. Gradient nonlinearity correction would be omitted (proprietary manufacturer files unavailable).
 
-Intended to use the POSIX staging approach (globus-s3-sync always runs). Planned WorkflowTemplate name: `cloudpipe-fullproc`.
+It was originally sketched around the POSIX staging path, which no longer exists ([ADR 001](decisions/001-s3-gateway-over-posix-staging.md)); a real design would use the S3 gateway like `cloudpipe_minproc`, or `presynced` if the DICOMs are staged by other means. Planned WorkflowTemplate name: `cloudpipe-fullproc`.
 
 ---
 
@@ -962,7 +956,7 @@ WorkflowTemplate name: `subregion-seg`, entrypoint `subregion-seg-dag-template`.
 `subregion-segmentation-dagtask` in `cloudpipe-long-master-workflow-template.yaml`:
 
 - `depends`: `anatomical-processing-pipeline-dagtask.Succeeded || .Skipped` — the same anatomical gate as the session-level branch, so the two run in parallel.
-- `when`: `subregions-exist == "False"` — skipped entirely when all five output tarballs are already in S3.
+- `when`: `subregions-exist == "False"` — skipped entirely when all three output trees carry `_complete.json` in S3.
 
 A downstream `record-outcome-subregion-seg-dagtask` records the phase outcome on every terminal status, including `Skipped`.
 
@@ -989,59 +983,60 @@ argo submit --from workflowtemplate/subregion-seg \
   -p T1w_sessions='["ses-00A","ses-02A"]'
 ```
 
-There is no longer a `fastsurfer-exists` parameter, and no `hydrate` step. Both used to gate/perform staging of FastSurfer outputs onto the shared EFS volume; both are gone as of [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77) — each segmentation pod now declares the FastSurfer S3 tarballs as its own input artifacts and extracts them onto a private `emptyDir`, so standalone submission needs no extra flag either way.
+There is no longer a `fastsurfer-exists` parameter, and no `hydrate` step. Both used to gate/perform staging of FastSurfer outputs onto the shared EFS volume; both are gone as of [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77) — each segmentation pod now declares the FastSurfer S3 derivatives trees (exploded per [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)) as its own input artifacts and stages them onto a private `emptyDir`, so standalone submission needs no extra flag either way.
 
 `T1w_sessions` controls which S3 artifact inputs are declared. Sessions beyond `ses-00A` are declared `optional: true`; the template reads `base-tps` from the long-template tarball at runtime to determine which timepoints to actually process.
 
 Workflow-level settings: `serviceAccountName: argo-workflows-runner`, `securityContext: runAsNonRoot / runAsUser 1000 / fsGroup 1000`, retry limit 3. No PVC — the master workflow no longer declares `volumeClaimTemplates`.
 
-This was formerly the **last consumer of the EFS PVC**. `segment-subregions-gems-template`'s and `segment-subregions-dl-template`'s per-region resume guards now check S3 directly (see "Resume guards" below) instead of a retry-persistent volume, which is what let the PVC come out — and let the EFS filesystem, StorageClass, and CSI driver be removed from the cluster entirely.
+This was formerly the **last consumer of the EFS PVC**. `segment-subregions-gems-template`'s per-region resume guards now check S3 directly (see "Resume guards" below) instead of a retry-persistent volume, which is what let the PVC come out — and let the EFS filesystem, StorageClass, and CSI driver be removed from the cluster entirely.
 
-### Structure: gems ∥ dl
+### Structure: one pod
 
-Two templates, running **concurrently**, each independently staging its own copy of the FastSurfer outputs (no shared pod, no hydrate step):
+One template, staging its own copy of the FastSurfer outputs (no shared volume, no hydrate step):
 
 ```
   segment-gems  (~50 min, 4.5G)
-  segment-dl    (~1 min, 13G)
 ```
 
-Artifact inputs are statically declared, since Argo requires all artifact paths to be known at template definition time. The DAG sets `failFast: false`, so one pod failing does not cancel the other — they produce independent derivatives, and a DL failure should not discard 50 minutes of GEMS work.
+Artifact inputs are statically declared, since Argo requires all artifact paths to be known at template definition time. The entrypoint is still a one-task DAG (`subregion-seg-dag-template`) because the master references it by that name.
 
 **`segment-subregions-gems-template`** — thalamus, brainstem, hippo-amygdala. Image `cloudpipe/freesurfer`, node `cpu-heavy-nodepool`, **4.5G / 3.5 CPU / 5G ephemeral-storage** (no memory limit). No TensorFlow is imported in this pod at all. The CPU request is deliberately half a core *below* the tool's `--threads 4`: at 4 no two pods fit on a `c*.2xlarge` (7.21 CPU usable after the DaemonSet tax), which is why 83 of 148 `cpu-heavy` nodes were carrying a single workflow pod when measured at 200 concurrent on 2026-08-11. There is no CPU limit, so the request is a scheduling weight rather than a cap — only a genuinely full node throttles the pod, and then to ~90% of its threads.
 
-**`segment-subregions-dl-template`** — hypothalamic subunits and ScLimbic. Same image and node pool, **13G / 4 CPU / 2G ephemeral-storage** (no memory limit), with `TF_ENABLE_ONEDNN_OPTS=0`.
+The 4.5G request is **provisional** — the ~3.5 GB plateau from an old 1 Hz trace plus ~1 GB of deliberate slack, and not read from `memory.peak`. If re-measuring, note that `memory.peak` cannot be reset in these containers (see below), so only a probe running a single step gives an exact figure.
 
-#### Why the phase is two pods (#134)
+The pod downloads `config/fslicense` and sources `SetUpFreeSurfer.sh` with strict shell flags relaxed (the script is not `set -u`-safe and returns non-zero), and creates symlinks from bare FastSurfer session IDs (`ses-00A`) to the `{tp}.long.{BASE}` naming that `--long-base` requires.
 
-Until [#134](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/134) this was a single sequential pod running all five regions, whose memory request went 16G → 5G in [#95](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/95) → 13G in [#129](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/129).
+#### Retired: FreeSurfer's TensorFlow regions (2026-09-16)
 
-The 5G came from a 3.38 GB peak inferred from `ram_efficiency`, which is a **lifetime average**. It is right for the three GEMS regions — they hold ~3.5 GB for ~50 of the fused pod's ~55 minutes — and blind to what follows: step 4 (`mri_segment_hypothalamic_subunits`, TensorFlow) allocates ~8 GB more in under a minute. With no memory limit that overrun is not a container-limit kill but the kernel firing inside `kubepods` and picking this container, so it presented as `OOMKilled` on 7/7 attempts that landed on a 16 GiB instance type and 0/10 on 32 GiB types, and the retry policy turned every one of them into a silent success. Measured directly with `scripts/manifests/subregion-oom-probe.yaml` (cgroup v2 `memory.peak`, an exact high-water mark rather than a sample): step-4 peak **16.28 G with oneDNN on, 11.87 G with it off**, for +10 s of wall clock. The peak does not scale with timepoint count (11.91 G at one timepoint, 11.87 G at three) — the tool processes sessions in a loop and frees between them. 13G sits above the measured peak, so the scheduler reserves what the pod will actually take and cannot pack a co-tenant into it — that, rather than the node size, is the fix. It does **not** exclude the 16 GiB instance type: such a node has 14.82 GB allocatable against only 0.554 GB of daemonset memory requests, so 13G fits it and the pod simply becomes the sole tenant. Do not re-derive either request from an averaged efficiency metric.
+Until 2026-09-16 a second pod, `segment-subregions-dl-template`, ran concurrently and produced two more regions. **Both were dropped, the pod was removed, and their legacy S3 trees are retired** with `scripts/retire_subregion_trees.py` (dry run by default; `--execute` refuses while any Running workflow still has the old template frozen in):
 
-#129 fixed the size of the request; #134 fixed its **shape**. Reserving 13G for ~55 minutes covered a peak lasting ~30 seconds — 0.9% of the pod's lifetime. Splitting it lets a `c8i-flex.4xlarge` (31.44 GB / 15.89 CPU allocatable, measured 2026-08-03) hold three GEMS pods where it held two fused ones, since a 4.5G GEMS pod is CPU-bound rather than memory-bound. The later 4 → 3.5 CPU trim takes that to four per `4xlarge`.
+- **`hypothalamic`** — `mri_segment_hypothalamic_subunits` (Billot et al.). Superseded by FastSurfer's **HypVINN**, which the anatomical phase already writes per session (`derivatives/fastsurfer/{subj}/{ses}/stats/hypothalamus.HypVINN.stats` — 24 labels: anterior/medial/lateral/posterior hypothalamus per side plus optic nerve, chiasm and tract, mammillary bodies, fornix, third ventricle, anterior commissure, pineal, pituitary, infundibulum and tuberal region). The two parcellations are **not interchangeable**: Billot cuts along anterior/tubular/posterior × superior/inferior, HypVINN along anterior/medial/lateral/posterior, with different boundaries. Legacy trees deleted 2026-09-16 (47,204 objects, 11,801 subjects).
+- **`sclimbic`** — `mri_sclimbic_seg`. Its nucleus accumbens is in FastSurfer's aseg and its fornix and mammillary bodies are in HypVINN; basal forebrain and septal nuclei, the only structures it uniquely provided, are not needed.
 
-The two pods can run concurrently because the DL tools do not consume GEMS output. Verified against the FreeSurfer 7.4.1 sources: in `--s` mode `mri_segment_hypothalamic_subunits` reads exactly one subject file, `mri/nu.mgz`, and `mri_sclimbic_seg` reads `mri/nu.mgz` plus an optional `mri/transforms/talairach.xfm.lta`. Both are FastSurfer outputs each pod has staged for itself; neither tool opens `ThalamicNuclei*`, `brainstemSs*` or `*hippoAmygLabels*`. **Re-check this before any FreeSurfer version bump.**
+**Both had been wrong for every multi-session subject.** The pod passed `--s ses-00A --s ses-02A --s ses-06A`; both tools declare `--s` as argparse `nargs='*'` with the default `store` action, so each flag *replaced* the list and only the **last** session was segmented (300 of 859 sessions in a 300-subject sample; cohort-wide ~65% of sessions, including nearly every baseline). `_complete.json` still landed, because the marker is per region and the collection `cp … || true` tolerated the missing files. The symptom had been seen and recorded as tool behaviour ("ships empty per-session `mri/` dirs for uncovered sessions"). **Do not use any legacy `hypothalamic/` or `sclimbic/` tree.**
 
-Each pod now has its own private `emptyDir` copy of `$SD` (no shared volume — GitHub #77), so there is nothing to race on between the two pods at all; the old "disjoint filenames in a shared directory" property is moot. Each pod still owns and uploads only its own artifacts: GEMS owns `thalamus`/`brainstem`/`hippoamyg`, DL owns `hypothalamic`/`sclimbic`.
+What the pod taught, kept because it applies to any TensorFlow step added to this phase again:
 
-The 4.5G GEMS request is **provisional** — it is the ~3.5 GB plateau seen on the probe's 1 Hz trace plus ~1 GB of deliberate slack, and is the one number here not read from `memory.peak`. Re-run the probe against steps 1–3 alone and set it from the high-water mark.
+- **History of its sizing (#95, #129, #134).** The phase began as one sequential pod whose request went 16G → 5G → 13G. The 5G came from `ram_efficiency`, a **lifetime average** blind to the hypothalamic step's ~30-second spike; with no memory limit the overrun was a kernel OOM kill inside `kubepods`, `OOMKilled` on 7/7 attempts on a 16 GiB type and 0/10 on 32 GiB types, and the retry policy hid every one. `TF_ENABLE_ONEDNN_OPTS=0` cut that step's peak from **16.28 G to 11.87 G** (#129; same mechanism as bold-to-t1w, #120). #134 then split the TensorFlow tail into its own pod so 13G was reserved for ~1 minute instead of ~55.
+- **TensorFlow memory can grow per session within one process.** The "11.91 G at one timepoint vs 11.87 G at three" claim came from a probe with the same `--s` bug, so it compared one session with one. With the flag fixed, the hypothalamic tool's anon memory climbed 8.6 → 11.0 → 11.9 → 12.8 G over four sessions to a **15.94 G** peak, above the pod's 13G request (3,598 subjects have four timepoints). One process per session held it at 10.89 G for +9 s. sclimbic did not grow: exactly **4.19 G** over four sessions.
+- **`memory.peak` cannot be reset in these containers** — `echo 0 >` fails silently — so it is a pod-lifetime high-water mark. Only a probe that runs a single step gives an exact per-step peak.
+- **`memory.current` and `memory.peak` count page cache**; size from `anon` (in `memory.stat`) or a single-step `memory.peak`. And a **2 Hz sampler is not enough**: on the sclimbic-only probe it read 3.38 G against an exact 4.19 G.
 
-Both pods download `config/fslicense` and source `SetUpFreeSurfer.sh` with strict shell flags relaxed (the script is not `set -u`-safe and returns non-zero). Only the GEMS pod creates the symlinks from bare FastSurfer session IDs (`ses-00A`) to the `{tp}.long.{BASE}` naming that `--long-base` requires; the DL tools take bare session IDs via `--s`.
-
-Results are collected into `/out`, which in each pod is its own **emptyDir volume** — the pod runs as UID 1000 and cannot `mkdir` at the image root filesystem.
+Results are collected into `/out`, which is its own **emptyDir volume** — the pod runs as UID 1000 and cannot `mkdir` at the image root filesystem.
 
 **Resume guards.** Each region checkpoints to and restores from its own final S3 prefix (`derivatives/subregions/{subjID}/{region}/`): before a region runs, `checkpoint_restore` stages that prefix if its `_complete.json` is present, instead of recomputing; after a region completes, `checkpoint_save` publishes it immediately. Because the checkpoint prefix *is* the derivative prefix, "checkpoint restored" and "already done in a prior run" stay the same question — and since [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md) it is the same question `check_subregions_derivatives` asks, so the phase's resume guard and the pipeline's skip gate cannot drift apart. This survives a full workflow resubmit, not just an in-workflow pod retry, since S3 outlives pod/volume lifetime.
 
 > Two things went away in the move off tarballs. The **`> 1 KB` size floor** is gone: it existed because a tarball key that exists is not proof the tarball is whole, and `_complete.json` answers that directly — a guess replaced by a fact. And the template's **`outputs.artifacts` re-upload** is gone: it used to write identical bytes to the key `checkpoint_save` had already written ("redundant but harmless"), which under the exploded layout would be worse than redundant, since Argo does not order artifact uploads and could land a file object after the marker claiming completeness.
 
-A secondary `have_all_tps <glob>` guard still checks the pod's own local `emptyDir` — it only matters within a single still-running pod (e.g. a later region in the same script), since the `emptyDir` itself does not survive a pod retry. Both checkpoint helpers are still duplicated across the two templates, but they are now four lines each rather than forty: the logic moved into `images/shared/fs_derivatives.py`, which is exactly the "bake it into the freesurfer image" step the old note said would be needed if they ever grew. The two copies guard disjoint regions, so the pods never race on the same prefix. Two weaker forms of `have_all_tps` were tried and are wrong:
+A secondary `have_all_tps <glob>` guard still checks the pod's own local `emptyDir` — it only matters within a single still-running pod (e.g. a later region in the same script), since the `emptyDir` itself does not survive a pod retry. The checkpoint helpers are four lines each rather than forty: the logic lives in `images/shared/fs_derivatives.py`. Two weaker forms of `have_all_tps` were tried and are wrong:
 
 - Guarding on `{BASE}/mri/` never fires — `segment_subregions --long-base` writes outputs per-timepoint and never into the base directory, so the region recomputes from scratch on every retry. (Confirmed empirically: the `{BASE}_template/mri/` directory is empty in every uploaded tarball.)
 - Guarding on the *first* timepoint only is unsafe — the tools process all timepoints in a single invocation, so an interruption can leave `ses-00A` complete and later sessions missing. A first-timepoint guard would skip the region and silently upload a partial segmentation.
 
 ### Regions
 
-Regions 1–3 run in order inside `segment-subregions-gems-template`; regions 4–5 run in order inside `segment-subregions-dl-template`, concurrently with them. Runtimes below are per-subject for a **single-timepoint** subject and scale with timepoint count. Output filenames are verified against a real FreeSurfer 7.4.1 run — note the longitudinal stream writes `.long.` where the FreeSurfer wiki's cross-sectional examples show `.v13.T1` / `-T1.v22`.
+All three regions run in order inside `segment-subregions-gems-template`. (Two former regions, `hypothalamic` and `sclimbic`, were retired on 2026-09-16 — see "Retired" above.) Runtimes below are per-subject for a **single-timepoint** subject and scale with timepoint count. Output filenames are verified against a real FreeSurfer 7.4.1 run — note the longitudinal stream writes `.long.` where the FreeSurfer wiki's cross-sectional examples show `.v13.T1` / `-T1.v22`.
 
 **1. Thalamic nuclei** — `segment_subregions thalamus --long-base {BASE} --threads 4`. GEMS/Bayesian atlas deformation, CPU-only, ~30–45 min.
 S3 output: `derivatives/subregions/{subjID}/thalamus/`
@@ -1066,23 +1061,16 @@ Contents (per timepoint, in `mri/`):
 
 That is 8 label maps per hemisphere (16 total): the primary segmentation plus three alternative *groupings* of the same result — `CA` (CA1/2/3/4), `HBT` (head/body/tail), and `FS60` (FreeSurfer 6.0-compatible) — a deliberate choice to keep every grouping analyzable rather than pick one. The packaging globs stay loose (`*hippoAmygLabels*`) so a FreeSurfer upgrade that reintroduces version suffixes does not silently drop outputs. All subregion labels stay in native T1w space; the subcortical structures are small and downstream analyses use them there rather than resampled into MNI.
 
-**4. Hypothalamic subunits** — `mri_segment_hypothalamic_subunits`, TensorFlow CNN, ~10 sec/session. Segments 5 bilateral hypothalamic subregions from model files in `$FREESURFER_HOME/models/`.
-S3 output: `derivatives/subregions/{subjID}/hypothalamic/`
-Contents (per session): `mri/hypothalamic_subunits_seg.v1.mgz`, `mri/hypothalamic_subunits_volumes.v1.csv`, `stats/hypothalamic_subunits_volumes.v1.stats`
+**Per-session coverage gate.** The pod checks every collected tree with `tree_has_all_tps` against its per-session volume tables (`ThalamicNuclei*volumes*`, `brainstemSs*volumes*`, `{lh,rh}.{hippoSf,amygNuc}Volumes*`), at both ends:
 
-**5. ScLimbic** — `mri_sclimbic_seg`, U-Net, <1 min/session. Segments hypothalamus (coarse), mammillary bodies, basal forebrain, septal nuclei, NAcc, fornix.
-S3 output: `derivatives/subregions/{subjID}/sclimbic/`
-Contents (per session): `mri/sclimbic.mgz`, `stats/sclimbic.stats`
+- **After a checkpoint restore**, an incomplete tree counts as absent and the region recomputes. That only happens when the phase runs: `check_subregions_derivatives` reads markers, so a master resubmit skips a subject whose markers exist even if a tree is short a session; repair takes a direct `argo submit --from workflowtemplate/subregion-seg`.
+- **Before a publish**, a tree missing a session fails the phase with exit 1 (not the retryable 75: a tool that skipped a session will skip it again) instead of being published under a marker claiming completeness.
 
-Steps 4–5 take space-separated `--s` args built from `base-tps`, so each tool is invoked once for all sessions rather than per-session.
+The patterns were checked against 300 published subjects (859/859 sessions for all three regions) before gating on them. Sessions come from `base-tps`, which the #248 completion guard prunes of rejected timepoints, so a rejected session never trips the gate (verified across all 11,503 subjects on 2026-09-15).
 
-**T1-only:** `segment_subregions` and the two deep-learning tools expose no T2 input, so the T2w scans this pipeline ingests are not used in this phase.
+**T1-only:** `segment_subregions` exposes no T2 input, so the T2w scans this pipeline ingests are not used in this phase. (FastSurfer's HypVINN, in the anatomical phase, *does* accept `--t2` and currently runs T1-only.)
 
-S3 outputs:
-- `derivatives/subregions/{subjID}/hypothalamic/`
-- `derivatives/subregions/{subjID}/sclimbic/`
-
-**Backfill:** `check_subregions_derivatives` in `src/inventory.py` gates on all five regions, `hippoamyg` included. A subject whose tarballs predate hippo-amygdala therefore reports `subregions-exist=False` and re-enters the phase on its next submission rather than remaining a four-region outlier. The per-region resume guards skip whatever is already present, so only hippo computes.
+**Backfill:** `check_subregions_derivatives` in `src/inventory.py` gates on all three regions, `hippoamyg` included. A subject whose tarballs predate hippo-amygdala therefore reports `subregions-exist=False` and re-enters the phase on its next submission rather than remaining a two-region outlier. The per-region resume guards skip whatever is already present, so only hippo computes.
 
 The real cost is upstream: if that subject's FastSurfer derivatives have been cleaned from S3, `fastsurfer-exists` is `False` and the anatomical phase regenerates them first (hours), which dominates the ~30–60 min segmentation. Backfilling an already-processed cohort is therefore a deliberate operation, not a free consequence of the gate.
 

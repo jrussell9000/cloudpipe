@@ -14,6 +14,13 @@ metadata:
   name: cloudflared
 spec:
   replicas: 2
+  # Never drop below two connectors during a rollout: surge a new pod first,
+  # then retire an old one.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: cloudflared
@@ -22,19 +29,53 @@ spec:
       labels:
         app: cloudflared
     spec:
-      # Spread across nodes so a single node loss cannot take out both
-      # connectors. Preferred rather than required: on a small or heavily
-      # packed cluster a hard constraint would leave a replica unschedulable,
-      # which is worse than co-location.
+      # Placement. This connector is the only path to the EKS API server once
+      # the Client VPN is retired, so it runs only on the stable, on-demand
+      # managed nodegroups — never on Karpenter spot capacity:
+      #   backend   — 2x m7g.2xlarge, <YOUR_AWS_REGION>a, taint CriticalAddonsOnly
+      #   karpenter — 1x m7g.xlarge,  <YOUR_AWS_REGION>b, untainted
+      # Both carry the node security group that the API server's cluster SG
+      # admits ("Node groups to cluster API"), so pinning here is also what
+      # guarantees cloudflared can reach the API server without the VPN's
+      # eks_api_from_vpn rule (plan 012 §6). All arm64.
+      #
+      # The previous *preferred* hostname anti-affinity was not enough: on
+      # 2026-09-17 both replicas were found on the single karpenter-nodegroup
+      # node, a single point of failure for all kubectl access.
       affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                topologyKey: kubernetes.io/hostname
-                labelSelector:
-                  matchLabels:
-                    app: cloudflared
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: eks.amazonaws.com/nodegroup
+                    operator: In
+                    values: [backend, karpenter]
+      tolerations:
+        - key: CriticalAddonsOnly
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # Hard: at most one replica per node (three eligible nodes, two
+      # replicas, so a single node loss or drain always leaves one running).
+      # Soft: spread across zones, which with this layout puts one replica in
+      # <YOUR_AWS_REGION>a and one in <YOUR_AWS_REGION>b. matchLabelKeys scopes the counting to
+      # the current ReplicaSet, so a rollout's surge pod is not blocked by the
+      # replicas it is replacing.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: cloudflared
+          matchLabelKeys: [pod-template-hash]
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: cloudflared
+          matchLabelKeys: [pod-template-hash]
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

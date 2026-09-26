@@ -17,4 +17,11 @@ RUN groupadd --gid 1000 cloudpipe && \
 
 COPY images/globus/transfer.py /app/transfer.py
 
+# The operator CLI's error translation, shared rather than copied: the pod log and
+# `pixi run globus` must say the same thing about the same Globus error. All three
+# files are standard-library only, so the image stays globus-sdk-only. Listing them
+# here is also what makes CI rebuild this image when they change —
+# .github/scripts/image_deps.py enrols an image by the exact files it COPYs.
+COPY src/globus_admin/__init__.py src/globus_admin/exits.py src/globus_admin/errors.py /app/globus_admin/
+
 USER 1000

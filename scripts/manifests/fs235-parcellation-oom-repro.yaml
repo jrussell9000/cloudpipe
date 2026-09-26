@@ -113,43 +113,9 @@ spec:
             s3:
               key: scratch/{{workflow.parameters.srcWorkflow}}/anat/sessions-seg/ses-06A.tar.gz
 
-      initContainers:
-        - name: download-fsaverage
-          image: '{{workflow.parameters.ecr-registry}}/cloudpipe/python:sha-cf6e136427e8740f8f356d8b63fd99a9242fa8b9'
-          imagePullPolicy: IfNotPresent
-          resources:
-            requests:
-              memory: 256M
-              cpu: '1'
-          mirrorVolumeMounts: true
-          env:
-            - name: BUCKET
-              value: '{{workflow.parameters.bucket}}'
-          command: [python]
-          args:
-            - -c
-            - |
-              import boto3, os
-              from pathlib import Path
-
-              dest = Path("/work/subjects/fsaverage")
-              if dest.exists():
-                  print("fsaverage already present, skipping download.", flush=True)
-              else:
-                  s3 = boto3.client('s3')
-                  bucket = os.environ['BUCKET']
-                  prefix = 'config/fsaverage/'
-                  paginator = s3.get_paginator('list_objects_v2')
-                  for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                      for obj in page.get('Contents', []):
-                          key = obj['Key']
-                          rel = key[len(prefix):]
-                          if not rel:
-                              continue
-                          local = dest / rel
-                          local.parent.mkdir(parents=True, exist_ok=True)
-                          s3.download_file(bucket, key, str(local))
-                  print("fsaverage downloaded.", flush=True)
+      # No fsaverage init container: recon-surf.sh reads fsaverage from the
+      # fastsurfer image's $FREESURFER_HOME, never from SUBJECTS_DIR (#372). The
+      # link in the script below mirrors the production templates.
 
       container:
         image: '{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer:sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad'
@@ -178,6 +144,9 @@ spec:
             # tarball can carry scripts/IsRunning.*, which wedges FastSurfer even in
             # a fresh emptyDir. sub-R4PV7WZ3 is known to have these.
             find "$SD" -name '*IsRunning*' -delete
+
+            # fsaverage from the image, as in production (#372).
+            ln -sfn "${FREESURFER_HOME:-/opt/freesurfer}/subjects/fsaverage" "$SD/fsaverage"
 
             K=4
             THREADS=$(( CPU_REQUEST / K ))
