@@ -213,9 +213,13 @@ pgbouncer:
     # depended on the override staying textually after the chart's own line.
     existingUserlistSecret: pgbouncer-auth-userlist
     # Static connection config rendered into pgbouncer-configmap by the chart.
+    # host is an ExternalName Service Terraform points at the RDS instance
+    # (modules/argo-workflows/database.tf, kubernetes_service_v1.rds), so the
+    # account-specific endpoint stays out of git. It depends on
+    # server_tls_sslmode = require below: verify-full would reject the name.
     databases:
       argoworkflows:
-        host: "cloudpipe-argo.c9quuwwes0p8.<YOUR_AWS_REGION>.rds.amazonaws.com"
+        host: "argo-rds.argo-workflows.svc.cluster.local"
         port: 5432
         dbname: "argoworkflows"
     pgbouncer:

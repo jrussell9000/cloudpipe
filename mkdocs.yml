@@ -166,3 +166,4 @@ nav:
       - decisions/017-exploded-derivatives-over-tarballs.md
       - decisions/018-declarative-gcs-config-and-operator-cli.md
       - decisions/019-signing-proxy-for-globus-ingress.md
+      - decisions/020-public-repo-as-upstream.md

@@ -1084,7 +1084,7 @@ Names in `SYNC_FILES` that don't exist locally now log a `WARNING` instead of be
 
 **The sync fails closed.** After scrubbing, two gates run before anything is published; either one exiting non-zero aborts the sync (and, in CI, fails the job before the PR is opened):
 
-1. **Pattern verifier** (in `sync-public.sh`): scans the staged tree for known-sensitive patterns — the AWS account ID, the institution domain, data-bucket names (`abcd-v*`), any Globus UUID, and personal (`@gmail.com`) emails. A surviving match prints `file:line:match` and the fix hint, then exits 1.
+1. **Pattern verifier** (in `sync-public.sh`): scans the staged tree for known-sensitive patterns — the AWS account ID, the institution domain, data-bucket names (`abcd-v*`), any Globus UUID, personal (`@gmail.com`) emails, ABCD subject IDs, and RDS instance endpoints (whether or not the region was scrubbed). A surviving match prints `file:line:match` and the fix hint, then exits 1. Exact matches listed in `VERIFY_ALLOWED_MATCHES` are placeholders and pass; today that is only the subject-ID placeholder `NDARINVXXXXXXXX`.
 2. **Secret scanner** (CI): `gitleaks detect --no-git` over the staged tree, as a backstop for keys/tokens/high-entropy strings the pattern list doesn't anticipate.
 
 **The published documentation site**
