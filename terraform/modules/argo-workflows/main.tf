@@ -252,38 +252,26 @@ resource "kubernetes_ingress_v1" "this" {
   metadata {
     name      = "argoworkflows-ingress"
     namespace = var.namespace
-    annotations = {
+    # ALB-level settings (scheme, group, security group, listeners, TLS policy,
+    # attributes) come from the caller, shared by every member of the ingress
+    # group. They must be identical across members; do not override them here.
+    #
+    # The caller's idle_timeout must stay long: the Argo UI live-updates the DAG
+    # over a Server-Sent Events stream that sends nothing between workflow
+    # events, so at the ALB's 60s default any step running longer than a minute
+    # idles the stream out and the UI silently freezes on stale state.
+    annotations = merge(var.alb_group_annotations, {
       # Create a Route53 alias record automatically via external-dns
       "external-dns.alpha.kubernetes.io/hostname" = "argo.${var.route53_zone_name}"
 
-      "alb.ingress.kubernetes.io/scheme"      = "internet-facing"
-      "alb.ingress.kubernetes.io/target-type" = "ip"
-
-      # TLS Configuration
+      "alb.ingress.kubernetes.io/target-type"     = "ip"
       "alb.ingress.kubernetes.io/certificate-arn" = var.certificate_arn
-      "alb.ingress.kubernetes.io/listen-ports"    = "[{\"HTTP\": 80}, {\"HTTPS\": 443}]"
-      "alb.ingress.kubernetes.io/ssl-redirect"    = "443"
-      "alb.ingress.kubernetes.io/ssl-policy"      = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-
-      # Restrict inbound access to the prefix list via a dedicated security group.
-      # inbound-cidrs does not accept prefix list IDs — security-groups is required.
-      "alb.ingress.kubernetes.io/security-groups"                     = aws_security_group.lb.id
-      "alb.ingress.kubernetes.io/manage-backend-security-group-rules" = "true"
 
       # Set protocols - backend protocol is HTTP because we terminate TLS at the load balancer
       "alb.ingress.kubernetes.io/backend-protocol"     = "HTTP"
       "alb.ingress.kubernetes.io/healthcheck-protocol" = "HTTP"
       "alb.ingress.kubernetes.io/healthcheck-path"     = "/"
-
-      # ALB access logging (H3) — delivered to the SSE-S3 access-log bucket, not the SSE-KMS
-      # master log bucket, which ALB cannot write to. See logging.tf.
-      #
-      # idle_timeout raised to the ALB maximum (4000s): the Argo UI live-updates the DAG over a
-      # Server-Sent Events stream that sends nothing between workflow events. At the 60s default,
-      # any step running longer than a minute idles the stream out and the UI silently freezes on
-      # stale state until refreshed.
-      "alb.ingress.kubernetes.io/load-balancer-attributes" = "access_logs.s3.enabled=true,access_logs.s3.bucket=${var.access_log_bucket},access_logs.s3.prefix=alb-argo-workflows,idle_timeout.timeout_seconds=4000"
-    }
+    })
   }
 
   spec {

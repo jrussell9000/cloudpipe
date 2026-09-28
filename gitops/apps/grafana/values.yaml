@@ -56,35 +56,50 @@ grafana:
 
   # ---------------------------------------------------------------------------
   # ALB Ingress — routes grafana.<YOUR_DOMAIN> → Grafana svc
-  # The certificate ARN is managed by cert-manager / ACM via external-dns.
+  #
+  # A member of the shared internal `cloudpipe-ui` ALB, with ArgoCD, Argo
+  # Workflows, Prefect and Kubecost (plan 012). Reachable only from inside the
+  # VPC — operators come in over Cloudflare WARP.
+  #
+  # No certificate-arn: the controller discovers the wildcard ACM certificate
+  # from the host rule (and the group's HTTPS listener carries it anyway).
   # ---------------------------------------------------------------------------
   ingress:
     enabled: true
     ingressClassName: alb
     annotations:
       external-dns.alpha.kubernetes.io/hostname: grafana.<YOUR_DOMAIN>
-      alb.ingress.kubernetes.io/scheme: internet-facing
-      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
-      alb.ingress.kubernetes.io/ssl-redirect: "443"
-      alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
       alb.ingress.kubernetes.io/backend-protocol: HTTP
       alb.ingress.kubernetes.io/target-type: ip
       alb.ingress.kubernetes.io/healthcheck-path: /api/health
       alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
-      # Restrict inbound access to UW Madison IPs via a dedicated security group
-      # (terraform/grafana.tf, aws_security_group.grafana_lb). Referenced by its
-      # Name tag rather than ID since this ingress is GitOps-managed, not a
-      # Terraform resource that could reference the SG output directly.
-      alb.ingress.kubernetes.io/security-groups: grafana-alb-sg
-      alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
-      # ALB access logging (H3) goes to the SSE-S3 access-log bucket, NOT the SSE-KMS
-      # cloudpipe-logging bucket, which ALB cannot deliver to. Hardcoded by name for the
-      # same reason the security group above is: this ingress is GitOps-managed and cannot
-      # reference terraform/logging.tf's aws_s3_bucket.access_logs output.
+      # --- Group-level: MUST equal local.ui_alb_group_annotations in
+      # terraform/ui_alb.tf byte for byte. One differing value stops the
+      # controller reconciling the whole shared ALB. Terraform's plan fails on a
+      # mismatch (precondition in terraform/argocd.tf), so change both together.
+      # Hardcoded because this ingress is GitOps-managed and cannot read
+      # Terraform outputs: the SG is referenced by Name tag, the access-log
+      # bucket (SSE-S3; ALB cannot deliver to the SSE-KMS cloudpipe-logging
+      # bucket) by name.
       #
-      # idle_timeout raised to the ALB maximum (4000s) so live-updating panels and Explore
-      # streams survive quiet periods; the 60s default tears them down mid-session.
-      alb.ingress.kubernetes.io/load-balancer-attributes: access_logs.s3.enabled=true,access_logs.s3.bucket=cloudpipe-logging-access,access_logs.s3.prefix=alb-grafana,idle_timeout.timeout_seconds=4000
+      # Do NOT add alb.ingress.kubernetes.io/wafv2-acl-arn here. The shared ALB's
+      # WAF association (Security Hub ELB.16) is set on the ArgoCD ingress alone,
+      # because the ARN is Terraform-generated and cannot be hardcoded reliably.
+      # It is Exclusive, so a second member setting it stops the whole group
+      # reconciling; Terraform's plan fails if this file grows that key.
+      #
+      # The `-Res-` in ssl-policy is required by Security Hub ELB.17, whose list of
+      # acceptable policies is not customizable and excludes the ALB default
+      # ELBSecurityPolicy-TLS13-1-2-2021-06. See the header comment in
+      # terraform/ui_alb.tf before changing it.
+      alb.ingress.kubernetes.io/group.name: cloudpipe-ui
+      alb.ingress.kubernetes.io/scheme: internal
+      alb.ingress.kubernetes.io/security-groups: cloudpipe-ui-alb-sg
+      alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+      alb.ingress.kubernetes.io/ssl-redirect: "443"
+      alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-Res-2021-06
+      alb.ingress.kubernetes.io/load-balancer-attributes: access_logs.s3.enabled=true,access_logs.s3.bucket=cloudpipe-logging-access,access_logs.s3.prefix=alb-ui,idle_timeout.timeout_seconds=4000,deletion_protection.enabled=true
     hosts:
       - grafana.<YOUR_DOMAIN>
     path: /
@@ -108,10 +123,45 @@ grafana:
 
   # ---------------------------------------------------------------------------
   # Persistence — keep dashboard state across pod restarts
+  #
+  # The volume is RWO EBS: exactly one node may attach it. With the chart's
+  # default 25% maxSurge the replacement pod is created before the old one goes
+  # away, and if it lands on another node it waits on Multi-Attach while the old
+  # pod keeps the volume — a rollout that never finishes.
+  #
+  # maxSurge: 0 makes the old pod terminate first, which releases the volume;
+  # with one replica that is a few seconds of downtime per deploy, and it is
+  # what lets a rollout finish at all here.
+  #
+  # NOT `type: Recreate`, though it describes the same behaviour: `rollingUpdate`
+  # is owned by other field managers (kubectl-rollout, kube-controller-manager),
+  # and Argo CD's server-side apply owns only `strategy.type`. Switching the type
+  # leaves the old `rollingUpdate` block in place, and the API server rejects
+  # that combination — "may not be specified when strategy `type` is 'Recreate'".
+  # Verified against the live object 2026-09-17.
   # ---------------------------------------------------------------------------
   persistence:
     enabled: true
     size: 5Gi
+
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+
+  # ---------------------------------------------------------------------------
+  # Local admin account — the Terraform-managed secret (terraform/grafana.tf),
+  # NOT the chart's own. Left to itself the chart generates a fresh random
+  # adminPassword on every render, and the Deployment's checksum/secret
+  # annotation turns that into a new rollout on every sync. Pointing at a stable
+  # secret also stops the chart templating a Secret at all, so the annotation
+  # becomes constant.
+  # ---------------------------------------------------------------------------
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
 
   # ---------------------------------------------------------------------------
   # SSO env bridge — values injected from Terraform-managed objects so the
@@ -124,6 +174,11 @@ grafana:
       secretKeyRef:
         name: grafana-sso
         key: clientSecret
+    # Must equal the renderer's AUTH_TOKEN (imageRenderer below).
+    GF_RENDERING_RENDERER_TOKEN:
+      secretKeyRef:
+        name: grafana-renderer-token
+        key: token
     DOMAIN:
       configMapKeyRef:
         name: grafana-oidc-config
@@ -132,6 +187,50 @@ grafana:
       configMapKeyRef:
         name: grafana-oidc-config
         key: admin_email
+
+  # ---------------------------------------------------------------------------
+  # Image renderer — a separate Deployment + Service that renders panels and
+  # dashboards to PNG/PDF with headless Chromium ("Share > Direct link rendered
+  # image", images in alert notifications). The chart also points Grafana at it
+  # (GF_RENDERING_SERVER_URL / GF_RENDERING_CALLBACK_URL, both in-cluster).
+  #
+  # Pinned: the chart defaults to `latest` + pullPolicy Always, so any pod
+  # restart could change the version. v5 is multi-arch, which the arm64
+  # (m7g) backend nodes need. v5 is the Go rewrite; the chart's default env
+  # (HTTP_HOST, XDG_*) is from v4 — harmless, and XDG_* still keeps Chromium
+  # writing under the /tmp emptyDir on a read-only root filesystem.
+  #
+  # Sized for occasional single-panel renders, not upstream's 16 GiB / 4 core
+  # guidance (which is for report fleets). GOMEMLIMIT follows upstream's
+  # 1 GiB per 8 GiB of limit, leaving the rest to Chromium.
+  #
+  # The chart's NetworkPolicy is not enforced (VPC CNI network policy is off),
+  # so the shared token (terraform/grafana.tf) is the actual access control.
+  # ---------------------------------------------------------------------------
+  imageRenderer:
+    enabled: true
+    image:
+      tag: v5.12.3
+      pullPolicy: IfNotPresent
+    env:
+      GOMEMLIMIT: 256MiB
+    envValueFrom:
+      AUTH_TOKEN:
+        secretKeyRef:
+          name: grafana-renderer-token
+          key: token
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: backend
+    tolerations:
+      - key: CriticalAddonsOnly
+        value: "true"
+        effect: NoSchedule
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        memory: 2Gi
 
   # ---------------------------------------------------------------------------
   # Grafana configuration

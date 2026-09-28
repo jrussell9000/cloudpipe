@@ -64,6 +64,11 @@ data "aws_iam_policy_document" "worker" {
 
   # cloudpipe_queue_manager reads the Globus dest collection UUID at runtime
   # so instance replacements take effect without redeploying the flow.
+  #
+  # session-established-at is read by the batch gate: before submitting, the
+  # queue manager checks how much life the Globus session has left, because a
+  # batch submitted against a lapsed session fails one workflow at a time until
+  # all of them have failed (2026-08-17: 300 subjects).
   statement {
     sid     = "SSMReadGlobusParams"
     actions = ["ssm:GetParameter"]
@@ -71,6 +76,40 @@ data "aws_iam_policy_document" "worker" {
       "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/collection-id",
       "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/source-collection-id",
       "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/source-base-path",
+      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/session-established-at",
+      # The gate measures the session against the gateway's DECLARED timeout, so
+      # it needs the document that declares it and the name of the gateway to
+      # read out of it. Both were missing, and the failure was invisible:
+      # `_read_ssm_optional` swallows every exception, so an AccessDenied read
+      # back as "not configured" and the gate fell through to
+      # DEFAULT_SESSION_TIMEOUT_MINUTES. It logged `from the default (nothing
+      # declares a timeout)` on every run since the gate shipped, and nobody read
+      # that line. Found by the 4.9 canary; #506 fixed the same symptom from the
+      # other end and was verified from a workstation, where the operator's own
+      # credentials could read both.
+      #
+      # These two belong together. Granting `config` alone makes the gate see two
+      # declared gateways with no name and raise AmbiguousGatewayError, refusing
+      # every batch.
+      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/config",
+      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/gateway-name",
+    ]
+  }
+
+  # The gate's second half is a live listing through the destination collection,
+  # which needs the transfer credential.
+  #
+  # The six `?` are Secrets Manager's own suffix: it appends a hyphen and exactly
+  # six random characters to every secret name, and the authorization request
+  # always carries the full ARN. `globus/refresh-token-*` would have been the
+  # obvious spelling and is wrong — it also matches `globus/refresh-token-staging`,
+  # handing the production worker the staging credential. `?` matches exactly one
+  # character, so this matches the production secret and nothing else.
+  statement {
+    sid     = "SecretsManagerReadGlobusToken"
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [
+      "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:globus/refresh-token-??????",
     ]
   }
 }
@@ -137,6 +176,47 @@ resource "kubernetes_role_binding_v1" "worker_jobs" {
     api_group = "rbac.authorization.k8s.io"
     kind      = "Role"
     name      = kubernetes_role_v1.worker_jobs.metadata[0].name
+  }
+
+  subject {
+    kind      = "ServiceAccount"
+    name      = var.worker_sa_name
+    namespace = var.namespace
+  }
+}
+
+################################################################################
+# RBAC — read Pending pods in the Argo namespace (#373)
+# The cloudpipe queue manager runs as the worker service account (prefect.yaml
+# job_variables.service_account_name) and, before each submission, lists Pending
+# pods in argo-workflows to decide whether gpu-nodepool is in a spot drought —
+# in which case the subject is submitted with fastsurfer-device=cpu. Read-only,
+# pods only, scoped to that one namespace. See prefect/flows/lib/gpu_drought.py.
+################################################################################
+
+resource "kubernetes_role_v1" "worker_argo_pods" {
+  metadata {
+    name      = "prefect-worker-argo-pods"
+    namespace = var.argo_namespace
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["pods"]
+    verbs      = ["get", "list"]
+  }
+}
+
+resource "kubernetes_role_binding_v1" "worker_argo_pods" {
+  metadata {
+    name      = "prefect-worker-argo-pods"
+    namespace = var.argo_namespace
+  }
+
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "Role"
+    name      = kubernetes_role_v1.worker_argo_pods.metadata[0].name
   }
 
   subject {

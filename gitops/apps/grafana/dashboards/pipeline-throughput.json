@@ -42,7 +42,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "### 🚚 Is work getting through the pipeline?\n\nOne **workflow** = one participant taken through the whole pipeline. A participant reprocessed after a failure has several workflows, and every attempt is counted here — that is deliberate, since throughput is about attempts, not about distinct people.\n\n**Waiting vs. running.** Queue wait is time spent with nowhere to run, before any processing starts: the cluster scales nodes on demand, so a burst of submissions waits for machines to boot.\n\n⚠️ Workflows are dated by when they **finished**, while the QC dashboards date records by when the workflow **started**. A batch running past midnight UTC therefore lands on different days across dashboards."
+        "content": "### 🚚 Is work getting through the pipeline?\n\nOne **workflow** = one participant taken through the whole pipeline. A participant reprocessed after a failure has several workflows, and every attempt is counted here — that is deliberate, since throughput is about attempts, not about distinct people.\n\n**Waiting vs. running.** Queue wait is time spent with nowhere to run, before any processing starts: the cluster scales nodes on demand, so a burst of submissions waits for machines to boot.\n\n🚨 **Averages here only count workflows that have FINISHED.** While a batch is running they describe the workflows that finished first — the short ones — not the batch. Check **n** and **Minutes since last finish** before quoting any average: near-zero minutes means the number is provisional and biased low. Leg 1 (true mean 3.68h) read **1.15h** three hours in and **6.28h** at nine hours before settling.\n\n⚠️ Workflows are dated by when they **finished**, while the QC dashboards date records by when the workflow **started**. A batch running past midnight UTC therefore lands on different days across dashboards. When comparing eras, filter on `started_at`, not `dt` — the pre-leg-1 test batches (through 2026-08-18T16:54Z) finished on dates that overlap leg 1."
       }
     },
     {
@@ -169,7 +169,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "SELECT ROUND(AVG(total_duration_s) / 3600.0, 2) AS mean_hours FROM cloudpipe_metrics.workflow_runs WHERE status = 'Succeeded' AND from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+          "rawSQL": "SELECT ROUND(AVG(total_duration_s) / 3600.0, 2) AS mean_hours, COUNT(*) AS workflows FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
         }
       ],
       "fieldConfig": {
@@ -179,13 +179,43 @@
             "mode": "fixed",
             "fixedColor": "blue"
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "workflows"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "displayName",
+                "value": "n"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "mean_hours"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "mean"
+              }
+            ]
+          }
+        ]
       },
-      "description": "Averaged over SUCCEEDED workflows only, so a fast failure cannot flatter this number. Runtime is driven mostly by how many BOLD runs a participant has.",
+      "description": "Mean wall-clock duration over ALL terminal workflows in range — successes and failures alike, because a workflow that ran 12h before being deadline-killed occupied a slot for 12h. Read the n beside it: this average is over COMPLETED workflows only, so while a batch is still running it reflects whichever workflows have finished so far, not the batch. That sample is length-biased — short workflows finish first. Replaying leg 1 (final mean 3.68h over n=2978), this panel would have read 1.15h at 3h elapsed, 6.28h at 9h, and only settled near 3.68h once the batch drained. Trust it when 'Minutes since last finish' is large; treat it as provisional when that is near zero.",
       "options": {
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value",
+        "textMode": "value_and_name",
         "justifyMode": "center"
       }
     },
@@ -253,7 +283,7 @@
       "gridPos": {
         "x": 6,
         "y": 6,
-        "w": 18,
+        "w": 12,
         "h": 6
       },
       "datasource": {
@@ -280,6 +310,63 @@
       "description": "Count per terminal status. Failed and Error are distinct: Error generally means the pod was lost (evicted, node reclaimed) rather than the code failing.",
       "fieldConfig": {
         "defaults": {}
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Minutes since last finish",
+      "gridPos": {
+        "x": 18,
+        "y": 6,
+        "w": 6,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "cloudpipe-athena",
+        "type": "grafana-athena-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "format": 1,
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default"
+          },
+          "rawSQL": "SELECT GREATEST(date_diff('minute', MAX(from_iso8601_timestamp(finished_at)), $__timeTo()), 0) AS mins_since_last_finish FROM cloudpipe_metrics.workflow_runs WHERE from_iso8601_timestamp(started_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 60
+              },
+              {
+                "color": "green",
+                "value": 360
+              }
+            ]
+          }
+        }
+      },
+      "description": "Gap between the newest finish in range and the end of the window — a censoring check for the averages above, NOT a health metric. Near zero (red) means workflows were still completing when the window closed, so the batch is only partly represented and 'Mean time to finish' is a running total over whichever workflows finished first — biased short. Large (green) means the batch drained well before the window ended, so the averages are over a complete population. Leg 1 read 1886 here once settled; a live batch reads 0. Clamped at 0, which also covers a fixed past window whose workflows finished after it closed.",
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
       }
     },
     {

@@ -1,0 +1,174 @@
+# Probe for the `simplify-globus-ingress` change: run ONE subject's Globus
+# transfer against the STAGING collection, with a candidate `globus` image.
+#
+# Deliberately a standalone Workflow under scripts/manifests/, not a
+# WorkflowTemplate under argo/workflows/: ArgoCD owns that directory and would
+# sync this into the cluster as production furniture. Submit it by hand instead.
+#
+# It writes only under the staging collection, which is rooted at
+# <bucket>/scratch/globus-staging (see terraform/modules/globus/staging.tf), and
+# the bucket's scratch/ lifecycle rule expires whatever it leaves behind after
+# 7 days. It uses the staging token secret, so production's refresh token and
+# its HA session are untouched.
+#
+# Every value below that identifies a Globus collection or a subject is
+# deliberately a placeholder: deployment-specific identifiers live in tfvars,
+# the answers document, or docs — never in code (see the change's D15).
+#
+# Prerequisites: Cloudflare WARP connected (this talks to the EKS API), the GCS
+# instance running, no production batch in flight (probe and production share
+# the one GridFTP node), and the `globus-credentials-staging` Secret present in
+# argo-workflows.
+#
+# Check them with `pixi run globus doctor --env staging --start-instance`, which
+# covers all four, rather than by eye. A stopped instance is the one that misleads:
+# the probe reaches pre-flight and fails there with a GridFTP login error, which
+# reads as a rejected credential and sends you after the wrong thing.
+#
+# Run:
+#   argo -n argo-workflows submit scripts/manifests/globus-ingress-probe.yaml \
+#     -p subjID=sub-XXXXXXXX \
+#     -p source-collection-id=<source collection uuid> \
+#     -p source-base-path=<source base path> \
+#     -p dest-collection-id=<staging collection uuid> \
+#     -p globus-image=<registry>/cloudpipe/globus@sha256:<digest>
+#
+#   # to pass the run identity through (the pinned image accepts it):
+#     -p pass-workflow-uid=true
+#
+# Read back:
+#   argo -n argo-workflows logs <name> | grep -E 'TRANSFER-SUMMARY|pre-flight|task'
+#   aws s3 ls s3://<bucket>/scratch/globus-staging/mmps_mproc/sub-XXXXXXXX/ --recursive
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: globus-ingress-probe-
+  namespace: argo-workflows
+  labels:
+    probe: globus-ingress
+spec:
+  entrypoint: main
+  serviceAccountName: argo-workflows-runner
+  activeDeadlineSeconds: 7200
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+  podMetadata:
+    labels:
+      app: cloudpipe-probe
+
+  arguments:
+    parameters:
+      - name: subjID
+        value: SET-ME
+
+      # Source: the same collection production reads from. Read-only here.
+      - name: source-collection-id
+        value: SET-ME
+      - name: source-base-path
+        value: SET-ME
+
+      # Destination: the STAGING collection. Its root already includes the
+      # staging prefix, so this path is relative to it and matches what
+      # production uses inside its own root.
+      - name: dest-collection-id
+        value: SET-ME
+      - name: dest-base-path
+        value: /mmps_mproc
+
+      - name: scan-types
+        value: '["T1w","rest"]'
+
+      # Candidate image. For a PR build this is the digest of the image built
+      # from the PR head (PR image builds must not reuse cached layers), which
+      # is the whole point of the probe: exercise the candidate, not the pin.
+      - name: globus-image
+        value: SET-ME
+
+      # The Secret holding the STAGING refresh token. Never the production
+      # `globus-credentials`.
+      - name: credentials-secret
+        value: globus-credentials-staging
+
+      # Pass `--workflow-uid` to transfer.py. The pinned image accepts it — the
+      # 2026-09-23 probe ran with `true` — so this is no longer waiting on task 6.1.
+      # It stays a parameter, and stays false by default, because `globus-image` is
+      # a parameter too: a candidate built before 6.1 exits on an unknown flag, and
+      # exercising candidates is what this manifest is for.
+      - name: pass-workflow-uid
+        value: "false"
+
+  templates:
+    - name: main
+      steps:
+        - - name: transfer
+            template: transfer-probe
+
+    - name: transfer-probe
+      metadata:
+        labels:
+          cloudpipe.io/step: globus-transfer-probe
+
+      # No semaphore, unlike globus-transfer-template: a probe is a single
+      # transfer run deliberately outside a batch, and holding a production
+      # slot would only hide that something else is running.
+      retryStrategy:
+        limit: "1"
+        retryPolicy: Always
+        backoff:
+          duration: "60s"
+          factor: "2"
+
+      nodeSelector:
+        karpenter.sh/nodepool: cpu-light-nodepool
+
+      container:
+        image: "{{workflow.parameters.globus-image}}"
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            memory: 256M
+            cpu: '100m'
+            ephemeral-storage: 200M
+        env:
+          - name: GLOBUS_NATIVE_APP_CLIENT_ID
+            valueFrom:
+              secretKeyRef:
+                name: "{{workflow.parameters.credentials-secret}}"
+                key: native-app-client-id
+          - name: GLOBUS_REFRESH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: "{{workflow.parameters.credentials-secret}}"
+                key: refresh-token
+          - name: WORKFLOW_UID
+            value: "{{workflow.uid}}"
+          - name: PASS_WORKFLOW_UID
+            value: "{{workflow.parameters.pass-workflow-uid}}"
+
+        # sh -c rather than the template's plain arg list, so one manifest works
+        # both before and after task 6.1 adds --workflow-uid.
+        command: [sh, -c]
+        args:
+          - |
+            set -eu
+            EXTRA=""
+            if [ "${PASS_WORKFLOW_UID}" = "true" ]; then
+              EXTRA="--workflow-uid ${WORKFLOW_UID}"
+            fi
+            echo "[probe] workflow=${WORKFLOW_UID} extra_args='${EXTRA}'" >&2
+            # shellcheck disable=SC2086
+            exec python /app/transfer.py \
+              --subject-id '{{workflow.parameters.subjID}}' \
+              --source-collection-id '{{workflow.parameters.source-collection-id}}' \
+              --source-base-path '{{workflow.parameters.source-base-path}}' \
+              --dest-collection-id '{{workflow.parameters.dest-collection-id}}' \
+              --dest-base-path '{{workflow.parameters.dest-base-path}}' \
+              --scan-types '{{workflow.parameters.scan-types}}' \
+              ${EXTRA}

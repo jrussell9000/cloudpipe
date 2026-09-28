@@ -143,3 +143,34 @@ Concretely:
 - Any future refactor must preserve this rule rather than "simplify" it back
   into a direct output/exitCode reference — that simplification is exactly
   what caused `dagval-330e63gh-tarerr2`.
+
+## Amendment (2026-09-15): a Failed/Errored gate does not make exitCode safe
+
+The failure-arm split above keeps a *skipped* producer away from an
+`exitCode` reference, but that was never the whole hazard. Argo records
+`outputs.exitCode` only when the node's main container terminated. A step that
+dies in its init container (artifact staging, `init: Error (exit code 64)`:
+the 64 is in the message, not in `exitCode`) or whose pod is deleted before
+main runs is Failed or Errored **with no exitCode**. A bare
+`{{tasks.X.exitCode}}` then misses the controller's strict `tasks.*`
+resolution, which treats a missing variable as "not yet available" and
+**requeues**: the recorder is never instantiated, and the DAG waits forever.
+
+It is worse than the original skipped-output deadlock in one respect: the
+requeue returns before deadline enforcement, so the workflow's
+`activeDeadlineSeconds` does not rescue it. Only `argo terminate` does.
+Probed on Argo v4.1.3 (`argo-4-1-3-probe-sb56d`): the bare form was never
+instantiated and ran more than 4 minutes past a 600 s deadline; its twin using
+`{{= tasks['X'].exitCode ?? '' }}` ran and passed `''`.
+
+So the rule is extended: **an `exitCode` reference must always be written
+`{{= tasks['X'].exitCode ?? '' }}`**, even on an arm that can only fire for
+Failed/Errored. The `??` fallback requires Argo ≥ 4.0.7 (#16274, which made
+the strict check honour `??` guards). `outcome_recorder.py` treats an empty
+`--exit-code` as "no code". `tests/images/afni/test_driver_gating.py` enforces
+the form.
+
+Separately, since Argo v4.0.7 the original skipped-output case no longer
+hangs: a reference to a Skipped/Omitted producer's output that nothing handles
+now **fails the node** instead. The rule in this ADR stands — failing a
+recorder is still losing the record — but the failure mode is now loud.

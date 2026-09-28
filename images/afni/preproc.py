@@ -270,17 +270,17 @@ def precompute_composite_warp(
             "-d",
             "3",
             "-i",
-            bold_ref,
+            str(bold_ref),
             "-r",
-            mni_template,
+            str(mni_template),
             "-o",
             f"[{composite},1]",
             "-t",
-            t1w2mni_warp,
+            str(t1w2mni_warp),
             "-t",
-            t1w2mni_affine,
+            str(t1w2mni_affine),
             "-t",
-            bold2t1w_affine,
+            str(bold2t1w_affine),
         ]
     )
     return composite
@@ -469,13 +469,13 @@ def apply_mni_mask(bold_mni: Path, mask_mni: Path, outdir: Path, prefix: str) ->
         [
             "3dcalc",
             "-a",
-            bold_mni,
+            str(bold_mni),
             "-b",
-            mask_mni,
+            str(mask_mni),
             "-expr",
             "a*step(b)",
             "-prefix",
-            out,
+            str(out),
         ]
     )
     return out
@@ -700,17 +700,17 @@ def extract_subcortical(
             "-d",
             "3",
             "-i",
-            aseg,
+            str(aseg),
             "-r",
-            mni_template,
+            str(mni_template),
             "-o",
-            aseg_mni,
+            str(aseg_mni),
             "-n",
             "NearestNeighbor",
             "-t",
-            t1w2mni_warp,
+            str(t1w2mni_warp),
             "-t",
-            t1w2mni_affine,
+            str(t1w2mni_affine),
         ]
     )
 

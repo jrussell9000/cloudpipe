@@ -1,0 +1,541 @@
+# t1w-to-mni VRAM probe — how many fit one card, per device-plugin profile? (#374)
+#
+# QUESTION
+# --------
+# GPU slice counts are set against the LARGEST GPU tenant, t1w-to-mni, because nothing
+# stops the scheduler from filling a card with it:
+#
+#   profile   pool                 card              slices   needs @4447   needs @~5100
+#   default   gpu-nodepool         T4    ~15109 MiB  3        13341  fit    15300  OOM
+#   dense     gpu-dense-nodepool   A10G/L4 ~22731    5*       22235  fit    25500  OOM
+#   (* the dense profile at the time; it is 4 now — see RESULT)
+#
+# RESULT (2026-09-15, Tesla T4 on g4dn.xlarge, driver 580.178.04, fireants @303225d3)
+# ---------------------------------------------------------------------------------
+#   smoke  probe-374-t1w-vram-wwzjz  profile=default x1
+#   run1   probe-374-t1w-vram-pfnxp  profile=default x3, 2 reps   verdict FIT
+#
+#   1. SOLO FOOTPRINT = 4903 MiB device-wide (nvidia-smi per-process 4900). torch's
+#      max_memory_allocated reads 3698 for the same process, so ~1.2 GiB is CUDA context
+#      and allocator cache. The script's "4.9 GB" comment was right; 4447 was not.
+#   2. UNDER CONCURRENCY every one of the 6 processes still peaked at exactly 4900 —
+#      sharing the card does not shrink the footprint. The card peaked at 13263 / 12215,
+#      below 3 x 4903 = 14709, only because peaks did not ALIGN: each process spends
+#      ~80-100 s on CPU before touching the GPU and holds its full footprint for just its
+#      last ~10-20 s, and at most 2 of 3 were at >=90% of peak simultaneously.
+#   CONSEQUENCES
+#      default (T4 x3): 14709 <= 15360 even fully aligned. Stands.
+#      dense (A10G/L4 x5): 24515 > ~22731 once four t1w-to-mni share a card. Cut to 4
+#        (19612, fits any mix). T1W_TO_MNI_WORKING_SET_MIB = 4903 in
+#        tests/argo/test_gpu_step_resources.py now fails the build at 5.
+#   NOT YET RUN: `dense` (confirmation only; does not change the decision above).
+#   FastSurfer needs no run: its 3694 MiB was measured one pod per card, before time-slicing
+#   (commit 8a9d65e, ~10 pods); GPU_WORKING_SET_MIB = 3789 is that figure rounded to 3.7 GiB.
+#
+# The figures on record before this probe disagreed by more than the margin:
+#
+#   3698 MiB  torch max_memory_allocated per attempt on a T4 (rescue work,
+#             2026-09-11). Excludes the CUDA context and the allocator's cache.
+#   4447 MiB  8893 MiB device-wide / 2 tenants (2026-07-31 duty-cycle handoff).
+#             Assumes the co-tenant was another t1w-to-mni; if it was a
+#             ~3.7 GiB FastSurfer pod, one t1w-to-mni is ~5100 MiB.
+#   ~4.9 GB   "one SyN peaks near 4.9 GB" — comment in fst1w_to_mni.py, unsourced.
+#
+# The DEFAULT row is the one that matters most: it is production every day, not only
+# in a drought. A CUDA OOM exits 1, which the step's retryStrategy does not retry, so
+# the session would fail outright.
+#
+# It answers:
+#   1. SOLO FOOTPRINT. Device memory one t1w-to-mni process takes, context and
+#      allocator cache INCLUDED. This one number decides BOTH rows above.
+#   2. DO N FIT. N = the profile's slice count, started together on one card. Started
+#      together is the best a probe can do toward aligned peaks; it does NOT guarantee
+#      them (see RESULT), so size from question 1 x N, not from the observed card peak.
+#   3. (dense only) END-TO-END POOL. Requesting the dense slice count can only schedule
+#      on a node running the `dense` device-plugin profile. Scheduling at all is a pass.
+#
+# RUN `default` FIRST. It needs no scarce capacity, and question 1 settles the dense
+# row by arithmetic (4 x measured <= 22731). Run `dense` later as confirmation, when
+# g5/g6 2xlarge spot exists — on 2026-09-15 01:44-02:07Z it failed 8 of 8 asks
+# (UnfulfillableCapacity) and was terminated rather than left retrying, since every
+# failed ask inflates the insufficient_capacity counters drought reviews rely on.
+#
+# DESIGN — one pod, N processes, not N pods
+# -----------------------------------------
+# VRAM is per CUDA context, i.e. per process; it does not care whether processes share
+# a pod. N processes in one pod give the footprint of N time-sliced pods, and avoid:
+#
+#   - CONTAMINATION. memory.used is whole-card. A production GPU pod on the same card
+#     would be counted as ours. Requesting ALL the card's slices leaves none free.
+#   - SYNCHRONISATION. N pods start seconds to minutes apart, so their peaks would
+#     not overlap. N processes launched from one shell start within milliseconds.
+#
+# Resourcing matches production per process: cpu 1 and one thread each (set
+# explicitly — the downward API would project the pod's cpu: N), 2G each.
+# `--rescue-tickets 0` because the per-attempt peak is flat across rescue attempts
+# (3698 MiB at 1, 2, 3 and 4 attempts) and extra attempts only lengthen the run. Use a
+# session whose production t1w-to-mni PASSED.
+#
+# WHY 200 ms SAMPLING CATCHES THE PEAK: fst1w_to_mni.py releases the torch cache only at
+# the END of an attempt (gc + empty_cache). Until then the caching allocator keeps what
+# it reserved, so device memory rises to its high-water mark and stays there.
+#
+# INSTANCE TYPES — why `default` is NOT pinned to g4dn. gpu-nodepool requires minValues
+# 4 instance types and 3 families (MIN_VALUES_POLICY=Strict). A pod allowing only g4dn
+# offers 2 types from 1 family, so Karpenter would never launch a node for it. The
+# default profile therefore accepts any gpu-nodepool type and RECORDS the card. The
+# fleet is overwhelmingly g4dn.xlarge; if it lands on an A10G/L4 xlarge instead, the
+# solo footprint (question 1) still stands and only the T4 overflow test becomes
+# arithmetic. `dense` excludes g6e.2xlarge (45 GiB cannot answer "does it fit 22.7"),
+# leaving exactly the 2 types its pool's minValues needs.
+#
+# HOW TO READ IT (summary.json, also printed at the end of the pod log)
+# --------------------------------------------------------------------
+#   verdict FIT        every concurrent process exited 0 or 65 (65 = QC gate fail, a
+#                      registration verdict, not a crash), no CUDA OOM in any log, peak
+#                      below memory.total. The profile's slice count stands ON THIS CARD.
+#   verdict OOM        a process hit CUDA OOM or the card filled.
+#                        default -> production T4s are exposed; raise before any batch.
+#                        dense   -> lower `dense` replicas to 4 (values.yaml +
+#                                   gpu-dense-timeslice-nodeoverlay.yaml + its name).
+#   verdict HARNESS    a process died for another reason. Read its log in probe-out/;
+#                      the measurement is incomplete, not negative.
+#
+#   `profile_fits` applies the measured working set to BOTH profiles' cards, so one
+#   default run answers the dense row too. Then set T1W_TO_MNI_WORKING_SET_MIB in
+#   tests/argo/test_gpu_step_resources.py to summary.recommended_working_set_mib —
+#   the measured value, never a device-wide reading divided by a tenant count again.
+#
+# SAFETY: writes nothing to derivatives/ or the metrics corpus. Each process's QC record
+# stays in the pod; the only upload is probe-out.tgz under scratch/.
+#
+# COST: default ~$0.09 (one g4dn.xlarge slot-set for ~20 min); dense ~$0.20 plus a
+# possibly long Pending (activeDeadlineSeconds bounds it at 4 h).
+#
+# DUA: no participant identifiers in this file. subject and session have NO default,
+# so Argo refuses a submit that omits them.
+#
+# USAGE
+#   # smoke — one process, one rep:
+#   argo -n argo-workflows submit scripts/manifests/gpu-t1w-vram-probe.yaml \
+#     -p subject=<sub-XXXX> -p session=<ses-XXX> -p profile=default \
+#     -p run-label=smoke -p concurrency=1 -p reps=1
+#
+#   # the measurement (concurrency 0 = one process per slice):
+#   argo -n argo-workflows submit scripts/manifests/gpu-t1w-vram-probe.yaml \
+#     -p subject=<sub-XXXX> -p session=<ses-XXX> -p profile=default -p run-label=run1
+#
+#   # results
+#   argo -n argo-workflows logs @latest | tail -60
+#   aws s3 cp s3://<YOUR_S3_BUCKET>/scratch/probe-374-t1w-vram/default/run1/probe-out.tgz - | tar -xz -C /tmp
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: probe-374-t1w-vram-
+  namespace: argo-workflows
+  labels:
+    cloudpipe.io/probe: "374-t1w-vram"
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    labels:
+      app: cloudpipe
+      cloudpipe.io/probe: "374-t1w-vram"
+    annotations:
+      # A reclaim mid-run loses the measurement outright (the concurrent phase is the
+      # whole point), and the pod holds its node for only ~20 min.
+      karpenter.sh/do-not-disrupt: "true"
+
+  # Includes time Pending on spot capacity.
+  activeDeadlineSeconds: 14400
+
+  entrypoint: probe
+
+  arguments:
+    parameters:
+      - name: subject
+      - name: session
+      # `default` (gpu-nodepool, 3 slices) or `dense` (gpu-dense-nodepool, 4 slices).
+      # Keep these slice counts equal to the device-plugin profiles' replicas.
+      # Pool, types, slice count and resources all derive from this one value, so a
+      # submit cannot pair a pool with the wrong slice count. Validated in the script.
+      - name: profile
+        value: default
+      - name: run-label
+        value: run1
+      # 0 = one process per slice (the measurement). Override only for a smoke run.
+      - name: concurrency
+        value: "0"
+      - name: reps
+        value: "2"
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      # The digest the live `registration` WorkflowTemplate serves, so the probe
+      # measures production code. Update together with that template.
+      - name: fireants-image
+        value: cloudpipe/fireants@sha256:303225d3838713cdb8ae998915ea30ec0a3b17f06ab8ed51268e5a1e68436946
+
+  templates:
+    - name: probe
+      inputs:
+        parameters:
+          # Re-declared as an INPUT so the profile expressions below use the
+          # `inputs.parameters.x` form — the form the production device ternaries use
+          # and the #374 affinity probe verified renders inside nodeSelector/affinity.
+          - name: profile
+            value: '{{workflow.parameters.profile}}'
+        artifacts:
+          # `archive: none` is required on staged `.mgz` (#274) — see the production
+          # t1w-to-mni-template.
+          - name: fastsurfer-orig
+            path: /fastsurfer/input/mri/orig.mgz
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{workflow.parameters.subject}}/{{workflow.parameters.session}}/mri/orig.mgz'
+
+          - name: fastsurfer-brainmask
+            path: /fastsurfer/input/mri/brainmask.mgz
+            archive:
+              none: {}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{workflow.parameters.subject}}/{{workflow.parameters.session}}/mri/brainmask.mgz'
+
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
+      outputs:
+        artifacts:
+          # Default tar+gzip archive: one object holding every CSV, log and the summary.
+          - name: probe-out
+            path: /work/probe-out
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/probe-374-t1w-vram/{{workflow.parameters.profile}}/{{workflow.parameters.run-label}}/probe-out.tgz'
+
+      nodeSelector:
+        karpenter.sh/nodepool: "{{= inputs.parameters.profile == 'dense' ? 'gpu-dense-nodepool' : 'gpu-nodepool' }}"
+      # NotIn rather than In, so that ONE expression covers both profiles: dense drops
+      # g6e.2xlarge (leaving g5/g6 2xlarge, exactly its pool's minValues 2); default
+      # names a type that does not exist, excluding nothing — see INSTANCE TYPES above
+      # for why default must not be narrowed.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: NotIn
+                    values:
+                      - "{{= inputs.parameters.profile == 'dense' ? 'g6e.2xlarge' : 'no-such-instance-type' }}"
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      # Resources switch on the profile through a values-only patch, as the production
+      # FastSurfer device switch does: Argo cannot substitute into resource quantities
+      # in the container spec itself, and a JSON literal inside one expression would
+      # end at its first `}}`. The static block below is the `default` profile; the
+      # patch restates it on that branch.
+      podSpecPatch: |
+        containers:
+          - name: main
+            resources:
+              requests:
+                cpu: "{{= inputs.parameters.profile == 'dense' ? '4' : '3' }}"
+                memory: "{{= inputs.parameters.profile == 'dense' ? '8G' : '6G' }}"
+                ephemeral-storage: "{{= inputs.parameters.profile == 'dense' ? '16G' : '12G' }}"
+              limits:
+                nvidia.com/gpu: "{{= inputs.parameters.profile == 'dense' ? '4' : '3' }}"
+
+      container:
+        image: '{{workflow.parameters.ecr-registry}}/{{workflow.parameters.fireants-image}}'
+        imagePullPolicy: IfNotPresent
+
+        volumeMounts:
+          - name: work
+            mountPath: /work
+
+        env:
+          # One thread per process, as production gets from its cpu: 1 request.
+          # Hardcoded, NOT projected: the downward API would read this pod's cpu: N.
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: MKL_NUM_THREADS
+            value: "1"
+          - name: OPENBLAS_NUM_THREADS
+            value: "1"
+          - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+            value: "1"
+          - name: USE_FFO
+            value: "False"
+          # Parameters reach the scripts as env vars so the heredocs below stay free of
+          # Argo substitution.
+          - name: SUBJ
+            value: '{{workflow.parameters.subject}}'
+          - name: SES
+            value: '{{workflow.parameters.session}}'
+          - name: PROFILE
+            value: '{{inputs.parameters.profile}}'
+          - name: SLICES
+            value: "{{= inputs.parameters.profile == 'dense' ? '4' : '3' }}"
+          - name: CONCURRENCY
+            value: '{{workflow.parameters.concurrency}}'
+          - name: REPS
+            value: '{{workflow.parameters.reps}}'
+          - name: RUN_LABEL
+            value: '{{workflow.parameters.run-label}}'
+
+        # `default` profile; the podSpecPatch above switches these for `dense`.
+        resources:
+          requests:
+            # Production t1w-to-mni x N: cpu 1 / 2G each. A g4dn.xlarge has ~3920m.
+            cpu: "3"
+            memory: 6G
+            ephemeral-storage: 12G
+          limits:
+            # ALL the card's slices — see DESIGN.
+            nvidia.com/gpu: "3"
+
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+            OUT=/work/probe-out
+            mkdir -p "$OUT"
+            harness_fail() { echo "HARNESS FAIL: $*" >&2; echo "$*" > "$OUT/harness_error.txt"; exit 1; }
+
+            case "$PROFILE" in default|dense) ;; *) harness_fail "profile must be default or dense, got '$PROFILE'";; esac
+            [ -n "${EPOCHREALTIME:-}" ] || harness_fail "bash has no EPOCHREALTIME; timestamps would be wrong"
+            case "$CONCURRENCY" in ''|*[!0-9]*) harness_fail "concurrency must be an integer, got '$CONCURRENCY'";; esac
+            case "$REPS" in ''|*[!0-9]*) harness_fail "reps must be an integer, got '$REPS'";; esac
+            [ "$CONCURRENCY" = 0 ] && CONCURRENCY=$SLICES
+            export CONCURRENCY
+
+            nvidia-smi -L > "$OUT/gpus.txt" 2>&1 || harness_fail "nvidia-smi -L failed"
+            cat "$OUT/gpus.txt" >&2
+            # All the pod's slices are replicas of one physical GPU and must appear as
+            # ONE card; anything else means the node is not what this probe measures.
+            [ "$(grep -c '^GPU ' "$OUT/gpus.txt")" = 1 ] || harness_fail "expected exactly 1 physical GPU"
+            nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader,nounits > "$OUT/card.csv"
+            echo "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-unset}" >> "$OUT/gpus.txt"
+            echo "profile=$PROFILE slices=$SLICES run=$RUN_LABEL concurrency=$CONCURRENCY reps=$REPS card=$(cat "$OUT/card.csv")" >&2
+
+            mark() { echo "$EPOCHREALTIME,$1" >> "$OUT/phases.csv"; }
+
+            # Whole-card memory at 5 Hz, and per-process memory at 2 Hz. Both stamped
+            # with the same clock as the phase marks.
+            nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits -lms 200 \
+              | while IFS= read -r l; do echo "$EPOCHREALTIME,$l"; done > "$OUT/gpu.csv" &
+            GPU_MON=$!
+            ( while :; do
+                ts=$EPOCHREALTIME
+                nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
+                  | while IFS= read -r l; do echo "$ts,$l"; done
+                sleep 0.5
+              done ) > "$OUT/apps.csv" &
+            APPS_MON=$!
+            trap 'kill $GPU_MON $APPS_MON 2>/dev/null' EXIT
+
+            run_one() {
+              local tag=$1
+              python /app/fst1w_to_mni.py \
+                --t1w /fastsurfer/input/mri/orig.mgz \
+                --brainmask /fastsurfer/input/mri/brainmask.mgz \
+                --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+                --out-dir "/work/runs/$tag/t1w_to_mni" \
+                --prefix "probe_${tag}" \
+                --subj "$SUBJ" \
+                --ses "${SES}-${tag}" \
+                --pipeline cloudpipe_minproc \
+                --rescue-tickets 0 \
+                > "$OUT/$tag.log" 2>&1
+              echo $? > "$OUT/$tag.exit"
+            }
+
+            mark baseline-start; sleep 10; mark baseline-end
+
+            mark solo-start
+            run_one solo
+            mark solo-end
+            echo "solo exit=$(cat "$OUT/solo.exit")" >&2
+            sleep 10
+
+            for rep in $(seq 1 "$REPS"); do
+              mark "concurrent-r${rep}-start"
+              # Wait on the workers' own PIDs. A bare `wait` would block forever on
+              # the monitors, and filtering `jobs -p` does not work: it reports a
+              # pipeline by its FIRST process, while $GPU_MON is its last.
+              workers=()
+              for i in $(seq 1 "$CONCURRENCY"); do run_one "c-r${rep}-p${i}" & workers+=($!); done
+              wait "${workers[@]}"
+              mark "concurrent-r${rep}-end"
+              echo "rep $rep exits: $(cat "$OUT"/c-r"${rep}"-p*.exit | tr '\n' ' ')" >&2
+              sleep 10
+            done
+
+            kill $GPU_MON $APPS_MON 2>/dev/null
+            sleep 1
+
+            python3 - <<'SUMMARY'
+            import csv, glob, json, os, re, statistics, sys
+            out = '/work/probe-out'
+
+            name, total_mib, driver = [s.strip() for s in open(f'{out}/card.csv').read().split(',')]
+            total_mib = int(float(total_mib))
+
+            marks = {}
+            for ts, label in csv.reader(open(f'{out}/phases.csv')):
+                marks[label] = float(ts)
+
+            def window(phase):
+                return marks[f'{phase}-start'], marks[f'{phase}-end']
+
+            gpu = []
+            for row in csv.reader(open(f'{out}/gpu.csv')):
+                try:
+                    gpu.append((float(row[0]), int(row[1]), int(row[2])))
+                except (ValueError, IndexError):
+                    pass  # nvidia-smi prints [N/A] or a partial line at kill time
+
+            apps = []
+            for row in csv.reader(open(f'{out}/apps.csv')):
+                try:
+                    apps.append((float(row[0]), row[1].strip(), int(row[2])))
+                except (ValueError, IndexError):
+                    pass
+
+            def used_in(phase):
+                lo, hi = window(phase)
+                return [m for t, m, _ in gpu if lo <= t <= hi]
+
+            def per_process_max(phase):
+                lo, hi = window(phase)
+                peaks = {}
+                for t, pid, m in apps:
+                    if lo <= t <= hi:
+                        peaks[pid] = max(peaks.get(pid, 0), m)
+                return sorted(peaks.values(), reverse=True)
+
+            OOM = re.compile(r'out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED', re.I)
+
+            def processes(prefix):
+                result = []
+                for exit_file in sorted(glob.glob(f'{out}/{prefix}*.exit')):
+                    tag = os.path.basename(exit_file)[:-5]
+                    code = int(open(exit_file).read().strip() or -1)
+                    log = open(f'{out}/{tag}.log', errors='replace').read()
+                    torch_peaks = [int(x) for x in re.findall(r'VRAM: attempt peak (\d+) MiB', log)]
+                    result.append({
+                        'tag': tag,
+                        'exit': code,
+                        'oom': bool(OOM.search(log)),
+                        'torch_allocated_peak_mib': max(torch_peaks) if torch_peaks else None,
+                    })
+                return result
+
+            base_samples = used_in('baseline')
+            baseline = round(statistics.median(base_samples)) if base_samples else 0
+            solo_used = used_in('solo')
+            solo = {
+                'peak_used_mib': max(solo_used) if solo_used else None,
+                'delta_over_baseline_mib': (max(solo_used) - baseline) if solo_used else None,
+                'per_process_max_mib': per_process_max('solo'),
+                'processes': processes('solo'),
+            }
+
+            reps = []
+            n_reps = int(os.environ['REPS'])
+            conc = int(os.environ['CONCURRENCY'])
+            for r in range(1, n_reps + 1):
+                used = used_in(f'concurrent-r{r}')
+                reps.append({
+                    'rep': r,
+                    'peak_used_mib': max(used) if used else None,
+                    'headroom_mib': (total_mib - max(used)) if used else None,
+                    'implied_per_process_mib': round((max(used) - baseline) / conc) if used else None,
+                    'per_process_max_mib': per_process_max(f'concurrent-r{r}'),
+                    'processes': processes(f'c-r{r}-p'),
+                })
+
+            all_procs = solo['processes'] + [p for r in reps for p in r['processes']]
+            any_oom = any(p['oom'] for p in all_procs)
+            card_full = any(r['peak_used_mib'] is not None and r['peak_used_mib'] >= total_mib - 64 for r in reps)
+            crashed = [p['tag'] for p in all_procs if p['exit'] not in (0, 65) and not p['oom']]
+            if any_oom or card_full:
+                verdict = 'OOM'
+            elif crashed or solo['peak_used_mib'] is None:
+                verdict = 'HARNESS'
+            else:
+                verdict = 'FIT'
+
+            candidates = [solo['delta_over_baseline_mib']] + solo['per_process_max_mib'][:1] \
+                + [m for r in reps for m in r['per_process_max_mib'][:1]]
+            candidates = [c for c in candidates if c]
+            recommended = max(candidates) if candidates else None
+
+            # The measured working set applied to BOTH profiles, against the usable VRAM
+            # tests/argo/test_gpu_step_resources.py assumes for each card. This is what
+            # lets one run on either profile answer the other row of the header table.
+            profiles = {'default_T4_x3': (3, 15109), 'dense_A10G_L4_x4': (4, 22731)}
+            profile_fits = {
+                k: {'needs_mib': n * recommended, 'usable_mib': usable, 'fits': n * recommended <= usable}
+                for k, (n, usable) in profiles.items()
+            } if recommended else None
+
+            summary = {
+                'verdict': verdict,
+                'profile': os.environ['PROFILE'],
+                'slices': int(os.environ['SLICES']),
+                'run_label': os.environ['RUN_LABEL'],
+                'card': name, 'memory_total_mib': total_mib, 'driver': driver,
+                'concurrency': conc,
+                'baseline_used_mib': baseline,
+                'solo': solo,
+                'concurrent': reps,
+                'crashed': crashed,
+                'recommended_working_set_mib': recommended,
+                'profile_fits': profile_fits,
+                'per_process_source_note': (
+                    'per_process_max_mib is empty when nvidia-smi cannot list processes '
+                    'from inside the container PID namespace; the solo delta still stands'
+                ),
+            }
+            json.dump(summary, open(f'{out}/summary.json', 'w'), indent=2)
+            print(json.dumps(summary, indent=2), file=sys.stderr)
+            fits = {k: v['fits'] for k, v in (profile_fits or {}).items()}
+            print(f'=== VERDICT {verdict} [{os.environ["PROFILE"]} x{conc}]: {name} {total_mib} MiB, '
+                  f'solo +{solo["delta_over_baseline_mib"]} MiB, concurrent peaks '
+                  f'{[r["peak_used_mib"] for r in reps]}, working set {recommended} MiB, fits {fits} ===',
+                  file=sys.stderr)
+            SUMMARY
+            [ $? -eq 0 ] || harness_fail "summary step failed; raw CSVs and logs are in probe-out"
+
+            # Exit 0 on FIT and on OOM alike: both are answers, and the artifact must
+            # upload either way. Only a broken harness fails the pod.
+            exit 0

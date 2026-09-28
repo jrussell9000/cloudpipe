@@ -101,31 +101,19 @@ resource "kubernetes_ingress_v1" "this" {
   metadata {
     name      = "prefect-ingress"
     namespace = var.namespace
-    annotations = {
+    # ALB-level settings (scheme, group, security group, listeners, TLS policy,
+    # attributes) come from the caller, shared by every member of the ingress
+    # group. They must be identical across members; do not override them here.
+    annotations = merge(var.alb_group_annotations, {
       "external-dns.alpha.kubernetes.io/hostname" = "prefect.${var.route53_zone_name}"
 
-      "alb.ingress.kubernetes.io/scheme"      = "internet-facing"
-      "alb.ingress.kubernetes.io/target-type" = "ip"
-
+      "alb.ingress.kubernetes.io/target-type"     = "ip"
       "alb.ingress.kubernetes.io/certificate-arn" = var.certificate_arn
-      "alb.ingress.kubernetes.io/listen-ports"    = "[{\"HTTP\": 80}, {\"HTTPS\": 443}]"
-      "alb.ingress.kubernetes.io/ssl-redirect"    = "443"
-      "alb.ingress.kubernetes.io/ssl-policy"      = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-
-      "alb.ingress.kubernetes.io/security-groups"                     = aws_security_group.lb.id
-      "alb.ingress.kubernetes.io/manage-backend-security-group-rules" = "true"
 
       "alb.ingress.kubernetes.io/backend-protocol"     = "HTTP"
       "alb.ingress.kubernetes.io/healthcheck-protocol" = "HTTP"
       "alb.ingress.kubernetes.io/healthcheck-path"     = "/ping"
-
-      # ALB access logging (H3) — delivered to the SSE-S3 access-log bucket, not the SSE-KMS
-      # master log bucket, which ALB cannot write to. See logging.tf.
-      #
-      # idle_timeout raised to the ALB maximum (4000s) so the UI's live-update streams survive
-      # quiet periods; the 60s default tears them down and the page silently shows stale state.
-      "alb.ingress.kubernetes.io/load-balancer-attributes" = "access_logs.s3.enabled=true,access_logs.s3.bucket=${var.access_log_bucket},access_logs.s3.prefix=alb-prefect,idle_timeout.timeout_seconds=4000"
-    }
+    })
   }
 
   spec {

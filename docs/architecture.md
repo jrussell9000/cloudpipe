@@ -115,10 +115,10 @@ Each workflow processes one subject. The master DAG (`cloudpipe-long-master-work
 | Step | Template | Skips when |
 |---|---|---|
 | Start Globus EC2 instance | `globus-transfer` → `start-globus-instance-template` | Instance already running |
-| Globus transfer | `globus-transfer` → `globus-transfer-template` | Never (always runs) |
-| S3 sync (POSIX staging) | `globus-transfer` → `globus-s3-sync-template` | `globus-use-s3-gateway == "true"` (current default) |
+| Globus transfer | `globus-transfer` → `globus-transfer-template` | `ingress-mode != globus` (i.e. `presynced`) |
+| Verify staged input | `ingress-verify` → `verify-staged-input-template` | `ingress-mode == globus` |
 
-With the S3 gateway (current config), the transfer step writes directly to `<YOUR_S3_BUCKET>` and the sync step is skipped. Semaphore caps concurrent transfers at 8.
+The transfer step writes directly to `<YOUR_S3_BUCKET>` through the S3 storage gateway. Exactly one of the two rows above runs; the other is Skipped, and the inventory gate accepts either. Semaphore caps concurrent transfers at 8.
 
 Node pool: `cpu-light-nodepool`
 
@@ -126,7 +126,7 @@ Node pool: `cpu-light-nodepool`
 
 Template: `inventory` → `subject-data-inventory-template`
 
-Scans S3 `mmps_mproc/{subj}/` to discover sessions and BOLD runs (task-rest, task-nback only). For each run, checks whether `b2t_exists` and `func_exists` in `derivatives/`. Checks `t1w_to_mni.tar.gz` per session. Checks FastSurfer templated derivatives for all sessions. Attaches `nss_frames` from `config/nss_volumes.csv`. Outputs a JSON array describing the subject's **inputs**.
+Scans S3 `mmps_mproc/{subj}/` to discover sessions and BOLD runs (task-rest, task-nback only). For each run, checks whether `b2t_exists` and `func_exists` in `derivatives/`. Checks `t1w_to_mni.tar.gz` per session. Checks FastSurfer derivatives for all sessions and the long-template, by each tree's `_complete.json` marker and nothing else ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)). Attaches `nss_frames` from `config/nss_volumes.csv`. Outputs a JSON array describing the subject's **inputs**.
 
 A second template in the same WorkflowTemplate, `published-sessions-template`, narrows that array to the sessions the anatomical phase actually published, and it is that narrowed list the per-session fan-out iterates. The two are not interchangeable: the first is about inputs, the second about outputs, and they diverge whenever the completion guard rejects one timepoint.
 
@@ -155,14 +155,14 @@ One iteration of the session-level DAG runs per session discovered in inventory.
 
 #### 4a — Registration
 
-T1w-to-MNI and BOLD-to-T1w run in parallel. BOLD-to-T1w is **one pod per session**, looping over that session's runs internally (not one pod per run) — this avoids paying node provisioning, an image pull, and a redundant FastSurfer tarball download per run.
+T1w-to-MNI and BOLD-to-T1w run in parallel. BOLD-to-T1w is **one pod per session**, looping over that session's runs internally (not one pod per run) — this avoids paying node provisioning, an image pull, and a redundant download of the session's FastSurfer derivatives tree per run.
 
 | Step | Tool | Node pool | Skips when |
 |---|---|---|---|
 | T1w → MNI152NLin2009cAsym | FireANTs (GPU) affine + SyN | `gpu-nodepool` | `t1w-to-mni-exists == "true"` (per inventory) |
-| BOLD reference → T1w | SynthMorph (deep learning affine) | `cpu-heavy-nodepool` | `b2t_exists == "true"` (per run, per inventory) |
+| BOLD reference → T1w | SynthMorph (deep learning rigid) | `cpu-heavy-nodepool` | `b2t_exists == "true"` (per run, per inventory) |
 
-T1w→MNI uses FreeSurfer conformed `orig.mgz` (not BIDS `T1w.nii.gz`) to ensure the source space matches BOLD→T1w. SynthMorph receives `brainmask.mgz` as its fixed image, so the transform it writes is referenced to the 256³ conformed frame; registering T1w→MNI from the same frame lets `antsApplyTransforms` compose BOLD→conformed→MNI in a **single interpolation**. See [ADR 003](decisions/003-orig-mgz-for-t1w-registration.md).
+T1w→MNI uses FreeSurfer conformed `orig.mgz` (not BIDS `T1w.nii.gz`) to ensure the source space matches BOLD→T1w. SynthMorph receives `T1.mgz` as its fixed image, so the transform it writes is referenced to the 256³ conformed frame; registering T1w→MNI from the same frame lets `antsApplyTransforms` compose BOLD→conformed→MNI in a **single interpolation**. See [ADR 003](decisions/003-orig-mgz-for-t1w-registration.md).
 
 Outputs stored in `derivatives/registration/{subj}/{ses}/`:
 - `t1w_to_mni.tar.gz` — affine.mat, warp, invwarp (reused across reruns)
@@ -172,7 +172,7 @@ Outputs stored in `derivatives/registration/{subj}/{ses}/`:
 
 Template: `functional-preprocessing` → `functional-preprocessing-session-template`
 
-**One pod per session**, looping over that session's `(task, run)` pairs internally (not one pod per `(session, task, run)` tuple) — the same consolidation rationale as bold-to-t1w: it collapses the FastSurfer tarball, MNI template, and t1w→MNI warp into a single download per session rather than one per run. Downloads from S3: BOLD NIfTI + BIDS sidecar, motion params, brain mask and ITK affine (from bold-to-t1w), ANTs transforms (from t1w-to-mni), FreeSurfer aseg (for aCompCor WM/CSF masks), MNI template.
+**One pod per session**, looping over that session's `(task, run)` pairs internally (not one pod per `(session, task, run)` tuple) — the same consolidation rationale as bold-to-t1w: it collapses the FastSurfer inputs, MNI template, and t1w→MNI warp into a single download per session rather than one per run. Downloads from S3: BOLD NIfTI + BIDS sidecar, motion params, brain mask and ITK affine (from bold-to-t1w), ANTs transforms (from t1w-to-mni), FastSurfer `mri/aseg.auto.mgz` (for aCompCor WM/CSF masks), `surf/` and `_links.json` (for grayordinate extraction), MNI template.
 
 Runs `preproc.py` (AFNI-based). Output: MNI-space BOLD tar.gz uploaded to `derivatives/func/{subj}/{ses}/`.
 
@@ -261,6 +261,8 @@ Prefect API is at `https://prefect.<YOUR_DOMAIN>/api`.
 | Max concurrent Argo workflows (namespace-wide, **enforced**) | 400 | `namespaceParallelism`, `terraform/modules/argo-workflows/main.tf` |
 | Max concurrent Argo workflows (cloudpipe) | 50 (fallback when Variable unset, overridable live) | Prefect Variable `cloudpipe-max-concurrent` |
 | Max concurrent Argo workflows (first-level) | 25 (fallback when Variable unset, overridable live) | Prefect Variable `first-level-max-concurrent` |
+| Max cloudpipe submissions per minute | 5 (fallback when Variable unset, `0` disables, overridable live) | Prefect Variable `cloudpipe-max-submissions-per-minute` |
+| FastSurfer segmentation device for new workflows | `auto` (cpu during a GPU spot drought, else cuda; overridable live) | Prefect Variable `cloudpipe-fastsurfer-device` |
 | Max pod creates per second | 50, burst 90 | `resourceRateLimit`, `terraform/modules/argo-workflows/main.tf` |
 | Max concurrent Globus transfers | 8 | `cloudpipe-semaphores` ConfigMap |
 | Max parallel sessions per workflow | 3 (master DAG `parallelism`) | `cloudpipe-long-master-workflow-template.yaml` |

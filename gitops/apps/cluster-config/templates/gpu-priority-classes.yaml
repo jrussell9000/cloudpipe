@@ -1,0 +1,71 @@
+# Scheduling order for the three GPU-holding steps (#370).
+#
+# WHY. Under spot scarcity the scheduler and Karpenter serve pending GPU pods
+# roughly in arrival order. On 2026-09-10 16:50Z that meant 47 `template-build`
+# pods competing equally with 35 `long-segmentation` pods for every freed slice
+# — and every `template-build` that wins goes on to spawn another GPU pod. Left
+# alone the batch maximises work-in-progress instead of draining it. Ranking
+# completion above starts shrinks WIP and the batch tail.
+# See docs/investigations/2026-09-10-gpu-spot-acquisition-review.md §4.1.
+#
+# NOTHING IS EVER EVICTED. All three carry `preemptionPolicy: Never`. These
+# classes reorder the *pending* queue only; a running pod is never displaced by
+# a higher-priority one. That is deliberate — every GPU step here is 6–12 min of
+# non-resumable inference, so preempting one to start another would destroy more
+# GPU-minutes than the reordering saves. `Never` is also what makes the values
+# below safe to raise or reshuffle without a blast radius.
+#
+# VALUES. Small positives, gaps of 100 so a step can be inserted between two
+# without renumbering. They sit far below everything already in the cluster
+# (aws-guardduty-agent 1000000, system-cluster-critical 2000000000), so no
+# cloudpipe pod can ever outrank a node-critical daemonset.
+#
+# The other cloudpipe pods (func-preproc, parcellation, inventory, recorders)
+# carry no class and so sit at priority 0, i.e. below all three of these. With
+# preemption off that only affects queue order, and it matters in exactly one
+# place worth knowing about: the #373 CPU fallback moves the two FastSurfer
+# segmentation pods onto cpu-heavy-nodepool while they KEEP their class, so
+# during a drought they are considered ahead of func-preproc for cpu-heavy
+# capacity. That is the same "finish over start" preference, applied to the
+# other pool, and no func-preproc pod is evicted for it.
+#
+# Karpenter reads pod priority too, so this also orders which pending pod its
+# provisioning loop tries to make room for first.
+#
+# The `cloudpipe.io/step` label each name ends in is the canonical step name
+# (see src/workflow_steps.py) — NOT the Argo template name, which differs with
+# no string rule between them. tests/argo/test_gpu_step_resources.py pins the
+# name, the rank order and `Never` against the workflow YAML.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: cloudpipe-gpu-t1w-to-mni
+value: 300
+globalDefault: false
+preemptionPolicy: Never
+description: >-
+  Highest GPU rank. ~30 s of FireANTs that unblocks a whole session's functional
+  phase, so it is the cheapest possible thing to let jump the queue.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: cloudpipe-gpu-long-segmentation
+value: 200
+globalDefault: false
+preemptionPolicy: Never
+description: >-
+  Middle GPU rank. Finishes a subject that already holds a built template, so
+  serving it retires work in flight rather than adding more.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: cloudpipe-gpu-template-build
+value: 100
+globalDefault: false
+preemptionPolicy: Never
+description: >-
+  Lowest GPU rank. Starts new GPU demand — each one that runs spawns a
+  long-segmentation pod behind it — so it yields to both steps above.

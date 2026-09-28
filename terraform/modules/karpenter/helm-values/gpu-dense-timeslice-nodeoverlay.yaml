@@ -1,0 +1,29 @@
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  # Count in the name, as with gpu-timeslice-3x: a stale name is the drift the sync
+  # requirement below exists to prevent. Renamed from gpu-dense-timeslice-5x when the
+  # measured t1w-to-mni footprint cut the count to 4 (2026-09-15); terraform replaces the
+  # object, and in the brief gap Karpenter falls back to gpu-timeslice-3x's 3 for these
+  # types — it over-launches slightly, it cannot strand a pod.
+  name: gpu-dense-timeslice-4x
+spec:
+  # Makes Karpenter model 4 nvidia.com/gpu per node for the gpu-dense-nodepool types,
+  # matching the `dense` profile's replicas in gitops/apps/nvidia-device-plugin/
+  # values.yaml. gpu-dense-nodepool.yaml carries the reasoning for 4.
+  #
+  # WEIGHT 10 IS LOAD-BEARING. gpu-timeslice-3x (weight 0) matches these same types by
+  # family, and NodeOverlays with EQUAL weight that set the same capacity key conflict
+  # and are not applied at all. Higher weight wins, so this overlay must stay above it.
+  #
+  # Matched by instance type, not by pool: NodeOverlay selects instance types, so the
+  # count applies wherever these types appear. That is why gpu-nodepool must exclude
+  # them — see the tests in tests/argo/test_gpu_step_resources.py.
+  weight: 10
+  requirements:
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      # Keep identical to gpu-dense-nodepool's instance-type list.
+      values: ["g5.2xlarge", "g6.2xlarge", "g6e.2xlarge"]
+  capacity:
+    nvidia.com/gpu: "4"

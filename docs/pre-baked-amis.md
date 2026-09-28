@@ -10,15 +10,16 @@ The solution is a custom AMI that has both images already in containerd's image 
 
 ```
 ECR (private)
-  ├── cloudpipe/fastsurfer:<sha-tag>
-  └── cloudpipe/fireants:<sha-tag>
+  ├── cloudpipe/fastsurfer@sha256:<digest>
+  └── cloudpipe/fireants@sha256:<digest>
           │
-          │  packer build (fastsurfer.pkr.hcl)
+          │  packer build (fastsurfer.pkr.hcl) — pulls BY DIGEST
           ▼
   Custom AMI (AL2023 NVIDIA)
     - Base: amazon-eks-node-al2023-x86_64-nvidia-<eks-version>-*
     - fastsurfer + fireants baked into /var/lib/containerd (k8s.io namespace)
-    - Tagged: fastsurfer-image-tag=<sha>, fireants-image-tag=<sha>, eks-version=<version>
+    - Selector tags: fastsurfer-image-digest, fireants-image-digest, eks-version
+      (the *-image-tag tags ride along for humans; nothing selects on them)
           │
           │  amiSelectorTerms in gpu-nodeclass
           ▼
@@ -37,31 +38,39 @@ ECR (private)
 | `packer/gpu-nodeclass/fastsurfer.pkr.hcl` | Packer template — builds the pre-baked AMI |
 | `terraform/modules/karpenter/helm-values/gpu-nodeclass.yaml` | AL2023 EC2NodeClass, selects AMI by tag |
 | `terraform/modules/karpenter/helm-values/gpu-nodepool.yaml` | GPU NodePool — references `gpu-nodeclass` |
-| `terraform/karpenter.tf` | Sets `fastsurfer_ami_tag` and `fireants_ami_tag` passed into the module |
+| `terraform/karpenter.tf` | Sets `fastsurfer_ami_digest` / `fireants_ami_digest` (what selection matches) and the informational `*_ami_tag` pair |
 
 ---
 
 ## Current state
 
+This table deliberately carries **no image pins and no AMI ID**. Both change on every
+fastsurfer or fireants build, and a hardcoded copy here went stale for a month before the
+AMI it named was deregistered in the 2026-09-15 cleanup. Read the live values with the
+commands below.
+
 | Item | Value |
 |---|---|
-| Fastsurfer tag | `sha-2478b13eb1e5e4cb901c37f03effcf43b9ee0dad` |
-| FireANTs tag | `sha-e6e6cd8d9a99799dbff55bba40fe618fef7cd29f` |
-| AMI ID | `ami-00f875f6c990e33a4` (built 2026-08-09; [#123](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/123) closed 2026-08-05 and live-verified) |
+| Selection key | `fastsurfer-image-digest` + `fireants-image-digest` + `eks-version` AMI tags, matched against `fastsurfer_ami_digest` / `fireants_ami_digest` in `terraform/karpenter.tf` |
 | EKS version | `1.35` |
 | Base AMI | latest `amazon-eks-node-al2023-x86_64-nvidia-1.35-*` — resolved by `source_ami_filter` at build time, **not pinned**, so two builds of the same image tags can sit on different base AMIs |
 | Region | `<YOUR_AWS_REGION>` |
 | Root volume | 150 GiB gp3 (covers fastsurfer + fireants + runtime pulls of afni/synthmorph) |
 
-The tags above are the authoritative pair: they are what `terraform/karpenter.tf` passes as
-`fastsurfer_ami_tag`/`fireants_ami_tag`, and `amiSelectorTerms` matches the AMI on *both* tags.
-Confirm against the live values rather than this table:
+Selection is by **digest**, not by the `sha-` tag. A rebuild at an unchanged commit produces
+the same tag but a different image, and kubelet matches its image cache by the full reference
+string, so a tag-keyed selector would silently cache-miss exactly the way #123 did. The
+`*_ami_tag` values in `karpenter.tf` and the `*-image-tag` AMI tags are for humans only;
+nothing selects on them.
+
+What the cluster is actually using: the selector and the AMI Karpenter resolved from it. Read
+the whole selector, not `rg -A2 amiSelectorTerms` — `eks-version` sorts first, so a two-line
+window stops before the digest tags:
 
 ```bash
-rg -n 'fastsurfer_ami_tag|fireants_ami_tag' terraform/karpenter.tf
-aws ec2 describe-images --owners self \
-  --filters "Name=tag:managed-by,Values=packer" \
-  --query 'sort_by(Images,&CreationDate)[-1].{Id:ImageId,Name:Name,Created:CreationDate}'
+kubectl get ec2nodeclass gpu-nodeclass \
+  -o jsonpath='{.spec.amiSelectorTerms}{"\n"}{range .status.amis[*]}{.id} {.name}{"\n"}{end}'
+rg -n 'ami_digest' terraform/karpenter.tf
 ```
 
 ---
@@ -86,13 +95,17 @@ cd packer/gpu-nodeclass
 packer init fastsurfer.pkr.hcl   # first time only — installs Amazon plugin
 
 packer build \
-  -var fastsurfer_tag=<new-fastsurfer-sha-tag> \
-  -var fireants_tag=<new-fireants-sha-tag> \
-  -var ecr_registry=<acct>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com \
+  -var fastsurfer_digest=sha256:<64-hex> \
+  -var fireants_digest=sha256:<64-hex> \
+  -var fastsurfer_tag=<fastsurfer-sha-tag> \
+  -var fireants_tag=<fireants-sha-tag> \
   fastsurfer.pkr.hcl
 ```
 
-Both `-var` flags are optional — each defaults to the tag currently pinned in the `.pkr.hcl` file, so you only need to pass the one that actually changed.
+Both `*_digest` variables are **required** and have no default on purpose: a stale default is
+how the wrong image gets baked without anyone noticing, so Packer refuses to build without
+them. Each must equal the digest pinned for that image in the workflow templates. The `*_tag`
+variables only name and describe the AMI; they are not pulled.
 
 The build takes ~20-25 minutes: ~5 min to start and connect to the instance, ~2 min for containerd to start, ~2-4 min to pull fastsurfer and fireants, ~12-15 min to snapshot the volume and register the AMI. The snapshot phase is AWS backend work and is the hard ceiling — volume I/O tuning and instance type affect the pull phase but not the snapshot.
 
@@ -100,9 +113,9 @@ The build takes ~20-25 minutes: ~5 min to start and connect to the instance, ~2 
 1. Launches a `g4dn.2xlarge` (8 vCPUs, 10 Gbps) from the latest `amazon-eks-node-al2023-x86_64-nvidia-<eks_version>-*` AMI
 2. Connects via SSH tunnelled through SSM (no public IP, no key management)
 3. Starts containerd (`systemctl start containerd`) — it is installed but not auto-started without the EKS nodeadm bootstrap
-4. Pulls fastsurfer and fireants into the `k8s.io` containerd namespace with `ctr -n k8s.io images pull`
+4. Pulls fastsurfer and fireants **by digest** into the `k8s.io` containerd namespace with `ctr -n k8s.io images pull`
 5. Stops the instance, snapshots the root volume, registers the AMI
-6. Tags the AMI with `fastsurfer-image-tag`, `fireants-image-tag`, `eks-version`, and `managed-by=packer`
+6. Tags the AMI with `fastsurfer-image-digest`, `fireants-image-digest` and `eks-version` (the selector), plus the informational `fastsurfer-image-tag`, `fireants-image-tag` and `managed-by=packer`
 
 The new AMI ID is printed at the end of the build:
 ```
@@ -111,14 +124,13 @@ The new AMI ID is printed at the end of the build:
 
 ### 3. Deploy the new AMI
 
-Update `fastsurfer_ami_tag` and/or `fireants_ami_tag` in `terraform/karpenter.tf` — **both must match tags actually baked into an existing AMI**, or `amiSelectorTerms` matches nothing and Karpenter cannot provision GPU nodes at all:
+Update `fastsurfer_ami_digest` and `fireants_ami_digest` in `terraform/karpenter.tf` (and the matching `*_ami_tag` pair, for traceability). **Both digests must match the tags on an AMI that actually exists**, or `amiSelectorTerms` matches nothing and Karpenter cannot provision GPU nodes at all. Check before applying:
 
-```hcl
-module "karpenter" {
-  ...
-  fastsurfer_ami_tag = "<new-fastsurfer-sha-tag>"   # ← update this
-  fireants_ami_tag   = "<new-fireants-sha-tag>"     # ← and/or this
-}
+```bash
+aws ec2 describe-images --owners self \
+  --filters "Name=tag:fastsurfer-image-digest,Values=<fastsurfer_ami_digest>" \
+            "Name=tag:fireants-image-digest,Values=<fireants_ami_digest>" \
+  --query 'Images[].[ImageId,State,CreationDate]' --output text
 ```
 
 Then apply, targeting only the GPU nodeclass to avoid touching unrelated resources:
@@ -146,9 +158,10 @@ Implemented in `.github/workflows/build-gpu-nodeclass-ami.yaml`. Triggers automa
 **What the workflow does:**
 1. Determines a candidate tag for each of fastsurfer and fireants independently (`sha-<head_sha>` for automatic runs, or the tag pinned in `karpenter.tf` for manual runs with no explicit tag)
 2. Verifies each candidate image actually exists in ECR — an image not rebuilt in the triggering run falls back to its currently-baked tag, so the AMI always carries a real image for both
-3. Skips the build only if *both* tags already match `karpenter.tf` — a rebuild of either image alone still triggers a new AMI carrying both. This comparison is tag-string-only, not AMI-existence — if `karpenter.tf` was hand-edited to pin a tag before any AMI was baked with it, dispatch manually with `force_rebuild: true` to bypass the skip.
+3. Skips the build only if *both* candidate **digests** already match `karpenter.tf` — a rebuild of either image alone still triggers a new AMI carrying both. Digests, not tags, because a rebuild at an unchanged commit keeps its tag but changes its digest. The comparison is string-only, not AMI-existence — if `karpenter.tf` was hand-edited to pin a digest before any AMI was baked with it, dispatch manually with `force_rebuild: true` to bypass the skip.
 4. Runs `packer build` on a `g4dn.2xlarge` using the `AWS_PACKER_ROLE_ARN` OIDC role
-5. Commits the updated `fastsurfer_ami_tag` and `fireants_ami_tag` in `terraform/karpenter.tf` with `[skip ci]`
+5. Sweeps up any builder instance, temporary key pair and temporary IAM profile/role that Packer did not delete (runs on cancel and failure too — see the gotcha below)
+6. Commits the updated `*_ami_digest` and `*_ami_tag` pairs in `terraform/karpenter.tf` with `[skip ci]`
 
 **The workflow does not roll the nodeclass.** It used to `kubectl apply` the
 rendered `gpu-nodeclass` directly, but the EKS API endpoint is private-only
@@ -160,14 +173,21 @@ So a green run means **the AMI exists, not that anything is using it**. Finish t
 roll from a machine with cluster access:
 
 ```bash
-git pull
+git pull   # only AFTER this workflow's run has finished — see below
 cd terraform && terraform apply
 ```
 
-Until that runs, GPU nodes keep booting the previous AMI and every GPU pod
+**Pull after the run finishes, not after the merge.** A merge that rebuilds fastsurfer
+or fireants is followed by two CI commits on `main`: `ci: pin workflow images` (a few
+minutes later) and then this workflow's `ci: update gpu-nodeclass to ...` (~15 minutes
+later, once the bake finishes). A pull taken at merge time has the first and not the
+second, so the apply plans nothing for the nodeclass and the roll silently doesn't happen.
+Hit on the 2026-09-15 fastsurfer roll (#391).
+
+Until the apply runs, GPU nodes keep booting the previous AMI and every GPU pod
 re-pulls whichever image changed at start. The `detect` job also prints a
-**pre-bake drift** warning to the run summary, per image, whenever the tag
-about to be baked disagrees with the tag the workflow templates pin, which is
+**pre-bake drift** warning to the run summary, per image, whenever the digest
+about to be baked disagrees with the digest the workflow templates pin, which is
 the signal that a roll was built but never applied.
 
 **Required secrets/variables:**
@@ -180,6 +200,18 @@ AL2023 nodes (unlike Bottlerocket) do not bundle the NVIDIA device plugin in the
 ---
 
 ## Gotchas
+
+**An interrupted build can strand its builder, and the builder is expensive at rest.** Packer stops the instance before snapshotting it, so a build killed in that window leaves a *stopped* `g4dn.2xlarge`. That costs nothing for compute but still bills for its 60 GiB root volume at 16000 IOPS / 1000 MB/s, about $105/month. A run cancelled on 2026-08-17 left one behind for three weeks ([#357](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/357)). GitHub delivers a cancel's SIGINT only to the step's entry process, so the workflow `exec`s packer to receive it, and then runs an `always()` cleanup step keyed on the run's key-pair name, `packer_gpu-nodeclass_<run_id>-<attempt>`. Nothing sweeps up after a **local** build, so check by hand after interrupting one:
+
+```bash
+aws ec2 describe-instances --region <YOUR_AWS_REGION> \
+  --filters 'Name=key-name,Values=packer_*' 'Name=instance-state-name,Values=pending,running,stopping,stopped' \
+  --query 'Reservations[].Instances[].[InstanceId,State.Name,KeyName]' --output text
+aws ec2 describe-key-pairs --region <YOUR_AWS_REGION> --query 'KeyPairs[?starts_with(KeyName,`packer`)].KeyName' --output text
+aws iam list-roles --query 'Roles[?starts_with(RoleName,`packer-`)].RoleName' --output text
+```
+
+Terminate any instance first. Each temporary instance profile, its role, and the role's inline policy all share one `packer-<uuid>` name.
 
 **containerd is not started by default** on the EKS AL2023 NVIDIA AMI without the nodeadm bootstrap. `sudo systemctl start containerd` is required in the provisioner before any `ctr` command will work.
 

@@ -173,6 +173,43 @@ def fetch_allocations(
     return data
 
 
+def _first_allocation_set(api_response: dict[str, Any], grain: str) -> dict[str, dict] | None:
+    """Return the accumulated allocation set, or None when the window has no data.
+
+    Kubecost expresses "no data for this window" in three different shapes, and
+    only the first two are the obvious ones:
+
+        {"data": []}      — empty list
+        {"data": null}    — null in place of the list
+        {"data": [null]}  — a ONE-ELEMENT list holding a nil set
+
+    The third is the dangerous one. A plain `if not sets` guard passes it (the
+    list is non-empty), `sets[0]` is then None, and iterating it raises
+    `AttributeError: 'NoneType' object has no attribute 'items'`. That is not
+    hypothetical: the aggregator OOMKilled at 2026-09-05T10:38:58Z, lost its
+    in-flight ingestion of that day, and served `data: [null]` for it
+    afterwards. The nightly scrape died on that shape at its first task, before
+    writing anything — so the run lost both the 2026-09-05 window it was
+    scraping and the settled re-scrape of 2026-09-03 that shared the flow run.
+    One bad window, two missing days, and 09-03 is stuck at scrape_age_days=1
+    permanently because no third read is ever scheduled.
+
+    A window with no data is a normal condition (an idle cluster, or a day the
+    aggregator has not ingested yet). It should skip the day and let the rest of
+    the flow proceed, never abort the run.
+    """
+    sets = api_response.get("data") or []
+    allocation_set = sets[0] if sets else None
+    if not allocation_set:
+        log.warning(
+            "Kubecost returned no %s allocation data for window (data=%s); skipping",
+            grain,
+            "[null]" if sets else api_response.get("data"),
+        )
+        return None
+    return allocation_set
+
+
 def parse_allocations(
     api_response: dict[str, Any],
     report_date: date,
@@ -190,12 +227,10 @@ def parse_allocations(
     when not given, so scrape_age_days is always populated even for callers that
     don't pass it explicitly.
     """
-    sets: list[dict] = api_response.get("data", [])
-    if not sets:
-        log.warning("Kubecost returned no allocation sets for window")
+    allocation_set = _first_allocation_set(api_response, "workflow")
+    if allocation_set is None:
         return []
 
-    allocation_set: dict[str, dict] = sets[0]
     records: list[CostAllocation] = []
 
     date_str = report_date.isoformat()
@@ -345,12 +380,10 @@ def parse_pod_allocations(
     failing — the counterfactual is an addition to this table, not a
     precondition for it.
     """
-    sets: list[dict] = api_response.get("data", [])
-    if not sets:
-        log.warning("Kubecost returned no pod allocation sets for window")
+    allocation_set = _first_allocation_set(api_response, "pod")
+    if allocation_set is None:
         return []
 
-    allocation_set: dict[str, dict] = sets[0]
     records: list[PodCost] = []
 
     date_str = report_date.isoformat()

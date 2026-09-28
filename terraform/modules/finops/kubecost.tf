@@ -93,7 +93,7 @@ resource "helm_release" "kubecost" {
   name             = "kubecost"
   chart            = "kubecost"
   repository       = "oci://public.ecr.aws/kubecost"
-  version          = "3.2.1"
+  version          = "3.3.0"
   namespace        = "kubecost"
   create_namespace = false
   wait             = false
@@ -237,13 +237,13 @@ resource "aws_vpc_security_group_egress_rule" "kubecost_lb" {
   ip_protocol       = "-1"
 }
 
-# Creating an ingress for Kubecost
+# Creating an ingress for Kubecost. It joins the caller's shared ALB ingress
+# group; the ALB-level annotations are the caller's, rendered verbatim.
 resource "kubectl_manifest" "kubecost_ingress" {
   yaml_body = templatefile("${path.module}/yamls/kubecost-alb-ingress.yaml", {
-    hostname          = var.hostname
-    certificate_arn   = var.certificate_arn
-    security_group    = aws_security_group.kubecost_lb.id
-    access_log_bucket = var.access_log_bucket
+    hostname              = var.hostname
+    certificate_arn       = var.certificate_arn
+    alb_group_annotations = var.alb_group_annotations
   })
   depends_on = [helm_release.kubecost]
 }

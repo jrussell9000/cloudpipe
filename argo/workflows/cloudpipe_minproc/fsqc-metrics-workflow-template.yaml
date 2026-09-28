@@ -113,10 +113,10 @@ spec:
   #
   # Reads from S3 (per subject):
   #   derivatives/fastsurfer/{subj}/{subj}_{ses}_templated.tar.gz   (all sessions)
-  #   derivatives/subregions/{subj}/{subj}_hippoamyg.tar.gz
-  #   derivatives/subregions/{subj}/{subj}_hypothalamic.tar.gz
-  # Deliberately NOT read: the long-template tarball (~480 MB, nothing enabled
-  # reads it) nor thalamus/brainstem/sclimbic. See the driver's module docstring.
+  #   derivatives/subregions/{subj}/hippoamyg/
+  # Deliberately NOT read: the long-template tree (~480 MB, nothing enabled
+  # reads it) nor thalamus/brainstem. The hypothalamic and sclimbic regions are
+  # retired (2026-09-16). See the driver's module docstring.
   #
   # Writes to the METRICS bucket (never the derivatives bucket — this step
   # produces QC records, not derivatives):
@@ -190,7 +190,7 @@ spec:
       # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
       # rewrites this to sha-<commit> once the first build lands, and only after
       # confirming that tag actually reached the registry.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fsqc@sha256:4d48884786140721c63a00f6caddca4065093ea0b463f9c6173a49242b4ee6f2"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fsqc@sha256:ef26ca76f0542d8ffde18fa0ce973e531a140fb2d87fdeb2f6001098f8e3b7b4"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

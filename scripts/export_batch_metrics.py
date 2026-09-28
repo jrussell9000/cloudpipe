@@ -36,6 +36,20 @@ validate_test_batch.py --cost: RFC3339 UTC bounding the batch's run time.
 The cost scrape date window is derived from them (widened one day past
 --window-end, since the scraper writes costs on the day *after* a workflow
 runs) rather than reusing --dt-from/--dt-to directly.
+
+Engines. The default is athena. duckdb does not partition-prune — it globs every
+file under each prefix — so on the full cohort (~654k files across the six grains)
+it takes ~4 h against athena's ~14 min, measured 2026-09-18.
+
+The two engines do NOT see the same partitions. Glue's partition projection is
+`projection.dt.range = "2026-08-18,NOW"` (terraform/modules/metrics/main.tf), so
+athena cannot read any dt before 2026-08-18. Today that floor hides only the
+superseded pre-leg-1 copies of reprocessed units — athena's row counts equal
+duckdb's after dedupe, table for table — but that is a property of the current
+data, not a guarantee. Anything retained from before 2026-08-18 would be dropped
+without a warning. Pass --engine duckdb to see everything, and check a cohort
+export against the census (--census-scope), whose counts come from an S3 scan and
+do not depend on either engine.
 """
 
 from __future__ import annotations
@@ -271,6 +285,123 @@ def cross_batch_warning(foreign: set[str], foreign_rows: int, foreign_usd: float
     )
 
 
+def write_subject_costs(out_dir, cost, census, m, subjects, date_from, date_to) -> None:
+    """Per-subject totals, derived from the already-scoped frame so the two cost CSVs
+    cannot disagree. subject_costs() is the fallback when costs_raw itself failed to load.
+    """
+    try:
+        if cost.frame is not None and not cost.frame.empty:
+            subj_costs = summarize_subject_costs(cost.frame)
+        elif census is not None:
+            # No unscoped fallback under --census-scope: subject_costs() re-queries the
+            # store and would quietly hand back totals the census deliberately excluded.
+            raise RuntimeError("census scope left no cost rows; refusing to fall back unscoped")
+        else:
+            subj_costs = m.subject_costs(subjects=subjects, date_from=date_from, date_to=date_to)
+        out_path = out_dir / "costs_by_subject.csv"
+        subj_costs.to_csv(out_path, index=False)
+        print(f"  {'costs_by_subject':<18} {len(subj_costs):>5} rows -> {out_path}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [SKIP] costs_by_subject: {exc}")
+
+
+def print_census_summary(census_dropped: dict[str, str]) -> None:
+    """Say what --census-scope removed. Silently shrinking a table is the failure mode
+    this option exists to prevent, so it is never left to the row counts alone."""
+    if not census_dropped:
+        return
+    print("\nCensus scope removed:")
+    for name, what in census_dropped.items():
+        print(f"  {name:<18} {what}")
+
+
+class ProgressReporter:
+    """Live per-table progress for a long export.
+
+    A cohort export runs for hours and, before this, printed nothing between tables — so a
+    wedged query and a slow one looked identical. Two phases are worth seeing: Athena
+    running the query, and paginating its results, which costs one API round-trip per
+    1,000 rows (func_qc's 180k rows is ~180 of them, and that is where the time goes).
+
+    On a TTY it rewrites one line in place. Redirected to a file it prints a line every
+    `interval` seconds instead, so a log stays readable rather than filling with \\r.
+    """
+
+    def __init__(self, stream=None, interval: float = 30.0):
+        self.stream = stream or sys.stderr
+        self.tty = hasattr(self.stream, "isatty") and self.stream.isatty()
+        self.interval = interval
+        self.table = ""
+        # None, not 0.0: the first tick often arrives at elapsed=0, and `0 - 0 >= interval`
+        # would suppress it — so a fast table would print nothing at all.
+        self._last: float | None = None
+
+    def for_table(self, name: str) -> None:
+        self.table = name
+        self._last = None
+
+    def __call__(self, phase: str, info: dict) -> None:
+        secs = info.get("elapsed") or 0.0
+        if phase == "waiting":
+            # Athena leaves Statistics unpopulated while a query is RUNNING, so a byte
+            # count is usually absent here — printing "0.00 GB" would read as "scanning
+            # nothing" rather than "not reported yet".
+            gb = (info.get("scanned_bytes") or 0) / 1e9
+            scanned = f", {gb:.2f} GB scanned" if gb else ""
+            msg = f"{self.table}: querying… {secs:5.0f}s{scanned}"
+        elif phase == "fetching":
+            rows = info.get("rows") or 0
+            rate = rows / secs if secs else 0.0
+            msg = f"{self.table}: fetched {rows:,} rows, {secs:5.0f}s ({rate:,.0f}/s)"
+        else:
+            msg = f"{self.table}: {info.get('rows', 0):,} rows in {secs:.0f}s"
+
+        if self.tty:
+            self.stream.write(f"\r  {msg:<78}")
+            if phase == "done":
+                self.stream.write("\n")
+            self.stream.flush()
+            return
+        # Not a TTY: rate-limit, and always print the final line.
+        if phase == "done" or self._last is None or secs - self._last >= self.interval:
+            self._last = secs
+            print(f"  {msg}", file=self.stream, flush=True)
+
+
+def load_census(census_dir: str | None):
+    """Load the census sidecars, or None when --census-scope was not given."""
+    if not census_dir:
+        return None
+    from metrics.census_scope import load_scope
+
+    census = load_scope(census_dir)
+    print(
+        f"Census scope: {len(census.units):,} stored units, "
+        f"{len(census.cost_share):,} cost rows, {len(census.workflows):,} workflows "
+        f"({census_dir})"
+    )
+    return census
+
+
+def apply_census_scope(name: str, df, census):
+    """Restrict one fetched table to what the census kept.
+
+    Returns (frame, note) where note describes what was removed, for the summary the
+    export prints at the end — silently shrinking a table is exactly the failure mode
+    this option exists to prevent.
+    """
+    from metrics.census_scope import scope_cost_frame, scope_metric_frame, scope_workflow_runs
+
+    if name == "costs_raw":
+        df, n, usd = scope_cost_frame(df, census)
+        return df, (f"{n} rows (${usd:,.2f}) for workflows that kept nothing" if n else None)
+    if name == "workflow_runs":
+        df, n = scope_workflow_runs(df, census)
+        return df, (f"{n} workflows produced nothing we kept" if n else None)
+    df, n = scope_metric_frame(df, name, census)
+    return df, (f"{n} rows describe no retained object" if n else None)
+
+
 def scope_costs_to_workflows(df, batch_workflows: set[str]):
     """Restrict cost rows to the batch's own workflows.
 
@@ -357,10 +488,23 @@ def main() -> None:
     p.add_argument(
         "--engine",
         choices=["duckdb", "athena"],
-        default="duckdb",
-        help="Query backend. duckdb reads S3 JSON directly (no billing, scans every "
-        "matched file). athena queries the Glue-cataloged tables (partition-pruned, "
-        "billed per query) — prefer it for wide date ranges over the full cohort.",
+        default="athena",
+        help="Query backend (default: athena). athena queries the Glue-cataloged tables: "
+        "partition-pruned and billed per query — a full-cohort export takes ~14 min. "
+        "duckdb reads S3 JSON directly and does NOT partition-prune, so it scans every "
+        "file under each prefix (~130-180 files/s) — the same export takes ~4 h. duckdb "
+        "is still the only engine that sees dt partitions before 2026-08-18, which Glue's "
+        "projection.dt.range does not generate; see the module docstring.",
+    )
+    p.add_argument(
+        "--census-scope",
+        metavar="DIR",
+        help=(
+            "Restrict the export to what the completeness census kept (DIR holds its "
+            "units.parquet and cost_scope.parquet, normally data/census). Without this the "
+            "export keeps every record written for a subject and every cost row whose "
+            "workflow finished — which on the full cohort admits superseded retries."
+        ),
     )
     p.add_argument("--dt-from", help="Inclusive YYYY-MM-DD lower bound on QC/workflow write date.")
     p.add_argument("--dt-to", help="Inclusive YYYY-MM-DD upper bound on QC/workflow write date.")
@@ -374,6 +518,8 @@ def main() -> None:
         from metrics.duckdb_query import CloudpipeMetrics
     else:
         from metrics.athena import CloudpipeMetrics
+
+    census = load_census(args.census_scope)
 
     subjects = read_subjects(args.subjects)
     if not subjects:
@@ -418,13 +564,26 @@ def main() -> None:
     subject_counts: dict[str, int] = {}
     batch_workflows: set[str] = set()
     cost = CostScope(None, set(), [], set(), 0, 0.0)
+    census_dropped: dict[str, str] = {}
+
+    progress = ProgressReporter()
+    if hasattr(m, "progress"):
+        m.progress = progress
 
     for name, fetch in tables.items():
+        progress.for_table(name)
         try:
             df = fetch()
         except Exception as exc:  # noqa: BLE001 - report and continue with other tables
             print(f"  [SKIP] {name}: {exc}")
             continue
+        # Census scope FIRST. It re-attributes cost rows, and a workflow name two subjects
+        # reused on one day is stored as one object with subject="" — so filtering on the
+        # subject list first discarded exactly the rows the census exists to split.
+        if census is not None:
+            df, note = apply_census_scope(name, df, census)
+            if note:
+                census_dropped[name] = note
         df = scope_to_subjects(df, subjects)
         if name == "workflow_runs" and "workflow_name" in df.columns:
             batch_workflows = set(df["workflow_name"].dropna().unique())
@@ -439,19 +598,7 @@ def main() -> None:
         if isinstance(covered, int):
             subject_counts[name] = covered
 
-    # Per-subject totals, derived from the scoped frame above so the two cost
-    # CSVs cannot disagree; subject_costs() is the fallback when costs_raw
-    # itself failed to load.
-    try:
-        if cost.frame is not None and not cost.frame.empty:
-            subj_costs = summarize_subject_costs(cost.frame)
-        else:
-            subj_costs = m.subject_costs(subjects=subjects, date_from=date_from, date_to=date_to)
-        out_path = out_dir / "costs_by_subject.csv"
-        subj_costs.to_csv(out_path, index=False)
-        print(f"  {'costs_by_subject':<18} {len(subj_costs):>5} rows -> {out_path}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [SKIP] costs_by_subject: {exc}")
+    write_subject_costs(out_dir, cost, census, m, subjects, date_from, date_to)
 
     # Printed last, not inline with the tables, so they are the final thing on
     # screen — every defect here is one an operator can otherwise scroll past.
@@ -466,6 +613,8 @@ def main() -> None:
         )
         if w
     ]
+    print_census_summary(census_dropped)
+
     for warning in warnings:
         print(f"\n{warning}", file=sys.stderr)
 
