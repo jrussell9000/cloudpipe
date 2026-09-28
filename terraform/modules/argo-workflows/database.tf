@@ -158,6 +158,28 @@ resource "kubectl_manifest" "db_external_secret" {
   ]
 }
 
+# Stable in-cluster name for the RDS endpoint. pgbouncer's gitops values point at
+# argo-rds.<namespace>.svc.cluster.local instead of the instance hostname, so the
+# account-specific endpoint lives only in Terraform state, never in git (ADR 020),
+# and a replaced or restored instance is followed without a values edit.
+#
+# This works only because pgbouncer connects with server_tls_sslmode = require,
+# which encrypts without checking the certificate's hostname. Moving it to
+# verify-full would fail here: the name pgbouncer dials is not one on the RDS cert.
+resource "kubernetes_service_v1" "rds" {
+  metadata {
+    name      = "argo-rds"
+    namespace = var.namespace
+  }
+
+  spec {
+    type          = "ExternalName"
+    external_name = aws_db_instance.this.address
+  }
+
+  depends_on = [data.kubernetes_namespace_v1.this]
+}
+
 # ExternalSecret for pgbouncer userlist — formats username+password from the
 # RDS-managed secret into pgbouncer's userlist.txt format ("user" "pass").
 # Mounted at /etc/pgbouncer-auth/ via pgbouncer.extraVolumes in gitops values.

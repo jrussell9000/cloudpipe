@@ -23,3 +23,4 @@ Key design choices that are not obvious from reading the code. Each record captu
 | [017](017-exploded-derivatives-over-tarballs.md) | Exploded S3 objects with a symlink manifest, not tarballs, for FastSurfer and subregion derivatives | Accepted |
 | [018](018-declarative-gcs-config-and-operator-cli.md) | Declarative GCS configuration, reconciled from one answers document, behind one operator CLI | Accepted |
 | [019](019-signing-proxy-for-globus-ingress.md) | A loopback signing proxy in the Globus ingress path, so no long-lived AWS key exists | Accepted |
+| [020](020-public-repo-as-upstream.md) | The public repo is the upstream; `<YOUR_GITHUB_REPO>` is a private deployment layer | Accepted |
