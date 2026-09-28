@@ -16,6 +16,23 @@ FROM public.ecr.aws/docker/library/python:3.10-slim-bookworm
 
 ARG FSQC_VERSION=2.1.7
 
+# Two of fsqc's modules are overlaid from an unreleased upstream commit after the
+# pip install below — see images/fsqc/patches/README.md for the full rationale.
+# Short version: Deep-MI/fsqc#105 is a positional-indexing bug that crashes the
+# hypothalamus and hippocampus modules — on this cohort 1,286 of 3,610 covered
+# sessions plus all 82 hippocampus failures, ~100% of the anatomical-QC triage
+# panel. Both were A/B'd against real data, stock vs patched, before vendoring.
+# Note the two halves have DIFFERENT triggers: the hypothalamus cases really are
+# missing a subunit label, the hippocampus ones have a complete label set and
+# fail anyway. The fix is on `dev` only; v.2.1.7 is the newest release and has it.
+#
+# We overlay two files rather than pinning the `dev` commit because `dev` also
+# adds an UNGATED checkMotion call that needs mriqc/scikit-learn. Missing, it is
+# swallowed by fsqc's per-module try/except and sets metrics_status = 1 on every
+# session — while all three build checks below still pass. Do not "simplify" this
+# to a dev pin without reading that README.
+ARG FSQC_PATCH_REF=9fcd40cf76ec8de9d8239528cb35e3b2124dd40b
+
 # libgomp1 is needed by scipy/scikit-image's OpenMP-threaded kernels.
 #
 # `apt-get upgrade` is the same-release security upgrade (NIST SP 800-171 SI-2,
@@ -89,6 +106,40 @@ RUN pip install --disable-pip-version-check --root-user-action=ignore --no-cache
         boto3==1.43.72 \
         botocore==1.43.72 \
         urllib3==2.7.0
+
+# Overlay the two patched modules onto the installed 2.1.7 tree, then PROVE the
+# swap landed. The assert matters: site-packages layout is not contractual, and a
+# COPY to a path fsqc does not actually import would leave the buggy modules in
+# place and ship silently — the failure mode is a status flag on a QC record, not
+# a crash, so nothing downstream would notice for a whole cohort.
+#
+# Staged through /tmp and placed by python rather than COPY'd straight into
+# site-packages, so the destination is resolved from fsqc.__file__ instead of a
+# hardcoded /usr/local/lib/python3.10/... that a base-image bump could silently
+# invalidate.
+COPY images/fsqc/patches/evaluateHypothalamicSegmentation.py \
+     images/fsqc/patches/evaluateHippocampalSegmentation.py \
+     /tmp/fsqc-patches/
+
+# NB: do not re-declare `ARG FSQC_PATCH_REF` here. This is a single-stage build,
+# so the declaration near the top is already in scope; a bare re-declaration
+# RESETS the value to empty unless --build-arg is passed, which silently wrote an
+# empty /opt/fsqc-patch-ref and dropped the version suffix.
+RUN python -c "\
+import os, shutil, fsqc; \
+d = os.path.dirname(fsqc.__file__); \
+[shutil.copy2(os.path.join('/tmp/fsqc-patches', f), os.path.join(d, f)) for f in os.listdir('/tmp/fsqc-patches')]; \
+print('patched fsqc at', d)" \
+    && rm -rf /tmp/fsqc-patches \
+    && python -c "\
+import os, fsqc; \
+d = os.path.dirname(fsqc.__file__); \
+[__import__('sys').exit('FATAL: fsqc#105 patch missing from ' + f) \
+ for f in ('evaluateHypothalamicSegmentation.py', 'evaluateHippocampalSegmentation.py') \
+ if 'expected_labels' not in open(os.path.join(d, f)).read()]; \
+print('fsqc#105 patch verified in both modules')" \
+    && mkdir -p /opt \
+    && echo "${FSQC_PATCH_REF}" > /opt/fsqc-patch-ref
 
 # Fail the build if the trimmed dependency set above is insufficient. Three
 # distinct checks, because they catch different things:

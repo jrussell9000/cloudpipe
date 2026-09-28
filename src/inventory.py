@@ -336,12 +336,26 @@ def check_fastsurfer_derivatives(s3, bucket: str, subj: str, sessions: list[str]
 
 def check_subregions_derivatives(s3, bucket: str, subj: str) -> bool:
     """
-    Return True iff all five subregion-segmentation output trees are COMPLETE in S3.
+    Return True iff all three subregion-segmentation output trees are COMPLETE in S3.
 
     The outputs are subject-level (each tree covers all sessions), so this is a
-    single subject-level flag mirroring fastsurfer_exists. Requiring all five
+    single subject-level flag mirroring fastsurfer_exists. Requiring all three
     (not any) means a partial or failed prior run re-runs cleanly; the phase's
     per-region resume guards then skip whatever regions did complete.
+
+    Three, not five: FreeSurfer's two TensorFlow regions were dropped on
+    2026-09-16. `hypothalamic` is superseded by FastSurfer's HypVINN (written per
+    session by the anatomical phase as stats/hypothalamus.HypVINN.stats);
+    `sclimbic`'s structures are covered by aseg and HypVINN except basal
+    forebrain and septal nuclei, which are not needed. Gating on either would
+    make every subject processed after that date read as incomplete forever.
+    Both had been published for each subject's LAST session only (a
+    repeated-`--s` bug), and their legacy trees are retired by
+    scripts/retire_subregion_trees.py.
+
+    What a marker cannot tell you: per-session coverage. `_complete.json` is per
+    region. The segmentation phase checks coverage itself (tree_has_all_tps), but
+    only when it runs — this gate cannot see a tree missing a session.
 
     As with check_fastsurfer_derivatives, completeness is `_complete.json` and
     nothing else (ADR 017). Note this check and the segmentation phase's own
@@ -357,7 +371,7 @@ def check_subregions_derivatives(s3, bucket: str, subj: str) -> bool:
     but for a subject whose derivatives have been cleaned from S3 that
     regeneration, not the segmentation, dominates the cost of the backfill.
     """
-    regions = ("thalamus", "brainstem", "hippoamyg", "hypothalamic", "sclimbic")
+    regions = ("thalamus", "brainstem", "hippoamyg")
     missing = []
     for region in regions:
         key = f"derivatives/subregions/{subj}/{region}/_complete.json"

@@ -18,10 +18,8 @@ Usage
         -p subjects_file=s3://<YOUR_S3_BUCKET>/first-level-subjects.csv
 """
 
-import time
-
 import boto3
-from lib.argo import ConcurrencyGate, submit
+from lib.argo import ConcurrencyGate, cap_reader, list_active_names, submit, wait_for_slot
 from lib.subjects import load
 from prefect.variables import Variable
 
@@ -29,6 +27,9 @@ from prefect import flow, get_run_logger, task
 
 S3_BUCKET = "<YOUR_S3_BUCKET>"
 S3_UPLOAD_PREFIX = "derivatives/first_levels"
+
+MAX_CONCURRENT_VARIABLE = "first-level-max-concurrent"
+DEFAULT_MAX_CONCURRENT = 25
 
 
 @task(name="check-first-level-complete")
@@ -78,7 +79,16 @@ def first_level_queue_manager(
     ceiling server-side regardless of what any client does.
     """
     logger = get_run_logger()
-    gate = ConcurrencyGate()
+    # See cloudpipe_queue_manager: retries are logged so a degrading API is visible
+    # before it exhausts the budget.
+    gate = ConcurrencyGate(
+        lister=lambda: list_active_names(
+            on_retry=lambda attempt, exc, delay: logger.warning(
+                f"Argo list attempt {attempt} failed ({type(exc).__name__}: {exc}) "
+                f"— retrying in {delay:.0f}s"
+            )
+        )
+    )
 
     subjects = load(subjects_file)
     batch = subjects[start_index:end_index]
@@ -87,20 +97,35 @@ def first_level_queue_manager(
         f"Loaded {len(subjects)} subjects; submitting {total} (indices {start_index}–{end_index or len(subjects)})"
     )
 
+    read_cap = cap_reader(
+        lambda: int(
+            str(Variable.get(MAX_CONCURRENT_VARIABLE, default=str(DEFAULT_MAX_CONCURRENT)))
+        ),
+        initial=DEFAULT_MAX_CONCURRENT,
+        on_error=lambda exc, held: logger.warning(
+            f"Could not read {MAX_CONCURRENT_VARIABLE} ({type(exc).__name__}: {exc}) "
+            f"— holding cap at {held}"
+        ),
+    )
+
     for i, subj_id in enumerate(batch):
         if is_completed(subj_id):
             logger.info(f"[{i + 1}/{total}] skipping {subj_id} — outputs already in S3")
             continue
 
-        while True:
-            active = gate.count()
-            max_concurrent = int(str(Variable.get("first-level-max-concurrent", default="25")))
-            if active < max_concurrent:
-                break
-            logger.info(
-                f"[{i}/{total}] {active} active ≥ {max_concurrent} — waiting {poll_interval}s"
-            )
-            time.sleep(poll_interval)
+        active = wait_for_slot(
+            gate,
+            read_cap,
+            poll_interval=poll_interval,
+            on_wait=lambda active, cap, i=i: logger.info(
+                f"[{i}/{total}] {active} active ≥ {cap} — waiting {poll_interval}s"
+            ),
+            on_count_error=lambda exc, stalled, budget, i=i: logger.warning(
+                f"[{i}/{total}] could not read active count "
+                f"({type(exc).__name__}: {exc}) — holding, "
+                f"{stalled:.0f}s of {budget:.0f}s budget used"
+            ),
+        )
 
         name = submit_workflow(subj_id)
         gate.record(name)

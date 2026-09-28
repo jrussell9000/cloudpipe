@@ -20,8 +20,38 @@ The subscription also enables the S3 storage gateway add-on (ADR 001), which is 
 
 ## Consequences
 
-- HA authentication requirements apply to the `cloudpipe-transfer` native app: `--authentication-timeout-mins` is set to 1 week (max 30 days for HA endpoints)
+- HA authentication requirements apply to the `cloudpipe-transfer` native app: `--authentication-timeout-mins` is set to 1 week (max 30 days for HA endpoints) — *the parenthesised ceiling is wrong; see the Correction below*
 - `setup_auth.py` uses `prompt=login` to force a fresh authentication event; reusing an existing browser session can produce a `No effective ACL rules` 403 on HA collections
-- The refresh token expires after up to 30 days. When it expires, all transfers fail with an auth error and `setup_auth.py` must be re-run interactively. There is no automated token rotation.
+- The refresh token expires after up to 30 days. When it expires, all transfers fail with an auth error and `setup_auth.py` must be re-run interactively. There is no automated token rotation. — *this attributes the lapse to the wrong mechanism; see the Correction below*
 - Globus subscription status is tied to the UW-Madison institutional account. If the institution's Globus subscription lapses or the cloudpipe endpoint is removed from the subscription, the cloudpipe collection loses HA status and transfers from the DAIRC source will fail
 - The GCS endpoint UUID (`<YOUR_GLOBUS_ENDPOINT_ID>`) and collection UUID (`<YOUR_GLOBUS_DEST_COLLECTION_ID>`) must be preserved across instance replacements — which the `gcs-auto-reregister` boot script and `lifecycle { ignore_changes }` on the SSM parameter ensure (see `docs/globus.md`)
+
+## Correction (2026-09): there is no 30-day High Assurance ceiling
+
+Two consequences above were wrong, and together they made a self-inflicted
+weekly chore look like a Globus constraint. **The decision to subscribe to HA is
+unaffected** — only its stated consequences were misdescribed.
+
+Measured 2026-09-15 through the Transfer API's `get_endpoint`:
+
+| | `cloudpipe-s3` (ours) | NBDC Datashare ABCD Release (source) |
+|---|---|---|
+| high assurance | true | true |
+| `authentication_timeout_mins` | 10080 (7 days) | **525600 (1 year)** |
+
+**There is no 30-day maximum.** A High Assurance collection we transfer with
+every day is configured an order of magnitude above the supposed ceiling, which
+a real limit would forbid. Our 7-day cadence is a value chosen when
+`cloudpipe-s3` was created, not a rule imposed on us.
+
+**The weekly failure is the gateway's session timeout, not refresh-token
+expiry.** The cadence matched `10080` exactly, and `storage-gateway update s3`
+accepts `--authentication-timeout-mins` (only `--high-assurance` is immutable).
+The conflation mattered operationally: it pointed whoever hit the failure at
+rotating a credential, when the fix was a one-line change to a gateway setting.
+
+The refresh token's own lifetime was never measured, so no replacement figure is
+asserted here — only that it is not what was forcing the weekly re-login.
+
+`simplify-globus-ingress` raises the production gateway to `43200` (30 days) and
+declares it in version-controlled configuration so it cannot drift back.

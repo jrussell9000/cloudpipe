@@ -26,7 +26,7 @@
   "version": 3,
   "refresh": "5m",
   "time": {
-    "from": "now-30d",
+    "from": "now-7d",
     "to": "now"
   },
   "templating": {
@@ -147,7 +147,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_sessions FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni'"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT SUM(CASE WHEN registration_type = 't1w_to_mni' THEN 1 ELSE 0 END) AS n_sessions, SUM(CASE WHEN registration_type = 'bold_to_t1w' THEN 1 ELSE 0 END) AS n_runs, ROUND(100.0 * SUM(CASE WHEN registration_type = 't1w_to_mni' AND verdict IS NOT NULL AND verdict <> '' AND verdict IN ('fail', 'warn') THEN 1 ELSE 0 END) / NULLIF(SUM(CASE WHEN registration_type = 't1w_to_mni' AND verdict IS NOT NULL AND verdict <> '' THEN 1 ELSE 0 END), 0), 1) AS pct_rejected_anat, ROUND(100.0 * SUM(CASE WHEN registration_type = 'bold_to_t1w' AND verdict IS NOT NULL AND verdict <> '' AND verdict IN ('fail', 'warn') THEN 1 ELSE 0 END) / NULLIF(SUM(CASE WHEN registration_type = 'bold_to_t1w' AND verdict IS NOT NULL AND verdict <> '' THEN 1 ELSE 0 END), 0), 1) AS pct_rejected_bold, ROUND(AVG(CASE WHEN registration_type = 't1w_to_mni' THEN lncc END), 3) AS mean_lncc, ROUND(100.0 * SUM(CASE WHEN registration_type = 't1w_to_mni' AND lncc < 0.65 THEN 1 ELSE 0 END) / NULLIF(COUNT(CASE WHEN registration_type = 't1w_to_mni' THEN lncc END), 0), 1) AS pct_below, ROUND(100.0 * SUM(CASE WHEN registration_type = 't1w_to_mni' AND jac_det_frac_negative > 0.005 THEN 1 ELSE 0 END) / NULLIF(COUNT(CASE WHEN registration_type = 't1w_to_mni' THEN jac_det_frac_negative END), 0), 1) AS pct_folded, ROUND(AVG(CASE WHEN registration_type = 't1w_to_mni' THEN mask_dice END), 4) AS mean_mask_dice, ROUND(AVG(CASE WHEN registration_type = 't1w_to_mni' THEN jac_det_mean END), 3) AS mean_jac, ROUND(approx_percentile(CASE WHEN registration_type = 't1w_to_mni' THEN centroid_displacement_mm END, 0.5), 2) AS median_shift, ROUND(approx_percentile(CASE WHEN registration_type = 't1w_to_mni' THEN log_jac_frac_beyond_1p5 END, 0.5), 5) AS median_frac, ROUND(approx_percentile(CASE WHEN registration_type = 'bold_to_t1w' AND nmi > 0 THEN nmi_gain END, 0.5), 5) AS median_gain, ROUND(100.0 * SUM(CASE WHEN registration_type = 'bold_to_t1w' AND nmi_gain <= 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(CASE WHEN registration_type = 'bold_to_t1w' THEN nmi_gain END), 0), 1) AS pct_failed, ROUND(AVG(CASE WHEN registration_type = 'bold_to_t1w' AND nmi > 0 THEN nmi END), 4) AS mean_nmi, ROUND(AVG(CASE WHEN registration_type = 'bold_to_t1w' AND nmi_identity > 0 THEN nmi_identity END), 4) AS mean_nmi_identity, ROUND(approx_percentile(CASE WHEN registration_type = 'bold_to_t1w' AND seg_bbr_contrast > -999 THEN seg_bbr_contrast END, 0.5), 4) AS median_seg, ROUND(approx_percentile(CASE WHEN registration_type = 'bold_to_t1w' AND ngf > 0 THEN ngf END, 0.5), 3) AS median_ngf, ROUND(approx_percentile(CASE WHEN registration_type = 'bold_to_t1w' AND mhd_mm >= 0 THEN mhd_mm END, 0.5), 2) AS median_mhd, ROUND(approx_percentile(CASE WHEN registration_type = 'bold_to_t1w' AND rigid_disp_max_mm > 0 THEN rigid_disp_max_mm END, 0.5), 1) AS median_disp FROM d WHERE rn = 1"
         }
       ],
       "fieldConfig": {
@@ -165,7 +165,14 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^n_sessions$/"
+        }
       }
     },
     {
@@ -180,20 +187,18 @@
         "h": 7
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_runs FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w'"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -211,7 +216,14 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^n_runs$/"
+        }
       }
     },
     {
@@ -226,20 +238,18 @@
         "h": 7
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN verdict IN ('fail', 'warn') THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS pct_rejected FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND verdict IS NOT NULL AND verdict <> ''"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -270,7 +280,14 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^pct_rejected_anat$/"
+        }
       }
     },
     {
@@ -285,20 +302,18 @@
         "h": 7
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN verdict IN ('fail', 'warn') THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS pct_rejected FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND verdict IS NOT NULL AND verdict <> ''"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -329,7 +344,14 @@
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^pct_rejected_bold$/"
+        }
       }
     },
     {
@@ -357,20 +379,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(lncc), 3) AS mean_lncc FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND lncc IS NOT NULL"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -402,7 +422,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^mean_lncc$/"
+        }
       }
     },
     {
@@ -417,20 +444,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN lncc < 0.65 THEN 1 ELSE 0 END) / NULLIF(COUNT(lncc), 0), 1) AS pct_below FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni'"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -461,7 +486,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^pct_below$/"
+        }
       }
     },
     {
@@ -476,20 +508,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN jac_det_frac_negative > 0.005 THEN 1 ELSE 0 END) / NULLIF(COUNT(jac_det_frac_negative), 0), 1) AS pct_folded FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni'"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -520,7 +550,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^pct_folded$/"
+        }
       }
     },
     {
@@ -548,7 +585,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT lncc FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND lncc IS NOT NULL"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT lncc, jac_det_frac_negative, mask_dice, log_jac_frac_beyond_1p5 FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni'"
         }
       ],
       "fieldConfig": {
@@ -581,7 +618,19 @@
         "legend": {
           "showLegend": false
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "lncc"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 15,
@@ -595,20 +644,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT jac_det_frac_negative FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND jac_det_frac_negative IS NOT NULL"
+          "panelId": 14,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -641,7 +688,19 @@
         "legend": {
           "showLegend": false
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "jac_det_frac_negative"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 110,
@@ -668,20 +727,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(mask_dice), 4) AS mean_mask_dice FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND mask_dice IS NOT NULL"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -713,7 +770,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^mean_mask_dice$/"
+        }
       }
     },
     {
@@ -728,20 +792,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(jac_det_mean), 3) AS mean_jac FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND jac_det_mean IS NOT NULL"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -760,7 +822,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^mean_jac$/"
+        }
       }
     },
     {
@@ -775,20 +844,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(approx_percentile(centroid_displacement_mm, 0.5), 2) AS median_shift FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND centroid_displacement_mm IS NOT NULL"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -820,7 +887,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^median_shift$/"
+        }
       }
     },
     {
@@ -835,20 +909,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(approx_percentile(log_jac_frac_beyond_1p5, 0.5), 5) AS median_frac FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND log_jac_frac_beyond_1p5 IS NOT NULL"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -867,7 +939,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^median_frac$/"
+        }
       }
     },
     {
@@ -882,20 +961,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mask_dice FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND mask_dice IS NOT NULL"
+          "panelId": 14,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -932,7 +1009,19 @@
         "legend": {
           "showLegend": false
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "mask_dice"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 25,
@@ -946,20 +1035,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT log_jac_frac_beyond_1p5 FROM d WHERE rn = 1 AND registration_type = 't1w_to_mni' AND log_jac_frac_beyond_1p5 IS NOT NULL"
+          "panelId": 14,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -980,7 +1067,19 @@
         "legend": {
           "showLegend": false
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "log_jac_frac_beyond_1p5"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 26,
@@ -1154,20 +1253,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(approx_percentile(nmi_gain, 0.5), 5) AS median_gain FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND nmi > 0 AND nmi_gain IS NOT NULL"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1184,7 +1281,7 @@
               },
               {
                 "color": "green",
-                "value": 0.000001
+                "value": 1e-06
               }
             ]
           }
@@ -1195,7 +1292,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^median_gain$/"
+        }
       }
     },
     {
@@ -1210,20 +1314,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(100.0 * SUM(CASE WHEN nmi_gain <= 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(nmi_gain), 0), 1) AS pct_failed FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w'"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1254,7 +1356,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^pct_failed$/"
+        }
       }
     },
     {
@@ -1269,20 +1378,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(nmi), 4) AS mean_nmi FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND nmi > 0"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1301,7 +1408,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^mean_nmi$/"
+        }
       }
     },
     {
@@ -1316,20 +1430,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(AVG(nmi_identity), 4) AS mean_nmi_identity FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND nmi_identity > 0"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1348,7 +1460,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^mean_nmi_identity$/"
+        }
       }
     },
     {
@@ -1376,7 +1495,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT nmi_gain FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND nmi_gain IS NOT NULL AND nmi > 0"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT CASE WHEN nmi > 0 THEN nmi_gain END AS nmi_gain, CASE WHEN seg_bbr_contrast > -999 THEN seg_bbr_contrast END AS seg_bbr_contrast, CASE WHEN ngf > 0 THEN ngf END AS ngf FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w'"
         }
       ],
       "fieldConfig": {
@@ -1398,7 +1517,7 @@
               },
               {
                 "color": "green",
-                "value": 0.000001
+                "value": 1e-06
               }
             ]
           }
@@ -1410,7 +1529,19 @@
         "legend": {
           "showLegend": false
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "nmi_gain"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 35,
@@ -1512,20 +1643,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(approx_percentile(seg_bbr_contrast, 0.5), 4) AS median_seg FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND seg_bbr_contrast > -999"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1544,7 +1673,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^median_seg$/"
+        }
       }
     },
     {
@@ -1559,20 +1695,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(approx_percentile(ngf, 0.5), 3) AS median_ngf FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND ngf > 0"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1591,7 +1725,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^median_ngf$/"
+        }
       }
     },
     {
@@ -1606,20 +1747,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(approx_percentile(mhd_mm, 0.5), 2) AS median_mhd FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND mhd_mm >= 0"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1638,7 +1777,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^median_mhd$/"
+        }
       }
     },
     {
@@ -1653,20 +1799,18 @@
         "h": 4
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ROUND(approx_percentile(rigid_disp_max_mm, 0.5), 1) AS median_disp FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND rigid_disp_max_mm > 0"
+          "panelId": 1,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1685,7 +1829,14 @@
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^median_disp$/"
+        }
       }
     },
     {
@@ -1700,20 +1851,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT seg_bbr_contrast FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND seg_bbr_contrast > -999"
+          "panelId": 34,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1735,7 +1884,19 @@
         "legend": {
           "showLegend": false
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "seg_bbr_contrast"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 45,
@@ -1749,20 +1910,18 @@
         "h": 8
       },
       "datasource": {
-        "uid": "cloudpipe-athena",
-        "type": "grafana-athena-datasource"
+        "type": "datasource",
+        "uid": "-- Dashboard --"
       },
       "targets": [
         {
           "refId": "A",
-          "queryType": "table",
-          "format": 1,
-          "connectionArgs": {
-            "catalog": "__default",
-            "database": "__default",
-            "region": "__default"
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, registration_type, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.registration WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${schema_version}' = 'All' OR schema_version = '${schema_version}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT ngf FROM d WHERE rn = 1 AND registration_type = 'bold_to_t1w' AND ngf > 0"
+          "panelId": 34,
+          "withTransforms": false
         }
       ],
       "fieldConfig": {
@@ -1784,7 +1943,19 @@
         "legend": {
           "showLegend": false
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "ngf"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
       "id": 46,

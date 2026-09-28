@@ -21,3 +21,5 @@ Key design choices that are not obvious from reading the code. Each record captu
 | [015](015-s3-backend-after-state-loss.md) | S3 remote backend for Terraform state, adopted after a state-loss incident | Accepted |
 | [016](016-skipped-producer-deadlock-in-dag-recording.md) | Never let a DAG task reference a skipped producer's outputs or exit code | Accepted |
 | [017](017-exploded-derivatives-over-tarballs.md) | Exploded S3 objects with a symlink manifest, not tarballs, for FastSurfer and subregion derivatives | Accepted |
+| [018](018-declarative-gcs-config-and-operator-cli.md) | Declarative GCS configuration, reconciled from one answers document, behind one operator CLI | Accepted |
+| [019](019-signing-proxy-for-globus-ingress.md) | A loopback signing proxy in the Globus ingress path, so no long-lived AWS key exists | Accepted |

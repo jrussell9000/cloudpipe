@@ -37,6 +37,12 @@ spec:
   requirements:
     - key: karpenter.k8s.aws/instance-family
       operator: In
+      # g7 was added here 2026-09-04 alongside the gpu-nodepool family list and REVERTED
+      # the same day: the stock AL2023 NVIDIA AMI (580.159.03) does not support the RTX
+      # PRO 4500, so g7 nodes came up Ready advertising no nvidia.com/gpu at all. Keep
+      # this list identical to the gpu-nodepool instance-family list — an entry here for
+      # a family the pool cannot launch is harmless, but a MISSING entry for one it can
+      # makes Karpenter model that family at 1 GPU/node and over-launch ~3x.
       values: ["g4dn", "g5", "g6", "g6e"]
   capacity:
     nvidia.com/gpu: "3"

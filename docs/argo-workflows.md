@@ -61,12 +61,12 @@ PgBouncer runs as a Deployment in the `argo-workflows` namespace and sits betwee
 
 | Setting | Value | Reason |
 |---|---|---|
-| Pool mode | `session` | Argo uses pgx with prepared statement caching; transaction mode drops server-side statements between transactions and causes errors |
-| `default_pool_size` | `20` | Caps real connections to RDS well below the `db.t4g.micro` max (~112) |
+| Pool mode | `session` | Required since Argo v4.1, which talks to Postgres through lib/pq. lib/pq splits each parameterised query across two Sync cycles using an *unnamed* statement, which PgBouncer does not track, so transaction pooling can route the second half to a different server. Full rationale in `values.yaml` |
+| `default_pool_size` | `80` | Session mode needs one server connection per client: controller leader `maxOpenConns` 40 + argo-server 40 (the standby holds none). Plus `reserve_pool_size` 10, well under `db.m7g.large`'s ~800 |
 | `max_client_conn` | `200` | Allows Argo goroutines to queue during bulk operations instead of failing immediately |
 | `server_tls_sslmode` | `require` | Enforces SSL on the PgBouncer → RDS leg |
 
-PgBouncer is defined in `gitops/apps/argo-workflows/templates/pgbouncer.yaml` (managed by ArgoCD). Credentials are pulled from the `argo-db` Secret (`host`, `username`, `password` keys) — the same secret used by the Argo controller. The Deployment has `secret.reloader.stakater.com/reload: "argo-db"` so it restarts on password rotation.
+PgBouncer is the `icoretech/pgbouncer` subchart of `gitops/apps/argo-workflows` (managed by ArgoCD); its settings live under `pgbouncer.config` in that app's `values.yaml`. The RDS host is static in `config.databases`; credentials come from the `pgbouncer-auth-userlist` ExternalSecret, which rotates with the RDS password, and the pod restarts on rotation via a Reloader annotation.
 
 ---
 
@@ -97,7 +97,7 @@ This means:
 - The workflow does not need a shared PVC to pass data between steps that run on different nodes
 - Artifacts are persisted across workflow retries (no re-work on retry)
 
-There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregion-seg` was the last consumer (its two segmentation pods now stage FastSurfer outputs onto their own private `emptyDir`s and checkpoint per-region progress to S3 instead — see [pipelines.md](pipelines.md#subregion-seg), tracked in [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77)). The EFS filesystem, StorageClass, and CSI driver have since been removed from the cluster entirely.
+There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregion-seg` was the last consumer (its segmentation pod — originally two, the DL pod was removed in #401 — now stages FastSurfer outputs onto a private `emptyDir` and checkpoint per-region progress to S3 instead — see [pipelines.md](pipelines.md#subregion-seg), tracked in [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77)). The EFS filesystem, StorageClass, and CSI driver have since been removed from the cluster entirely.
 
 ---
 
@@ -108,6 +108,8 @@ There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregi
 | `master-pipeline-dag.parallelism` | `3` | Max pods running simultaneously within one workflow. This is the only `parallelism` setting in the whole template set — sessions fan out simultaneously but are throttled by it. |
 | `globus-transfer` semaphore | `8` | Max concurrent Globus transfers cluster-wide (ConfigMap `cloudpipe-semaphores`) |
 | Prefect Variable `cloudpipe-max-concurrent` / `first-level-max-concurrent` | `50` (cloudpipe) / `25` (first-level), when the Variable is unset | Max active Argo workflows submitted by Prefect; set live with `prefect variable set <name> <N>`, not a deployment-run parameter |
+| Prefect Variable `cloudpipe-max-submissions-per-minute` | `5` when unset; `0` disables | Arrival rate of cloudpipe submissions, independent of the cap, so a cold start ramps up instead of creating the cap's whole width at once. Re-read live; see [#393](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/393) |
+| Prefect Variable `cloudpipe-fastsurfer-device` | `auto` when unset | Where new workflows run FastSurfer segmentation (workflow parameter `fastsurfer-device`). `auto`: the queue manager submits `cpu` while ≥10 GPU pods have been Pending ≥15 min and returns to `cuda` at ≤3 (hysteresis). `cpu` / `cuda` force it. Re-read every submission; see [#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373) |
 | `namespaceParallelism` | `400` | Max active workflows in `argo-workflows`, **all pipelines combined**; enforced by the controller, excess workflows held `Pending` |
 | `parallelism` | `1000` | Max active workflows cluster-wide — a second, looser ceiling above `namespaceParallelism` |
 | `resourceRateLimit` | `50/s`, burst `90` | Rate at which the controller creates pods, cluster-wide |
@@ -129,7 +131,7 @@ The inventory step (`src/inventory.py`) drives which subsequent steps are skippe
 | Flag | Completion marker checked | Skips |
 |---|---|---|
 | `fastsurfer_exists` | Every session has `derivatives/fastsurfer/{subj}/{ses}/_complete.json` | Entire anatomical processing phase |
-| `subregions_exists` | All four subregion output tarballs exist | `subregion-segmentation-dagtask` |
+| `subregions_exists` | All three subregion output trees carry `_complete.json` | `subregion-segmentation-dagtask` |
 | `t1w_to_mni_exists` (per session) | `…_desc-t1w2mni_affine.mat` — terminal output of `fst1w_to_mni.py` | `t1w-to-mni-step` for that session |
 | `b2t_exists` (per run) | `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_itk.txt` | `bold-to-t1w-step` for that run |
 | `func_exists` (per run) | `derivatives/func/{subj}/{ses}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz` | `functional-preprocessing-dagtask` for that run |
@@ -154,7 +156,7 @@ Every pipeline pod is labelled for Kubecost cost attribution:
 | Label | Values | Set by |
 |---|---|---|
 | `cloudpipe.io/phase` | `transfer`, `inventory`, `anatomical`, `registration`, `functional`, `subregion-segmentation`, `observability`, `cleanup`, `first-level` | Template `metadata.labels` |
-| `cloudpipe.io/step` | `start-globus-instance`, `globus-transfer`, `globus-s3-sync`, `delete-globus-input`, `subject-data-inventory`, `published-sessions`, `template-build`, `template-parcellation`, `long-segmentation`, `long-parcellation`, `fsqc-metrics`, `t1w-to-mni`, `bold-to-t1w`, `bold-preprocessing`, `surface-resample`, `segment-gems`, `segment-dl`, `orchestrate`, `workflow-start-marker`, `workflow-run-metrics`, `record-step-outcome` | Template `metadata.labels` |
+| `cloudpipe.io/step` | `start-globus-instance`, `globus-transfer`, `delete-globus-input`, `subject-data-inventory`, `published-sessions`, `template-build`, `template-parcellation`, `long-segmentation`, `long-parcellation`, `fsqc-metrics`, `t1w-to-mni`, `bold-to-t1w`, `bold-preprocessing`, `surface-resample`, `segment-gems`, `segment-dl`, `orchestrate`, `workflow-start-marker`, `workflow-run-metrics`, `record-step-outcome` | Template `metadata.labels` |
 | `subjectid` | `{subjID}` | `podMetadata.labels` in master WorkflowTemplate |
 | `app` | `cloudpipe` | `podMetadata.labels` in master WorkflowTemplate |
 
@@ -184,11 +186,11 @@ Parameters (all read from `cloudpipe-config` ConfigMap by default):
 | `globus-dest-collection-id` | — | Destination GCS collection UUID |
 | `globus-dest-base-path` | — | Root path on destination collection |
 | `globus-scan-types` | — | JSON array of BIDS scan types |
-| `globus-use-s3-gateway` | `"true"` | Skip S3 sync step when using GCS S3 gateway |
+| `globus-use-s3-gateway` | `"true"` | **Deprecated and unread.** Declared so older submitters are not rejected; the POSIX sync step it selected is gone |
 
 DAG structure (see architecture.md for the full phase breakdown):
 ```
-start-globus-instance → globus-transfer → [globus-s3-sync (skipped with S3 gateway)]
+start-globus-instance → globus-transfer
                                         ↓
                               subject-data-inventory
                                         ↓
@@ -212,8 +214,6 @@ Three templates, called in sequence by the master DAG:
 
 **`globus-transfer-template`** — Submits the Globus transfer and polls until completion. Semaphore `globus-transfer` limits to 8 concurrent transfers. Credentials come from the `globus-credentials` K8s Secret (synced from Secrets Manager via ExternalSecret every hour). Node pool: `cpu-light`. Image: `globus`.
 
-**`globus-s3-sync-template`** — POSIX staging path only (skipped when `globus-use-s3-gateway == "true"`). SSM `send-command` runs `aws s3 sync` on the GCS instance, then cleans up local staging data. Polls SSM for up to 2 hours. Node pool: `cpu-light`. Image: `python`.
-
 ### inventory (`inventory-workflow-template.yaml`)
 
 Two templates, both `src/inventory.py` under a different `--mode`.
@@ -232,7 +232,9 @@ Node pool: `cpu-light` for both. Image: `python` (pinned SHA).
 
 Two templates for the longitudinal template phase:
 
-**`fastsurfer-template-build-template`** — Runs `long_prepare_template.sh` and then, only if that succeeded, `run_fastsurfer.sh --seg_only --base --threads 1`. Downloads T1w inputs and `fsaverage` from S3 via init containers (`cloudpipe/python`). Creation and segmentation share this pod because both are GPU-bound and strictly sequential. Node pool: `gpu-nodepool`. Image: `fastsurfer`.
+**`fastsurfer-template-build-template`** — Runs `long_prepare_template.sh` and then, only if that succeeded, `run_fastsurfer.sh --seg_only --base --threads 1`. Downloads T1w inputs from S3 via one init container (`cloudpipe/python`); `fsaverage` is not downloaded at all — it ships in the image and is symlinked into `SUBJECTS_DIR` ([#372](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/372)). Creation and segmentation share this pod because both are GPU-bound and strictly sequential. Node pool: `gpu-nodepool`. Image: `fastsurfer`.
+
+Both this template and `fastsurfer-long-segmentation-template` take a `device` input (`cuda`, the default, or `cpu`), fed from the workflow parameter `fastsurfer-device`. With `cpu` the pod moves to `cpu-heavy-nodepool`, a `podSpecPatch` re-sizes it to 7 CPU / 8G and **zeroes** `nvidia.com/gpu` (a strategic-merge patch cannot delete the key; the scheduler ignores a 0-quantity extended resource), and the script appends `--device cpu --threads <cpu request>` to every FastSurfer call. This is the GPU spot-drought fallback from [#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373); the queue manager sets it automatically (see [Concurrency controls](#concurrency-controls)). The static resources block remains the GPU truth, and the workflow carries the device as the label `cloudpipe.io/fastsurfer-device`.
 
 **`fastsurfer-template-parcellation-template`** — Surface reconstruction (`--surf_only --base --3T --fsaparc`). Node pool: `cpu-heavy-nodepool`, 3G/4CPU. `--threads` is **derived from the cpu request** via the downward API (`resourceFieldRef` on `requests.cpu`) rather than written into the master template, so the resources block is the single source of truth and the two cannot drift. Cut 6→4 threads from measured `cpu_efficiency` 0.577; do not cut below 2 — `recon-surf.sh` runs the hemispheres serially at `threads == 1`, which roughly *doubles* the surface stage.
 
@@ -240,7 +242,7 @@ Two templates for the longitudinal template phase:
 
 Two templates for the longitudinal session-level phase:
 
-**`fastsurfer-long-segmentation-template`** — All sessions in parallel (`--subjects ses-00A=from-base ses-02A=from-base ...`), `--seg_only --long`. Node pool: `gpu-nodepool`.
+**`fastsurfer-long-segmentation-template`** — All sessions in parallel (`--subjects ses-00A=from-base ses-02A=from-base ...`), `--seg_only --long`. Node pool: `gpu-nodepool`, or `cpu-heavy-nodepool` when `device=cpu` (same mechanism as `fastsurfer-template-build-template` above).
 
 **`fastsurfer-long-parcellation-template`** — All sessions, surface reconstruction, `--long --parallel N` where N = number of sessions. Waits for both long segmentation and template parcellation to complete. Node pool: `cpu-heavy-nodepool`.
 
@@ -250,11 +252,11 @@ Two templates for the longitudinal session-level phase:
 
 Entry point `registration-dag-template`, called once per session:
 
-**`t1w-to-mni-template`** — FireANTs affine + SyN registration of FreeSurfer conformed `orig.mgz` to MNI152NLin2009cAsym. Skipped when `t1w-to-mni-exists == "true"`. Downloads FastSurfer tarball and MNI template from S3 as artifacts. GPU-accelerated (nvidia-smi monitor in background). Output: `t1w_to_mni.tar.gz` → `derivatives/registration/{subj}/{ses}/`. Node pool: `gpu-nodepool`. Image: `fireants`.
+**`t1w-to-mni-template`** — FireANTs affine + SyN registration of FreeSurfer conformed `orig.mgz` to MNI152NLin2009cAsym. Skipped when `t1w-to-mni-exists == "true"`. Downloads FastSurfer's `mri/orig.mgz` and `mri/brainmask.mgz` (single objects from the exploded derivatives tree, [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)) and the MNI template from S3 as artifacts. GPU-accelerated (nvidia-smi monitor in background). Output: `t1w_to_mni.tar.gz` → `derivatives/registration/{subj}/{ses}/`. Node pool: `gpu-nodepool`. Image: `fireants`.
 
-**`bold-to-t1w-session-template`** — SynthMorph contrast-agnostic deep learning affine registration of BOLD reference to T1w. **One pod per session**, looping over that session's runs internally (previously one pod per run via `withParam`). The task is skipped when `b2t_exists == "true"` for every run; individual complete runs are skipped inside the pod. Downloads the session's whole `func/` prefix and the FastSurfer tarball from S3 — the tarball once per session rather than once per run, which is the point of the change. No EFS PVC: outputs stage in `/tmp` and upload as one directory artifact to `derivatives/registration/{subj}/{ses}/`, preserving the per-run `bold_to_t1w_{task}_{run}/` keys. Node pool: `cpu-heavy-nodepool`. Image: `freesurfer` (which carries `bold_to_t1w.py` — there is no separate `synthmorph` image).
+**`bold-to-t1w-session-template`** — SynthMorph contrast-agnostic deep learning rigid registration (`-m rigid`) of BOLD reference to T1w. **One pod per session**, looping over that session's runs internally (previously one pod per run via `withParam`). The task is skipped when `b2t_exists == "true"` for every run; individual complete runs are skipped inside the pod. Downloads the session's whole `func/` prefix and its whole FastSurfer derivatives tree (`derivatives/fastsurfer/{subj}/{ses}/`, exploded per [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md); `restore_links.py` replays the `_links.json` aliases before the runs start) from S3 — the tree once per session rather than once per run, which is the point of the change. No EFS PVC: outputs stage in `/tmp` and upload as one directory artifact to `derivatives/registration/{subj}/{ses}/`, preserving the per-run `bold_to_t1w_{task}_{run}/` keys. Node pool: `cpu-heavy-nodepool`. Image: `freesurfer` (which carries `bold_to_t1w.py` — there is no separate `synthmorph` image).
 
-The T1w→MNI step uses `orig.mgz` (FreeSurfer conformed space) rather than the BIDS T1w to ensure the source space matches the BOLD→T1w transform, which **SynthMorph** produces in conformed space (its fixed image is `brainmask.mgz`). bbregister was removed in `61ccff7` — see [ADR 002](decisions/002-synthmorph-over-bbregister.md) and [ADR 003](decisions/003-orig-mgz-for-t1w-registration.md).
+The T1w→MNI step uses `orig.mgz` (FreeSurfer conformed space) rather than the BIDS T1w to ensure the source space matches the BOLD→T1w transform, which **SynthMorph** produces in conformed space (its fixed image is `T1.mgz`). bbregister was removed in `61ccff7` — see [ADR 002](decisions/002-synthmorph-over-bbregister.md) and [ADR 003](decisions/003-orig-mgz-for-t1w-registration.md).
 
 ### functional-preprocessing (`functional-preprocessing-workflow-template.yaml`)
 
@@ -271,7 +273,7 @@ argo submit --from workflowtemplate/functional-preprocessing \
   -p nss-frames=15
 ```
 
-**`functional-preprocessing-session-template`** — **One pod per session**, looping over the session's `(task, run)` pairs (previously one pod per `(session, task, run)`). Downloads from S3 as whole-prefix directory artifacts: the session's `func/` (BOLD + BIDS sidecars + motion params) and `registration/` (bold-to-t1w brain masks and ITK affines, plus the shared t1w-to-mni transforms), along with the FastSurfer tarball (for aCompCor's aseg) and the MNI template — the last two once per session rather than once per run. Runs `preproc.py` (AFNI) per run and tars each run's output itself. The task is skipped when `func_exists == "true"` for every run; individual complete runs are skipped inside the pod.
+**`functional-preprocessing-session-template`** — **One pod per session**, looping over the session's `(task, run)` pairs (previously one pod per `(session, task, run)`). Downloads from S3 as whole-prefix directory artifacts: the session's `func/` (BOLD + BIDS sidecars + motion params) and `registration/` (bold-to-t1w brain masks and ITK affines, plus the shared t1w-to-mni transforms), along with FastSurfer's `mri/aseg.auto.mgz` (for aCompCor), `surf/` and `_links.json` (for grayordinate extraction) and the MNI template — the last two once per session rather than once per run. Runs `preproc.py` (AFNI) per run and tars each run's output itself. The task is skipped when `func_exists == "true"` for every run; individual complete runs are skipped inside the pod.
 
 Resources: 4 GB RAM (6 GB limit), 3 CPU, 20 GB ephemeral storage (30 GB limit) requested. Node pool: `cpu-heavy-nodepool`. Image: `afni`.
 
@@ -303,17 +305,13 @@ argo submit --from workflowtemplate/subregion-seg \
 
 Prefix keys on an **input** artifact must not carry a trailing `/` (with one, Argo silently downloads nothing); an output key must keep it.
 
-Each pod then runs `/app/restore_links.py` over every staged tree **before** reading anything, because Argo downloads objects but cannot recreate symlinks. That ordering is load-bearing rather than tidy: `base-tps` is itself one of FastSurfer's aliases (`base-tps -> base-tps.fastsurfer`), and both pods read it within a couple of lines of starting, so a later replay would abort the pod under `set -eu` before any segmentation ran.
+The pod then runs `/app/restore_links.py` over every staged tree **before** reading anything, because Argo downloads objects but cannot recreate symlinks. That ordering is load-bearing rather than tidy: `base-tps` is itself one of FastSurfer's aliases (`base-tps -> base-tps.fastsurfer`), and the pod reads it within a couple of lines of starting, so a later replay would abort the pod under `set -eu` before any segmentation ran.
 
-**Two templates: `gems` ∥ `dl`**, running concurrently under `failFast: false`, both on `cpu-heavy-nodepool`, both using the `freesurfer` image. No shared PVC and no hydrate step (GitHub #77) — each pod independently declares the FastSurfer S3 prefixes as input artifacts, staged onto its own private `emptyDir`.
+**One template, `gems`**, on `cpu-heavy-nodepool` with the `freesurfer` image. No shared PVC and no hydrate step (GitHub #77) — the pod declares the FastSurfer S3 prefixes as input artifacts, staged onto its own private `emptyDir`.
 
-**`segment-subregions-gems-template`** — `segment_subregions {thalamus,brainstem,hippo-amygdala} --long-base`, GEMS/Bayesian, CPU-only, ~50 min at 4 threads. Symlinks FastSurfer bare session IDs (`ses-00A`) to the `{tp}.long.{base}` naming `--long-base` expects; `segment_subregions` writes through the symlinks into the real directories. Before each region runs, the script checks S3 for that region's final prefix (`derivatives/subregions/{subjID}/{region}/`) and stages it instead of recomputing if its `_complete.json` is present; after a region completes it publishes to that same prefix immediately, so a pod retry or workflow resubmit resumes per-region rather than redoing completed work. Outputs → `derivatives/subregions/{subjID}/{thalamus,brainstem,hippoamyg}/`. **4.5G/4CPU** (provisional — see pipelines.md).
+**`segment-subregions-gems-template`** — `segment_subregions {thalamus,brainstem,hippo-amygdala} --long-base`, GEMS/Bayesian, CPU-only, ~50 min at 4 threads. Symlinks FastSurfer bare session IDs (`ses-00A`) to the `{tp}.long.{base}` naming `--long-base` expects; `segment_subregions` writes through the symlinks into the real directories. Before each region runs, the script checks S3 for that region's final prefix (`derivatives/subregions/{subjID}/{region}/`) and stages it instead of recomputing if its `_complete.json` is present; after a region completes it publishes to that same prefix immediately, so a pod retry or workflow resubmit resumes per-region rather than redoing completed work. Outputs → `derivatives/subregions/{subjID}/{thalamus,brainstem,hippoamyg}/`. **4.5G/3.5CPU** (provisional — see pipelines.md).
 
-**`segment-subregions-dl-template`** — two TensorFlow tools, ~30 s total, reading model files from `$FREESURFER_HOME/models/`, with the same per-region S3 checkpoint/restore as the GEMS pod:
-1. `mri_segment_hypothalamic_subunits` — CNN, ~10 sec/session, 5 bilateral hypothalamic subregions → `derivatives/subregions/{subjID}/hypothalamic/`
-2. `mri_sclimbic_seg` — U-Net, <1 min/session, hypothalamus (coarse), mammillary bodies, basal forebrain, septal nuclei, NAcc, fornix → `derivatives/subregions/{subjID}/sclimbic/`
-
-**13G/4CPU** with `TF_ENABLE_ONEDNN_OPTS=0` — a measured 11.87 GB peak lasting ~30 s, which is why it is its own pod ([#129](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/129), [#134](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/134)). Needs no symlinks and no GEMS output: both tools read only `mri/nu.mgz` (plus an optional `talairach.xfm.lta`), which this pod has already staged for itself.
+**Removed 2026-09-16: `segment-subregions-dl-template`.** A second, concurrent pod ran FreeSurfer's TensorFlow tools `mri_segment_hypothalamic_subunits` (superseded by FastSurfer's HypVINN, `stats/hypothalamus.HypVINN.stats`) and `mri_sclimbic_seg` (its structures covered by aseg and HypVINN except basal forebrain and septal nuclei, which were not needed). Both had published last-session-only trees for every subject; the legacy `hypothalamic/` and `sclimbic/` prefixes are retired. The pod's sizing history ([#129](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/129), [#134](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/134)) and memory lessons are in pipelines.md.
 
 ### fmri-first-level-proc (`fmri-first-level-proc-workflow-template.yaml`)
 

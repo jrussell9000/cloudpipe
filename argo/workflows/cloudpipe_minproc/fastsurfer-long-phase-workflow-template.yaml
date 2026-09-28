@@ -65,6 +65,11 @@ spec:
     inputs:
       parameters:
         - name: argstring
+        # "cuda" (default) or "cpu" — the GPU spot-drought fallback (#373). See
+        # the nodeSelector / podSpecPatch below and the master template's
+        # fastsurfer-device parameter, which is where this comes from.
+        - name: device
+          value: cuda
 
       artifacts:
       - name: template-base
@@ -149,59 +154,57 @@ spec:
           region: <YOUR_AWS_REGION>
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-10A.tar.gz'
 
-    nodeSelector:
-      karpenter.sh/nodepool: gpu-nodepool
+    # DEVICE SWITCH (#373) — same mechanism and the same reasoning as
+    # fastsurfer-template-build-template in fast-tmpl; read the comment there.
+    # cuda: no-op patch, either GPU pool (gpu-nodepool preferred, gpu-dense-nodepool
+    # as the #374 drought fallback), the static block below is the truth.
+    # cpu: cpu-heavy-nodepool, 7 cpu / 8G, GPU limit zeroed (not deleted — a
+    # strategic-merge patch cannot remove the key, and the scheduler skips a
+    # 0-quantity extended resource). Values-only expressions, because Argo
+    # closes a tag at the first `}}` and a JSON literal would end in one. The
+    # affinity carries one ternary per pool; the comment in fast-tmpl explains why.
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: karpenter.sh/nodepool
+                  operator: In
+                  values:
+                    - "{{= inputs.parameters.device == 'cpu' ? 'cpu-heavy-nodepool' : 'gpu-nodepool' }}"
+                    - "{{= inputs.parameters.device == 'cpu' ? 'cpu-heavy-nodepool' : 'gpu-dense-nodepool' }}"
+    podSpecPatch: |
+      containers:
+        - name: main
+          resources:
+            requests:
+              cpu: "{{= inputs.parameters.device == 'cpu' ? '7' : '1' }}"
+              memory: "{{= inputs.parameters.device == 'cpu' ? '8G' : '1G' }}"
+            limits:
+              nvidia.com/gpu: "{{= inputs.parameters.device == 'cpu' ? '0' : '1' }}"
+
+    # Middle of the three GPU ranks (#370): above template-build because this
+    # finishes a subject that already holds a built template, below t1w-to-mni.
+    # NOT switched on `device` — it deliberately stays set on the cpu branch, so
+    # a drought's fallback pods are also served ahead of func-preproc on
+    # cpu-heavy. `preemptionPolicy: Never` means nothing is evicted either way;
+    # see gitops/apps/cluster-config/templates/gpu-priority-classes.yaml.
+    priorityClassName: cloudpipe-gpu-long-segmentation
 
     volumes:
       - name: work
         emptyDir: {}
 
-    initContainers:
-      # --seg_only should not touch fsaverage, but the argstring still carries
-      # --fsaparc and under the old shared volume this directory was always
-      # present (step A put it there and every later step saw it). Re-creating
-      # that guarantee costs ~480 MiB of in-region S3 per pod and a few seconds
-      # of GPU node time; discovering the assumption was wrong costs a failed
-      # batch. TODO: drop this once a real run confirms seg_only never reads it.
-      - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
-        imagePullPolicy: IfNotPresent
-        resources:
-          requests:
-            memory: 256M
-            cpu: '1'
-        mirrorVolumeMounts: true
-        env:
-          - name: BUCKET
-            value: "{{workflow.parameters.bucket}}"
-        command: [python]
-        args:
-          - -c
-          - |
-            import boto3, os
-            from pathlib import Path
-
-            dest = Path("/work/subjects/fsaverage")
-            if dest.exists():
-                print("fsaverage already present, skipping download.", flush=True)
-            else:
-                s3 = boto3.client('s3')
-                bucket = os.environ['BUCKET']
-                prefix = 'config/fsaverage/'
-                paginator = s3.get_paginator('list_objects_v2')
-                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                    for obj in page.get('Contents', []):
-                        key = obj['Key']
-                        rel = key[len(prefix):]
-                        if not rel:
-                            continue
-                        local = dest / rel
-                        local.parent.mkdir(parents=True, exist_ok=True)
-                        s3.download_file(bucket, key, str(local))
-                print("fsaverage downloaded.", flush=True)
+    # No init containers, and specifically no `download-fsaverage` (#372). The
+    # old one carried a TODO asking whether --seg_only ever reads fsaverage;
+    # the answer is that NO FastSurfer step reads it from SUBJECTS_DIR — all
+    # three call sites resolve $FREESURFER_HOME/subjects/fsaverage, which the
+    # image ships and images/fastsurfer/Dockerfile asserts. It mattered most
+    # here: an init container holds this pod's GPU time-slice from admission,
+    # so 312 sequential S3 GETs were billed as slice time.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:6da3131b48d6d7ea417dae17498d2d8d95d61ece195aa57a2d73b395cab749dd"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:43656c2a7e116124bae4519e68b9617b70245023959b14ec018038bee529a67e"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -264,17 +267,35 @@ spec:
       command: [bash, -c]
       args:
         - |
-          nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
-            --format=csv -l 5 >&2 &
-          MONITOR=$!
+          # Device switch (#373) — see fast-tmpl for the full note. brun_fastsurfer.sh
+          # consumes `--device` itself (it skips its CUDA device-count probe on cpu)
+          # and forwards `--threads` to run_fastsurfer.sh, where the LAST one wins
+          # over the argstring's `--threads 1`. OMP_NUM_THREADS is the cpu request
+          # via the downward API: 7 after the cpu podSpecPatch, 1 on the GPU.
+          DEVICE_FLAGS=""
+          MONITOR=""
+          if [[ "{{inputs.parameters.device}}" == "cpu" ]]; then
+            DEVICE_FLAGS="--device cpu --threads ${OMP_NUM_THREADS}"
+            echo "[device] cpu: FastSurfer inference on ${OMP_NUM_THREADS} threads (cpu-heavy-nodepool drought fallback, #373)" >&2
+          else
+            nvidia-smi --query-gpu=timestamp,name,memory.total,utilization.gpu,utilization.memory,memory.used \
+              --format=csv -l 5 >&2 &
+            MONITOR=$!
+          fi
 
           # See the equivalent note in fast-tmpl: an interrupted upstream step can
           # exit 0 and publish a tarball carrying scripts/IsRunning.*, which would
           # wedge FastSurfer here even though this emptyDir is fresh.
           find /work/subjects -name '*IsRunning*' -delete
 
-          /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}}
-          EXIT=$?; kill $MONITOR 2>/dev/null; exit $EXIT
+          # fsaverage comes from the image — see the full note on fast-tmpl's
+          # args block and images/fastsurfer/Dockerfile (#372). Kept as a link
+          # even though --seg_only demonstrably never reads it, so all four
+          # FastSurfer steps present an identical SUBJECTS_DIR.
+          ln -sfn "${FREESURFER_HOME:-/opt/freesurfer}/subjects/fsaverage" "$SUBJECTS_DIR/fsaverage"
+
+          /fastsurfer/brun_fastsurfer.sh {{inputs.parameters.argstring}} ${DEVICE_FLAGS}
+          EXIT=$?; [[ -n "$MONITOR" ]] && kill $MONITOR 2>/dev/null; exit $EXIT
 
   ##############################################
   # D. Long Parcellation (surf_only --long)
@@ -675,48 +696,12 @@ spec:
       - name: work
         emptyDir: {}
 
-    initContainers:
-      # recon-surf.sh registers each timepoint to fsaverage, which is not carried
-      # in either the template or the per-session scratch tarballs.
-      - name: download-fsaverage
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3afd4e6c64d284e5bd261f4b0db04901f8e3ef637445cf91b0d80b03a052cdd9"
-        imagePullPolicy: IfNotPresent
-        resources:
-          requests:
-            memory: 256M
-            cpu: '1'
-        mirrorVolumeMounts: true
-        env:
-          - name: BUCKET
-            value: "{{workflow.parameters.bucket}}"
-        command: [python]
-        args:
-          - -c
-          - |
-            import boto3, os
-            from pathlib import Path
-
-            dest = Path("/work/subjects/fsaverage")
-            if dest.exists():
-                print("fsaverage already present, skipping download.", flush=True)
-            else:
-                s3 = boto3.client('s3')
-                bucket = os.environ['BUCKET']
-                prefix = 'config/fsaverage/'
-                paginator = s3.get_paginator('list_objects_v2')
-                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                    for obj in page.get('Contents', []):
-                        key = obj['Key']
-                        rel = key[len(prefix):]
-                        if not rel:
-                            continue
-                        local = dest / rel
-                        local.parent.mkdir(parents=True, exist_ok=True)
-                        s3.download_file(bucket, key, str(local))
-                print("fsaverage downloaded.", flush=True)
+    # No init containers: fsaverage comes from the image (#372). recon-surf.sh
+    # does register every timepoint to fsaverage, but it reads it from
+    # $FREESURFER_HOME/subjects/fsaverage — see the args block below.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:6da3131b48d6d7ea417dae17498d2d8d95d61ece195aa57a2d73b395cab749dd"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:43656c2a7e116124bae4519e68b9617b70245023959b14ec018038bee529a67e"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -751,6 +736,12 @@ spec:
           # reassembles SUBJECTS_DIR from TWO upstream tarballs (B and C), so it
           # has the most inherited state of any anatomical pod.
           find "$SD" -name '*IsRunning*' -delete
+
+          # fsaverage comes from the image — see the full note on fast-tmpl's
+          # args block and images/fastsurfer/Dockerfile (#372). This is the step
+          # that runs the per-timepoint surface registration and balabels, and
+          # both read $FREESURFER_HOME/subjects/fsaverage directly.
+          ln -sfn "${FREESURFER_HOME:-/opt/freesurfer}/subjects/fsaverage" "$SD/fsaverage"
 
           # --threads is the per-instance share of the pod's TOTAL cpu request, and
           # the argstring already carries `--parallel K` for the same K. Deriving it

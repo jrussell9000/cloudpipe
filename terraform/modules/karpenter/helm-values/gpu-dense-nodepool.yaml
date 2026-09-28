@@ -1,0 +1,107 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-dense-nodepool
+spec:
+  # DROUGHT FALLBACK for gpu-nodepool (#374), carrying 4 time-sliced GPU pods per card
+  # instead of 3. Source: docs/investigations/2026-09-10-gpu-spot-acquisition-review.md
+  # §5.2 — a capacity lever, not a cost one: during a spot drought every grant should
+  # carry as many pods as the card allows.
+  #
+  # WHY A SECOND POOL. The device-plugin slice count is chosen per node by the
+  # `nvidia.com/device-plugin.config` label, and Karpenter can only set labels
+  # statically per NodePool — not per instance type. So the types that can hold more
+  # slices get their own pool whose template carries the `dense` label.
+  #
+  # WHICH TYPES, AND WHY 4. Slice count is min(CPU, VRAM, duty cycle) per node:
+  #   CPU    2xlarge = 7910m allocatable, every GPU step requests cpu: 1  -> 7
+  #   VRAM   A10G / L4 ~22731 MiB usable. The worst tenant is t1w-to-mni, MEASURED at
+  #          4903 MiB per process (scripts/manifests/gpu-t1w-vram-probe.yaml, 2026-09-15:
+  #          solo and under three-way concurrency alike). 4 x 4903 = 19612 fits any mix
+  #          of steps with ~3.1 GiB spare; 5 x 4903 = 24515 does not.           -> 4
+  #   duty   ~17% per FastSurfer pod                                          -> 5 (~85%)
+  #
+  # WHY NOT 5, WHICH THIS POOL SHIPPED WITH. 5 was set against an ESTIMATE of 4447 MiB
+  # (a device-wide reading divided by 2 tenants). At the measured 4903, a card holding
+  # k t1w-to-mni and 5-k FastSurfer pods overflows for k >= 4. That is not a corner
+  # case: a fresh dense node after a drought hands its slices to the highest-priority
+  # pending pods first, and t1w-to-mni is the highest GPU rank (#370). Under 3-way
+  # concurrency the probe saw at most 2 processes at peak at once (the peak is the last
+  # ~15 s of each run), so an OOM needs aligned peaks — unlikely, not excluded. Slice
+  # counts here are bounded by the worst case, as tests/argo/test_gpu_step_resources.py
+  # enforces, and that test now fails at 5.
+  #
+  # g4dn is absent at any size: the T4's 15 GiB holds 3 however many cores it has.
+  # The xlarge sizes are absent because 3920m allocatable holds 3. g6e.2xlarge (L40S,
+  # 45 GiB) is VRAM-unbound; it is kept at the same 4 because one device-plugin profile
+  # covers the whole pool, and splitting it would cost a third pool for an overflow type.
+  #
+  # THESE TYPES MUST NOT ALSO BE IN gpu-nodepool. NodeOverlays apply per instance type
+  # across every pool, so gpu-dense-timeslice-4x models every g5.2xlarge as holding 4.
+  # A g5.2xlarge launched by gpu-nodepool would carry no `dense` label, advertise 3, and
+  # Karpenter would under-provision against it — pods Pending with nothing launching.
+  # gpu-nodepool excludes them with an instance-type NotIn; tests/argo/
+  # test_gpu_step_resources.py fails the build if the two type sets ever overlap.
+  #
+  # ORDERING. No `weight` here, and gpu-nodepool sets one, so Karpenter tries
+  # gpu-nodepool first and reaches this pool only when every gpu-nodepool offering is
+  # filtered out — which is what the ICE cache does for ~3 min after
+  # InsufficientInstanceCapacity. At 7-day spot means (2026-09-10) a slice here costs
+  # $0.115 (g6.2xlarge) / $0.158 (g5.2xlarge) against $0.086 on g4dn.xlarge, so leading
+  # with this pool would raise normal-time cost for no capacity gain. This is NOT the
+  # priceAdjustment bias that failed for g7 on 2026-09-04: those nodes were unusable.
+  #
+  # CAVEAT (same doc): CloudTrail showed g5/g6/g6e granted 0 of 16 asks during the
+  # 2026-09-04 crunch. This raises the yield of a grant; it does not create supply.
+  disruption:
+    # Same policy and reasoning as gpu-nodepool: FastSurfer pods carry
+    # karpenter.sh/do-not-disrupt, so underutilised-consolidation could not repack them.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 10m
+    budgets:
+    - nodes: "20%"
+  limits:
+    # 64 x 2xlarge = 256 slices, above gpu-nodepool's peak observed fleet.
+    cpu: 512
+    memory: 2048Gi
+  template:
+    metadata:
+      labels:
+        # Selects the `dense` profile in gitops/apps/nvidia-device-plugin/values.yaml.
+        # A node without this label falls back to the `default` profile (3 slices).
+        nvidia.com/device-plugin.config: dense
+    spec:
+      expireAfter: 720h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-nodeclass
+      requirements:
+      - key: "kubernetes.io/arch"
+        operator: In
+        values: ["amd64"]
+      - key: "kubernetes.io/os"
+        operator: In
+        values: ["linux"]
+      # Spot-only, like gpu-nodepool. On-demand is excluded by policy.
+      - key: "karpenter.sh/capacity-type"
+        operator: In
+        values: ["spot"]
+      - key: "karpenter.k8s.aws/instance-hypervisor"
+        operator: In
+        values: ["nitro"]
+      # Named types rather than family x size so this list is literally the same list
+      # as the overlay's and gpu-nodepool's NotIn. Every entry is a single-GPU part
+      # driven by the stock AL2023 NVIDIA AMI (driver 580) — g6f and g7 stay out; see
+      # gpu-nodepool.yaml for why each was dropped.
+      - key: "node.kubernetes.io/instance-type"
+        operator: In
+        values: ["g5.2xlarge", "g6.2xlarge", "g6e.2xlarge"]
+        # 2 of 3 keeps the CreateFleet override list from collapsing onto one pool (the
+        # all-or-nothing failure in the 2026-07-17 scarcity report) while leaving one
+        # type of slack, so a single ICE-cached type cannot make the pool unsatisfiable.
+        minValues: 2
+      - key: "topology.kubernetes.io/zone"
+        operator: In
+        values: ["<YOUR_AWS_REGION>a", "<YOUR_AWS_REGION>b", "<YOUR_AWS_REGION>c"]
+        minValues: 2

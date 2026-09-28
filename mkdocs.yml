@@ -129,14 +129,18 @@ nav:
       - observability.md
       - metrics_data_dictionary.md
       - how-to-timeframe-metrics-dataframe.md
+      - anatomical-stats.md
 
   - Infrastructure:
       - architecture.md
       - infrastructure.md
       - gitops.md
       - pre-baked-amis.md
+      - data-ingress.md
+      - globus-prerequisites.md
       - globus.md
       - globus-setup.md
+      - globus-contract.md
 
   - Operations:
       - operations.md
@@ -160,3 +164,5 @@ nav:
       - decisions/015-s3-backend-after-state-loss.md
       - decisions/016-skipped-producer-deadlock-in-dag-recording.md
       - decisions/017-exploded-derivatives-over-tarballs.md
+      - decisions/018-declarative-gcs-config-and-operator-cli.md
+      - decisions/019-signing-proxy-for-globus-ingress.md

@@ -2,8 +2,8 @@
 """Snapshot a batch's DERIVED numbers where no flush can reach them (#238).
 
 `metrics/` is a scratchpad by design: `scripts/prep_test_batch.py` clears every
-`metrics/` prefix before each test batch, and `--flush-qc` additionally wipes all
-of `metrics/compacted/`. Most of what a batch produces is redoable at the cost of
+`metrics/` prefix before each test batch, raw and compacted alike, and `--flush-qc`
+additionally takes the per-scan QC. Most of what a batch produces is redoable at the cost of
 re-running it — but some of it is only readable in a window that closes, and that
 has already bitten once: the 2026-08-05 pilot's settled cost was due 2026-08-09,
 the raw records were flushed ahead of the 08-10 batch, and the number cannot be

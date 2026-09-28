@@ -10,6 +10,13 @@ version = "0.1.0"
 [tasks]
 test = "pytest"
 
+# Operator surface for the Globus ingress: `pixi run globus doctor`, `... login`,
+# `... status`. PYTHONPATH rather than an installed package, matching how
+# pytest.ini puts src/ on the path — there is no build step in this repo.
+# AWS credentials come from the caller's environment (an AWS CLI v2 SSO profile);
+# the CLI never takes keys. See docs/globus-setup.md.
+globus = { cmd = "python -m globus_admin", env = { PYTHONPATH = "src" } }
+
 # --- Code-health / lint tooling (dev-only) ---
 # Lives in the `lint` feature/environment so runtime image builds don't pull it.
 # See docs/code-health-plan.md. All tasks are read-only / report-only by default;

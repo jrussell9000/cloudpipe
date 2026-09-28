@@ -3,13 +3,38 @@ nvidia-device-plugin:
   # The chart's default affinity requires feature.node.kubernetes.io/pci-10de.present
   # (set by Node Feature Discovery, not installed here); override both to use the
   # Karpenter nodepool label instead.
-  nodeSelector:
-    karpenter.sh/nodepool: gpu-nodepool
-  affinity: {}
+  #
+  # EVERY GPU NodePool MUST BE LISTED HERE. A GPU node this DaemonSet does not reach
+  # comes up Ready and advertises no nvidia.com/gpu — the exact failure that stranded
+  # 63 g7 nodes on 2026-09-04, with Karpenter launching more for the Pending pods. The
+  # list is an affinity rather than a nodeSelector because a nodeSelector takes one
+  # value per key. tests/argo/test_gpu_step_resources.py pins it to the set of
+  # gpu-*nodepool.yaml files in terraform/modules/karpenter/helm-values/.
+  nodeSelector: {}
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: karpenter.sh/nodepool
+                operator: In
+                values:
+                  - gpu-nodepool
+                  - gpu-dense-nodepool
   # Explicitly lock to the legacy device plugin API. DRA is not supported with
   # Karpenter per AWS guidance, and auto-detection in v0.16+ can silently switch
   # to DRA on EKS 1.26+ clusters, breaking nvidia.com/gpu resource registration.
   config:
+    # PER-NODE PROFILES (#374). The chart's config-manager sidecar reads the node's
+    # `nvidia.com/device-plugin.config` label and loads the profile of that name;
+    # an unlabelled node gets `default`. Karpenter sets the label statically per
+    # NodePool (gpu-dense-nodepool -> dense), which is why slice counts are split by
+    # pool rather than by instance type. Each profile's replicas must equal the
+    # nvidia.com/gpu capacity of the NodeOverlay covering that pool's instance types.
+    #
+    # Naming `default` explicitly: with more than one profile the chart's `single`
+    # fallback no longer applies, and `named` depends on this exact key.
+    default: default
     map:
       default: |-
         version: v1
@@ -55,3 +80,23 @@ nvidia-device-plugin:
             resources:
               - name: nvidia.com/gpu
                 replicas: 3
+      # gpu-dense-nodepool only: g5/g6/g6e 2xlarge. The binding ceiling is A10G/L4 VRAM
+      # against the LARGEST tenant, t1w-to-mni, MEASURED at 4903 MiB per process
+      # (scripts/manifests/gpu-t1w-vram-probe.yaml, 2026-09-15): 4 x 4903 = 19612 MiB fits
+      # the ~22731 usable with ~3.1 GiB to spare, whatever mix of steps lands on the card.
+      # It was 5 until that measurement: 5 x 4903 = 24515 overflows as soon as four
+      # t1w-to-mni pods share a card — and a fresh dense node after a drought is filled
+      # highest-priority-first, which is t1w-to-mni. CPU (7910m) allows 7.
+      # Full reasoning in terraform/modules/karpenter/helm-values/gpu-dense-nodepool.yaml.
+      # Keep replicas in sync with gpu-dense-timeslice-nodeoverlay.yaml.
+      dense: |-
+        version: v1
+        flags:
+          migStrategy: none
+        sharing:
+          timeSlicing:
+            renameByDefault: false
+            failRequestsGreaterThanOne: false
+            resources:
+              - name: nvidia.com/gpu
+                replicas: 4

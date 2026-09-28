@@ -1,0 +1,201 @@
+# Throwaway Kubecost aggregator, for recovering reconciled cost for a single day.
+#
+# WHY
+# ---
+# The production aggregator OOMKilled on 2026-09-05 and its daily rollups for
+# 09-03 and 09-05 never rebuilt. Reconciliation (the cloud-billing correction
+# that turns gross list price into what was actually paid) exists ONLY in those
+# daily rollups, so those two days cannot be reported as true cost.
+#
+# The obvious fix — clear the production DB and force a full re-ingest — is
+# irreversible without an EBS snapshot restore, takes hours, re-reads 91 days,
+# and leaves cost data unavailable throughout. This does the same job without
+# touching production: a second aggregator, own storage, reading the SAME
+# federated store, with a retention window just wide enough to reach the target
+# day. Query it, scrape the records, delete it.
+#
+# WHY THIS CAN WORK
+# -----------------
+# The production aggregator mounts no cloud-integration secret, so reconciliation
+# is computed by reconciling allocations against ASSETS, both of which come from
+# the federated store. Both are present and structurally intact for 09-05,
+# despite that day's files being flushed early as the agent died:
+#
+#   allocations/1d/1788566400-1788652800  185,849,482 B  BGST … ffff0000  ~337,779 records
+#   assets/1d/1788566400-1788652800           510,127 B  BGST … ffff0000    ~1,744 records
+#
+# Both carry the BGST magic and the ffff0000 stream terminator, so neither was
+# truncated. A fresh ingest also applies TODAY's billing data, which for 09-05
+# has now settled — so this should return the day already reconciled, not at
+# age 1.
+#
+# DELIBERATE DIFFERENCES FROM PRODUCTION
+# --------------------------------------
+#   RESOLUTION_1D_RETENTION=7   ingest ~7 daily files, not 91. 09-05 is 2 days
+#                               back; 7 gives margin without the bulk.
+#   RESOLUTION_1H_RETENTION=1   hourly data is not needed — reconciliation lives
+#   RESOLUTION_10M_RETENTION=1  in the daily rollups. This is the single biggest
+#                               reduction in ingest volume and memory pressure.
+#   emptyDir, not a PVC         nothing to clean up, and no EBS/AZ pinning, so it
+#                               is free to schedule off the backend node.
+#   no nodeSelector             the backend node is a 13.78Gi m7g.xlarge already
+#                               at ~140% limit overcommit; this runs on general
+#                               capacity instead, where 12Gi is affordable.
+#   READ_ONLY=true              it must never write back to the federated store.
+#
+# USE
+# ---
+#   kubectl apply -f scripts/manifests/kubecost-aggregator-scratch.yaml
+#   kubectl -n kubecost logs -f kubecost-aggregator-scratch-0
+#   # once "Derivation complete" and the day returns data:
+#   kubectl -n kubecost port-forward svc/kubecost-aggregator-scratch 9105:9004
+#   python scripts/backfill_cost_from_hourly.py --date 2026-09-05 \
+#       --base-url http://127.0.0.1:9105 ...
+#
+#   # ALWAYS delete when done — it holds a duplicate copy of the ETL
+#   kubectl delete -f scripts/manifests/kubecost-aggregator-scratch.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubecost-aggregator-scratch
+  namespace: kubecost
+  labels:
+    app: kubecost-aggregator-scratch
+    cloudpipe.io/ephemeral: "true"
+spec:
+  clusterIP: None
+  selector:
+    app: kubecost-aggregator-scratch
+  ports:
+    - name: tcp-api
+      port: 9004
+      targetPort: 9004
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kubecost-aggregator-scratch
+  namespace: kubecost
+  labels:
+    app: kubecost-aggregator-scratch
+    cloudpipe.io/ephemeral: "true"
+spec:
+  serviceName: kubecost-aggregator-scratch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubecost-aggregator-scratch
+  template:
+    metadata:
+      labels:
+        app: kubecost-aggregator-scratch
+        cloudpipe.io/ephemeral: "true"
+    spec:
+      # Same SA as production: carries the IRSA role that can read the
+      # federated store bucket. Read-only use, see READ_ONLY below.
+      serviceAccountName: kubecost
+      containers:
+        - name: aggregator
+          image: public.ecr.aws/kubecost/cost-model:3.2.1
+          imagePullPolicy: IfNotPresent
+          # REQUIRED. The image's default entrypoint runs the `cost-model`
+          # command, which panics on startup in 3.2.1:
+          #   "The 'cost-model' command has been deprecated. Please use the
+          #    ibm-finops-agent as the reporting agent!"
+          # `waterfowl` is the aggregator subcommand, and is what the production
+          # StatefulSet passes. Copying only env from production is not enough.
+          args: ["waterfowl"]
+          ports:
+            - containerPort: 9004
+          env:
+            - name: CLUSTER_ID
+              value: cloudpipe
+            - name: KUBECOST_NAMESPACE
+              value: kubecost
+            - name: CONFIG_PATH
+              value: /var/configs/
+            # "false", matching production.
+            #
+            # READ_ONLY=true was tried first, on the reasoning that this instance
+            # should never write back to the federated store. It made no
+            # difference — the pod behaved identically either way — so it is NOT
+            # what stalls a cold start, despite looking like an obvious
+            # candidate. What actually happens is that the aggregator spends
+            # ~10 minutes enumerating the federated store before its first
+            # ingest, logging "Planning to derive file-windows: 0" and then
+            # nothing. That is normal; wait it out rather than changing settings.
+            #
+            # It is not needed for safety in any case: the aggregator only READS
+            # the federated store (the finops agent writes it), so a read-write
+            # aggregator cannot corrupt the shared source.
+            - name: READ_ONLY
+              value: "false"
+            - name: LOG_LEVEL
+              value: info
+            # Just enough history to cover the target day.
+            - name: RESOLUTION_1D_RETENTION
+              value: "7"
+            - name: RESOLUTION_1H_RETENTION
+              value: "1"
+            - name: RESOLUTION_10M_RETENTION
+              value: "1"
+            - name: CONTAINER_RESOURCE_USAGE_RETENTION_DAYS
+              value: "0"
+            # Same memory-shaping settings that stabilised production.
+            - name: NUM_DB_COPY_CHUNKS
+              value: "500"
+            - name: DB_READ_THREADS
+              value: "0"
+            - name: DB_WRITE_THREADS
+              value: "1"
+            - name: DB_CONCURRENT_INGESTION_COUNT
+              value: "1"
+            - name: DB_TRIM_MEMORY_ON_CLOSE
+              value: "true"
+            - name: TELEMETRY_ENABLED
+              value: "false"
+            - name: AWS_REGION
+              value: <YOUR_AWS_REGION>
+            - name: AWS_DEFAULT_REGION
+              value: <YOUR_AWS_REGION>
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 6Gi
+            # Generous because it is isolated and short-lived — this is the
+            # headroom the backend node could not offer.
+            limits:
+              memory: 12Gi
+          volumeMounts:
+            - name: persistent-configs
+              mountPath: /var/configs
+            - name: user-helm-values
+              mountPath: /var/configs/values
+            - name: federated-storage-config
+              mountPath: /var/configs/federated-store.yaml
+              subPath: federated-store.yaml
+            - name: db-storage
+              mountPath: /var/configs/waterfowl/duckdb
+            - name: db-storage
+              mountPath: /var/lib/clickhouse
+            - name: staging
+              mountPath: /var/configs/waterfowl
+      volumes:
+        - name: persistent-configs
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: user-helm-values
+          configMap:
+            name: helm-values-kubecost
+        - name: federated-storage-config
+          secret:
+            secretName: kubecost-s3-configs
+        # emptyDir, not a PVC: throwaway, and no AZ pinning so it can schedule
+        # anywhere with capacity. 7 days of daily bingen is a few GB.
+        - name: db-storage
+          emptyDir:
+            sizeLimit: 40Gi
+        - name: staging
+          emptyDir:
+            sizeLimit: 4Gi

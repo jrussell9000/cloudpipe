@@ -220,28 +220,36 @@ pgbouncer:
         dbname: "argoworkflows"
     pgbouncer:
       auth_type: md5
-      # Transaction pooling returns a server connection to the pool after every
-      # transaction instead of holding it for a client's whole session, so
-      # default_pool_size is sized by concurrent transactions rather than by
-      # client connection count. Session mode gave no multiplexing at all: it
-      # required default_pool_size >= peak client connections, which does not
-      # scale with the controller's workflowWorkers.
-      pool_mode: transaction
-      # Mandatory for transaction pooling here. Argo's persistence layer
-      # (upper/db over lib/pq) uses protocol-level prepared statements, which
-      # transaction pooling breaks unless pgbouncer tracks them and re-prepares
-      # them on whichever server connection serves the next transaction.
-      # Introduced in pgbouncer 1.21.0; default-on at 200 since 1.24.0. Pinned
-      # explicitly so a future default change cannot silently shrink the cache,
-      # and so the coupling to pool_mode is visible in one place.
-      # NOTE: covers protocol-level statements only, not SQL-level
-      # PREPARE/EXECUTE. Argo does not use those.
-      max_prepared_statements: 200
+      # SESSION pooling, and it is not optional from Argo v4.1 onward. v4.1
+      # replaced the Postgres driver: v4.0.x used pgx through the upper/db
+      # adapter (default_query_exec_mode=cache_describe, which re-sends
+      # Parse+Bind+Execute in one Sync cycle — safe under transaction pooling);
+      # v4.1 opens lib/pq directly (util/sqldb/sqldb.go, via otelsql).
+      #
+      # lib/pq sends every parameterised query as Parse(UNNAMED)+Describe+Sync,
+      # waits for ReadyForQuery, THEN Bind+Execute+Sync (lib/pq conn.go query()).
+      # upper/db's prepared-statement cache is off by default and Argo never
+      # enables it, so every non-transactional query takes that path. Under
+      # transaction pooling pgbouncer may release the server connection at the
+      # first ReadyForQuery, sending the Bind to a server that never parsed the
+      # statement. max_prepared_statements cannot help: pgbouncer 1.25 returns
+      # PS_IGNORE for unnamed statements (inspect_parse_packet/inspect_bind_packet)
+      # and only tracks named ones. lib/pq's own fix, binary_parameters=yes, is
+      # not settable — Argo builds the DSN from fixed fields (upstream #14019).
+      # Intermittent by nature: fine at idle, wrong under a cold-start burst.
+      #
+      # max_prepared_statements is deliberately absent: it only acts in
+      # transaction/statement mode.
+      pool_mode: session
       max_client_conn: 200
-      # 25, not the 60 that session mode required: under transaction pooling
-      # this is sized by concurrent transactions, not by peak client count.
-      # maxOpenConns=40 on the controller multiplexes onto these 25.
-      default_pool_size: 25
+      # Session mode pins one server connection per CLIENT connection, so this
+      # must cover peak client connections or clients queue (query_wait_timeout).
+      # Peak is the leader controller's maxOpenConns (40) plus argo-server's (40 —
+      # it reads the same persistence.connectionPool key). The standby controller
+      # holds none: measured 2026-09-15 at idle, one client connection total, from
+      # the lease holder. 80 + reserve_pool_size 10 = at most 90 RDS connections;
+      # db.m7g.large on default.postgres16 allows ~800.
+      default_pool_size: 80
       min_pool_size: 2
       reserve_pool_size: 10
       reserve_pool_timeout: 3

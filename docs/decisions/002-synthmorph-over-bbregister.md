@@ -21,21 +21,21 @@ bbregister also makes a T1-weighted assumption: it expects standard T1w-like con
 
 ## Decision
 
-Use `mri_synthmorph` from the SynthMorph toolbox (Hoffmann et al. 2023) for BOLD→T1w registration. SynthMorph is a contrast-agnostic deep learning registration model trained on synthetic data covering a wide range of contrasts and resolutions. Registration is a single neural network forward pass (~5 seconds on CPU, faster on GPU) rather than an iterative optimization.
+Use `mri_synthmorph` from the SynthMorph toolbox (Hoffmann et al. 2023) for BOLD→T1w registration. SynthMorph is a contrast-agnostic deep learning registration model trained on synthetic data covering a wide range of contrasts and resolutions. Registration is a neural network forward pass rather than an iterative optimization. (This ADR originally quoted ~5 seconds per run; measured wall time is ~45–50 s per run at `cpu: 2` — see issue #106 and the resource notes on `bold-to-t1w-session-template`.)
 
 The `bold_to_t1w.py` script:
-1. Extracts the BOLD reference volume (first non-steady-state frame, controlled by `nss-frames`)
-2. Calls `mri_synthmorph` to produce an LTA transform (FreeSurfer format)
+1. Builds the BOLD reference volume: the temporal mean of all steady-state frames, skipping the leading non-steady-state frames (`--nss-frames`, else the sidecar's `NumberOfVolumesDiscarded*` fields)
+2. Calls `mri_synthmorph -m rigid` with the reference as the moving image and FastSurfer's conformed `T1.mgz` as the fixed image, producing an LTA transform (FreeSurfer format)
 3. Converts the LTA to an ANTs/ITK affine text file (RAS→LPS coordinate flip) for use in `antsApplyTransforms`
 4. Produces a brain mask in BOLD space from the FreeSurfer `brainmask.mgz`
 
 Step 3 is **hand-rolled in numpy rather than shelled out to `lta_convert --outitk`**, which segfaults with `munmap_chunk` on SynthMorph LTAs. The conversion is `A_lps = D · R · D`, `t_lps = D · t` with `D = diag(-1, -1, 1)`, and the result is applied **as-is, with no inversion**.
 
-All FreeSurfer CLI dependencies are replaced with Python equivalents (`nibabel`, `numpy`, `scipy`) to stay compatible with the lightweight `freesurfer/synthmorph` container without requiring a full FreeSurfer installation.
+All FreeSurfer CLI dependencies other than `mri_synthmorph` itself are replaced with Python equivalents (`nibabel`, `numpy`, `scipy`). That was originally chosen to fit a lightweight `freesurfer/synthmorph` container; no such image exists now — the step runs in `cloudpipe/freesurfer`, which carries a full FreeSurfer 7.4.1 install (see [docs/images.md](../images.md)). The Python paths remain because `lta_convert` crashes on SynthMorph LTAs (above).
 
 ## Consequences
 
-- Per-run registration time drops from ~5–10 minutes to ~5 seconds
+- Per-run registration time drops from ~5–10 minutes to ~45–50 seconds (measured at `cpu: 2`; the originally quoted ~5 seconds was not borne out)
 - Contrast-agnostic: works equally well across rest, nback, SST, and MID BOLD acquisitions
 - The bold-to-t1w step runs on `cpu-heavy-nodepool` (no GPU required in practice, though SynthMorph can use one). It requests 3G/2 CPU with a 12G limit — a deliberately wide gap, because real peak memory is **host-dependent**: 8.67 G on a c6i.4xlarge (Ice Lake) versus 4.25 G on a c5.4xlarge. `TF_ENABLE_ONEDNN_OPTS=0` is set to suppress the oneDNN allocation path responsible for that spread
 - The LTA→ITK conversion introduces a fixed RAS-to-LPS coordinate flip — any consumer of the ITK transform must account for this convention. The transform is **not** inverted in the process; a prior version of this pipeline had the direction wrong (fixed 2026-07-23, `cd33678`), which is worth knowing when reading pre-fix QC numbers

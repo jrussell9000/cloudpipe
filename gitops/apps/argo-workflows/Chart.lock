@@ -1,9 +1,9 @@
 dependencies:
 - name: argo-workflows
   repository: https://argoproj.github.io/argo-helm
-  version: 1.0.18
+  version: 2.0.6
 - name: pgbouncer
   repository: https://icoretech.github.io/helm
   version: 4.1.9
-digest: sha256:09e9d32bbf9de783f879280bfafe944735e8c388d929be7e4bfa5c635ac01620
-generated: "2026-07-26T20:05:02.233133243-05:00"
+digest: sha256:9e957afd7cdda5e9d405295214a47463dfeb2ab35ef9a4f775698fe3eb351394
+generated: "2026-09-15T11:26:07.026337679-05:00"

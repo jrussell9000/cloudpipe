@@ -177,9 +177,9 @@ variable "log_bucket" {
   type        = string
 }
 
-variable "access_log_bucket" {
-  description = "SSE-S3 bucket receiving this module's ALB access logs. Must not be log_bucket — that bucket is SSE-KMS and ALB cannot deliver to it."
-  type        = string
+variable "alb_group_annotations" {
+  description = "ALB-level ingress annotations (group.name, scheme, security-groups, listen-ports, ssl-redirect, ssl-policy, load-balancer-attributes, ...) shared by every member of the ALB ingress group. Must be identical across members, so they are set by the caller, not here."
+  type        = map(string)
 }
 
 ################################################################################

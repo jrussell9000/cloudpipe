@@ -1,0 +1,13 @@
+# A voluntary disruption — a node drain, a nodegroup AMI roll — may never take
+# both tunnel connectors at once. Paired with the Deployment's hard per-node
+# spread, a drain evicts at most the one replica on that node, and waits for
+# its replacement to be Ready elsewhere before the next can go.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudflared
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: cloudflared

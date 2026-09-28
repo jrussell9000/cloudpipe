@@ -427,7 +427,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:e2a886f3628d82661c194cdc3fb48e877d408f77ad619985e3ea56fe696e8f0d"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:ea2fd29ea38c4f0c43c7115817030ae65b4afade49e85f8c66126d3a0eede71d"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -485,7 +485,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:e2a886f3628d82661c194cdc3fb48e877d408f77ad619985e3ea56fe696e8f0d"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:ea2fd29ea38c4f0c43c7115817030ae65b4afade49e85f8c66126d3a0eede71d"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather
@@ -1098,25 +1098,47 @@ spec:
         if skipped:
             print(f"[driver] skipped (no upstream transform): {' '.join(skipped)}")
 
-        # Fail the step only when the session produced nothing at all — no run
-        # wrote any new tarball. A partial failure (some runs, or some
-        # derivatives, succeeded) exits 0 so their artifacts and per-run records
-        # survive.
-        #
-        # Runs skipped for a missing upstream transform are excluded from the
-        # denominator (issue #222): a session whose every run was QC-rejected by
-        # bold-to-t1w has nothing for this step to produce, and exiting non-zero
-        # would mark the whole session failed, fire the DAG's fallback recorder
-        # over the per-run `skipped` records this pod just wrote, and put a
-        # func-preproc failure in the batch report for a correct outcome. If any
-        # run was actually attempted and none produced, that is still a failure.
-        #
-        # The original rationale was that Argo does not save output artifacts
-        # from a failed pod. Measured 2026-07-22 (dagval-330e63gh-tarerr), it
-        # does — the artifact uploaded after a non-zero exit. What a non-zero
-        # exit actually costs is the output *parameters* (skipped when their
-        # file is missing) and the session's status, which the outcome fan-out
-        # stamps onto every sibling run. Those are the reasons to keep this.
-        attempted = [p for p, ff, sf, prod, msg, up in results if not up]
-        if attempted and not produced:
-            sys.exit(1)
+        def session_exit_code(results, runs):
+            """The pod's exit code, given every pending run's process() result.
+
+            Fail the step only when the session has nothing at all — no run
+            wrote a new tarball in this pod, and no run had a derivative from an
+            earlier workflow. A partial failure (some runs, or some derivatives,
+            succeeded) exits 0 so their artifacts and per-run records survive.
+
+            Runs skipped for a missing upstream transform are excluded from the
+            denominator (issue #222): a session whose every run was QC-rejected
+            by bold-to-t1w has nothing for this step to produce, and exiting
+            non-zero would mark the whole session failed, fire the DAG's
+            fallback recorder over the per-run `skipped` records this pod just
+            wrote, and put a func-preproc failure in the batch report for a
+            correct outcome. If any run was actually attempted and none produced,
+            that is still a failure — unless an earlier workflow already left
+            output for some run.
+
+            That exception is #388. `results` holds only the runs this pod
+            drove, so on a resubmit whose sole pending run failed, the session
+            read as empty and exited 1 despite its complete siblings. That does
+            not cost surface-resample (it runs on Failed too), but it fires the
+            fallback recorder, which writes a session-level (task=na) failure on
+            top of the per-run records this pod already wrote. bold-to-t1w had
+            the same shape with a worse cost; see its session_exit_code.
+
+            The original rationale was that Argo does not save output artifacts
+            from a failed pod. Measured 2026-07-22 (dagval-330e63gh-tarerr), it
+            does — the artifact uploaded after a non-zero exit. What a non-zero
+            exit actually costs is the output *parameters* (skipped when their
+            file is missing) and the session's status, which the outcome fan-out
+            stamps onto every sibling run. Those are the reasons to keep this.
+            """
+            attempted = [p for p, ff, sf, prod, msg, up in results if not up]
+            produced = [p for p, ff, sf, prod, msg, up in results if prod]
+            # inventory's flags: either derivative already in S3 coming in.
+            already_output = any(r.get("func_exists") or r.get("surf_exists") for r in runs)
+            if attempted and not produced and not already_output:
+                return 1
+            return 0
+
+        exit_code = session_exit_code(results, RUNS)
+        if exit_code:
+            sys.exit(exit_code)

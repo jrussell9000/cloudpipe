@@ -1,0 +1,358 @@
+# t1w-to-mni RANDOM-rescue VALIDATION — the new fst1w_to_mni.py on real brains, pre-merge
+#
+# WHAT SHIPS
+# ----------
+# fst1w_to_mni.py now runs the NONE-sampling affine first (unchanged) and, only if it
+# fails the QC gate, up to three RANDOM tickets — ONE ITK thread, seeds 42/43/44 — keeping
+# the FIRST to pass the same gate. Every accepted transform clears the same gate; nothing
+# compares attempts. Schema 2.7 records which attempt a row describes.
+#
+# The rescue probes that justified it (t1w-mni-rescue-mbzr5, 30 gate-failed cohort
+# sessions) varied the THREAD COUNT, 1/4/8 at seed 42. The shipped ladder varies the SEED
+# at one thread instead, because RANDOM above one thread is not reproducible at all (the
+# identical config twice in fresh processes: 0.89 mm apart on the test fixture; at one
+# thread: bit-identical every way tried). So seed 42 @ 1 thread IS the probes' itk1 arm,
+# but seeds 43 and 44 have never run on a real brain. This run closes that, and the three
+# things no unit test can reach.
+#
+# WHAT THIS CHECKS — on the same 30 tranche-1 sessions, so every number has a baseline
+# --------------------------------------------------------------------------------------
+#   1. SEED 43 / 44 EFFICACY  — arms `seed43`, `seed44`: one RANDOM ticket each, run
+#      regardless of outcome, through the NEW script's own code path (its attempt plan is
+#      patched to that single ticket). Per-seed recovery on n=30, directly comparable to the
+#      probes' itk4 26/30 and itk8 27/29. This is the real open risk. The ladder alone could
+#      not answer it: only the ~5 sessions whose seed-42 ticket fails ever reach ticket 2.
+#   2. THE LADDER END TO END  — arm `ladder`: the new script exactly as production will run
+#      it (default --rescue-tickets). Exercises run_with_rescue, rescue_provenance and the
+#      schema-2.7 record on real outputs.
+#   3. VRAM ACROSS ATTEMPTS   — up to four SyN runs now share one pod on a time-sliced T4
+#      (~5 GB/slice, one SyN ~4.9 GB). The script frees memory between attempts and logs
+#      each attempt's peak; the wrapper lifts those peaks into the record. A session that
+#      needs every ticket is the worst case: the one tranche-1 session on which every
+#      strategy converges to lncc ~0.61 exercises all four — smoke-test on it first.
+#   4. REAL-DATA REPRODUCIBILITY — the ladder's first ticket is seed 42 @ 1 thread, i.e.
+#      the probes' itk1 arm, on the same card model, and its NONE attempt is the probes'
+#      control. The AFFINE is bit-exact at one thread (unit-tested); the final lncc also
+#      carries GPU SyN's run-to-run residual, so expect near-agreement, not identity.
+#
+# HOW TO READ IT
+# --------------
+#   seed43/seed44 recover ~25-27 of 30 each   efficacy holds; the seed ladder is sound.
+#   seed43/seed44 recover markedly less        the thread arms' yield did not transfer to
+#                                              seeds; stop and rethink before merging.
+#   ladder: any 'fail' where a seed arm passed  impossible by construction — a bug.
+#   ladder: pod OOM / CUDA out-of-memory        the between-attempt release is insufficient.
+#   a few same-card lncc gaps of ~0.01-0.02   GPU SyN nondeterminism on rugged sessions —
+#                                              expected. A SYSTEMATIC offset across many
+#                                              sessions, or any VERDICT flip, is not.
+#
+# RESULT (run1, t1w-mni-rescue-validate-m4nsm, 2026-09-11, all 30 on Tesla T4):
+#   seed43 27/30, seed44 26/30 (thread arms: 26/30, 27/29). Ladder 29/30 — 25 / 2 / 2 at
+#   tickets 1 / 2 / 3, one total failure (the session every strategy puts at ~0.61),
+#   exactly the probes' 29/30. VRAM peak 3698 MiB whether a pod ran 2, 3 or 4 attempts; no
+#   growth, no OOM. Tickets 2/3 matched the standalone seed arms. NONE vs the probes'
+#   control: median gap 1.8e-4, 24/30 within 1e-3, two rugged sessions at 0.013 / 0.023 —
+#   one of which was already a same-card outlier between production and the
+#   probes, and here AGREES with production. Zero verdict flips. 8 pods were preempted
+#   ("pod deleted") and all recovered via the OnError retry.
+#
+# NOT PINNED TO A CARD — it cannot be. gpu-nodepool requires every NEW launch to be
+# eligible for >=5 instance types across >=3 families (Karpenter minValues, #345: spot
+# diversification). A single-type pin such as g4dn.xlarge therefore schedules only onto
+# nodes that already happen to be warm; with none, it is Unschedulable forever, and the
+# event says "minValues requirement is not met" — not a spot shortage. Instead each pod
+# stamps its card, and the analysis compares only same-card pairs: the card shifts lncc
+# (A10G->T4 ~-0.053 on failed sessions). Tranche 1 ran unpinned and landed wholly on T4
+# (cheapest spot), so most pods likely will again.
+#
+# SAFETY: writes nothing to derivatives/ and nothing to the metrics corpus — the QC record
+# goes to scratch/. Participant IDs are not in this file; `sessions` is supplied at submit.
+#
+# USAGE
+#   SHA=$(sha256sum images/fireANTs/scripts/fst1w_to_mni.py | cut -c1-12)
+#   aws s3 cp images/fireANTs/scripts/fst1w_to_mni.py s3://<YOUR_S3_BUCKET>/scratch/rescue-validation/script-$SHA/fst1w_to_mni.py
+#   argo -n argo-workflows submit scripts/manifests/t1w-to-mni-rescue-validation.yaml \
+#     -p script-sha=$SHA -p run-label=run1 \
+#     -p sessions="$(cat data/reprocess/rescue_tranche1.json)"
+#   aws s3 sync s3://<YOUR_S3_BUCKET>/scratch/rescue-validation/run1/ /tmp/rescue-validation/
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: t1w-mni-rescue-validate-
+  namespace: argo-workflows
+spec:
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  artifactRepositoryRef:
+    key: cloudpipe-artifacts
+
+  podMetadata:
+    labels:
+      app: cloudpipe
+    # No karpenter.sh/do-not-disrupt: this measures verdicts, not timing, so a preempted
+    # arm is a lost measurement rather than a wrong one — and the retryStrategy below
+    # re-runs it.
+
+  activeDeadlineSeconds: 21600
+  parallelism: 10
+  entrypoint: validate
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: <YOUR_S3_BUCKET>
+      - name: ecr-registry
+        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+      # The image the live `registration` WorkflowTemplate serves. Only the SCRIPT is new;
+      # its libraries (SimpleITK, fireants, torch) and registration_qc.py are unchanged.
+      - name: fireants-image
+        value: cloudpipe/fireants@sha256:4730e00580ea1dd4622e73341ba4c35ad6257b2fe682816baa507290ae46d21c
+      # First 12 hex of the staged script's sha256 — both the S3 key and a check the pod
+      # runs, so a stale upload cannot quietly stand in for the code under test.
+      - name: script-sha
+      - name: run-label
+        value: run1
+      # JSON array of {subject, session, band, lncc}; empty default does nothing.
+      - name: sessions
+        value: "[]"
+      - name: arms
+        value: |
+          [{"arm":"ladder","mode":"ladder","seed":"0"},
+           {"arm":"seed43","mode":"seed","seed":"43"},
+           {"arm":"seed44","mode":"seed","seed":"44"}]
+
+  templates:
+    - name: validate
+      steps:
+        - - name: session
+            template: session-arms
+            arguments:
+              parameters:
+                - {name: subject, value: '{{item.subject}}'}
+                - {name: session, value: '{{item.session}}'}
+                - {name: band, value: '{{item.band}}'}
+                - {name: recorded-lncc, value: '{{item.lncc}}'}
+            withParam: '{{workflow.parameters.sessions}}'
+
+    - name: session-arms
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: band
+          - name: recorded-lncc
+      steps:
+        - - name: arm
+            template: arm
+            arguments:
+              parameters:
+                - {name: subject, value: '{{inputs.parameters.subject}}'}
+                - {name: session, value: '{{inputs.parameters.session}}'}
+                - {name: band, value: '{{inputs.parameters.band}}'}
+                - {name: recorded-lncc, value: '{{inputs.parameters.recorded-lncc}}'}
+                - {name: arm, value: '{{item.arm}}'}
+                - {name: mode, value: '{{item.mode}}'}
+                - {name: seed, value: '{{item.seed}}'}
+            withParam: '{{workflow.parameters.arms}}'
+
+    - name: arm
+      # Error = the pod died under us (spot preemption, "pod deleted"). A non-zero exit is
+      # Failed, not Error, and is NOT retried: that is a real script failure, and running
+      # it again would only burn a GPU slot to fail identically.
+      retryStrategy:
+        limit: 2
+        retryPolicy: OnError
+      inputs:
+        parameters:
+          - name: subject
+          - name: session
+          - name: band
+          - name: recorded-lncc
+          - name: arm
+          - name: mode
+          - name: seed
+        artifacts:
+          # .mgz is gzip, and argoexec sniffs gzip and tries to untar it (#274) — every
+          # staged .mgz needs archive: none, exactly as the production template has it.
+          - name: fastsurfer-orig
+            path: /fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/orig.mgz
+            archive: {none: {}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{inputs.parameters.subject}}/{{inputs.parameters.session}}/mri/orig.mgz'
+          - name: fastsurfer-brainmask
+            path: /fastsurfer/{{inputs.parameters.subject}}_{{inputs.parameters.session}}/mri/brainmask.mgz
+            archive: {none: {}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'derivatives/fastsurfer/{{inputs.parameters.subject}}/{{inputs.parameters.session}}/mri/brainmask.mgz'
+          - name: mni-template
+            path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+          - name: script
+            path: /stage/fst1w_to_mni.py
+            archive: {none: {}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/rescue-validation/script-{{workflow.parameters.script-sha}}/fst1w_to_mni.py'
+
+      outputs:
+        artifacts:
+          - name: reg-qc
+            path: '/tmp/{{inputs.parameters.subject}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
+            archive: {none: {}}
+            s3:
+              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              bucket: '{{workflow.parameters.bucket}}'
+              region: <YOUR_AWS_REGION>
+              key: 'scratch/rescue-validation/{{workflow.parameters.run-label}}/{{inputs.parameters.subject}}_{{inputs.parameters.session}}__{{inputs.parameters.arm}}_reg_qc.json'
+
+      nodeSelector:
+        karpenter.sh/nodepool: gpu-nodepool  # no instance-type pin — see header (minValues)
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+      container:
+        image: '{{workflow.parameters.ecr-registry}}/{{workflow.parameters.fireants-image}}'
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - name: work
+            mountPath: /work
+        env:
+          - name: USE_FFO
+            value: "False"
+          # Production projects all four from requests.cpu (= 1), so the NONE attempt runs
+          # at one thread there too. RANDOM tickets pin 1 themselves at runtime.
+          - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: MKL_NUM_THREADS
+            value: "1"
+          - name: OPENBLAS_NUM_THREADS
+            value: "1"
+          - name: PYTHONPATH
+            value: /app  # registration_qc.py, unchanged, from the image
+          - name: MODE
+            value: '{{inputs.parameters.mode}}'
+          - name: PROBE_SEED
+            value: '{{inputs.parameters.seed}}'
+          - name: PROBE_ARM
+            value: '{{inputs.parameters.arm}}'
+          - name: PROBE_BAND
+            value: '{{inputs.parameters.band}}'
+          - name: PROBE_RECORDED_LNCC
+            value: '{{inputs.parameters.recorded-lncc}}'
+          - name: SCRIPT_SHA
+            value: '{{workflow.parameters.script-sha}}'
+          - name: SUBJ_SES
+            value: '{{inputs.parameters.subject}}_{{inputs.parameters.session}}'
+        resources:
+          requests:
+            memory: 2G  # production t1w-to-mni step, exactly
+            cpu: '1'
+            ephemeral-storage: 10G
+          limits:
+            nvidia.com/gpu: '1'
+        command: [bash, -c]
+        args:
+          - |
+            set -uo pipefail
+            echo "=== $SUBJ_SES arm=$PROBE_ARM mode=$MODE seed=$PROBE_SEED band=$PROBE_BAND ===" >&2
+            nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv >&2
+
+            # The code under test must be the code that was staged — refuse a mismatch
+            # rather than validate the wrong file.
+            GOT=$(sha256sum /stage/fst1w_to_mni.py | cut -c1-12)
+            if [ "$GOT" != "$SCRIPT_SHA" ]; then
+              echo "FATAL: staged script sha $GOT != expected $SCRIPT_SHA" >&2; exit 1
+            fi
+            cp /stage/fst1w_to_mni.py /work/fst1w_to_mni.py
+
+            # seed mode: collapse the attempt plan to ONE RANDOM ticket so this seed runs
+            # regardless of what NONE would have done. Asserts an exact single match: a
+            # silent no-op would run the full ladder instead and mislabel it a seed arm.
+            python3 - <<'PATCH'
+            import os, pathlib, sys
+            if os.environ['MODE'] == 'ladder':
+                print('[patch] ladder arm — script run unmodified', file=sys.stderr)
+                sys.exit(0)
+            p = pathlib.Path('/work/fst1w_to_mni.py')
+            src = p.read_text()
+            old = "plan = [('NONE', None)] + [('RANDOM', s) for s in rescue_seeds]"
+            new = "plan = [('RANDOM', int(os.environ['PROBE_SEED']))]"
+            if src.count(old) != 1:
+                sys.exit(f'[patch] FATAL: expected 1 attempt-plan line, found {src.count(old)}')
+            p.write_text(src.replace(old, new))
+            print(f"[patch] seed arm — single RANDOM ticket, seed {os.environ['PROBE_SEED']}",
+                  file=sys.stderr)
+            PATCH
+            if [ $? -ne 0 ]; then echo "FATAL: patch step failed" >&2; exit 1; fi
+            grep -n "plan = \[" /work/fst1w_to_mni.py >&2
+
+            python /work/fst1w_to_mni.py \
+              --t1w "/fastsurfer/$SUBJ_SES/mri/orig.mgz" \
+              --brainmask "/fastsurfer/$SUBJ_SES/mri/brainmask.mgz" \
+              --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
+              --out-dir '/work/registration/{{inputs.parameters.session}}/t1w_to_mni' \
+              --prefix "${SUBJ_SES}_desc-t1w2mni" \
+              --subj '{{inputs.parameters.subject}}' \
+              --ses '{{inputs.parameters.session}}' \
+              --pipeline cloudpipe_minproc 2>&1 | tee /work/run.log
+            EXIT=${PIPESTATUS[0]}
+            echo "=== arm=$PROBE_ARM exit=$EXIT (65 = every attempt failed the gate) ===" >&2
+
+            QC="/tmp/${SUBJ_SES}_t1w_to_mni_reg_qc.json"
+            if [ ! -f "$QC" ]; then
+              echo "FATAL: no QC record written — the arm produced no measurement" >&2; exit 1
+            fi
+
+            # Lift what the record doesn't carry into it, so the analysis never has to go
+            # hunting through archived pod logs: the card, the arm, and every attempt's
+            # VRAM peak. `probe_` keeps these distinct from RegistrationQC; this file never
+            # reaches the metrics corpus.
+            python3 - <<'STAMP'
+            import json, os, re, subprocess, sys
+            p = f"/tmp/{os.environ['SUBJ_SES']}_t1w_to_mni_reg_qc.json"
+            d = json.load(open(p))
+            try:
+                gpu = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                                     capture_output=True, text=True, timeout=30
+                                     ).stdout.strip().splitlines()[0]
+            except Exception as e:
+                gpu = f'unknown ({e.__class__.__name__})'
+            log = open('/work/run.log', errors='replace').read()
+            d.update(
+                probe_arm=os.environ['PROBE_ARM'],
+                probe_mode=os.environ['MODE'],
+                probe_band=os.environ['PROBE_BAND'],
+                probe_recorded_lncc=float(os.environ['PROBE_RECORDED_LNCC']),
+                probe_gpu_name=gpu,
+                probe_script_sha=os.environ['SCRIPT_SHA'],
+                probe_vram_peaks_mib=[int(m) for m in re.findall(r'VRAM: attempt peak (\d+) MiB', log)],
+                probe_oom='out of memory' in log.lower(),
+            )
+            json.dump(d, open(p, 'w'))
+            print(f"[stamp] arm={d['probe_arm']} gpu={gpu} verdict={d.get('verdict')} "
+                  f"lncc={d.get('lncc')} ticket={d.get('rescue_ticket')} "
+                  f"attempts={d.get('attempts_run')} vram={d['probe_vram_peaks_mib']}", file=sys.stderr)
+            STAMP
+            if [ $? -ne 0 ]; then echo "FATAL: stamp step failed" >&2; exit 1; fi
+            exit 0

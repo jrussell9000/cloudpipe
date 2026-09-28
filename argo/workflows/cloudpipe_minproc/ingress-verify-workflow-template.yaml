@@ -1,0 +1,205 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ingress-verify
+  namespace: argo-workflows
+
+# Staged-input validator for `ingress-mode=presynced` (#336,
+# plans/011-pluggable-data-ingress.md §6). Invoked only through templateRef from
+# cloudpipe-long-master, so it has no entrypoint and no spec.arguments.
+#
+# It checks the ingress contract in docs/data-ingress.md against what an
+# operator staged by hand, BEFORE inventory consumes it. Everything it fails on
+# would also fail later — but later means an opaque inventory traceback or, for
+# the T1w case, nothing at all: a mis-named T1w reads as "this session has no
+# anatomical scan" and the session is silently dropped from the anatomical
+# phase. That silent case is the reason this template exists, and it is a
+# warning rather than an error only because a session with no T1w is legitimate.
+#
+# The key patterns are NOT restated here. The script imports /app/inventory.py
+# from the same image digest the inventory step runs, so the validator and the
+# thing it validates cannot drift apart. That is also why this template needs no
+# image rebuild: inventory.py has shipped in cloudpipe/python since the pin.
+#
+# Exit status: 1 on any contract violation. Not retried — the workflow-level
+# retryStrategy admits only infrastructure codes (64/75/143), and a staging
+# mistake fails identically on every attempt.
+spec:
+  templates:
+
+  - name: verify-staged-input-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: ingress
+        cloudpipe.io/step: verify-staged-input
+    inputs:
+      parameters:
+        # The master runs this on `ingress-mode != "globus"`, so it is the only
+        # thing that sees a misspelt mode, and must reject it (see the note on
+        # the ingress-mode parameter in cloudpipe-long-master).
+        - name: ingress-mode
+        - name: subject-id
+        - name: s3-bucket
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:6df3d28acabb21cbde45ca04806bc5e9f50c3a770fb73eb60186d9c2e79247a5"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 128M
+          cpu: '100m'
+          ephemeral-storage: 200M
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+      command: [python]
+      # tests/argo/test_ingress_modes.py extracts check_staged_input from this
+      # source and runs it against a fake S3 client, so the shipped copy is the
+      # tested copy. Keep the logic in functions; main() is the only place that
+      # touches Argo parameters or the exit status.
+      source: |
+        import re
+        import sys
+
+        sys.path.insert(0, "/app")
+
+        INGRESS_MODES = ("globus", "presynced")
+
+
+        def unknown_mode_error(mode):
+            """An error message if this step should not be validating `mode` at all."""
+            if mode == "presynced":
+                return None
+            return (
+                f"ingress-mode={mode!r} is not one of {list(INGRESS_MODES)}. The Globus "
+                f"tasks were skipped because it is not 'globus', so nothing was "
+                f"transferred; refusing to run inventory over whatever is staged. "
+                f"Resubmit with a valid mode."
+            )
+
+
+        def _list_keys(s3, bucket, prefix):
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    yield obj["Key"]
+
+
+        def check_staged_input(s3, bucket, subj, inventory):
+            """Return (errors, warnings) for subj's staged input; both lists of str.
+
+            `inventory` is the imported src/inventory.py module, passed in rather
+            than imported here so a test can supply the repo copy.
+            """
+            errors, warnings = [], []
+            root = f"mmps_mproc/{subj}/"
+
+            sessions = sorted(inventory.list_sessions(s3, bucket, subj))
+            if not sessions:
+                errors.append(
+                    f"no session prefixes under s3://{bucket}/{root} — expected "
+                    f"{root}ses-*/. Check the subject ID (case matters) and that the "
+                    f"data was staged under mmps_mproc/, not the bucket root."
+                )
+                return errors, warnings
+
+            misnamed = [s for s in sessions if not s.startswith("ses-")]
+            if misnamed:
+                errors.append(
+                    f"session prefixes not named ses-*: "
+                    f"{[f'{root}{s}/' for s in misnamed]} — every downstream path "
+                    f"assumes the BIDS ses- prefix."
+                )
+
+            try:
+                nss = inventory.load_nss_volumes(s3, bucket, subj)
+            except inventory.InventoryError as e:
+                errors.append(f"{e} — it is bucket-level config, not derived from the data.")
+                nss = None
+            if nss is not None:
+                missing = [s for s in sessions if s not in nss]
+                if missing:
+                    errors.append(
+                        f"s3://{bucket}/config/nss_volumes.csv has no row with "
+                        f"subject_id={subj} for session(s) {missing} — inventory fails "
+                        f"the subject on the first one."
+                    )
+
+            bold_total = 0
+            for ses in sessions:
+                runs = inventory.list_bold_runs(s3, bucket, subj, ses)
+                bold_total += len(runs)
+                print(f"{ses}: {len(runs)} rest/nback BOLD run(s)")
+
+                t1w = f"{root}{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz"
+                if inventory.check_t1w_source_exists(s3, bucket, subj, ses):
+                    print(f"{ses}: T1w present")
+                    continue
+                near = [
+                    k for k in _list_keys(s3, bucket, f"{root}{ses}/anat/")
+                    if re.search(r"_T1w\.nii(\.gz)?$", k)
+                ]
+                if near:
+                    warnings.append(
+                        f"{ses}: T1w is not at the exact key inventory reads, so this "
+                        f"session will be DROPPED from the anatomical phase. Expected "
+                        f"{t1w}, found {near}. Rename it if it is the same scan."
+                    )
+                else:
+                    warnings.append(
+                        f"{ses}: no T1w ({t1w} absent) — the session gets no "
+                        f"anatomical processing. Fine if the session has no T1w."
+                    )
+
+            if bold_total == 0:
+                func_images = [
+                    k
+                    for ses in sessions
+                    for k in _list_keys(s3, bucket, f"{root}{ses}/func/")
+                    if k.endswith((".nii", ".nii.gz"))
+                ]
+                detail = (
+                    f" Found func images that match no rest/nback run pattern: "
+                    f"{func_images[:10]}"
+                    if func_images
+                    else ""
+                )
+                errors.append(
+                    f"no rest/nback BOLD run in any session — expected "
+                    f"{root}ses-*/func/*_task-(rest|nback)_run-NN*.nii[.gz].{detail}"
+                )
+
+            return errors, warnings
+
+
+        def main():
+            import boto3
+            import inventory
+
+            mode = "{{inputs.parameters.ingress-mode}}"
+            subj = "{{inputs.parameters.subject-id}}"
+            bucket = "{{inputs.parameters.s3-bucket}}"
+            mode_error = unknown_mode_error(mode)
+            if mode_error:
+                print(f"ERROR: {mode_error}", file=sys.stderr)
+                sys.exit(1)
+            errors, warnings = check_staged_input(boto3.client("s3"), bucket, subj, inventory)
+            for w in warnings:
+                print(f"WARNING: {w}", file=sys.stderr)
+            for e in errors:
+                print(f"ERROR: {e}", file=sys.stderr)
+            if errors:
+                print(
+                    f"Staged input for {subj} violates the ingress contract "
+                    f"(docs/data-ingress.md); not proceeding to inventory.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f"Staged input for {subj} satisfies the ingress contract.")
+
+
+        main()

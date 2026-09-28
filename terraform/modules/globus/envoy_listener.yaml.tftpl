@@ -1,0 +1,226 @@
+# Loopback S3 signing listener for the ${gateway} storage gateway.
+#
+# RENDERED BY TERRAFORM — do not edit on the host. Installed as
+# /etc/cloudpipe/envoy/${gateway}.yaml and run by
+# cloudpipe-s3-listener@${gateway}.service, which validates it before starting.
+#
+# WHAT THIS IS FOR: the Globus S3 connector accepts only a static access key, so
+# the ingress path has held one that is never rotated. Globus signs with a dummy
+# key, this listener discards that signature and re-signs with STS credentials
+# from ${role_arn}, which can reach only that gateway's prefix. The key Globus
+# holds therefore authenticates nothing and is not a credential.
+#
+# THREE THINGS HERE ARE LOAD-BEARING AND EASY TO "TIDY" INTO A BREAKAGE:
+#
+#   1. Signing is an UPSTREAM filter. SigV4 covers the Host header, and
+#      host_rewrite_literal changes it. Signing downstream signs headers that
+#      then change, and every request fails with SignatureDoesNotMatch.
+#   2. use_unsigned_payload. Without it Envoy buffers each body to hash it, so a
+#      multi-GB PUT is held in memory before being forwarded.
+#   3. custom_credential_provider_chain: true. It REPLACES the default chain
+#      rather than prepending to it, which is the point: the default chain ends
+#      at instance metadata, and the instance role still holds s3:*Object on the
+#      whole bucket. Without this line the listener silently falls back to that
+#      role and signs with bucket-wide credentials — the prefix confinement would
+#      be gone and nothing would report it. Verified against the pinned Envoy
+#      1.39.1: with the custom chain in place, environment credentials were never
+#      used.
+#
+# WHAT A CREDENTIAL FAILURE LOOKS LIKE, measured rather than assumed: if the role
+# cannot be assumed, the filter forwards the request UNSIGNED and S3 answers 403
+# in a couple of hundred milliseconds. No data moves, so it does fail closed — but
+# it fails closed as an ordinary AccessDenied, indistinguishable from a role scoped
+# to the wrong prefix or a transfer aimed outside it. That is why the credential
+# check belongs in `doctor`, interrogating the role directly, and cannot be
+# inferred from a failed transfer.
+#
+# Also 1.39.1-specific: `assume_role_credential_provider` accepts `role_arn`,
+# `role_session_name` and a nested `credential_provider`, and REJECTS `region`
+# and `sts_region`. The current upstream docs describe `credential_provider_chain`
+# with an `AwsStsAssumeRole` typed extension, which does not exist in this binary.
+# Check both against the pinned version before changing this block.
+#
+# NO ADMIN LISTENER, deliberately. The reference config binds 127.0.0.1:9901, and
+# two gateways on one host cannot both have it. Rather than allocate a port per
+# gateway, there is none: the admin interface is unauthenticated and offers
+# /quitquitquit and /config_dump, and "it is only on loopback" is not a
+# distinction here — anything that can reach the listener can reach admin. The
+# cost is no /stats and no /ready, so liveness (sibling task 4.3) probes this
+# listener's own port. Envoy treats the block as optional; a config without it
+# validates and runs.
+
+static_resources:
+  listeners:
+    - name: s3_loopback_${gateway_slug}
+      # Loopback only (D4). Envoy never verifies the dummy key Globus presents, so
+      # reachability IS the access control at this hop; the assumed role bounds
+      # what a reachable client can do. A non-loopback address here would publish
+      # an unauthenticated writer for one prefix of the bucket — which is why
+      # tests/test_globus_envoy_listener.py fails on one.
+      address:
+        socket_address: { address: 127.0.0.1, port_value: ${listener_port} }
+
+      # TLS, because Globus's own documented examples use an https endpoint
+      # (including `--s3-endpoint https://localhost:8443` for ActiveScale), and
+      # D5 keeps that shape. The identity is generated on FIRST BOOT, not baked —
+      # a key in the AMI snapshot would be shared by every instance launched from
+      # it. cloudpipe-listener-tls.service creates it and installs trust with
+      # update-ca-certificates; this unit Requires= that one.
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: ${tls_cert_path}
+                    private_key:
+                      filename: ${tls_key_path}
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: s3_${gateway_slug}
+                # To the journal, not a file: the unit runs with
+                # ProtectSystem=strict and the listener must write nothing to
+                # disk. Headers are not logged — the request carries Globus's
+                # dummy Authorization on the way in.
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "%REQ(:METHOD)% %REQ(:PATH)% %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED%/%BYTES_SENT% %DURATION%ms\n"
+                route_config:
+                  name: s3_route
+                  virtual_hosts:
+                    - name: s3
+                      domains: ["*"]
+                      # Globus's signature is meaningless to AWS, so it must not
+                      # survive to be seen alongside the real one.
+                      request_headers_to_remove:
+                        - authorization
+                        - x-amz-date
+                        - x-amz-content-sha256
+                        - x-amz-security-token
+                      routes:
+                        # PATH-STYLE ADDRESSING ONLY, and that is a constraint
+                        # rather than a preference: host_rewrite_literal replaces
+                        # the Host header, so a virtual-hosted-style request
+                        # (`<bucket>.s3...`) loses the only place its bucket was
+                        # named and would be routed to no bucket at all. Matching
+                        # on the bucket in the path both relies on that and checks
+                        # it.
+                        #
+                        # The three allowed shapes are exactly what the role
+                        # permits: ListAllMyBuckets at `/`, bucket-level requests
+                        # at `/<bucket>` (listing, GetBucketLocation), and object
+                        # requests under `/<bucket>/`.
+                        #
+                        # Written out three times rather than shared by a YAML
+                        # anchor. Envoy's parser does resolve aliases, so this is
+                        # a readability choice, not a workaround: a reader
+                        # checking which requests can be signed here should not
+                        # have to resolve a reference to find out.
+                        - match: { path: "/" }
+                          route:
+                            cluster: aws_s3
+                            # The signature covers Host, so it has to be the real
+                            # S3 host before signing happens.
+                            host_rewrite_literal: ${s3_endpoint_host}
+                            # No deadline: a single multipart part can be large
+                            # and slow, and a timeout here truncates a transfer
+                            # that would otherwise finish.
+                            timeout: 0s
+                        - match: { path: "/${bucket}" }
+                          route:
+                            cluster: aws_s3
+                            host_rewrite_literal: ${s3_endpoint_host}
+                            timeout: 0s
+                        - match: { prefix: "/${bucket}/" }
+                          route:
+                            cluster: aws_s3
+                            host_rewrite_literal: ${s3_endpoint_host}
+                            timeout: 0s
+                        # Anything else is a misconfiguration, and it gets a
+                        # legible one. Left to fall through to S3 it would arrive
+                        # as a signed request for a bucket this role cannot touch
+                        # and come back as an opaque AccessDenied — the same
+                        # symptom as a wrong prefix, a wrong role, or a broken
+                        # assume. Naming the cause here separates them.
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 421
+                            body:
+                              inline_string: "This listener serves only bucket ${bucket} using path-style addressing. A request for another bucket, or one using virtual-hosted-style addressing, cannot be signed here.\n"
+
+                # The DOWNSTREAM filter chain, and it must be here. Envoy accepts
+                # a config with no http_filters — `--mode validate` says OK and
+                # the process starts — and then every request is received, parsed,
+                # and never answered, because nothing terminates the chain. The
+                # symptom is a stream that hangs until the client gives up, logged
+                # as response code 0, which reads like a network fault rather than
+                # a config error. Found exactly that way; see
+                # tests/test_globus_envoy_listener.py, which asserts this filter
+                # because validation cannot.
+                #
+                # Not to be confused with the cluster's upstream http_filters
+                # below, where the signing happens.
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: aws_s3
+      type: LOGICAL_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: aws_s3
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: ${s3_endpoint_host}
+                      port_value: 443
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+          http_filters:
+            - name: envoy.filters.http.aws_request_signing
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.http.aws_request_signing.v3.AwsRequestSigning
+                service_name: s3
+                region: ${region}
+                signing_algorithm: AWS_SIGV4
+                use_unsigned_payload: true
+                match_excluded_headers:
+                  - prefix: x-envoy
+                  - exact: x-forwarded-for
+                credential_provider:
+                  custom_credential_provider_chain: true
+                  assume_role_credential_provider:
+                    role_arn: ${role_arn}
+                    role_session_name: ${session_name}
+                    # The INNER provider is instance metadata, and that is
+                    # correct: the host's own identity is what is permitted to
+                    # assume the writer role. Only the SIGNING identity is the
+                    # assumed role.
+                    credential_provider:
+                      instance_profile_credential_provider: {}
+            - name: envoy.filters.http.upstream_codec
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.http.upstream_codec.v3.UpstreamCodec
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: ${s3_endpoint_host}

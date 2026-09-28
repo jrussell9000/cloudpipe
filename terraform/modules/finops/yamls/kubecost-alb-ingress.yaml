@@ -6,30 +6,18 @@ metadata:
   annotations:
     # This tells external-dns to update the Route 53 records for the hostname with the reference to the loadbalancer
     external-dns.alpha.kubernetes.io/hostname: kubecost.${hostname}
-    # Orientation of the ingress (internet facing vs. internal)
-    alb.ingress.kubernetes.io/scheme: internet-facing
     # Provide the certificate ARN - will automagically enable TLS
     alb.ingress.kubernetes.io/certificate-arn: ${certificate_arn}
-    # Listen on both HTTP and HTTPS
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
-    # BUT, automatically redirect HTTP to HTTPS (80>443)
-    alb.ingress.kubernetes.io/ssl-redirect: '443'
-    # Set the TLS policy - just an extra security caution
-    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
     # Set the backend protocol - AWS LB talking to pods
     alb.ingress.kubernetes.io/backend-protocol: HTTP
     # Route directly to pods with target-type: ip. We want to talk to pods, not nodes (instances)
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/healthcheck-path: /
     alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
-    alb.ingress.kubernetes.io/security-groups: ${security_group}
-    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
-    # ALB access logging (H3) — the SSE-S3 access-log bucket, not the SSE-KMS master log
-    # bucket, which ALB cannot deliver to. See terraform/logging.tf.
-    #
-    # Raise the idle timeout to the ALB maximum (4000s) so live-updating views survive quiet
-    # periods; the 60s default tears the connection down and the page shows stale state.
-    alb.ingress.kubernetes.io/load-balancer-attributes: access_logs.s3.enabled=true,access_logs.s3.bucket=${access_log_bucket},access_logs.s3.prefix=alb-kubecost,idle_timeout.timeout_seconds=4000
+    # ALB-level settings shared by every member of the ingress group (scheme,
+    # group, security group, listeners, TLS policy, attributes) — identical
+    # across members, so supplied by the caller rather than set here.
+    ${indent(4, trimspace(yamlencode(alb_group_annotations)))}
 
 spec:
   ingressClassName: alb
