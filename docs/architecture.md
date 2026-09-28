@@ -71,7 +71,8 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
                         │  Athena workgroup: cloudpipe_metrics_workgroup                  │
                         │                                                                  │
                         │  ┌──────────────────────────────────────────────────────────┐   │
-                        │  │ Grafana (grafana ns)   grafana.braveresearchcoll...org   │   │
+                        │  │ Grafana (grafana ns)                                     │   │
+                        │  │   grafana.<YOUR_DOMAIN>                 │   │
                         │  │   Pipeline Throughput / Functional QC / Anat QC / Costs  │   │
                         │  └──────────────────────────────────────────────────────────┘   │
                         └──────────────────────────────────────────────────────────────────┘
