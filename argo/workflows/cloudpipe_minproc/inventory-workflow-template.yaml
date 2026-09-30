@@ -72,7 +72,7 @@ spec:
   # that guard exists to handle. Fanning out on the input list then produces a
   # branch whose first pod dies staging an input artifact that was never
   # written: the workflow reports phase `Error`, and a subject with 25 of 27
-  # pods green (cloudpipe-knwr6 / sub-XXXXXXXX) is recorded the same as one
+  # pods green (workflow cloudpipe-knwr6) is recorded the same as one
   # where nothing ran at all.
   #
   # This runs on the anatomical gate rather than inside the anatomical phase

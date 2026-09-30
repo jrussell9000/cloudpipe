@@ -62,7 +62,7 @@ Builds `linux/arm64` on `ubuntu-24.04-arm`. After push, rewrites the SHA tag in 
 
 ### build-prefect-flow-runner.yaml
 
-Triggers on changes to `images/prefect-flow-runner/**`, `src/metrics/**` (`COPY`ed into the image), `prefect/flows/**`, or `prefect/prefect.yaml`. Uses `:latest` tag (not SHA). After push, warns in the GitHub Actions job summary if `prefect.yaml` changed and `prefect deploy --all` is needed. See operations.md for the full Prefect deployment procedure.
+Triggers on changes to `images/prefect-flow-runner/**`, `src/metrics/**` (`COPY`ed into the image), `prefect/flows/**`, or `prefect/prefect.yaml`. Uses `:latest` tag (not SHA). After push, warns in the GitHub Actions job summary if `prefect.yaml` changed and `pixi run prefect-deploy` is needed (never a bare `prefect deploy --all` — see operations.md). See operations.md for the full Prefect deployment procedure.
 
 ---
 
@@ -245,7 +245,7 @@ Used by the `fmri-first-level-proc` WorkflowTemplate. 2-hour active deadline; 30
 **Base**: `prefecthq/prefect:3-python3.12`  
 **Contents**: Prefect 3 + `hera` + `boto3` + all flow code under `prefect/flows/`.
 
-Flow code is baked in — changing any `.py` file under `prefect/flows/` requires a new image build and push. Build path: push to `main` (GitHub Actions) or run `images/prefect-flow-runner/build.sh` locally (also runs `prefect deploy --all`).
+Flow code is baked in — changing any `.py` file under `prefect/flows/` requires a new image build and push. Build path: push to `main` (GitHub Actions) or run `images/prefect-flow-runner/build.sh` locally (also runs `pixi run prefect-deploy`).
 
 `PYTHONPATH=/opt/prefect/flows` is set so relative imports within the flows directory work without installing the flows as a package.
 

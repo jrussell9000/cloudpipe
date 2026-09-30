@@ -549,7 +549,7 @@ _T1W_MNI_THRESHOLDS = {
 # failed 92 of and passed 0 of:
 #   - rigid_disp_max_mm is a SESSION-LEVEL CONSTANT: pooled within-session SD
 #     0.29 mm vs between-session SD 19.75 mm — a 69x ratio. All six runs of
-#     sub-XXXXXXXX/ses-04A score 17.58 +/- 0.37 mm; all six of that same
+#     one subject's ses-04A score 17.58 +/- 0.37 mm; all six of that same
 #     subject's ses-00A score 96.97 +/- 0.64 mm. A per-run *quality* metric
 #     cannot be a per-session constant; it was measuring the prescription.
 #   - It anti-correlates with quality: corr(nmi, rigid_disp_max_mm) = +0.425.

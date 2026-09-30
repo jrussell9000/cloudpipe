@@ -26,6 +26,8 @@ from datetime import date as _date
 from datetime import timedelta
 from pathlib import Path
 
+from lib.config import deployment_region
+
 from prefect import flow, get_run_logger, task
 
 # In the flow-runner image, src/metrics/ is COPYed to /opt/prefect/metrics and
@@ -54,8 +56,8 @@ def compact_day_task(bucket: str, region: str, dt: str, tables: list[str]) -> di
 
 @flow(name="metrics-compactor", log_prints=True)
 def metrics_compactor(
-    bucket: str = "cloudpipe-metrics",
-    region: str = "<YOUR_AWS_REGION>",
+    bucket: str,
+    region: str | None = None,
     date: str = "",
     lookback_days: int = 1,
     tables: str = "",
@@ -66,9 +68,12 @@ def metrics_compactor(
     ----------
     bucket:
         S3 bucket name (the metrics bucket — same one kubecost-cost-scraper
-        writes to, NOT the <YOUR_S3_BUCKET> data bucket).
+        writes to, NOT the data bucket). No default: the deployment stores
+        cloudpipe-config's `metrics_bucket` here when prefect/deploy.sh
+        registers it.
     region:
-        AWS region for S3 calls.
+        AWS region for S3 calls. Omit to use the pod's own AWS_REGION (see
+        lib/config.py).
     date:
         ISO 8601 anchor date (e.g. "2026-07-26"). Defaults to yesterday UTC —
         always a "closed" day, never today, so an in-flight write can't be
@@ -86,6 +91,7 @@ def metrics_compactor(
         Comma-separated table_name keys from compactor.RAW_PREFIXES to
         compact. Empty string (default) compacts all of them.
     """
+    region = region or deployment_region()
     table_list = [t.strip() for t in tables.split(",") if t.strip()] or list(RAW_PREFIXES)
     anchor = _date.fromisoformat(date) if date else _date.today() - timedelta(days=1)
 

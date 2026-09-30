@@ -174,6 +174,21 @@ spec:
             name: cloudpipe-config
             key: ecr_registry
 
+      # Deployment region — set by Terraform in cloudpipe-config. Read by the
+      # `s3:` artifact blocks in the templates this master invokes, which need
+      # both a regional endpoint and the region itself.
+      #
+      # It must be declared HERE even though this template has no `s3:` block of
+      # its own: a templateRef inherits `templates` only, so the region defaults
+      # in registration / functional-preprocessing / surface-resample /
+      # subregion-segmentation are ignored under this master and every artifact
+      # in the run resolves against this parameter set (issue #212).
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+
       # Globus transfer parameters
       - name: globus-source-collection-id
       - name: globus-source-base-path

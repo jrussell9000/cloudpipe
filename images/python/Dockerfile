@@ -12,5 +12,7 @@ RUN apk upgrade --no-cache
 RUN pip install --disable-pip-version-check --root-user-action=ignore --no-cache-dir boto3 botocore
 
 # Metrics scripts — sourced directly from src/metrics/ (no manual copies needed)
-COPY src/metrics/exit_handler.py src/metrics/writer.py src/metrics/schemas.py src/metrics/outcome_recorder.py src/metrics/record_workflow_start.py /app/
+# deployment_env.py resolves the region (and any CLOUDPIPE_* value) with no default;
+# the writer and all three recorders import it, so it must ship beside them.
+COPY src/metrics/exit_handler.py src/metrics/writer.py src/metrics/schemas.py src/metrics/outcome_recorder.py src/metrics/record_workflow_start.py src/metrics/deployment_env.py /app/
 COPY src/inventory.py /app/

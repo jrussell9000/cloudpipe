@@ -2,7 +2,7 @@
 
 Day-2 reference for submitting pipelines, monitoring progress, handling failures, and updating code.
 
-**Prerequisite**: connect **Cloudflare WARP** before using any CLI or web UI listed below — `kubectl`, `argo`, every Service URL, `prefect deploy` / `PREFECT_API_URL=https://prefect.…`, and the Kubecost scripts (`scripts/kubecost_data_harvest.py`, `scripts/cloudpipe_minproc_costs.py`, `src/validate_test_batch.py`). The EKS API endpoint and the web-UI load balancer are both private; without WARP every hostname resolves but **times out**. See [infrastructure.md → Remote access](infrastructure.md#remote-access-cloudflare-warp).
+**Prerequisite**: connect **Cloudflare WARP** before using any CLI or web UI listed below — `kubectl`, `argo`, every Service URL, `pixi run prefect-deploy` / `PREFECT_API_URL=https://prefect.…`, and the Kubecost scripts (`scripts/kubecost_data_harvest.py`, `scripts/cloudpipe_minproc_costs.py`, `src/validate_test_batch.py`). The EKS API endpoint and the web-UI load balancer are both private; without WARP every hostname resolves but **times out**. See [infrastructure.md → Remote access](infrastructure.md#remote-access-cloudflare-warp).
 
 - WARP's session lasts 24h. A *TLS handshake timeout* (kubectl) or a hanging page usually means it lapsed: `warp-cli debug access-reauth` (PowerShell: `& "C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe" debug access-reauth`).
 - The AWS Client VPN still works as a fallback until it is decommissioned. For VPN-specific trouble, see [docs/investigations/2026-07-16-vpn-remote-access-troubleshooting.md](https://github.com/jrussell9000/cloudpipe/blob/main/docs/investigations/2026-07-16-vpn-remote-access-troubleshooting.md).
@@ -45,7 +45,7 @@ Common optional parameters:
 | `globus_dest_base_path` | `/mmps_mproc` | Destination path within GCS collection |
 | `ingress_mode` | `globus` | `presynced` skips Globus and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else fails the flow at start |
 
-`ingress_mode` (like `batch_label`) exists only once the deployment has been re-registered with `prefect deploy --all`; until then `-p ingress_mode=…` fails with "parameters were specified but not found on the deployment".
+`ingress_mode` (like `batch_label`) exists only once the deployment has been re-registered with `pixi run prefect-deploy`; until then `-p ingress_mode=…` fails with "parameters were specified but not found on the deployment".
 
 `max_concurrent` is **not** a flow parameter — `prefect deployment run -p max_concurrent=N` has no effect. Concurrency is controlled live via the Prefect Variable `cloudpipe-max-concurrent` (code default `50`), checked on every poll cycle:
 
@@ -96,7 +96,7 @@ argo submit --from workflowtemplate/cloudpipe \
 
 Always use `submit --from workflowtemplate/` — never `resubmit` (resubmit snapshots the template from the prior run and ignores any template updates).
 
-`bucket` and `ecr-registry` are read automatically from the `cloudpipe-config` ConfigMap and do not need to be specified. Globus collection UUIDs are read from SSM at submission time.
+`bucket`, `metrics-bucket`, `ecr-registry` and `region` are read automatically from the `cloudpipe-config` ConfigMap and do not need to be specified. Globus collection UUIDs are read from SSM at submission time.
 
 For data already staged in S3, add `-p ingress-mode=presynced` and pass the `globus-*` parameters empty — the full command is in [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced).
 
@@ -575,10 +575,14 @@ deleted 24h after a workflow completes (`ttlStrategy`), so a late run silently l
 check — it warns rather than passing when the data is gone:
 
 ```bash
-python src/validate_test_batch.py \
+pixi run -e ops python src/validate_test_batch.py \
   --subjects tools/cloudpipe_test_sample.csv \
   --since <run_start_utc>
 ```
+
+The `ops` environment exports the metrics and data buckets and the Kubecost URL from the
+cluster (`scripts/cloudpipe-env.sh`), so no `--bucket` flags are needed. Nothing in `src/`
+has a default for them: run it without `-e ops` and it stops naming the variable it needed.
 
 Expected output:
 ```
@@ -696,11 +700,11 @@ prefect deployment run kubecost-cost-scraper/kubecost-cost-scraper
 If the batch crossed the UTC midnight boundary and the nightly scraper missed it, backfill with
 the explicit date:
 ```bash
-pixi run python src/metrics/kubecost_scraper.py \
-  --bucket cloudpipe-metrics \
-  --base-url https://kubecost.<YOUR_DOMAIN> \
+pixi run -e ops bash -c 'python src/metrics/kubecost_scraper.py \
+  --bucket "$CLOUDPIPE_METRICS_BUCKET" \
+  --base-url "$KUBECOST_BASE_URL" \
   --date <YYYY-MM-DD> \
-  --insecure
+  --insecure'
 ```
 
 `--bucket` here is the *metrics* bucket, not the data bucket — the scraper writes
@@ -717,7 +721,7 @@ never appear in Athena.
 ### Step 6 — Validate cost data
 
 ```bash
-python src/validate_test_batch.py \
+pixi run -e ops python src/validate_test_batch.py \
   --subjects tools/cloudpipe_test_sample.csv \
   --cost \
   --window-start <run_start_utc> \
@@ -1042,15 +1046,17 @@ Flow code is baked into the `cloudpipe-flow-runner` Docker image.
 ```bash
 # Option A: push to main (triggers GitHub Actions automatically)
 git push
-# GitHub Actions builds and pushes public.ecr.aws/l9e7l1h1/cloudpipe/cloudpipe-flow-runner:latest
-# If prefect.yaml also changed, the job summary will warn that prefect deploy --all is needed.
+# GitHub Actions builds and pushes <ecr-registry>/cloudpipe/cloudpipe-flow-runner:latest
+# If prefect.yaml also changed, the job summary will warn that a redeploy is needed.
 
 # Option B: manual local build + deploy (from repo root)
-bash images/prefect-flow-runner/build.sh
-# This builds, pushes, and runs prefect deploy --all in one step.
+PREFECT_API_URL=https://prefect.<your-domain>/api bash images/prefect-flow-runner/build.sh
+# This builds, pushes, and runs `pixi run prefect-deploy` in one step.
 ```
 
-`prefect deploy --all` is only needed when `prefect/prefect.yaml` changes (adding deployments, changing parameters, etc.). Changing flow logic in `.py` files only requires a new image push.
+Redeploy with `PREFECT_API_URL=… pixi run prefect-deploy` when `prefect/prefect.yaml` changes (adding deployments, changing parameters, etc.), or when a flow gains a parameter the deployment must store. Changing flow logic in `.py` files otherwise only requires a new image push.
+
+**Never run a bare `prefect deploy --all`.** `prefect.yaml` names no bucket and no registry: they are `{{ $CLOUDPIPE_* }}` placeholders that `prefect/deploy.sh` fills from the `cloudpipe-config` ConfigMap. Prefect resolves a placeholder once, at deploy time, and an unset one stores `""` with only a warning — so a bare deploy *succeeds* and overwrites every deployment with an image of `/cloudpipe/cloudpipe-flow-runner:latest` and an empty bucket. `deploy.sh` refuses an empty value before deploying and reads every deployment back from the server afterwards, failing on any field that differs from what `prefect.yaml` renders to. The region is not configured at all: EKS Pod Identity injects `AWS_REGION` into every flow-run pod.
 
 ### Updating infrastructure (Terraform)
 

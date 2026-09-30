@@ -73,6 +73,15 @@ spec:
           configMapKeyRef:
             name: cloudpipe-config
             key: ecr_registry
+      # Read by every `s3:` artifact block below, which needs a regional
+      # endpoint and the region itself. Same #212 shape as metrics-bucket: the
+      # default is for a standalone submission, and under the master the
+      # master's workflow-scope value wins.
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
       # Required by the metrics-emission step. Declared here so a standalone
       # submission resolves it; under the master this default is ignored (a
       # templateRef inherits `templates` only) and the master's own
@@ -181,9 +190,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/components'
 
         - name: anat
@@ -191,9 +200,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/anat'
 
         # Static fsLR registration meshes, staged once (see docs/pipelines.md).
@@ -202,9 +211,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'config/fsLR'
 
     outputs:
@@ -218,9 +227,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.metrics-bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
 
         # Trailing slash REQUIRED on output directory keys (Argo artifact GC).
@@ -230,9 +239,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/fsLR32k/'
 
     nodeSelector:

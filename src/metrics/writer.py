@@ -19,7 +19,7 @@ def emit_to_s3(
     data: dict[str, Any],
     bucket: str,
     key: str,
-    region: str = "<YOUR_AWS_REGION>",
+    region: str | None = None,
     retries: int = 3,
     retry_delay_s: float = 2.0,
 ) -> None:
@@ -35,7 +35,7 @@ def emit_jsonl_to_s3(
     records: list[dict[str, Any]],
     bucket: str,
     key: str,
-    region: str = "<YOUR_AWS_REGION>",
+    region: str | None = None,
     retries: int = 3,
     retry_delay_s: float = 2.0,
 ) -> None:
@@ -61,15 +61,19 @@ def _put(
     body: bytes,
     bucket: str,
     key: str,
-    region: str,
+    region: str | None,
     retries: int,
     retry_delay_s: float,
 ) -> None:
-    """Retrying put_object shared by the JSON and JSONL emitters."""
+    """Retrying put_object shared by the JSON and JSONL emitters.
+
+    `region=None` means this deployment's own region (deployment_env.region()).
+    """
     import boto3
+    import deployment_env
     from botocore.exceptions import ClientError
 
-    s3 = boto3.client("s3", region_name=region)
+    s3 = boto3.client("s3", region_name=region or deployment_env.region())
 
     for attempt in range(1, retries + 1):
         try:

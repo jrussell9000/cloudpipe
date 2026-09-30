@@ -180,7 +180,8 @@ Parameters (all read from `cloudpipe-config` ConfigMap by default):
 | `subjID` | — | Subject ID (required) |
 | `bucket` | from ConfigMap | S3 data bucket (inputs and derivatives) |
 | `metrics-bucket` | from ConfigMap | Separate versioned QC-metrics bucket (`cloudpipe-metrics`). Distinct from `bucket` so metrics survive a derivative flush — see [observability.md](observability.md). |
-| `ecr-registry` | from ConfigMap | Container registry prefix. Now the **private** ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com`) — set from `local.ecr_registry` in `terraform/modules/stack/argowf.tf`. ECR Public remains a dual-push secondary kept for rollback for most images; it is no longer what workflows pull from, and its repos are being retired image by image (`fmri-first-level-proc` already is). |
+| `ecr-registry` | from ConfigMap | Container registry prefix. Now the **private** ECR registry (`{account-id}.dkr.ecr.{region}.amazonaws.com`) — set from `local.ecr_registry` in `terraform/modules/stack/argowf.tf`. ECR Public remains a dual-push secondary kept for rollback for most images; it is no longer what workflows pull from, and its repos are being retired image by image (`fmri-first-level-proc` already is). |
+| `region` | from ConfigMap | Deployment region. Read by every `s3:` artifact block in the templates this master invokes, which need both the regional endpoint (`s3.{region}.amazonaws.com`) and the region itself. Declared on the master even though the master has no artifact of its own: a `templateRef` inherits `templates` only, so the sub-templates' own defaults are ignored under it and every artifact resolves against the master's parameter set (issue #212). |
 | `globus-source-collection-id` | — | Source Globus collection UUID |
 | `globus-source-base-path` | — | Root path on source collection |
 | `globus-dest-collection-id` | — | Destination GCS collection UUID |

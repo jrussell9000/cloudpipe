@@ -15,7 +15,7 @@ stopped. The cost of a wrong resubmit is a Globus transfer and an inventory pass
 
 The cost of a *pointless* resubmit is higher than that, though, which is what most
 of this module is about. A deterministic failure reproduces identically on every
-attempt — re-driving `sub-XXXXXXXX` after a HISTOalloc blowup burns a full k=4
+attempt — re-driving a subject after a HISTOalloc blowup burns a full k=4
 FastSurfer run to fail in the same place. So the sweep classifies before it acts,
 and the classifier's central rule is that **determinism is a property of
 repetition, not of the exit code**:
@@ -33,7 +33,7 @@ precisely because back-to-back reclaims on one long step are routine, so countin
 two of them as a deterministic pair strands a healthy subject.
 
 That last case is not hypothetical. It is what this classifier got wrong on its
-first live run against the 2026-08-14 batch, calling `sub-XXXXXXXX` deterministic
+first live run against the 2026-08-14 batch, calling one subject deterministic
 on two SIGTERMs.
 
 Usage
@@ -73,7 +73,7 @@ TERMINAL_PHASES = frozenset({"Failed", "Error"})
 # needed. Matched case-insensitively against the node message.
 #
 # Both are properties of the *input*, which a fresh workflow does not change: a
-# 2.1e9-bin histogram is 17-25 GB regardless of pod size, and `sub-XXXXXXXX`
+# 2.1e9-bin histogram is 17-25 GB regardless of pod size, and one subject's
 # ses-02A blew up identically on 2026-08-12 and 2026-08-14.
 #
 # Note what is deliberately NOT here: `specified key does not exist`. The
@@ -199,7 +199,7 @@ def _absent_key_verdict(attempts: list[Attempt]) -> Verdict | None:
 
     Retryable, and the reasoning is the layer distinction: the key is absent
     because a producer never published, and a resubmission re-runs that producer.
-    The 2026-08-14 batch's `sub-XXXXXXXX` and `sub-XXXXXXXX` are the archetype —
+    Two subjects in the 2026-08-14 batch (one the #235 repro) are the archetype —
     a spot kill orphaned a FastSurfer tree, so every downstream init failed on a
     genuine 404 with zero retries. Nothing was wrong with either subject.
 

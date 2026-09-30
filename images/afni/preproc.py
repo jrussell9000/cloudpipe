@@ -899,7 +899,7 @@ def compute_confounds(
     # This previously only warned and continued. The run then exited 0 and wrote a
     # near-empty output that looked valid by filename, so the pod, the driver's
     # own tally, and the Argo workflow all reported success; only downstream
-    # output-size verification caught it (sub-XXXXXXXX ses-00A, 2026-07-23: ~7 MB
+    # output-size verification caught it (one subject's ses-00A, 2026-07-23: ~7 MB
     # vs ~120 MB for its sibling sessions, which is a mostly-zero volume gzipping
     # down). Similarity metrics do not catch it either — that session scored the
     # HIGHEST bold→T1w mutual information of the three, because MI is computed

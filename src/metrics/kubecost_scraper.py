@@ -51,8 +51,11 @@ SETTLED RE-SCRAPE
     which read it came from. Overwrites are guarded — see PARTIAL_READ_FRACTION.
 
 Usage:
-    python kubecost_scraper.py --bucket <YOUR_S3_BUCKET> --region <YOUR_AWS_REGION>
-    python kubecost_scraper.py --bucket <YOUR_S3_BUCKET> --settled   # re-scrape day-3
+    python kubecost_scraper.py --bucket "$CLOUDPIPE_METRICS_BUCKET"
+    python kubecost_scraper.py --bucket "$CLOUDPIPE_METRICS_BUCKET" --settled   # re-scrape day-3
+
+The metrics bucket, not the data bucket: writes to the data bucket's metrics/
+prefix are denied. --region defaults to this deployment's own region.
 
 This module is also imported by prefect/flows/cost_scraper.py.
 """
@@ -312,7 +315,7 @@ def _capacity_type(asset: dict[str, Any]) -> str:
 
 def parse_node_assets(
     assets_response: dict[str, Any],
-    region: str = "<YOUR_AWS_REGION>",
+    region: str | None = None,
 ) -> dict[str, NodeRate]:
     """Build {node_hostname: NodeRate} from an Assets API response.
 
@@ -480,7 +483,7 @@ def _resolve_window(report_date: date | None) -> tuple[date, date, str]:
 def count_stored_workflows(
     bucket: str,
     report_date: date,
-    region: str = "<YOUR_AWS_REGION>",
+    region: str | None = None,
     prefix: str = "metrics/costs/",
 ) -> int:
     """Count objects already stored under {prefix}dt={report_date}/.
@@ -490,8 +493,9 @@ def count_stored_workflows(
     count for either prefix — which is what makes one guard serve both passes.
     """
     import boto3
+    import deployment_env
 
-    s3 = boto3.client("s3", region_name=region)
+    s3 = boto3.client("s3", region_name=region or deployment_env.region())
     paginator = s3.get_paginator("list_objects_v2")
     full_prefix = f"{prefix}dt={report_date.isoformat()}/"
     return sum(
@@ -502,7 +506,7 @@ def count_stored_workflows(
 
 def _guard_partial_read(
     bucket: str,
-    region: str,
+    region: str | None,
     report_date: date,
     prefix: str,
     n_fetched: int,
@@ -528,7 +532,7 @@ def _guard_partial_read(
 
 def scrape_and_upload(
     bucket: str,
-    region: str = "<YOUR_AWS_REGION>",
+    region: str | None = None,
     base_url: str = KUBECOST_BASE,
     pipeline: str = "cloudpipe_minproc",
     report_date: date | None = None,
@@ -565,7 +569,7 @@ def scrape_and_upload(
 
 def scrape_pod_costs_and_upload(
     bucket: str,
-    region: str = "<YOUR_AWS_REGION>",
+    region: str | None = None,
     base_url: str = KUBECOST_BASE,
     pipeline: str = "cloudpipe_minproc",
     report_date: date | None = None,
@@ -675,8 +679,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     p = argparse.ArgumentParser(description="Scrape Kubecost and write cost metrics to S3")
-    p.add_argument("--bucket", required=True, help="S3 bucket name")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument("--bucket", required=True, help="the metrics bucket")
+    p.add_argument("--region", default=None, help="default: this deployment's region")
     p.add_argument("--base-url", default=KUBECOST_BASE)
     p.add_argument("--pipeline", default="cloudpipe_minproc")
     p.add_argument("--date", default=None, help="Report date ISO 8601 (default: yesterday)")

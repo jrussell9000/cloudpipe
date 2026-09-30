@@ -14,6 +14,16 @@ spec:
       - name: bucket
       - name: ecr-registry
       - name: T1w_sessions
+      # Read by every `s3:` artifact block below, which needs a regional
+      # endpoint and the region itself. Unlike `bucket` and `ecr-registry`
+      # above it carries a configMapKeyRef default, so a standalone submission
+      # need not name the deployment's region; under the master the default is
+      # ignored and the master's workflow-scope value wins (issue #212).
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
 
   retryStrategy:
     # Sized for spot churn: gpu-nodepool and cpu-heavy-nodepool are spot-only by
@@ -167,9 +177,9 @@ spec:
         - name: fslicense
           path: /opt/freesurfer/.license
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: config/fslicense
 
         - name: long-template
@@ -177,9 +187,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template
 
         - name: ses-00A-templated
@@ -188,9 +198,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-00A
 
         - name: ses-02A-templated
@@ -199,9 +209,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-02A
 
         - name: ses-04A-templated
@@ -210,9 +220,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-04A
 
         - name: ses-06A-templated
@@ -221,9 +231,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-06A
 
         - name: ses-08A-templated
@@ -232,9 +242,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-08A
 
         - name: ses-10A-templated
@@ -243,9 +253,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: derivatives/fastsurfer/{{workflow.parameters.subjID}}/ses-10A
 
     # NO OUTPUT ARTIFACTS (ADR 017). thalamus/brainstem/hippoamyg are published
@@ -432,7 +442,7 @@ spec:
           # the phase permanently. Map it to 75 (EX_TEMPFAIL, retryable and ours
           # alone). A clean non-zero exit is left alone: that is PublishError (empty
           # tree, escaping link), deterministic, and should not retry. Same defect
-          # as the one that cost sub-XXXXXXXX on the fastsurfer side in the
+          # as the one that cost a subject on the fastsurfer side in the
           # 2026-08-14 batch — see issue #268 and the matching guard in
           # fastsurfer-long-phase-workflow-template.yaml.
           #

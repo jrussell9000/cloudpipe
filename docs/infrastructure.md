@@ -170,7 +170,7 @@ even three-way split will under-provision.
 
 ### Remote access (Cloudflare WARP)
 
-The EKS API (no public endpoint in steady state) and all five web UIs are **private**: nothing is reachable from the internet. Operators connect the Cloudflare WARP client, enrolled with a UW-Madison NetID login (MFA required), before using `kubectl`, `argo`, the web UIs, `prefect deploy`, or the Kubecost scripts. See [ADR 014](decisions/014-cloudflare-tunnel-over-vpn.md) and plans 010/012.
+The EKS API (no public endpoint in steady state) and all five web UIs are **private**: nothing is reachable from the internet. Operators connect the Cloudflare WARP client, enrolled with a UW-Madison NetID login (MFA required), before using `kubectl`, `argo`, the web UIs, `pixi run prefect-deploy`, or the Kubecost scripts. See [ADR 014](decisions/014-cloudflare-tunnel-over-vpn.md) and plans 010/012.
 
 - **Path:** WARP → Cloudflare Gateway → tunnel `cloudpipe-eks` → `cloudflared` (two replicas, `gitops/apps/cloudflared/`) → the three private `/20`s, which the tunnel routes.
 - **Who:** one Access application, `private_services` (`terraform/modules/stack/cloudflare.tf`), covers TCP 443 and 80 on those subnets, gated by the `cluster_admins` policy. Adding a person there grants both `kubectl` reachability and the UIs; each UI still logs in separately through Dex.

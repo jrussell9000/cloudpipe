@@ -1,36 +1,28 @@
 name: cloudpipe-queue-manager
 prefect-version: "3.x"
 
-# The `image:` refs below point at PRIVATE ECR
-# (<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com), repointed 2026-08-17 off
-# `public.ecr.aws/l9e7l1h1/`. This is Step 6 of
-# handoffs/ecr-private-registry-migration.md, and it closes assessment finding N5
-# (the flow runner was the last consumer still pulling from the public gallery —
-# unpinned AND outside the Inspector scanning configuration, so the RA-5 "all
-# images are continuously scanned" claim did not hold for it).
+# Deploy with
 #
-# ⚠️ EDITING THIS FILE CHANGES NOTHING BY ITSELF. Prefect stores
-# `job_variables.image` server-side per deployment and only re-reads it on an
-# explicit deploy. Until someone runs
+#   PREFECT_API_URL=https://prefect.<your-domain>/api pixi run prefect-deploy
 #
-#   cd prefect && PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
-#     prefect deploy --all
+# and NEVER with a bare `prefect deploy --all`. Every deployment value here — the
+# data bucket, the metrics bucket and the private registry — is a
+# `{{ $CLOUDPIPE_* }}` placeholder, and prefect/deploy.sh is what fills them from
+# the cloudpipe-config ConfigMap Terraform writes (the same one the Argo
+# WorkflowTemplates read). Prefect resolves a placeholder ONCE, at deploy time,
+# and stores the result as a plain literal; an unset one logs a WARNING and
+# stores "". So a bare deploy succeeds and registers an image of
+# `/cloudpipe/cloudpipe-flow-runner:latest` and an empty bucket, and nothing fails
+# until the next run. deploy.sh refuses an empty value before deploying and reads
+# every deployment back from the server afterwards.
 #
-# the live flow runner keeps pulling the OLD image and `git diff` looks clean.
-# build-prefect-flow-runner.yaml prints a reminder to the step summary, but a
-# printed warning is not an enforcement point.
+# The region is not here at all: EKS Pod Identity injects AWS_REGION into every
+# pod on the prefect-worker service account, and flows/lib/config.py reads it.
 #
-# That was verified rather than assumed: `prefect deployment inspect` still
-# reported the public image after this file was committed. The deploy was then
-# run 2026-08-17 and all four deployments now store the private ref, so file and
-# server agree AS OF THAT DATE ONLY. The next edit to this file re-opens the gap
-# — check the server, not the diff:
-#
-#   prefect deployment inspect <name>/<name> | grep -A1 "'image':"
-#
-# The registry literal is hand-maintained in three places — here,
-# .github/workflows/build-prefect-flow-runner.yaml (`IMAGE`), and
-# images/prefect-flow-runner/build.sh. Nothing keeps them in sync.
+# ⚠️ EDITING THIS FILE CHANGES NOTHING BY ITSELF. Prefect stores a deployment's
+# parameters and job_variables server-side and only re-reads this file on an
+# explicit deploy, so `git diff` looks clean while the server serves the old
+# values. Check the server, not the diff — deploy.sh's read-back does exactly that.
 #
 # `:latest` (with `image_pull_policy: Always`) is intentional and is how a rebuild
 # reaches the runner without a redeploy. It is also the one workload that a future
@@ -49,12 +41,12 @@ deployments:
       job_variables:
         namespace: prefect
         service_account_name: prefect-worker
-        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
+        image: "{{ $CLOUDPIPE_ECR_REGISTRY }}/cloudpipe/cloudpipe-flow-runner:latest"
         image_pull_policy: Always
         finished_job_ttl: 60
     schedules: []
     parameters:
-      subjects_file: s3://<YOUR_S3_BUCKET>/subjects.csv
+      subjects_file: "s3://{{ $CLOUDPIPE_BUCKET }}/subjects.csv"
       start_index: 0
 
   - name: first-level-queue-manager
@@ -64,12 +56,13 @@ deployments:
       job_variables:
         namespace: prefect
         service_account_name: prefect-worker
-        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
+        image: "{{ $CLOUDPIPE_ECR_REGISTRY }}/cloudpipe/cloudpipe-flow-runner:latest"
         image_pull_policy: Always
         finished_job_ttl: 60
     schedules: []
     parameters:
-      subjects_file: s3://<YOUR_S3_BUCKET>/first-level-subjects.csv
+      subjects_file: "s3://{{ $CLOUDPIPE_BUCKET }}/first-level-subjects.csv"
+      bucket: "{{ $CLOUDPIPE_BUCKET }}"
       start_index: 0
 
   - name: kubecost-cost-scraper
@@ -79,7 +72,7 @@ deployments:
       job_variables:
         namespace: prefect
         service_account_name: prefect-worker
-        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
+        image: "{{ $CLOUDPIPE_ECR_REGISTRY }}/cloudpipe/cloudpipe-flow-runner:latest"
         image_pull_policy: Always
         finished_job_ttl: 60
     schedules:
@@ -87,12 +80,11 @@ deployments:
         timezone: UTC
         active: true
     parameters:
-      # Metrics run of record — the dedicated versioned bucket, NOT the <YOUR_S3_BUCKET>
-      # data bucket. Cost records must land where the Glue `costs` table reads
-      # (cloudpipe-metrics/metrics/costs/); pointing this at <YOUR_S3_BUCKET> silently
-      # orphans them from Athena. See terraform/modules/stack/metrics_bucket.tf.
-      bucket: cloudpipe-metrics
-      region: <YOUR_AWS_REGION>
+      # Metrics run of record — the dedicated versioned bucket, NOT the data
+      # bucket. Cost records must land where the Glue `costs` table reads
+      # (<metrics bucket>/metrics/costs/); pointing this at the data bucket
+      # silently orphans them from Athena. See terraform/modules/stack/metrics_bucket.tf.
+      bucket: "{{ $CLOUDPIPE_METRICS_BUCKET }}"
       pipeline: cloudpipe_minproc
 
   - name: metrics-compactor
@@ -102,7 +94,7 @@ deployments:
       job_variables:
         namespace: prefect
         service_account_name: prefect-worker
-        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
+        image: "{{ $CLOUDPIPE_ECR_REGISTRY }}/cloudpipe/cloudpipe-flow-runner:latest"
         image_pull_policy: Always
         finished_job_ttl: 60
     schedules:
@@ -112,8 +104,7 @@ deployments:
         timezone: UTC
         active: true
     parameters:
-      bucket: cloudpipe-metrics
-      region: <YOUR_AWS_REGION>
+      bucket: "{{ $CLOUDPIPE_METRICS_BUCKET }}"
       # Must stay > kubecost_scraper.SETTLED_AGE_DAYS (3). The 02:00 scrape
       # re-scrapes the report-date 3 days back with reconciled costs; anchored
       # on yesterday, a lookback of 4 re-compacts dt=today-4..today-1 and so

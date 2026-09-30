@@ -29,9 +29,6 @@ import logging
 
 log = logging.getLogger(__name__)
 
-METRICS_BUCKET = "cloudpipe-metrics"
-REGION = "<YOUR_AWS_REGION>"
-
 # Registration columns worth carrying. mask_dice and lncc are the overlap and
 # local-correlation scores; verdict is the gate's own answer; the jacobian and
 # inverse-consistency fields say whether the warp is well-behaved rather than
@@ -46,7 +43,7 @@ REGISTRATION_COLUMNS = (
 )
 
 
-def _metrics_client(engine: str, bucket: str, region: str):
+def _metrics_client(engine: str, bucket: str, region: str | None):
     """Build a CloudpipeMetrics for the chosen engine.
 
     Athena is the default for the same reason the metrics export defaults to it
@@ -80,18 +77,26 @@ def latest_per_unit(frame, order_column: str = "completed_at"):
 
 def anatomical_qc(
     engine: str = "athena",
-    bucket: str = METRICS_BUCKET,
-    region: str = REGION,
+    bucket: str | None = None,
+    region: str | None = None,
     dt_from: str | None = None,
     dt_to: str | None = None,
 ):
     """One row per subject×session: anat_qc ⋈ fsqc_qc, plus t1w→MNI registration.
+
+    `bucket` defaults to $CLOUDPIPE_METRICS_BUCKET and `region` to this
+    deployment's own; neither has a literal fallback (metrics/deployment_env.py).
 
     Every metric is nullable, and 0.0 is a legitimate value for several of them
     (`rot_tal_*`, `n_outlier_*`, curvature means). Filter on IS NOT NULL, never
     on `> 0` — the same rule the `FsqcQC` docstring spells out. On this pipeline
     `holes_*`, `defects_*`, `topo_*` and `n_outlier_sample_*` are always null.
     """
+    # Imported here, like the engines in _metrics_client: the in-region
+    # aggregation mounts only src/anat_stats/, and never calls this.
+    from metrics import deployment_env
+
+    bucket = bucket or deployment_env.required("CLOUDPIPE_METRICS_BUCKET", "the metrics bucket")
     client = _metrics_client(engine, bucket, region)
     anatomical = client.anatomical_qc(dt_from=dt_from, dt_to=dt_to)
     log.info("anatomical_qc: %d rows", len(anatomical))

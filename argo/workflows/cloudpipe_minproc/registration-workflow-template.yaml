@@ -168,8 +168,8 @@ spec:
       #
       # Without the code, an OOMKill recorded as `failure_category: unknown` with
       # `failure_reason: expected output not found` — indistinguishable from a
-      # crash, a data problem, or exhausted spot retries (observed on
-      # sub-XXXXXXXX ses-00A, 2026-08-18). A pod killed by the OOM killer is
+      # crash, a data problem, or exhausted spot retries (observed on one
+      # subject's ses-00A, 2026-08-18). A pod killed by the OOM killer is
       # SIGKILLed, so it can never write its own in-pod record (ADR 016) — this
       # fallback recorder is the ONLY place the cause can be captured, which is
       # why it has to carry the code.
@@ -263,7 +263,7 @@ spec:
         # registration-dagtask reports Succeeded and functional-preprocessing runs
         # against transforms that were never uploaded.
         #
-        # Observed on sub-XXXXXXXX ses-00A, 2026-08-18: func-preproc ran 1m instead
+        # Observed on one subject's ses-00A, 2026-08-18: func-preproc ran 1m instead
         # of the ~35m its sibling sessions took, produced nothing, and the session's
         # surface-resample then failed (exit 1, 10s) on the missing input. Two pods
         # scheduled to accomplish nothing, and six runs recorded `skipped` plus
@@ -327,7 +327,7 @@ spec:
         # through to isTarball() whenever an input declares no archive strategy:
         # gzip magic, then one tar.Next(). Every `.mgz` therefore reaches the tar
         # parse and the verdict depends on the IMAGE DATA. 3 of 2511 staged
-        # objects were accepted as tarballs; sub-XXXXXXXX died in all 3 sessions
+        # objects were accepted as tarballs; one subject died in all 3 sessions
         # on `illegal file path: ` (untar's path-escape guard firing on an empty
         # member name). The hard failure was the lucky outcome — a plausible
         # member name would silently untar garbage over the artifact path and the
@@ -337,9 +337,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/orig.mgz'
 
         - name: fastsurfer-brainmask
@@ -347,9 +347,9 @@ spec:
           archive:
             none: {}   # required, not decorative — see fastsurfer-orig (#274)
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/brainmask.mgz'
 
         - name: mni-template
@@ -358,9 +358,9 @@ spec:
           # uses its own 2mm --mni-template as the output grid.
           path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
 
     outputs:
@@ -381,9 +381,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_affine.mat'
 
         - name: t1w-to-mni-warp
@@ -392,9 +392,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_warp.nii.gz'
 
         - name: t1w-to-mni-t1w-brain
@@ -403,9 +403,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_T1w_brain.nii.gz'
 
         - name: t1w-to-mni-t1w-orig
@@ -414,9 +414,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_T1w_orig.nii.gz'
 
         - name: t1w-to-mni-warped
@@ -425,9 +425,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_warped.nii.gz'
 
         - name: t1w-to-mni-qc-json
@@ -436,9 +436,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/t1w_to_mni/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni_qc.json'
 
         - name: t1w-to-mni-reg-qc
@@ -446,10 +446,10 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             # Metrics artifact → versioned metrics bucket, not the data bucket.
             bucket: "{{workflow.parameters.metrics-bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'metrics/registration/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_t1w_to_mni_reg_qc.json'
 
     # Either GPU pool (#374): gpu-nodepool is preferred by weight, gpu-dense-nodepool
@@ -619,7 +619,7 @@ spec:
     # step where an OOMKill is NOT deterministic, so the spec-level exclusion of 137
     # is wrong here and right everywhere else.
     #
-    # Measured on sub-XXXXXXXX, 2026-08-18 batch. One session OOMed; the same
+    # Measured on one subject in the 2026-08-18 batch. One session OOMed; that
     # subject's three other sessions succeeded, in the same workflow, at the same
     # 12G limit:
     #
@@ -732,9 +732,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func'
 
         # Downloaded ONCE per session instead of once per run.
@@ -771,17 +771,17 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}'
 
         - name: fslicense
           path: '/opt/freesurfer/.license'
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'config/fslicense'
 
     outputs:
@@ -795,9 +795,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.metrics-bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
         # One directory upload replaces the five per-run file artifacts. The
         # driver names each run's directory bold_to_t1w_{task}_{run}, so files
@@ -809,9 +809,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/'
 
         # Per-run QC JSONs, collected flat by the driver. Filenames are
@@ -822,10 +822,10 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             # Metrics artifact → versioned metrics bucket, not the data bucket.
             bucket: "{{workflow.parameters.metrics-bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'metrics/registration/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
 
     nodeSelector:

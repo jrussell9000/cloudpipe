@@ -97,9 +97,9 @@ spec:
       - name: fslicense
         path: '/opt/freesurfer/.license'
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'config/fslicense'
 
     outputs:
@@ -115,9 +115,9 @@ spec:
             # recompression burns CPU on both ends for very little size win.
             compressionLevel: 1
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/template-base.tar.gz'
 
     # DEVICE SWITCH (#373). device=cuda runs on a GPU pool exactly as the static
@@ -144,7 +144,7 @@ spec:
     # here, on top of the ~0.9 GB host working set — cgroup memory.peak read
     # 3.96G on the probe, so 8G is ~2x headroom.
     #
-    # MEASURED (fastsurfer-cpu-probe-lmkgg, 2026-09-10, sub-XXXXXXXX ses-00A,
+    # MEASURED (fastsurfer-cpu-probe-lmkgg, 2026-09-10, one subject's ses-00A,
     # long-segmentation of one session on a c8i-flex.4xlarge spot node at 7
     # threads, against the same session's GPU output from cloudpipe-zztxz):
     #   wall 396 s vs 357 s on a 3-way time-sliced T4 — only ~10% slower, because
@@ -388,18 +388,18 @@ spec:
       - name: fslicense
         path: '/opt/freesurfer/.license'
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'config/fslicense'
 
       # The base template from step A, landed directly at its SUBJECTS_DIR path.
       - name: template-base
         path: '/work/subjects/{{workflow.parameters.subjID}}_template'
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/template-base.tar.gz'
 
     outputs:
@@ -411,9 +411,9 @@ spec:
           tar:
             compressionLevel: 1
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/template-parcellated.tar.gz'
 
     nodeSelector:
@@ -429,7 +429,7 @@ spec:
     # backstop was the master workflow's 24h activeDeadlineSeconds, so one such
     # subject held a 4-cpu cpu-heavy pod and a concurrency slot for a full day.
     #
-    # Observed on sub-XXXXXXXX (cloudpipe-qqtg7, 2026-08-18): rh mris_fix_topology
+    # Observed in workflow cloudpipe-qqtg7 (2026-08-18): rh mris_fix_topology
     # ran 3.0h and then FAILED with "euler number != 2", handing off to FreeSurfer's
     # mris_topo_fixer fallback, which spun at 100% cpu with no progress output and
     # no bound. Deterministic — the seed is fixed at 1234 and the input surface is

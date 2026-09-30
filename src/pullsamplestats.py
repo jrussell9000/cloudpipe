@@ -34,9 +34,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from metrics import deployment_env
 from metrics.duckdb_query import CloudpipeMetrics
 
-BUCKET = "<YOUR_S3_BUCKET>"
 SUBJECTS_CSV = Path(__file__).resolve().parents[1] / "tools" / "cloudpipe_test_sample.csv"
 
 pd.set_option("display.width", 200)
@@ -86,7 +86,11 @@ def main() -> None:
 
     subjects = load_batch_subjects(SUBJECTS_CSV)
     print(f"Batch: {len(subjects)} subjects from {SUBJECTS_CSV.name}")
-    m = CloudpipeMetrics(bucket=BUCKET)
+    # The metrics bucket. This read the data bucket until task 6.3, which has held
+    # no metrics since the bucket split — writes to its metrics/ are denied.
+    m = CloudpipeMetrics(
+        bucket=deployment_env.required("CLOUDPIPE_METRICS_BUCKET", "the metrics bucket")
+    )
 
     # Functional QC — per BOLD run
     func = scope(m.func_qc(), subjects)

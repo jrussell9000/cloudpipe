@@ -1,5 +1,5 @@
 [workspace]
-authors = ["Justin Russell <<YOUR_MAINTAINER_EMAIL>>"]
+authors = ["Justin Russell"]
 channels = ["conda-forge"]
 name = "workbench"
 platforms = ["linux-64"]
