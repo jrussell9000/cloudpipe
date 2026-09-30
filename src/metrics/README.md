@@ -17,8 +17,8 @@ FastSurfer container                           Argo exit handler
         ↓
         All uploaded via Argo output artifacts
         ↓
-s3://cloudpipe-metrics/metrics/      (versioned; NOT the <YOUR_S3_BUCKET> data bucket —
-        ↓                             writes to <YOUR_S3_BUCKET>/metrics/* are denied)
+s3://<metrics bucket>/metrics/      (versioned; NOT the data bucket —
+        ↓                             writes to <data bucket>/metrics/* are denied)
         ↓
 nightly compaction (prefect/flows/metrics_compactor_flow.py)
   → {table}_compacted  (Parquet, partitioned on dt + schema_version)
@@ -35,8 +35,10 @@ Grafana — dashboards via Athena datasource
 
 ## S3 Layout
 
-All metrics live under `s3://cloudpipe-metrics/metrics/` — a dedicated,
-versioned bucket, not the `<YOUR_S3_BUCKET>` data bucket. The table name is always the
+All metrics live under `s3://<metrics bucket>/metrics/` — a dedicated,
+versioned bucket (`metrics_bucket` in the cloudpipe-config ConfigMap, and
+`$CLOUDPIPE_METRICS_BUCKET` under `pixi run -e ops`), not the data bucket. The
+table name is always the
 prefix's last segment with hyphens → underscores.
 
 | Prefix | Table | Grain |

@@ -227,7 +227,13 @@ analyses:
 # Credentials: configured via standard AWS credential chain
 #   (environment variables, ~/.aws/credentials, EC2 instance role, etc.)
 #
-# bucket               — bucket name only; no "s3://" prefix and no slashes
+# bucket               — bucket name only; no "s3://" prefix and no slashes.
+#                        A PLACEHOLDER in the image: the fmri-first-level-proc
+#                        WorkflowTemplate renders this file into /scratch with
+#                        the `bucket` from the cloudpipe-config ConfigMap, and
+#                        refuses to run if the placeholder survives. Running the
+#                        orchestrator on this file directly fails on a bucket
+#                        name S3 rejects, rather than reaching a real bucket.
 # *_s3_prefix          — S3 key prefix; no leading or trailing slash
 # upload_prefix        — destination prefix for output archives
 # cleanup_after_upload — if true, delete downloaded/extracted files after
@@ -235,7 +241,7 @@ analyses:
 # available_sessions   — pool of possible session codes to probe on S3
 s3:
   enabled: true
-  bucket: "<YOUR_S3_BUCKET>"
+  bucket: "__CLOUDPIPE_BUCKET__"
   fmriprep_s3_prefix: "derivatives/fmriprep"
   mmps_mproc_s3_prefix: "mmps_mproc_noimages"
   upload_prefix: "derivatives/first_levels"

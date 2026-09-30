@@ -584,7 +584,7 @@ class CloudpipeMetrics:
     def __init__(
         self,
         bucket: str,
-        region: str = "<YOUR_AWS_REGION>",
+        region: str | None = None,
         workgroup: str = "cloudpipe_metrics_workgroup",
         output_prefix: str = "grafana-query-results",
         finops_bucket: str | None = None,
@@ -595,7 +595,7 @@ class CloudpipeMetrics:
         bucket:
             Main cloudpipe S3 bucket (where metrics/ lives).
         region:
-            AWS region.
+            AWS region; defaults to this deployment's own (deployment_env.region()).
         workgroup:
             Athena workgroup for cloudpipe_metrics queries.
         output_prefix:
@@ -605,7 +605,14 @@ class CloudpipeMetrics:
         """
         import boto3
 
-        self._athena = boto3.client("athena", region_name=region)
+        # Imported both as `metrics.athena` and flat as `athena` (scripts/ put
+        # src/metrics on sys.path), so the helper is reached either way.
+        try:
+            from . import deployment_env
+        except ImportError:
+            import deployment_env
+
+        self._athena = boto3.client("athena", region_name=region or deployment_env.region())
         self._workgroup = workgroup
         self._results_bucket = finops_bucket or bucket
         self._results_prefix = output_prefix

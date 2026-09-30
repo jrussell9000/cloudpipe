@@ -374,7 +374,7 @@ def read_live_state(*, runner=subprocess.run) -> dict[str, Any]:
     # Without the flag the planner does not MISREAD base_path, it cannot read it
     # at all: `_unreported` degrades to "cannot be checked" rather than to
     # drift, which is safe. It is also useless, because base_path is the prefix
-    # confinement — staging is rooted at /<YOUR_S3_BUCKET>/scratch/globus-staging and the
+    # confinement — staging is rooted at /<bucket>/scratch/globus-staging and the
     # whole point is that it stays there. Unverifiable base_path means the one
     # field bounding a collection's reach is the one field never checked.
     collection_payload = run(["collection", "list", "--include-private-policies"], runner=runner)

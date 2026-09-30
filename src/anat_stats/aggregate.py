@@ -5,7 +5,7 @@ Shape of the job, measured rather than guessed (see `data/census/s3_scan.jsonl`,
 per session plus 5 per long-template plus 6 subregion tables per session. That
 is ~650k GET requests for ~4 GB of text, which parses to roughly 210 million
 rows. The request charge is about $0.26, and the transfer is egress-free only
-when this runs INSIDE <YOUR_AWS_REGION> — from a laptop it is ~4 GB of internet egress,
+when this runs INSIDE the bucket's region — from a laptop it is ~4 GB of internet egress,
 and every one of those small GETs pays a cross-country round trip. Measured from
 a laptop: 96 s per ~97-subject shard, ~3.4 hours for the cohort. Run it in-region.
 
@@ -63,7 +63,6 @@ from .parsers import (
 
 log = logging.getLogger(__name__)
 
-REGION = "<YOUR_AWS_REGION>"
 DEFAULT_SHARDS = 128
 DEFAULT_WORKERS = 32
 
@@ -96,7 +95,12 @@ def _client(s3=None):
         return s3
     client = getattr(_LOCAL, "s3", None)
     if client is None:
-        client = boto3.client("s3", region_name=REGION)
+        # No region_name: boto3 resolves it the way this job runs — from the
+        # AWS_DEFAULT_REGION Pod Identity injects in-cluster, or the AWS profile
+        # on a workstation. Not metrics/deployment_env.py, deliberately: the
+        # in-region run mounts only src/anat_stats/ (scripts/manifests/
+        # anat-stats-aggregate.yaml), so importing `metrics` would fail there.
+        client = boto3.client("s3")
         _LOCAL.s3 = client
     return client
 

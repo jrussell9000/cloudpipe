@@ -72,6 +72,7 @@ and runnable as a CLI:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import date as _date
 from datetime import datetime, timedelta, timezone
@@ -127,8 +128,8 @@ def _collect(
 
 
 def probe_and_upload(
-    bucket: str = "cloudpipe-metrics",
-    region: str = "<YOUR_AWS_REGION>",
+    bucket: str,
+    region: str | None = None,
     base_url: str = KUBECOST_BASE,
     verify_ssl: bool = True,
     lookback_days: int = 21,
@@ -148,8 +149,12 @@ def probe_and_upload(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Kubecost reconciliation convergence probe")
-    p.add_argument("--bucket", default="cloudpipe-metrics")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument(
+        "--bucket",
+        default=os.environ.get("CLOUDPIPE_METRICS_BUCKET"),
+        help="metrics bucket (default: $CLOUDPIPE_METRICS_BUCKET)",
+    )
+    p.add_argument("--region", default=None, help="default: this deployment's region")
     p.add_argument("--base-url", default=KUBECOST_BASE)
     p.add_argument("--lookback-days", type=int, default=21)
     p.add_argument(
@@ -158,6 +163,8 @@ def main() -> None:
         help="Disable SSL verification (for the external Kubecost URL)",
     )
     args = p.parse_args()
+    if not args.bucket:
+        p.error("--bucket is required when CLOUDPIPE_METRICS_BUCKET is not set")
 
     run_ts = datetime.now(timezone.utc)
     rows = _collect(args.base_url, not args.insecure, args.lookback_days, run_ts)

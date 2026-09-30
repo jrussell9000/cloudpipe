@@ -46,7 +46,7 @@
       "type": "string",
       "pattern": "^[a-z]{2}(-gov)?-[a-z]+-[0-9]$",
       "title": "AWS region",
-      "description": "The region holding the S3 bucket and the Globus Connect Server instance, for example <YOUR_AWS_REGION>. The bucket must be in this region: the S3 storage gateway addresses one regional endpoint."
+      "description": "The region holding the S3 bucket and the Globus Connect Server instance, for example eu-west-1. The bucket must be in this region: the S3 storage gateway addresses one regional endpoint."
     },
     "bucket": {
       "type": "string",

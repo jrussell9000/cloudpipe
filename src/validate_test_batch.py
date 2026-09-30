@@ -35,6 +35,7 @@ import argparse
 import collections
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
@@ -47,6 +48,7 @@ import pandas as pd
 import requests
 
 sys.path.insert(0, str(Path(__file__).parent))
+from metrics import deployment_env
 from metrics.athena import CloudpipeMetrics, cost_scope_clause
 
 # Step names emitted by outcome-recorder tasks in the Argo WorkflowTemplates.
@@ -136,8 +138,6 @@ def classify_bold_to_t1w_evidence(b2t_row: dict | None) -> tuple[bool, str]:
         return True, ""
     return False, f" — bold-to-t1w {b2t_row['status']}: {reason or 'no reason recorded'}"
 
-
-KUBECOST_BASE_URL = "https://kubecost.<YOUR_DOMAIN>"
 
 ARGO_NAMESPACE = "argo-workflows"
 
@@ -429,17 +429,17 @@ class TestBatchValidator:
     _func_df: pd.DataFrame | None = None
     _no_bold: list[str] | None = None
     _s3 = None
-    _data_bucket = "<YOUR_S3_BUCKET>"
-    _region = "<YOUR_AWS_REGION>"
+    _data_bucket: str | None = None
+    _region: str | None = None
 
     def __init__(
         self,
         subjects: list[str],
-        bucket: str = "cloudpipe-metrics",
-        region: str = "<YOUR_AWS_REGION>",
+        bucket: str,
+        region: str | None = None,
         cost_date_from: str | None = None,
         cost_date_to: str | None = None,
-        data_bucket: str = "<YOUR_S3_BUCKET>",
+        data_bucket: str | None = None,
     ):
         self.subjects = subjects
         self._m = CloudpipeMetrics(bucket=bucket, region=region)
@@ -465,7 +465,7 @@ class TestBatchValidator:
         if self._s3 is None:
             import boto3
 
-            self._s3 = boto3.client("s3", region_name=self._region)
+            self._s3 = boto3.client("s3", region_name=self._region or deployment_env.region())
         return self._s3
 
     def _functional_outcomes(self) -> pd.DataFrame:
@@ -585,7 +585,7 @@ class TestBatchValidator:
 
         Subjects with no BOLD runs in the requested scan types are excluded from the
         denominator rather than counted as gaps. Not every ABCD subject has usable
-        rest/nback data — sub-XXXXXXXX has no minimally preprocessed BOLD at all
+        rest/nback data — one test-batch subject has no minimally preprocessed BOLD at all
         (it is absent from mmps_mproc/), so subject-data-inventory returned
         `runs:[]` and every BOLD-dependent step was correctly skipped. Counting that
         as a coverage failure made a healthy batch report FAIL and buried a real
@@ -829,7 +829,7 @@ class TestBatchValidator:
         both the numerator and the denominator and is indistinguishable from a
         subject that completed. An anat-only subject can therefore be lost
         outright — its anatomical phase hung or failed — while the batch reads
-        clean. `sub-XXXXXXXX` was lost that way in the 2026-08-14 batch and did
+        clean. One subject was lost that way in the 2026-08-14 batch and did
         not appear in that batch's FAIL list; the FAIL came from unrelated causes,
         so had those been absent the loss would have gone unreported.
 
@@ -893,10 +893,16 @@ class TestBatchValidator:
             sessions.setdefault(row.subject, []).append(row.session)
 
         s3 = self._s3_client()
+        # Resolved up front, not inside marker_exists: that swallows every
+        # exception as "absent", so an unset bucket there would report every
+        # session's marker missing instead of failing on the missing setting.
+        data_bucket = self._data_bucket or deployment_env.required(
+            "CLOUDPIPE_BUCKET", "the data bucket, where derivatives/ lives"
+        )
 
         def marker_exists(key: str) -> bool:
             try:
-                s3.head_object(Bucket=self._data_bucket, Key=key)
+                s3.head_object(Bucket=data_bucket, Key=key)
                 return True
             except Exception:  # noqa: BLE001 — absent marker is the answer, not an error
                 return False
@@ -1155,8 +1161,11 @@ class TestBatchValidator:
 
     def check_kubecost_api(self, window_start: str, window_end: str) -> ValidationResult:
         """All subjects must have totalCost > 0 in Kubecost for the run window."""
+        base_url = deployment_env.required(
+            "KUBECOST_BASE_URL", "the Kubecost UI's external URL, https://kubecost.<domain>"
+        )
         url = (
-            f"{KUBECOST_BASE_URL}/model/allocation"
+            f"{base_url}/model/allocation"
             f"?window={window_start},{window_end}"
             f"&aggregate=label:subjectid"
             f"&filterNamespaces=argo-workflows"
@@ -1347,16 +1356,20 @@ def main() -> None:
     parser.add_argument(
         "--subjects", required=True, help="Path to subjects CSV (subject_id column)"
     )
-    parser.add_argument("--bucket", default="cloudpipe-metrics")
+    parser.add_argument(
+        "--bucket",
+        default=os.environ.get("CLOUDPIPE_METRICS_BUCKET"),
+        help="the metrics bucket (default: $CLOUDPIPE_METRICS_BUCKET)",
+    )
     parser.add_argument(
         "--data-bucket",
-        default="<YOUR_S3_BUCKET>",
+        default=os.environ.get("CLOUDPIPE_BUCKET"),
         help=(
             "Bucket holding derivatives/, read by the anat-only delivery check "
-            "(the `bucket` key in the cloudpipe-config ConfigMap)"
+            "(default: $CLOUDPIPE_BUCKET, the `bucket` key in cloudpipe-config)"
         ),
     )
-    parser.add_argument("--region", default="<YOUR_AWS_REGION>")
+    parser.add_argument("--region", default=None, help="default: this deployment's region")
     parser.add_argument(
         "--namespace",
         default=ARGO_NAMESPACE,
@@ -1383,6 +1396,11 @@ def main() -> None:
 
     if args.cost and not (args.window_start and args.window_end):
         parser.error("--window-start and --window-end are required when --cost is specified")
+    if not args.bucket:
+        parser.error(
+            "--bucket is required when CLOUDPIPE_METRICS_BUCKET is not set "
+            "(`pixi run -e ops …` sets it from cloudpipe-config)"
+        )
 
     # Default --since to the cost window start when one was given: they are the
     # same instant — the batch submission time — and the operator has already

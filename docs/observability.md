@@ -372,8 +372,8 @@ PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
 **Direct CLI**:
 
 ```bash
-python src/metrics/kubecost_scraper.py --bucket cloudpipe-metrics --region <YOUR_AWS_REGION>
-python src/metrics/kubecost_scraper.py --bucket cloudpipe-metrics --settled   # re-read day-3
+pixi run -e ops bash -c 'python src/metrics/kubecost_scraper.py --bucket "$CLOUDPIPE_METRICS_BUCKET"'
+pixi run -e ops bash -c 'python src/metrics/kubecost_scraper.py --bucket "$CLOUDPIPE_METRICS_BUCKET" --settled'   # re-read day-3
 ```
 
 **Settled re-scrape**: the nightly run reads yesterday at day+1, where Kubecost has not finished

@@ -33,8 +33,8 @@ FROM public.ecr.aws/docker/library/debian:bookworm-slim AS afni-dist
 # NIMH publishes no versioned artifact. `--build-arg AFNI_SHA256=` (empty) skips
 # the digest check for an emergency build; the version assertion still applies.
 ARG AFNI_URL=https://afni.nimh.nih.gov/pub/dist/tgz/linux_ubuntu_24_64.tgz
-ARG AFNI_SHA256=988f5d7f84b7e26f80de4ed0b2af41b93cea52a92422d0d703505e97cd980738
-ARG AFNI_VERSION=AFNI_26.2.07
+ARG AFNI_SHA256=d5b20bf8b7af281bea0341800632916d8b124145d7a9f4668d1b2896aa9d7daa
+ARG AFNI_VERSION=AFNI_26.2.09
 
 # Programs lifted out of the tarball. preproc.py shells out to exactly ONE AFNI
 # binary — 3dcalc, for Stage 5's MNI masking — so that is all that ships. Adding

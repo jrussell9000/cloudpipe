@@ -33,8 +33,8 @@ Both were A/B'd against real production data, stock 2.1.7 vs patched, in this im
 
 | | data | stock 2.1.7 | patched |
 |---|---|---|---|
-| hypothalamus | `sub-XXXXXXXX/ses-06A` | `IndexError: index 9 is out of bounds for axis 0 with size 9` | completes, warns about the missing label |
-| hippocampus | `sub-XXXXXXXX/ses-02A` | `IndexError: too many indices for array: array is 2-dimensional, but 3 were indexed` | completes, both hemispheres |
+| hypothalamus | one subject's `ses-06A` | `IndexError: index 9 is out of bounds for axis 0 with size 9` | completes, warns about the missing label |
+| hippocampus | another subject's `ses-02A` | `IndexError: too many indices for array: array is 2-dimensional, but 3 were indexed` | completes, both hemispheres |
 
 The hypothalamus case is the issue as written: label 806 is genuinely absent from the
 segmentation, so the centroid array is short and the positional index runs off the end.

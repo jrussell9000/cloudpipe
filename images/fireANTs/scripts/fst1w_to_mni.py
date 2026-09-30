@@ -269,7 +269,7 @@ def _run_affine(
     # ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS to requests.cpu (2 -> 1), that moved the
     # sampled set and t1w-to-mni QC failures went 1.1% -> 12.3% of sessions (#138).
     #
-    # Measured on sub-XXXXXXXX/ses-00A (the flipped session), varying only the thread
+    # Measured on the flipped session from #138 (a ses-00A), varying only the thread
     # count — RANDOM 0.1: lncc .645/.716/.702/.159/.275 at 1/2/4/8/16 threads. There is
     # no safe constant to pin, so the fix is to remove the sampled set as a variable
     # rather than to freeze the thread count. NONE: lncc .77511/.77507/.77506 at

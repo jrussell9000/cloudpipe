@@ -48,11 +48,14 @@ class CloudpipeMetrics:
     def __init__(
         self,
         bucket: str,
-        region: str = "<YOUR_AWS_REGION>",
+        region: str | None = None,
     ):
         import boto3
         import duckdb
 
+        from . import deployment_env
+
+        region = region or deployment_env.region()
         self._bucket = bucket
         self._region = region
         self._con = duckdb.connect()
@@ -353,7 +356,7 @@ class CloudpipeMetrics:
 
         Example
         -------
-            m = CloudpipeMetrics(bucket="cloudpipe-metrics")
+            m = CloudpipeMetrics(bucket=os.environ["CLOUDPIPE_METRICS_BUCKET"])
             df = m.subject_costs(subjects=batch, date_from="2026-06-29",
                                  date_to="2026-07-02")
             print(df["total_cost_usd"].describe())
