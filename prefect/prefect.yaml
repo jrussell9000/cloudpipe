@@ -90,7 +90,7 @@ deployments:
       # Metrics run of record — the dedicated versioned bucket, NOT the <YOUR_S3_BUCKET>
       # data bucket. Cost records must land where the Glue `costs` table reads
       # (cloudpipe-metrics/metrics/costs/); pointing this at <YOUR_S3_BUCKET> silently
-      # orphans them from Athena. See terraform/metrics_bucket.tf.
+      # orphans them from Athena. See terraform/modules/stack/metrics_bucket.tf.
       bucket: cloudpipe-metrics
       region: <YOUR_AWS_REGION>
       pipeline: cloudpipe_minproc

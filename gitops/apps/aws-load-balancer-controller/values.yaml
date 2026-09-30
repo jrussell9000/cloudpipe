@@ -1,6 +1,14 @@
 aws-load-balancer-controller:
-  clusterName: <YOUR_CLUSTER_NAME>
-  region: <YOUR_AWS_REGION>
+  # `clusterName` and `region` are NOT set here. They differ between deployments,
+  # so Terraform supplies them: the root ApplicationSet patches them in from
+  # local.argocd_app_overrides in terraform/modules/stack/argocd.tf, with clusterName coming
+  # from module.eks.cluster_name. Setting either here would shadow nothing — the
+  # override wins — but it would put the value in two places. See "Per-app Helm
+  # overrides" in docs/gitops.md.
+  #
+  # The chart refuses to render without clusterName, so if the override ever goes
+  # missing this app goes Degraded rather than quietly tagging the wrong cluster.
+  #
   # vpcId is omitted — LBC auto-discovers from EC2 instance metadata
   nodeSelector:
     eks.amazonaws.com/nodegroup: backend

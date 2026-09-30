@@ -157,10 +157,10 @@ qc:
 #   The orchestrator builds "sub-{subj_id}_ses-{session}A_{post_id}" for
 #   each analysis. Session labels are injected automatically.
 #
-# Resulting prefixes (for subj_id "NDARABC123", session "00"):
-#   out_file_pre:         "sub-NDARABC123_ses-00A_nback"
-#   extract_out_file_pre: "sub-NDARABC123_ses-00A_nback_Shen368"
-#   conn_out_file_pre:    "sub-NDARABC123_ses-00A_nback_Shen368"
+# Resulting prefixes (for subj_id "XXXXXXXX", session "00"):
+#   out_file_pre:         "sub-XXXXXXXX_ses-00A_nback"
+#   extract_out_file_pre: "sub-XXXXXXXX_ses-00A_nback_Shen368"
+#   conn_out_file_pre:    "sub-XXXXXXXX_ses-00A_nback_Shen368"
 #
 # fd_threshold (required, per-analysis):
 #   Different analyses can use different FD thresholds. For example,

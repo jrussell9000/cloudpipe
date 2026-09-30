@@ -67,7 +67,7 @@ variable "bucket" {
 }
 
 variable "metrics_bucket" {
-  description = "Name of the dedicated, versioned S3 bucket that pipeline QC and cost metrics are written to. The kubecost-cost-scraper flow writes CostAllocation records here. Separate from `bucket` so metrics survive derivative flushes — see terraform/metrics_bucket.tf."
+  description = "Name of the dedicated, versioned S3 bucket that pipeline QC and cost metrics are written to. The kubecost-cost-scraper flow writes CostAllocation records here. Separate from `bucket` so metrics survive derivative flushes — see terraform/modules/stack/metrics_bucket.tf."
   type        = string
 }
 

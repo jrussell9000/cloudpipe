@@ -91,7 +91,7 @@ resource "aws_glue_crawler" "cur_report_crawler" {
 }
 
 # CUR Report Definition — delivers to the athena/ prefix of the finops bucket.
-# Must use the us-east-1 (billing) provider; delivery target is <YOUR_AWS_REGION>.
+# Must use the us-east-1 (billing) provider; delivery target is the deployment region.
 resource "aws_cur_report_definition" "cur_report" {
   provider = aws.billing
 

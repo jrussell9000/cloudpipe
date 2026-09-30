@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 List subjects under s3://<YOUR_S3_BUCKET>/derivatives/fmriprep/ and write a CSV of
-subject IDs (sub-NDARXXX format) for use with the first-level Prefect flow.
+subject IDs (sub-XXXXXXXX format) for use with the first-level Prefect flow.
 
 Usage
 -----

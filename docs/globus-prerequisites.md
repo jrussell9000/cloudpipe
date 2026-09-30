@@ -22,7 +22,7 @@ avoidable way to lose a month.
 
 | Gate | What | Who grants it | Typical time | Can it be automated? | Gate id |
 |---|---|---|---|---|---|
-| 1 | ABCD data access (NDA Data Use Certification) | NIMH Data Archive + your institution's signing official | Weeks | No | `nda_duc` |
+| 1 | ABCD data access (NBDC Data Use Certification) | NBDC Data Hub + your institution's signing official | Weeks | No | `nda_duc` |
 | 2 | Globus subscription, **High Assurance** tier | Globus, via your institution | Days–weeks (or already exists) | No | `globus_subscription` |
 | 3 | Your endpoint added to that subscription | A human Globus admin at your institution | Hours–days | No | `endpoint_subscription` |
 | 4 | The GCS build itself | You | ~1 day | Mostly — `pixi run globus` does it; registering two Globus apps and one login are in a browser | `globus_app_registration`, `globus_login` |
@@ -37,7 +37,7 @@ endpoint UUID from the first half of gate 4. Gate 4's storage-gateway step canno
 complete until gate 3 is done.
 
 ```
-Gate 1 (NDA DUC) ─────────────────────────┐
+Gate 1 (NBDC DUC) ────────────────────────┐
                                           ├──> transfers work
 Gate 2 (HA subscription) ──> Gate 3 ──────┤
                               ↑           │
@@ -60,33 +60,44 @@ but it is a placeholder that authenticates nothing — see
 
 ## Gate 1 — ABCD data access
 
-**What it is.** ABCD data is distributed by the [NIMH Data Archive
-(NDA)](https://nda.nih.gov). Access is granted per-investigator under a **Data
-Use Certification (DUC)**, not per-institution and not per-project. The
-minimally preprocessed imaging data that CloudPipe consumes (Hagler et al.
-2019) is prepared by the ABCD **DAIRC** and served from a Globus collection.
+**What it is.** ABCD data is distributed by the [NIH Brain Development Cohorts
+(NBDC) Data Hub](https://www.nbdc-datahub.org), which replaced the NIMH Data
+Archive (NDA) as ABCD's distributor. Access is granted under an NBDC **Data Use
+Certification (DUC)**, applied for as an individual or a group. The minimally
+preprocessed imaging data that CloudPipe consumes (Hagler et al. 2019) is
+prepared by the ABCD **DAIRC** and served from a Globus collection on the NBDC
+Data Hub.
 
-**Why it gates everything.** The DAIRC collection is a Globus High Assurance
+**Why it gates everything.** The NBDC Data Hub collection is a Globus High Assurance
 collection precisely *because* it holds DUC-governed human subjects data. No
 DUC, no access to the collection, regardless of what infrastructure you build.
 
-**How to obtain it.**
+**How to obtain it.** The NBDC's [data access
+process](https://www.nbdc-datahub.org/data-access-process) is authoritative; in
+outline:
 
-1. Create an NDA account at [nda.nih.gov](https://nda.nih.gov).
+1. Sign in to the NBDC Data Hub through RAS with your institutional email
+   address.
 2. Identify your institution's **signing official** — the person authorised to
    sign data use agreements on the institution's behalf. This is usually in the
    sponsored programs or research compliance office, not in your lab or
    department.
-3. Confirm your institution has an active **Federalwide Assurance (FWA)**. NDA
-   requires one; an institution without it cannot sign.
-4. Submit the DUC for the ABCD collection through the NDA portal and have the
-   signing official countersign.
-5. Once approved, request access to the DAIRC minimally preprocessed imaging
-   share and ask the DAIRC how they grant Globus access for your NDA identity.
+3. Confirm your institution has an active **Federalwide Assurance (FWA)**. The
+   NBDC requires one; an institution without it cannot sign.
+4. Submit the DUC. It includes a research data use statement, a plan for
+   deleting the data when the project ends, and an attestation of compliance
+   with **NIST SP 800-171**. You sign it through DocuSign, then the signing
+   official countersigns.
+5. The NBDC Data Access Committee reviews the request.
+6. Once approved, complete the NBDC Responsible Data and Biospecimen Use
+   Training (a score of at least 90% on its quiz is required).
+7. Ask the NBDC how they grant Globus access to the imaging collection for your
+   approved identity.
 
 **How to verify you cleared it.** Log into [app.globus.org](https://app.globus.org)
 with the identity your DUC is associated with, search the collection list for
-the DAIRC MMPS collection by name, and browse it. If you can list a subject
+the NBDC Data Hub's ABCD collection by name (it is listed as "NBDC Datashare
+ABCD Release"), and browse it. If you can list a subject
 directory, gate 1 is clear. Note the collection's UUID from its overview page —
 this becomes `globus_source_collection_id` in `terraform.tfvars`, and the path
 you browsed to becomes `globus_source_base_path`.
@@ -97,10 +108,11 @@ has not propagated to the identity you are logged in as. Check that you are
 logged in with the *same* identity your DUC names — a personal Globus account
 and an institutional one are different identities even with the same email.
 
-**Timeline.** Weeks is normal. The institutional signature is usually the long
-pole, and it is not something you can expedite from your side.
+**Timeline.** Weeks is normal. The institutional signature and the Data Access
+Committee review are usually the long poles, and neither is something you can
+expedite from your side.
 
-> The NDA and DAIRC own this process and change it independently of CloudPipe.
+> The NBDC Data Hub owns this process and changes it independently of CloudPipe.
 > Their documentation is authoritative; treat the steps above as orientation,
 > not as a specification.
 
@@ -391,9 +403,9 @@ rotation that page used to describe is gone with the key.
 
 Answer these in order. The first "no" is your answer.
 
-1. **Do you have, or can you obtain, an approved NDA DUC for ABCD?**
+1. **Do you have, or can you obtain, an approved NBDC DUC for ABCD?**
    No → you cannot use this data at all. Nothing else matters.
-2. **Are you pulling directly from the DAIRC Globus collection?**
+2. **Are you pulling directly from the NBDC Data Hub Globus collection?**
    No → use pre-staged S3 ingress ([data-ingress.md](data-ingress.md)). Skip
    Globus entirely.
 3. **Does your institution hold a Globus HA subscription and will it sponsor

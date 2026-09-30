@@ -3070,7 +3070,7 @@ resource "aws_glue_catalog_table" "workflow_runs" {
 # 300-subject batch, the 550-subject batch that ran into 2026-08-18, and the
 # earlier 08-04 through 08-15 batches -- and it is no longer wanted in
 # dashboards. Nothing was deleted; the bucket is versioned with no lifecycle
-# configuration (see terraform/metrics_bucket.tf), so all of it stays on disk.
+# configuration (see terraform/modules/stack/metrics_bucket.tf), so all of it stays on disk.
 #
 # Two mechanisms, because a whole-day partition cannot express the boundary:
 #

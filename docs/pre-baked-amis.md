@@ -38,7 +38,7 @@ ECR (private)
 | `packer/gpu-nodeclass/fastsurfer.pkr.hcl` | Packer template — builds the pre-baked AMI |
 | `terraform/modules/karpenter/helm-values/gpu-nodeclass.yaml` | AL2023 EC2NodeClass, selects AMI by tag |
 | `terraform/modules/karpenter/helm-values/gpu-nodepool.yaml` | GPU NodePool — references `gpu-nodeclass` |
-| `terraform/karpenter.tf` | Sets `fastsurfer_ami_digest` / `fireants_ami_digest` (what selection matches) and the informational `*_ami_tag` pair |
+| `terraform/modules/stack/karpenter.tf` | Sets `fastsurfer_ami_digest` / `fireants_ami_digest` (what selection matches) and the informational `*_ami_tag` pair |
 
 ---
 
@@ -51,7 +51,7 @@ commands below.
 
 | Item | Value |
 |---|---|
-| Selection key | `fastsurfer-image-digest` + `fireants-image-digest` + `eks-version` AMI tags, matched against `fastsurfer_ami_digest` / `fireants_ami_digest` in `terraform/karpenter.tf` |
+| Selection key | `fastsurfer-image-digest` + `fireants-image-digest` + `eks-version` AMI tags, matched against `fastsurfer_ami_digest` / `fireants_ami_digest` in `terraform/modules/stack/karpenter.tf` |
 | EKS version | `1.35` |
 | Base AMI | latest `amazon-eks-node-al2023-x86_64-nvidia-1.35-*` — resolved by `source_ami_filter` at build time, **not pinned**, so two builds of the same image tags can sit on different base AMIs |
 | Region | `<YOUR_AWS_REGION>` |
@@ -70,7 +70,7 @@ window stops before the digest tags:
 ```bash
 kubectl get ec2nodeclass gpu-nodeclass \
   -o jsonpath='{.spec.amiSelectorTerms}{"\n"}{range .status.amis[*]}{.id} {.name}{"\n"}{end}'
-rg -n 'ami_digest' terraform/karpenter.tf
+rg -n 'ami_digest' terraform/modules/stack/karpenter.tf
 ```
 
 ---
@@ -124,7 +124,7 @@ The new AMI ID is printed at the end of the build:
 
 ### 3. Deploy the new AMI
 
-Update `fastsurfer_ami_digest` and `fireants_ami_digest` in `terraform/karpenter.tf` (and the matching `*_ami_tag` pair, for traceability). **Both digests must match the tags on an AMI that actually exists**, or `amiSelectorTerms` matches nothing and Karpenter cannot provision GPU nodes at all. Check before applying:
+Update `fastsurfer_ami_digest` and `fireants_ami_digest` in `terraform/modules/stack/karpenter.tf` (and the matching `*_ami_tag` pair, for traceability). **Both digests must match the tags on an AMI that actually exists**, or `amiSelectorTerms` matches nothing and Karpenter cannot provision GPU nodes at all. Check before applying:
 
 ```bash
 aws ec2 describe-images --owners self \
@@ -161,7 +161,7 @@ Implemented in `.github/workflows/build-gpu-nodeclass-ami.yaml`. Triggers automa
 3. Skips the build only if *both* candidate **digests** already match `karpenter.tf` — a rebuild of either image alone still triggers a new AMI carrying both. Digests, not tags, because a rebuild at an unchanged commit keeps its tag but changes its digest. The comparison is string-only, not AMI-existence — if `karpenter.tf` was hand-edited to pin a digest before any AMI was baked with it, dispatch manually with `force_rebuild: true` to bypass the skip.
 4. Runs `packer build` on a `g4dn.2xlarge` using the `AWS_PACKER_ROLE_ARN` OIDC role
 5. Sweeps up any builder instance, temporary key pair and temporary IAM profile/role that Packer did not delete (runs on cancel and failure too — see the gotcha below)
-6. Commits the updated `*_ami_digest` and `*_ami_tag` pairs in `terraform/karpenter.tf` with `[skip ci]`
+6. Commits the updated `*_ami_digest` and `*_ami_tag` pairs in `terraform/modules/stack/karpenter.tf` with `[skip ci]`
 
 **The workflow does not roll the nodeclass.** It used to `kubectl apply` the
 rendered `gpu-nodeclass` directly, but the EKS API endpoint is private-only

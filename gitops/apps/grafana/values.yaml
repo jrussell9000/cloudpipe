@@ -13,35 +13,12 @@ grafana:
   plugins:
     - grafana-athena-datasource
 
-  # ---------------------------------------------------------------------------
-  # Datasource: Athena — cloudpipe_metrics database
-  # Credentials come from the Pod Identity role (no explicit key/secret).
-  # ---------------------------------------------------------------------------
-  datasources:
-    datasources.yaml:
-      apiVersion: 1
-      datasources:
-        - name: Prometheus
-          type: prometheus
-          uid: cloudpipe-prometheus
-          access: proxy
-          isDefault: false
-          url: http://prometheus-kube-prometheus-prometheus.prometheus.svc:9090
-          jsonData:
-            timeInterval: 30s
-
-        - name: Athena - CloudPipe Metrics
-          type: grafana-athena-datasource
-          uid: cloudpipe-athena
-          access: proxy
-          isDefault: true
-          jsonData:
-            authType: default
-            defaultRegion: <YOUR_AWS_REGION>
-            catalog: AwsDataCatalog
-            database: cloudpipe_metrics
-            workgroup: cloudpipe_metrics_workgroup
-            outputLocation: s3://cloudpipe-finops/grafana-query-results/
+  # Datasources — Prometheus and Athena — are rendered by Terraform into this
+  # app's Helm values (local.argocd_app_overrides in terraform/modules/stack/argocd.tf), not
+  # set here. Only the Athena entry's region is deployment-specific, but it sits
+  # inside a list and Helm replaces a list whole, so the whole `datasources` map
+  # is Terraform's. Athena credentials come from the Pod Identity role either
+  # way (no explicit key/secret).
 
   # ---------------------------------------------------------------------------
   # Dashboard provisioning — sidecar watches ConfigMaps labelled
@@ -55,7 +32,12 @@ grafana:
       searchNamespace: grafana
 
   # ---------------------------------------------------------------------------
-  # ALB Ingress — routes grafana.<YOUR_DOMAIN> → Grafana svc
+  # ALB Ingress — routes the Grafana hostname → Grafana svc
+  #
+  # The hostname itself is not here: `hosts` and the external-dns hostname
+  # annotation come from local.grafana_url through this app's entry in
+  # local.argocd_app_overrides (terraform/modules/stack/argocd.tf). The annotations below stay,
+  # and Terraform's precondition reads that override merged over this file.
   #
   # A member of the shared internal `cloudpipe-ui` ALB, with ArgoCD, Argo
   # Workflows, Prefect and Kubecost (plan 012). Reachable only from inside the
@@ -68,15 +50,14 @@ grafana:
     enabled: true
     ingressClassName: alb
     annotations:
-      external-dns.alpha.kubernetes.io/hostname: grafana.<YOUR_DOMAIN>
       alb.ingress.kubernetes.io/backend-protocol: HTTP
       alb.ingress.kubernetes.io/target-type: ip
       alb.ingress.kubernetes.io/healthcheck-path: /api/health
       alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
       # --- Group-level: MUST equal local.ui_alb_group_annotations in
-      # terraform/ui_alb.tf byte for byte. One differing value stops the
+      # terraform/modules/stack/ui_alb.tf byte for byte. One differing value stops the
       # controller reconciling the whole shared ALB. Terraform's plan fails on a
-      # mismatch (precondition in terraform/argocd.tf), so change both together.
+      # mismatch (precondition in terraform/modules/stack/argocd.tf), so change both together.
       # Hardcoded because this ingress is GitOps-managed and cannot read
       # Terraform outputs: the SG is referenced by Name tag, the access-log
       # bucket (SSE-S3; ALB cannot deliver to the SSE-KMS cloudpipe-logging
@@ -91,7 +72,7 @@ grafana:
       # The `-Res-` in ssl-policy is required by Security Hub ELB.17, whose list of
       # acceptable policies is not customizable and excludes the ALB default
       # ELBSecurityPolicy-TLS13-1-2-2021-06. See the header comment in
-      # terraform/ui_alb.tf before changing it.
+      # terraform/modules/stack/ui_alb.tf before changing it.
       alb.ingress.kubernetes.io/group.name: cloudpipe-ui
       alb.ingress.kubernetes.io/scheme: internal
       alb.ingress.kubernetes.io/security-groups: cloudpipe-ui-alb-sg
@@ -100,8 +81,6 @@ grafana:
       alb.ingress.kubernetes.io/ssl-redirect: "443"
       alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-Res-2021-06
       alb.ingress.kubernetes.io/load-balancer-attributes: access_logs.s3.enabled=true,access_logs.s3.bucket=cloudpipe-logging-access,access_logs.s3.prefix=alb-ui,idle_timeout.timeout_seconds=4000,deletion_protection.enabled=true
-    hosts:
-      - grafana.<YOUR_DOMAIN>
     path: /
     pathType: Prefix
 
@@ -151,7 +130,7 @@ grafana:
       maxUnavailable: 1
 
   # ---------------------------------------------------------------------------
-  # Local admin account — the Terraform-managed secret (terraform/grafana.tf),
+  # Local admin account — the Terraform-managed secret (terraform/modules/stack/grafana.tf),
   # NOT the chart's own. Left to itself the chart generates a fresh random
   # adminPassword on every render, and the Deployment's checksum/secret
   # annotation turns that into a new rollout on every sync. Pointing at a stable
@@ -166,7 +145,7 @@ grafana:
   # ---------------------------------------------------------------------------
   # SSO env bridge — values injected from Terraform-managed objects so the
   # domain/admin email are single-sourced from var.domain / var.admin_netid
-  # (see terraform/grafana.tf) rather than hardcoded here. Grafana expands
+  # (see terraform/modules/stack/grafana.tf) rather than hardcoded here. Grafana expands
   # these with $__env{...} inside grafana.ini below.
   # ---------------------------------------------------------------------------
   envValueFrom:
@@ -205,7 +184,7 @@ grafana:
   # 1 GiB per 8 GiB of limit, leaving the rest to Chromium.
   #
   # The chart's NetworkPolicy is not enforced (VPC CNI network policy is off),
-  # so the shared token (terraform/grafana.tf) is the actual access control.
+  # so the shared token (terraform/modules/stack/grafana.tf) is the actual access control.
   # ---------------------------------------------------------------------------
   imageRenderer:
     enabled: true
@@ -249,7 +228,13 @@ grafana:
       disable_login_form: false
     # SSO via the ArgoCD-bundled Dex (UW-Madison NetID upstream). Endpoints are
     # Dex's OIDC routes under the argocd host; the admin NetID gets the Admin
-    # role, everyone else in <YOUR_INSTITUTION_DOMAIN> gets Viewer.
+    # role, everyone else in the institution's email domain gets Viewer.
+    #
+    # allowed_domains is that domain, and it comes from var.institution_domain
+    # through local.argocd_app_overrides (terraform/modules/stack/argocd.tf) rather than from
+    # here. Grafana's own default is no domain restriction at all, so with
+    # allow_sign_up below this value going missing widens access instead of
+    # breaking anything.
     auth.generic_oauth:
       enabled: true
       name: UW-Madison NetID
@@ -259,7 +244,6 @@ grafana:
       auth_url: https://argocd.$__env{DOMAIN}/api/dex/auth
       token_url: https://argocd.$__env{DOMAIN}/api/dex/token
       api_url: https://argocd.$__env{DOMAIN}/api/dex/userinfo
-      allowed_domains: <YOUR_INSTITUTION_DOMAIN>
       allow_sign_up: true
       email_attribute_path: email
       role_attribute_path: "email == '$__env{ADMIN_EMAIL}' && 'Admin' || 'Viewer'"

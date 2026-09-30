@@ -103,8 +103,8 @@ a Globus endpoint without the S3 add-on, stage the data yourself and use
 
 | Path | Use when | Needs Globus subscription? | Status |
 |---|---|---|---|
-| **Globus** (`ingress-mode: globus`, the default) | You are pulling from the DAIRC MMPS collection and have cleared every gate in [globus-prerequisites.md](globus-prerequisites.md) | Yes — High Assurance tier | Production |
-| **Pre-staged S3** (`ingress-mode: presynced`) | You obtained the data another way (NDA download tool, an institutional copy, a collaborator's bucket, or a Globus endpoint without the S3 add-on) and put it in the bucket yourself | No | Supported — see below |
+| **Globus** (`ingress-mode: globus`, the default) | You are pulling from the NIH Brain Development Cohorts (NBDC) Data Hub collection and have cleared every gate in [globus-prerequisites.md](globus-prerequisites.md) | Yes — High Assurance tier | Production |
+| **Pre-staged S3** (`ingress-mode: presynced`) | You obtained the data another way (an NBDC Data Hub download, an institutional copy, a collaborator's bucket, or a Globus endpoint without the S3 add-on) and put it in the bucket yourself | No | Supported — see below |
 
 ### Pre-staging without Globus (`ingress-mode=presynced`)
 
@@ -123,7 +123,7 @@ defaults, so Argo rejects a submission that omits them — pass them empty:
 
 ```bash
 argo submit --from workflowtemplate/cloudpipe -n argo-workflows \
-  -p subjID=sub-NDARXXXXXXXX \
+  -p subjID=sub-XXXXXXXX \
   -p ingress-mode=presynced \
   -p globus-source-collection-id= -p globus-source-base-path= \
   -p globus-dest-collection-id= -p globus-dest-base-path= \
@@ -157,7 +157,7 @@ validator runs one subject at a time:
 
 ```bash
 BUCKET=<your-bucket>
-SUBJ=sub-NDARXXXXXXXX
+SUBJ=sub-XXXXXXXX
 
 # Sessions present?
 aws s3 ls "s3://${BUCKET}/mmps_mproc/${SUBJ}/"
@@ -184,10 +184,10 @@ In `presynced` mode the validator warns about it; in `globus` mode nothing does.
 ## Why the pipeline uses Globus at all
 
 Globus is not a convenience here. The ABCD minimally preprocessed data is
-distributed by the DAIRC through a Globus **High Assurance** collection, and
+distributed by the NBDC Data Hub through a Globus **High Assurance** collection, and
 Globus requires *both* sides of a transfer to be HA
 ([ADR 010](decisions/010-globus-ha-subscription.md)). For a deployment pulling
-directly from DAIRC, there is no non-Globus alternative — the constraint comes
+directly from the NBDC Data Hub, there is no non-Globus alternative — the constraint comes
 from the data provider, not from CloudPipe.
 
 What *is* CloudPipe's choice is writing straight to S3 through the GCS native S3

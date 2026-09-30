@@ -5,7 +5,7 @@
 # `fireants` wheel is published — so it must be compiled from the git tag matching
 # the installed wheel, which needs `nvcc` and therefore a `-devel` base. Building
 # in-place would add ~2-3 GB to an image that is baked into the GPU node AMI
-# (`fireants_ami_tag`, terraform/karpenter.tf), so the compiler stage is discarded
+# (`fireants_ami_tag`, terraform/modules/stack/karpenter.tf), so the compiler stage is discarded
 # and only the built wheel is carried forward.
 #
 # See handoffs/fireants-fused-ops.md for the measured baseline this must be

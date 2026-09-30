@@ -64,7 +64,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:6df3d28acabb21cbde45ca04806bc5e9f50c3a770fb73eb60186d9c2e79247a5"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:810f9def148557b03c2aef5a668eff203ece4e733a25dab7392f61db866abb1f"
       imagePullPolicy: IfNotPresent
 
       resources:

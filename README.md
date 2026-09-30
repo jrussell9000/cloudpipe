@@ -152,7 +152,7 @@ obtain your own licence file, which the workflow templates expect to be supplied
 original terms; check each tool's licence before redistributing an image.
 
 The ABCD data itself is not covered by any licence here. It is obtained separately through the
-NIMH Data Archive under its own data use agreement.
+NIH Brain Development Cohorts (NBDC) Data Hub under its own data use agreement.
 
 ---
 

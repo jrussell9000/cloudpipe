@@ -7,7 +7,7 @@ Runs as an Argo onExit template in a python+boto3 container.
 Usage:
   python exit_handler.py \
     --workflow-name cloudpipe-abc123 \
-    --subject sub-NDARABC123 \
+    --subject sub-XXXXXXXX \
     --status Succeeded \
     --started-at 2026-05-24T08:00:00Z \
     --duration-s 23400 \

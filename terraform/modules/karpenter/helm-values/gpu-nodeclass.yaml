@@ -43,7 +43,7 @@ spec:
   #
   # gp3 bills only ABOVE 3000 IOPS and 125 MB/s, so each node was paying
   # 13000 x $0.005 + 875 x $0.040 = ~$100/month-equivalent for headroom nothing
-  # asked for. Measured 2026-09-01..09-07 (one 5-day batch), <YOUR_AWS_REGION>:
+  # asked for. Measured 2026-09-01..09-07 (one 5-day batch), in the deployment region:
   #   EBS:VolumeP-IOPS.gp3        $315.81
   #   EBS:VolumeP-Throughput.gp3  $170.05
   # It tracked the batch exactly — $3.23/day at rest, $170.72 on the peak day.

@@ -2,9 +2,55 @@
 
 All infrastructure lives in `terraform/`. Run all Terraform commands from within that directory — never use `-chdir=terraform`.
 
+## Root and stack module
+
+The root is **only** what a module may not contain: the S3 backend, the provider configurations, the variable declarations `terraform.tfvars` binds to, and the `moved` blocks recording the extraction. Everything this project manages is in `terraform/modules/stack/`, called once from `terraform/main.tf`.
+
+| Root file | Why it cannot move into the module |
+|---|---|
+| `versions.tf` | A module declares no `backend`. |
+| `providers.tf` | A module configures no provider. What is left here is only what a `provider` block needs before any module runs — the cluster endpoint and the ECR Public token. Every other data source moved with the resources that read it. |
+| `variables.tf` | The declarations `terraform.tfvars` binds to. The module declares the same 51 names; `main.tf` passes each one through, which `tests/test_stack_module_extraction.py` checks in both directions. |
+| `main.tf` | The `module "stack"` call. Aliased providers (`aws.us_east_1`, `aws.billing`) are passed explicitly — Terraform hands a module its default provider configurations automatically but never an aliased one. |
+| `outputs.tf` | An output of a child module is not an output of the root, so each one is re-exported under the same name. |
+| `moved_to_stack.tf` | `moved` blocks may only be written in the *calling* module. **Keep them.** They are a permanent record: deleting them makes any state that has not been migrated — another deployment's, a restored backup — plan a destroy and recreate. |
+| `abcd_v7_metrics_retire.tf` | A history file, kept in the root by design; it reads one variable and nothing else. |
+
+Why one module rather than several: Terraform can move addresses into a child module only through `moved` blocks in the caller, so a partial extraction leaves cross-referencing resources split across two modules for no safety gain. See design D4 of `openspec/changes/public-upstream-readiness`.
+
+### The example root
+
+`terraform/modules/stack/example/` is a second, minimal root that calls the same module: `main.tf`, `terraform.tfvars.example`, a README and a copy of the root's `.terraform.lock.hcl`. It is what an outside deployment starts from, and it has to live *under* `terraform/modules` because that — not `terraform/` — is what the sync publishes. It is not deployed by anything; nothing in it is production configuration.
+
+CI runs `terraform init -backend=false -lockfile=readonly && terraform validate` in it, next to the same two steps for the real root. That is the guard against the module's interface moving without the example following it: an input that loses its default, a renamed output, a new provider alias. `tests/test_stack_example_root.py` covers what validate cannot see — a required input the example never declares is a *prompt*, not an error, until `-input=false`.
+
+Its lock file is a byte-for-byte copy of the root's, asserted by that test. After a provider upgrade, copy the root's lock over the example's in the same commit, or CI's `-lockfile=readonly` init fails there.
+
+### Variables that must be set
+
+**Twenty-one** variables have **no default**, because a default is one deployment's value handed to everyone who does not set it — and nothing errors. A fork inheriting `domain` publishes services under a domain it does not own; one inheriting `github_oidc_allowed_subs` trusts this repository's workflows to assume its roles. Without a default, Terraform prompts, or fails under `-input=false` naming the variable.
+
+Fifteen of the twenty-one are the ones task 4.5 stripped defaults from; the other six — `admin_netid`, `globus_client_id`, `globus_org_name`, `globus_contact_email`, `globus_owner_email`, `globus_identity_domain` — never had one. The list below is the fifteen, because they are the ones whose defaults were a claim about who is deploying. Both `terraform.tfvars.example` files are checked against the full twenty-one, derived from `variables.tf` rather than listed, so a twenty-second is covered without anyone editing a test.
+
+| Group | Variables |
+|---|---|
+| Identity | `domain`, `institution_domain`, `institution_oidc_issuer` |
+| AWS | `region`, `cloudflare_account_id`, `globus_admin_prefix_list_id`, `uwmadison_prefix_list_id` |
+| Source control | `github_user_url`, `github_repo`, `gitops_repo_url`, `github_oidc_allowed_subs` |
+| Data | `globus_s3_destination_bucket`, `globus_source_collection_id` |
+| Cloudflare Zero Trust | `cloudflare_team_domain`, `cloudflare_team_name` |
+
+All fifteen are in `terraform/terraform.tfvars.example` with placeholder values, and all but `cloudflare_team_name` carry a `validation` block — Cloudflare generates that name, so there is no shape to check. `tests/test_terraform_required_variables.py` keeps the three facts aligned: no default, a validation block, and a line in the example file.
+
+Two placeholders in the example root's `terraform.tfvars.example` are deliberately **not** well-formed. `globus_source_collection_id` and `globus_client_id` are UUIDs, that file is published, and the publish gate fails on any 8-4-4-4-12 hex string — a valid-looking placeholder is indistinguishable from a real collection identifier both to the gate and to a reader. Terraform's `validation` rejects them until they are replaced, which is the intended failure.
+
+Everything else keeps its default on purpose. `prefect_namespace` and `vpc_cidr` are sane starting values, not claims about who is deploying.
+
 ---
 
 ## Terraform file map
+
+Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 
 | File / directory | Manages |
 |---|---|
@@ -21,7 +67,6 @@ All infrastructure lives in `terraform/`. Run all Terraform commands from within
 | `finops.tf` | Kubecost + Athena CUR module |
 | `metrics.tf` | Pipeline observability module (Glue database + hand-declared catalog tables, Athena workgroup, Grafana Pod Identity) |
 | `metrics_bucket.tf` | The `cloudpipe-metrics` bucket (versioned) that holds all QC/cost records |
-| `abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix |
 | `grafana.tf` | Grafana's Terraform-owned Secrets (Dex SSO client, local admin, image-renderer token) + OIDC ConfigMap. The release itself, its Ingress and the image renderer are GitOps (`gitops/apps/grafana/`) |
 | `logging.tf` | S3 log bucket, CloudTrail |
 | `dns.tf` | Route53 zone lookup, ACM certificates (us-east-1 + <YOUR_AWS_REGION>) |
@@ -29,16 +74,19 @@ All infrastructure lives in `terraform/`. Run all Terraform commands from within
 | `s3_lifecycle.tf` | S3 lifecycle rules for data bucket |
 | `kube-system-network-policy.tf` | Default-deny/allow network policies in `kube-system` |
 | `locals.tf` | Derived locals — service URLs, VPC DNS resolver |
-| `variables.tf` | All input variables with defaults |
-| `versions.tf` + `providers.tf` | Provider pins, AWS provider aliases, S3 backend config |
-| `modules/` | Reusable sub-modules (see module reference below) |
+| `variables.tf` | All input variables with defaults (the root declares the same names and passes them in) |
+| `data.tf` | The account/partition/AZ lookups the stack's resources read; it was the root's "common data" block |
+| `example/` | A minimal root that calls this module, for an outside deployment to copy. Validated by CI, deployed by nothing — see [The example root](#the-example-root) |
+| `../<name>/` | Reusable sub-modules, siblings of `stack/` (see module reference below) |
+| `terraform/versions.tf` + `terraform/providers.tf` | Provider pins, AWS provider aliases, S3 backend config — in the root, see above |
+| `terraform/abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix — in the root |
 | `bootstrap/` | Separate Terraform root that creates the `cloudpipe-terraform-state` S3 bucket itself — its own local backend, not part of the main stack's state. Rarely touched; see [ADR 015](decisions/015-s3-backend-after-state-loss.md). |
 
 ---
 
 ## State management
 
-Terraform state lives in the `cloudpipe-terraform-state` S3 bucket (versioned, SSE-encrypted, public access blocked), configured via the `backend "s3"` block in `versions.tf` with native state locking (`use_lockfile = true`, requires Terraform >= 1.10). This bucket is itself managed by a separate, small Terraform config in `terraform/bootstrap/` — deliberately kept off the main stack's backend to avoid a chicken-and-egg dependency.
+Terraform state lives in the `cloudpipe-terraform-state` S3 bucket (versioned, SSE-encrypted, public access blocked), configured via the `backend "s3"` block in the root's `versions.tf` with native state locking (`use_lockfile = true`, requires Terraform >= 1.10). This bucket is itself managed by a separate, small Terraform config in `terraform/bootstrap/` — deliberately kept off the main stack's backend to avoid a chicken-and-egg dependency.
 
 This replaced a local-only backend (no remote state at all) after a 2026-07 incident where the machine holding the only state file was lost, requiring a full `terraform import` recovery of the entire stack. See [ADR 015](decisions/015-s3-backend-after-state-loss.md) for the incident writeup, what was recovered, two pieces of pre-existing infrastructure drift it surfaced (Globus AMI pinning, Karpenter `expireAfter`), and a list of diffs that are now permanent/expected rather than bugs.
 
@@ -125,7 +173,7 @@ even three-way split will under-provision.
 The EKS API (no public endpoint in steady state) and all five web UIs are **private**: nothing is reachable from the internet. Operators connect the Cloudflare WARP client, enrolled with a UW-Madison NetID login (MFA required), before using `kubectl`, `argo`, the web UIs, `prefect deploy`, or the Kubecost scripts. See [ADR 014](decisions/014-cloudflare-tunnel-over-vpn.md) and plans 010/012.
 
 - **Path:** WARP → Cloudflare Gateway → tunnel `cloudpipe-eks` → `cloudflared` (two replicas, `gitops/apps/cloudflared/`) → the three private `/20`s, which the tunnel routes.
-- **Who:** one Access application, `private_services` (`terraform/cloudflare.tf`), covers TCP 443 and 80 on those subnets, gated by the `cluster_admins` policy. Adding a person there grants both `kubectl` reachability and the UIs; each UI still logs in separately through Dex.
+- **Who:** one Access application, `private_services` (`terraform/modules/stack/cloudflare.tf`), covers TCP 443 and 80 on those subnets, gated by the `cluster_admins` policy. Adding a person there grants both `kubectl` reachability and the UIs; each UI still logs in separately through Dex.
 - **Which traffic:** the device profile's split tunnel is in **Include** mode for `var.vpc_cidr` only; everything else stays on the local network.
 - **Session:** the WARP identity lasts 24h. When it lapses, `kubectl` shows a *TLS handshake timeout* → `warp-cli debug access-reauth`.
 - **Web UIs:** served by one internal ALB — see [DNS and TLS](#dns-and-tls).
@@ -163,7 +211,7 @@ AWS Client VPN predates WARP and still works as a fallback: it source-NATs clien
 | `metrics-server` | Runs on `backend` node group |
 | `eks-pod-identity-agent` | Installed `before_compute` so Pod Identity works from first node join |
 
-`amazon-cloudwatch-observability` was **removed on 2026-09-08**. Container logs and Application Signals were already disabled, so ContainerInsights metrics were the addon's only remaining output — and nothing consumed them (0 CloudWatch alarms account-wide, no Grafana CloudWatch datasource, no reference to the namespace in this repo). Basic mode bills per unique metric, which is unbounded in pod count, so ephemeral Argo pods drove it to **$732 over the 2026-09-01..09-07 batch**. Cluster metrics come from Prometheus → Grafana. See the `addons` block in `terraform/eks.tf`.
+`amazon-cloudwatch-observability` was **removed on 2026-09-08**. Container logs and Application Signals were already disabled, so ContainerInsights metrics were the addon's only remaining output — and nothing consumed them (0 CloudWatch alarms account-wide, no Grafana CloudWatch datasource, no reference to the namespace in this repo). Basic mode bills per unique metric, which is unbounded in pod count, so ephemeral Argo pods drove it to **$732 over the 2026-09-01..09-07 batch**. Cluster metrics come from Prometheus → Grafana. See the `addons` block in `terraform/modules/stack/eks.tf`.
 
 ### Managed node groups (always-on, fixed size)
 
@@ -333,12 +381,12 @@ External DNS (running in `external-dns` namespace, managed by ArgoCD) automatica
 
 All five hostnames are aliases for **one `internal` ALB**, shared through the AWS Load Balancer Controller IngressGroup `cloudpipe-ui` ([#360](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/360), plan 012). Each UI keeps its own Ingress (host rule, backend, health check); the ALB-level settings are shared.
 
-- **Group-level annotations must be byte-identical on every member**, or the controller stops reconciling the *whole* ALB. Four members are Terraform (`argocd.tf` and the `argo-workflows`, `prefect`, `finops` modules), which all merge `local.ui_alb_group_annotations` from `terraform/ui_alb.tf`. Grafana's Ingress is GitOps-managed (`gitops/apps/grafana/values.yaml`) and hardcodes the same values; a precondition on the ArgoCD Ingress **fails `terraform plan`** if they differ, so change both together.
+- **Group-level annotations must be byte-identical on every member**, or the controller stops reconciling the *whole* ALB. Four members are Terraform (`argocd.tf` and the `argo-workflows`, `prefect`, `finops` modules), which all merge `local.ui_alb_group_annotations` from `terraform/modules/stack/ui_alb.tf`. Grafana's Ingress is GitOps-managed (`gitops/apps/grafana/values.yaml`) and repeats the same values; a precondition on the ArgoCD Ingress **fails `terraform plan`** if they differ, so change both together. That precondition reads `values.yaml` merged under Grafana's entry in `local.argocd_app_overrides`, because the hostname annotation comes from Terraform now and either source can carry an annotation — reading the file alone would let the `wafv2-acl-arn` check pass on an Ingress that does set the key.
 - **Security group** `cloudpipe-ui-alb-sg` (`ui_alb.tf`) admits 443/80 from `var.vpc_cidr` only. Members reference it by its Name tag, because Grafana's values cannot take a Terraform ID.
 - **DNS:** the records live in the public zone and resolve to the ALB's private IPs, both from the internet and from a WARP client — no split-horizon zone. In-cluster callers (Argo Workflows, Prefect and Grafana reaching Dex at `argocd.<domain>`) resolve the same way and reach the ALB directly inside the VPC.
 - **Access logs:** one prefix, `alb-ui/`, in `cloudpipe-logging-access`. Filter per UI on each log line's `domain_name` field.
 - **Deletion protection** is on, via `deletion_protection.enabled=true` in the shared `load-balancer-attributes` (Security Hub control **ELB.6**). The controller can no longer delete the ALB, which changes teardown — see below.
-- **WAF:** the regional WAFv2 web ACL `cloudpipe-ui-alb` (`terraform/waf.tf`, Security Hub control **ELB.16**) is associated by the `wafv2-acl-arn` annotation on the **ArgoCD Ingress alone** — it is the one group-level setting the other four members do not repeat, because the ARN is Terraform-generated and Grafana's values cannot hardcode it. **Both managed rule groups block.** Known Bad Inputs was verified live 2026-09-23, a Log4j JNDI canary returns 403; the Core rule set was promoted out of Count on 2026-09-24 and verified the same way, an XSS canary on `/waf-canary-core` returning 403 where the same path without the payload still returns 404. Four Core rules stay at Count **permanently** — `SizeRestrictions_BODY`, `SizeRestrictions_QUERYSTRING`, `CrossSiteScripting_BODY` and `GenericRFI_BODY` — because normal admin-UI use trips them: Grafana panel queries POST whole dashboard JSON, which runs past WAF's 8 KB body-inspection cap. Check for them in the API response as `RuleActionOverrides`, not just for the group-level override, since an ACL that reads as promoted while those four have been flattened would 403 every dashboard load. Only BLOCK and COUNT records are logged, to `aws-waf-logs-cloudpipe-ui`, with the `authorization` and `cookie` headers redacted. Because plain allows are not logged, **an empty log group does not mean a clean review** — it is equally consistent with broken delivery, so the promotion procedure in `terraform/waf.tf` starts by sending canaries to establish a positive control, and carries the reviewed Logs Insights query.
+- **WAF:** the regional WAFv2 web ACL `cloudpipe-ui-alb` (`terraform/modules/stack/waf.tf`, Security Hub control **ELB.16**) is associated by the `wafv2-acl-arn` annotation on the **ArgoCD Ingress alone** — it is the one group-level setting the other four members do not repeat, because the ARN is Terraform-generated and Grafana's values cannot hardcode it. **Both managed rule groups block.** Known Bad Inputs was verified live 2026-09-23, a Log4j JNDI canary returns 403; the Core rule set was promoted out of Count on 2026-09-24 and verified the same way, an XSS canary on `/waf-canary-core` returning 403 where the same path without the payload still returns 404. Four Core rules stay at Count **permanently** — `SizeRestrictions_BODY`, `SizeRestrictions_QUERYSTRING`, `CrossSiteScripting_BODY` and `GenericRFI_BODY` — because normal admin-UI use trips them: Grafana panel queries POST whole dashboard JSON, which runs past WAF's 8 KB body-inspection cap. Check for them in the API response as `RuleActionOverrides`, not just for the group-level override, since an ACL that reads as promoted while those four have been flattened would 403 every dashboard load. Only BLOCK and COUNT records are logged, to `aws-waf-logs-cloudpipe-ui`, with the `authorization` and `cookie` headers redacted. Because plain allows are not logged, **an empty log group does not mean a clean review** — it is equally consistent with broken delivery, so the promotion procedure in `terraform/modules/stack/waf.tf` starts by sending canaries to establish a positive control, and carries the reviewed Logs Insights query.
 - **Teardown:** the ALB is deleted only once every member Ingress is gone. `terraform/cleanup.sh` stops the ArgoCD controllers first so the Grafana Ingress is not recreated, deletes the Ingresses, then clears deletion protection on each pass of its wait loop before checking the `ingress.k8s.aws/stack=cloudpipe-ui` tag. Clearing protection has to happen *after* the Ingresses are deleted: while the group is non-empty the controller re-applies the attribute on every reconcile. Deleting the ALB by hand needs the same `modify-load-balancer-attributes` call first.
 
 ---
@@ -390,7 +438,7 @@ SSM parameters the workflows read:
 |---|---|
 | `/cloudpipe/globus/instance-id` | EC2 instance ID (Terraform) |
 | `/cloudpipe/globus/collection-id` | Destination collection UUID (recorded by `globus configure`; unchanged by instance replacement) |
-| `/cloudpipe/globus/source-collection-id` | Source collection UUID (DAIRC MMPS endpoint) |
+| `/cloudpipe/globus/source-collection-id` | Source collection UUID (NBDC Data Hub collection) |
 | `/cloudpipe/globus/source-base-path` | Root path on source collection |
 
 The full list, with what sets each one, is in

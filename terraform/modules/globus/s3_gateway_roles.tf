@@ -131,7 +131,7 @@ locals {
   #
   # Both forms are what GCS actually reports, read off the live endpoint on
   # 2026-09-27 rather than assumed: production (not cut over) answers
-  # `https://s3.<YOUR_AWS_REGION>.amazonaws.com` exactly, and staging answers
+  # `https://s3.<region>.amazonaws.com` exactly, and staging answers
   # `https://127.0.0.1:8443`. A declared value that differed by a trailing slash or
   # a null would put the reconcile in a loop proposing an update forever.
   #

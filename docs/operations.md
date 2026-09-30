@@ -1082,10 +1082,21 @@ So dropping a path from `SYNC_DIRS` is a **two-step** change: remove it there *a
 
 Names in `SYNC_FILES` that don't exist locally now log a `WARNING` instead of being skipped silently. That silent skip is why the public repo had **no front page for ~75 days**: `README.md` was correctly listed, the file simply didn't exist internally yet, and nothing reported it. Note also that `pixi.lock` must always travel with `pixi.toml` — publishing a current manifest beside a stale lockfile makes `pixi install` resolve to something nobody tested.
 
-**The sync fails closed.** After scrubbing, two gates run before anything is published; either one exiting non-zero aborts the sync (and, in CI, fails the job before the PR is opened):
+**Two kinds of scrub.** `REPLACEMENTS` is a fixed-string map — one entry per deployment literal — and it cannot express a value that is a *format* rather than a list. `REGEX_REPLACEMENTS` handles those with `sed -E`, running after the literal pass so a literal entry still wins where one exists. Both ABCD subject-ID forms are there, and every ID becomes its placeholder. The scrub loop bounds each pattern on the right, so a longer lookalike is left intact for the gate to reject instead of being half-rewritten into something that reads like a placeholder.
 
-1. **Pattern verifier** (in `sync-public.sh`): scans the staged tree for known-sensitive patterns — the AWS account ID, the institution domain, data-bucket names (`abcd-v*`), any Globus UUID, personal (`@gmail.com`) emails, ABCD subject IDs, and RDS instance endpoints (whether or not the region was scrubbed). A surviving match prints `file:line:match` and the fix hint, then exits 1. Exact matches listed in `VERIFY_ALLOWED_MATCHES` are placeholders and pass; today that is only the subject-ID placeholder `NDARINVXXXXXXXX`.
-2. **Secret scanner** (CI): `gitleaks detect --no-git` over the staged tree, as a backstop for keys/tokens/high-entropy strings the pattern list doesn't anticipate.
+Use `sub-XXXXXXXX` — and only that form — when writing an NBDC-form subject ID into a synced path. A placeholder of any other shape — a longer run of `X`s, or one carrying a prefix — fails the gate on its first 8 characters, because the verify pattern cannot tell a placeholder prefix from a real ID. This sentence is itself the demonstration: the first draft spelled such a placeholder out, and the sync refused to publish the paragraph.
+
+**The sync fails closed.** After scrubbing, three gates run before anything is published; any one exiting non-zero aborts the sync (and, in CI, fails the job before the PR is opened):
+
+1. **Content verifier** (in `sync-public.sh`): scans the staged tree's *contents* for known-sensitive patterns — the AWS account ID, the institution domain, data-bucket names (`abcd-v*`), any Globus UUID, personal (`@gmail.com`) emails, ABCD subject IDs in both the legacy `NDARINV…` and the current `sub-XXXXXXXX` form, and RDS instance endpoints (whether or not the region was scrubbed). A surviving match prints `file:line:match` and the fix hint, then exits 1. Exact matches listed in `VERIFY_ALLOWED_MATCHES` are placeholders and pass: the two subject-ID placeholders `NDARINVXXXXXXXX` and `sub-XXXXXXXX`.
+
+   Subject IDs are the one pattern the verifier cannot expect the scrub map to satisfy. `REPLACEMENTS` is fixed-string, one entry per value, which suits an account ID or a collection UUID but not a family of 11,834 ids that a pasted log excerpt may introduce at any time. They are handled by `REGEX_REPLACEMENTS`, an extended-regex pass that runs after the literal one and rewrites the whole family to its placeholder. **The internal repo is expected to contain real subject IDs** — it is private and covered by the DUA, and the docs are more useful with real examples. The gate's job is to guarantee none of them reach the mirror, not to keep them out of here.
+2. **Filename verifier** (in `sync-public.sh`): the same patterns, against every staged *path*. The content scan cannot cover this — it skips images and archives entirely, and no scrub can rewrite a filename. That is how nine brain montages named after real subjects stayed published for weeks with every content check green. Subject-named files are excluded from the sync outright (`--exclude="sub-*"`); this gate is the backstop for a naming form the excludes don't know about, and it fails rather than silently dropping a file someone meant to publish.
+3. **Secret scanner** (CI): `gitleaks detect --no-git` over the staged tree, as a backstop for keys/tokens/high-entropy strings the pattern list doesn't anticipate.
+
+**A new exclude also needs `--delete-excluded`.** rsync *protects* an excluded path in the destination, so `--exclude` alone stops future copies while guaranteeing that anything already published stays published. The rsync call passes both flags for that reason. Adding an exclude is therefore retroactive — check what the next sync deletes.
+
+**A verify pattern that cannot match is indistinguishable from one that works.** Until 2026-09-29 the subject-ID rule only knew the legacy `NDARINV…` form, and no synced path holds a real ID in that form — every ID this repo cites is an NBDC one. The rule matched nothing, passed on every run, and 575 real subject IDs reached the public repo underneath a green gate. When adding a pattern, confirm it matches the form the repo actually uses, and keep the positive-control tests in `tests/test_sync_public_scrub.py` and `tests/test_sync_public_check_source.py` honest.
 
 **The published documentation site**
 
@@ -1127,6 +1138,20 @@ If you add a new hardcoded value (account ID, domain, email, bucket, UUID, etc.)
 3. If the value is genuinely sensitive (not just deployment-specific), also add a matching pattern to `VERIFY_PATTERNS` in the same script so the fail-closed gate catches future omissions.
 
 **A gate fired — what now?** The script names the offending `file:line`. Apply step 1 or 2 above for that value, then re-run. The public repo is not updated until both gates pass.
+
+**Counting literals at the source**
+
+The public repo is to become the upstream once no synced code path holds a deployment literal ([ADR 020](decisions/020-public-repo-as-upstream.md)). Progress toward that is measured before anything is scrubbed:
+
+```bash
+bash scripts/sync-public.sh --check-source
+```
+
+This scans the tracked files the sync would publish (the same `SYNC_DIRS`, `SYNC_FILES` and rsync excludes) for every `REPLACEMENTS` literal and every `VERIFY_PATTERNS` pattern. It prints a count per directory and pattern, and syncs nothing. The CI `checks` job runs it on every PR that touches a synced path.
+
+It fails only for a directory listed in `ZERO_LITERAL_DIRS`, in the same script. That list is a ratchet: when a change removes a directory's last literal, add the directory to the list in the same change, and from then on any new literal there fails CI with its `file:line:match`. `docs/` is never added; its prose stays under the scrub until the docs are sorted into public and private.
+
+`gitops` is the first directory on the list. Every deployment value under it now comes from Terraform — the apps read `local.argocd_app_overrides` through the ApplicationSet's `templatePatch`, and the two bootstrap objects are rendered from `gitops/bootstrap/*.tftpl` — so a literal appearing there again means a value has acquired a second source, which is the thing [ADR 020](decisions/020-public-repo-as-upstream.md) removes. Adding a hostname, region or account ID to a chart's `values.yaml` now fails CI; put it in the override map instead (see "Per-app Helm overrides" in [gitops.md](gitops.md#per-app-helm-overrides)).
 
 ---
 

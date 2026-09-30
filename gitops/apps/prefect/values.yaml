@@ -18,10 +18,12 @@ prefect-server:
     name: prefect-db-credentials
 
   server:
-    uiConfig:
-      # Public URL the browser uses to reach the API — must match the ALB hostname.
-      prefectUiApiUrl: "https://prefect.<YOUR_DOMAIN>/api"
-
+    # `uiConfig.prefectUiApiUrl` is NOT set here. It is the public URL the browser
+    # uses to reach the API, so it has to be this deployment's ALB hostname:
+    # Terraform supplies it from local.prefect_url through the root ApplicationSet
+    # (local.argocd_app_overrides in terraform/modules/stack/argocd.tf). The chart's default is
+    # http://localhost:4200/api, which renders fine and fails only in the browser.
+    # See "Per-app Helm overrides" in docs/gitops.md.
     env:
       # Disable telemetry — ABCD data, keep metadata on-premises.
       - name: PREFECT_SERVER_ANALYTICS_ENABLED
@@ -135,15 +137,22 @@ oauth2-proxy:
 
   config:
     existingSecret: prefect-oauth2-proxy
-    emailDomains:
-      - "<YOUR_INSTITUTION_DOMAIN>"
+    # `emailDomains` is NOT set here — Terraform supplies it from
+    # var.institution_domain through the root ApplicationSet. Note the chart's
+    # own default is ["*"], so this is the one value in this file whose absence
+    # WIDENS access instead of breaking something: with no override, every
+    # identity Dex will issue a token for gets in, and the pod goes Healthy.
     upstreams:
       - "http://prefect-server:4200"
 
   extraArgs:
     provider: oidc
-    oidc-issuer-url: "https://argocd.<YOUR_DOMAIN>/api/dex"
-    redirect-url: "https://prefect.<YOUR_DOMAIN>/oauth2/callback"
+    # `oidc-issuer-url` and `redirect-url` are NOT set here. Both are
+    # deployment-specific hostnames, and the redirect has to agree with the
+    # `prefect` Dex static client registered in terraform/modules/stack/argocd.tf — so the
+    # same file owns both halves. The issuer is ArgoCD's hostname because Dex
+    # runs inside ArgoCD. Neither shows up in a manifest diff when wrong: they
+    # render, sync and then fail at sign-in.
     scope: "openid profile email"
     cookie-secure: "true"
     skip-provider-button: "true"

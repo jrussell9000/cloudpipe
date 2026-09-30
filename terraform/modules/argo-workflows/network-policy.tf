@@ -24,7 +24,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_default_deny" {
 # Pods resolve names through the kube-dns ClusterIP (172.20.0.10), which lives
 # in the EKS service CIDR — not the VPC CIDR and not selectable by namespace.
 # A namespace_selector only matches pod IPs and silently breaks external DNS
-# lookups (e.g. ssm.<YOUR_AWS_REGION>.amazonaws.com). Allowing port 53 to any
+# lookups (e.g. ssm.<region>.amazonaws.com). Allowing port 53 to any
 # destination is safe; the dedicated port is restriction enough.
 resource "kubernetes_network_policy_v1" "argo_workflows_egress_dns" {
   metadata {

@@ -31,7 +31,7 @@ for a `dt` genuinely has zero rows there, and its compacted partition is
 overwritten in place with a zero-row Parquet of its own schema. That is a
 PutObject, not a DeleteObject — the orphan key survives as a harmless empty
 file, so the "nothing may delete from the run-of-record bucket" stance in
-terraform/metrics_bucket.tf is preserved and no new IAM grant is needed.
+terraform/modules/stack/metrics_bucket.tf is preserved and no new IAM grant is needed.
 
 Repair is deliberately skipped whenever the evidence for it is incomplete
 (any unreadable raw key, or a `dt` with no raw keys at all) — leaving a

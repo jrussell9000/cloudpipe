@@ -180,7 +180,7 @@ Parameters (all read from `cloudpipe-config` ConfigMap by default):
 | `subjID` | — | Subject ID (required) |
 | `bucket` | from ConfigMap | S3 data bucket (inputs and derivatives) |
 | `metrics-bucket` | from ConfigMap | Separate versioned QC-metrics bucket (`cloudpipe-metrics`). Distinct from `bucket` so metrics survive a derivative flush — see [observability.md](observability.md). |
-| `ecr-registry` | from ConfigMap | Container registry prefix. Now the **private** ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com`) — set from `local.ecr_registry` in `terraform/argowf.tf`. ECR Public remains a dual-push secondary kept for rollback for most images; it is no longer what workflows pull from, and its repos are being retired image by image (`fmri-first-level-proc` already is). |
+| `ecr-registry` | from ConfigMap | Container registry prefix. Now the **private** ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com`) — set from `local.ecr_registry` in `terraform/modules/stack/argowf.tf`. ECR Public remains a dual-push secondary kept for rollback for most images; it is no longer what workflows pull from, and its repos are being retired image by image (`fmri-first-level-proc` already is). |
 | `globus-source-collection-id` | — | Source Globus collection UUID |
 | `globus-source-base-path` | — | Root path on source collection |
 | `globus-dest-collection-id` | — | Destination GCS collection UUID |

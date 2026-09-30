@@ -1,0 +1,109 @@
+# ArgoCD root ApplicationSet — rendered by terraform/modules/stack/argocd.tf with templatefile().
+#
+# Two template languages share this file and never collide:
+#   $${ ... } Terraform, expanded once when the manifest is applied
+#   {{ ... }} ArgoCD's Go template, expanded per generated Application
+# (the doubled dollar sign above is how a Terraform template escapes its own
+# delimiter — it renders as a single one)
+#
+# Terraform owns this object, so pushing a change here does nothing until
+# `terraform apply` runs. See "Ownership boundary" in docs/gitops.md.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-addons
+  namespace: argocd
+spec:
+  # goTemplate changes how generator parameters are referenced: `{{path.basename}}`
+  # becomes `{{.path.basename}}`, and `{{path}}` becomes `{{.path.path}}` — under
+  # goTemplate the git generator's `path` parameter is an object, not a string.
+  # It is required by templatePatch below.
+  #
+  # missingkey=error makes a mistyped reference fail generation. Without it a bad
+  # reference renders as an empty string, and an empty metadata.name would take
+  # the Application out of the set — which, with prune, deletes its resources.
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: ${repo_url}
+        revision: ${revision}
+        directories:
+          - path: gitops/apps/*
+  template:
+    metadata:
+      name: '{{.path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: ${repo_url}
+        # The generator scans `revision` and each Application tracks
+        # `targetRevision`. One Terraform variable feeds both: a generator reading
+        # one revision while the Applications sync another drifts silently.
+        targetRevision: ${revision}
+        path: '{{.path.path}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{.path.basename}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+  # Per-app Helm overrides, rendered by Terraform from its own inputs and module
+  # outputs so that each deployment value has a single source (design D2 of
+  # openspec/changes/public-upstream-readiness). The values themselves live in
+  # `local.argocd_app_overrides` in terraform/modules/stack/argocd.tf; this file only decides
+  # which app receives which entry.
+  #
+  # This is one if/else chain rather than one block per app on purpose: every
+  # branch sets `spec`, and two branches that both fired would put the key in the
+  # patch document twice.
+  #
+  # An override must never reach an app directory with no Chart.yaml: setting
+  # spec.source.helm on one makes ArgoCD render whatever it syncs as a Helm
+  # chart, with prune: true behind it. gitops/apps/pipelines was that app — a
+  # plain Application manifest pointing at the production WorkflowTemplates —
+  # and its object is rendered from workflow-templates.yaml.tftpl now, so no such
+  # directory is left; guarding each branch on `.path.basename` is what keeps the
+  # next one safe. See "Two traps if you do attempt broader parameterization" in
+  # docs/gitops.md.
+  #
+  # Apps with no branch here fall through to `spec: {}` — a strategic-merge patch
+  # of an empty object, which changes nothing.
+  templatePatch: |
+    {{- if eq .path.basename "external-dns" }}
+    spec:
+      source:
+        helm:
+          valuesObject:
+            ${indent(12, trimspace(yamlencode(app_overrides["external-dns"])))}
+    {{- else if eq .path.basename "aws-load-balancer-controller" }}
+    spec:
+      source:
+        helm:
+          valuesObject:
+            ${indent(12, trimspace(yamlencode(app_overrides["aws-load-balancer-controller"])))}
+    {{- else if eq .path.basename "cluster-config" }}
+    spec:
+      source:
+        helm:
+          valuesObject:
+            ${indent(12, trimspace(yamlencode(app_overrides["cluster-config"])))}
+    {{- else if eq .path.basename "prefect" }}
+    spec:
+      source:
+        helm:
+          valuesObject:
+            ${indent(12, trimspace(yamlencode(app_overrides["prefect"])))}
+    {{- else if eq .path.basename "grafana" }}
+    spec:
+      source:
+        helm:
+          valuesObject:
+            ${indent(12, trimspace(yamlencode(app_overrides["grafana"])))}
+    {{- else }}
+    spec: {}
+    {{- end }}

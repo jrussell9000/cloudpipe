@@ -32,7 +32,7 @@ variable "globus_ami_id" {
   description = <<-EOT
     AMI the Globus Connect Server instance boots. Built by
     `.github/workflows/build-globus-gcs-ami.yaml` from `packer/globus-gcs/`, which
-    opens a pull request bumping the pin in `terraform/globus.tf`.
+    opens a pull request bumping the pin in `terraform/modules/stack/globus.tf`.
 
     No default, and no AMI-name filter or `most_recent = true`: the instance must
     boot the image someone chose, and an id that resolves differently over time is

@@ -63,6 +63,6 @@ else
   # so say so once, plainly, in the console log a person actually reads.
   echo "ERROR: /usr/local/sbin/cloudpipe-gcs-boot is missing — this instance was" \
     "not launched from the AMI built by packer/globus-gcs/. It will never" \
-    "register as a Globus node. Check globus_ami_id in terraform/globus.tf."
+    "register as a Globus node. Check globus_ami_id in terraform/modules/stack/globus.tf."
   exit 1
 fi
