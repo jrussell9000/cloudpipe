@@ -20,7 +20,7 @@ marks the removal of `snr_gm`/`snr_wm`.
 Usage:
   python extract_qc.py \
     --subjects-dir /opt/freesurfer/subjects \
-    --subj sub-NDARABC123 \
+    --subj sub-XXXXXXXX \
     --ses ses-00A \
     --pipeline cloudpipe_minproc
 """

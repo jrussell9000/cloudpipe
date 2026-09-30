@@ -166,7 +166,7 @@ failed = b2t[b2t["nmi_gain"].astype(float) <= 0]
 # Full per-subject view: one row per BOLD run, with the subject's run-of-record
 # workflow status/duration/total_cost_usd attached. Those three are
 # workflow-grain and repeat on every run row — read one row, don't SUM them.
-summary = m.join_subject("sub-NDARABC123")
+summary = m.join_subject("sub-XXXXXXXX")
 ```
 
 > **Fixed — `compacted=True` used to fail for every table.** Two independent bugs

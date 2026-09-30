@@ -487,7 +487,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:303225d3838713cdb8ae998915ea30ec0a3b17f06ab8ed51268e5a1e68436946"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:78e95ce1263d98485c55eab70c8f36bf91f734cc83f210eda09abbd860a51e38"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

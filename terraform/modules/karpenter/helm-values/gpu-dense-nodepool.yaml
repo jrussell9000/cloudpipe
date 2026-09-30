@@ -103,5 +103,5 @@ spec:
         minValues: 2
       - key: "topology.kubernetes.io/zone"
         operator: In
-        values: ["<YOUR_AWS_REGION>a", "<YOUR_AWS_REGION>b", "<YOUR_AWS_REGION>c"]
+        values: ${zones_list}
         minValues: 2

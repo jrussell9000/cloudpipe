@@ -1,0 +1,12 @@
+# cluster-config wraps no upstream chart, so this file holds the chart's own
+# values rather than a subchart's.
+#
+# `region` is NOT set here. It differs between deployments, so Terraform supplies
+# it: the root ApplicationSet patches it in from local.argocd_app_overrides in
+# terraform/modules/stack/argocd.tf, and templates/cluster-secret-store.yaml reads it. Setting
+# it here would shadow nothing — the override wins — but it would put the value
+# in two places. See "Per-app Helm overrides" in docs/gitops.md.
+#
+# The template reads it through `required`, so if the override ever goes missing
+# this app goes Degraded rather than rendering an empty region that would stop
+# every ExternalSecret in the cluster from resolving.

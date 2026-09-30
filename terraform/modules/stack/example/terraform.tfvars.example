@@ -1,0 +1,141 @@
+# =============================================================================
+# CloudPipe — inputs a deployment must supply
+# =============================================================================
+# Copy to terraform.tfvars and replace every value. Each one below has no
+# default in the module on purpose: a default is one deployment's value handed
+# to everyone who does not set it, and nothing errors when that happens. A fork
+# that inherited `domain` would publish its services under a domain it does not
+# own and find out later, during ACM validation, against someone else's hosted
+# zone.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   $EDITOR terraform.tfvars
+#   terraform init && terraform validate
+#
+# Do NOT then run a bare `terraform apply` on an empty account: a fresh install
+# is phased, because the providers in main.tf look up a cluster that does not
+# exist yet. See "Bootstrap and install sequence" in
+# ../../../../docs/infrastructure.md.
+#
+# Most values are checked by a `validation` block in ../variables.tf, so a
+# malformed one fails at plan with a message naming it rather than at apply
+# against AWS. Two placeholders here are deliberately NOT well-formed — see the
+# Globus UUID note below.
+#
+# Every other input has a working default. To change one, add a `variable` block
+# to main.tf and pass it through; ../variables.tf is the full list.
+# =============================================================================
+
+
+# --- AWS ---------------------------------------------------------------------
+
+# Region for the cluster and almost everything else. ACM certificates for
+# CloudFront and the ECR Public token are always us-east-1 regardless of this,
+# which is why main.tf configures that as a separate provider alias.
+region = "us-west-2"
+
+# Name prefix for most AWS resources, and the EKS cluster name. This one HAS a
+# default ("cloudpipe") — it is here as the worked example of overriding a
+# defaulted input. Changing it after the first apply recreates a great deal.
+name = "cloudpipe"
+
+# AWS managed prefix list of the IP ranges allowed to reach the web UIs over
+# HTTPS (ArgoCD, Argo Workflows, Prefect, Kubecost, Grafana). An ID, not an ARN.
+# Create the prefix list in the VPC console with your institution's ranges.
+#
+# The name still says uwmadison; it is the reference deployment's and means
+# "the institution's ingress prefix list" here.
+uwmadison_prefix_list_id = "pl-0123456789abcdef0"
+
+
+# --- Identity ----------------------------------------------------------------
+
+# Where the services are published. Must match a Route53 hosted zone that
+# already exists in this account — every service URL is derived from it.
+domain = "example.org"
+
+# Who may sign in, which is a different question from where the services live.
+# Used by the SSO proxies and, with admin_netid below, to build the admin
+# address as <admin_netid>@<institution_domain>.
+institution_domain = "example.edu"
+
+# The institution's OIDC issuer — the upstream Cloudflare Access and Dex
+# authenticate against. The authorize/token/keyset endpoints are appended to it,
+# so it must be the issuer published at
+# <issuer>/.well-known/openid-configuration. No trailing slash.
+institution_oidc_issuer = "https://login.example.edu"
+
+# The one account allowed to enroll a WARP device and reach the cluster. A
+# username, not an address: the address is built from institution_domain.
+admin_netid = "example-admin"
+
+
+# --- Source control ----------------------------------------------------------
+
+# Repository whose GitHub Actions runs may assume the ECR push and Packer build
+# roles, in owner/repo form. Not necessarily the repository ArgoCD syncs.
+github_repo = "example-org/cloudpipe"
+
+# Repository ArgoCD reads gitops/apps/ from, and that every generated
+# Application tracks. Separate from github_repo on purpose: CI can run in one
+# repository while the cluster follows another.
+gitops_repo_url = "https://github.com/example-org/cloudpipe.git"
+
+# Owner prefix, used to scope the ArgoCD repository credential so it covers
+# every repository beneath it.
+github_user_url = "https://github.com/example-org"
+
+# Exact `token.actions.githubusercontent.com:sub` claims allowed to assume those
+# roles. StringLike is used, so `*` is a wildcard — keep these exact. A job that
+# sets a GitHub `environment:` mints repo:<repo>:environment:<name> instead and
+# would NOT match a ref-shaped entry.
+github_oidc_allowed_subs = ["repo:example-org/cloudpipe:ref:refs/heads/main"]
+
+
+# --- Cloudflare Zero Trust ---------------------------------------------------
+
+# Account that owns the Zero Trust organization: 32 hex characters, from the
+# dashboard URL.
+cloudflare_account_id = "0123456789abcdef0123456789abcdef"
+
+# The team domain, and the organization name Cloudflare generated for it. The
+# name is NOT derivable from the domain — read it back from the dashboard. A
+# wrong value is accepted and silently renames the organization.
+cloudflare_team_domain = "example-team.cloudflareaccess.com"
+cloudflare_team_name   = "example-team-0000.cloudflareaccess.com"
+
+
+# --- Globus ------------------------------------------------------------------
+# These do not have to be filled in by hand. Write the answers document
+# (../../../../docs/globus-setup.md, step 3.1) and run `pixi run globus init`:
+# it renders all but the bucket into a globus.auto.tfvars that Terraform loads
+# AFTER this file, so a value there wins over the same value here.
+
+# Bucket the Globus Connect Server reads from and writes to. Must already exist.
+globus_s3_destination_bucket = "example-neuroimaging-data"
+
+# The source (sending) collection, and the confidential service client that owns
+# the endpoint. Both are UUIDs, and both placeholders below are deliberately not
+# UUID-shaped: this file is published, and a well-formed UUID here would be
+# indistinguishable from a real collection identifier to the reader and to the
+# publish gate alike. Terraform rejects them until they are replaced, which is
+# the intended failure.
+globus_source_collection_id = "<source-collection-uuid>"
+globus_client_id            = "<service-client-uuid>"
+
+# Prefix list of IP ranges allowed SSH to the Globus EC2 instance. May be the
+# same list as uwmadison_prefix_list_id above, or a narrower sysadmin-only one.
+globus_admin_prefix_list_id = "pl-0123456789abcdef0"
+
+# Shown on the endpoint's public listing page.
+globus_org_name      = "Example University"
+globus_contact_email = "globus-admin@example.edu"
+
+# The person the institution contacts about the endpoint — typically an
+# institutional Globus administrator. Named in the subscription request
+# `globus bootstrap-endpoint` prints. NOT the endpoint owner, which is the
+# service client above.
+globus_owner_email = "globus-admins@example.edu"
+
+# Identity domain permitted to authenticate to the Globus storage gateway.
+globus_identity_domain = "example.edu"

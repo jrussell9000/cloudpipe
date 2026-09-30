@@ -5,7 +5,7 @@
 batch days) and scope the fix.
 **Related:** [2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md](2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md)
 (same Karpenter scale-up behavior that drives the spikes),
-`terraform/vpc.tf` (VPC flow logs + S3 gateway endpoint), `terraform/ecr.tf`.
+`terraform/modules/stack/vpc.tf` (VPC flow logs + S3 gateway endpoint), `terraform/modules/stack/ecr.tf`.
 
 ## 1. Summary
 
@@ -66,7 +66,7 @@ batch will be captured**, which will confirm the ECR-Public attribution directly
 
 - Workflow images are pulled from **ECR Public** (`public.ecr.aws/<alias>/cloudpipe/*`);
   the `ecr-registry` workflow parameter comes from the `cloudpipe-config` ConfigMap,
-  set from the Terraform `ecr_registry` output (`terraform/ecr.tf`).
+  set from the Terraform `ecr_registry` output (`terraform/modules/stack/ecr.tf`).
 - ECR Public is internet-facing (CloudFront-fronted) → pulls go through the NAT.
 - The **only** VPC endpoint is the S3 gateway. There is no ECR endpoint (and none
   exists for ECR *Public* regardless).
@@ -93,7 +93,7 @@ image-pull traffic drops to ~zero.
 
 Concrete changes:
 
-1. **`terraform/ecr.tf`** — add `aws_ecr_repository` (private, <YOUR_AWS_REGION>) for the
+1. **`terraform/modules/stack/ecr.tf`** — add `aws_ecr_repository` (private, <YOUR_AWS_REGION>) for the
    13 images currently in `local.ecr_images` (a private build-cache repo already
    exists as a pattern). Change the `ecr_registry` output to the private registry
    (`<acct>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/<prefix>`). Extend the GHA push role's
@@ -104,7 +104,7 @@ Concrete changes:
 3. **GHA variable `ECR_REGISTRY` / `cloudpipe-config` ConfigMap** — set to the
    private prefix. Workflow templates use `{{workflow.parameters.ecr-registry}}`
    and follow automatically.
-4. **`terraform/vpc.tf`** — add interface endpoints
+4. **`terraform/modules/stack/vpc.tf`** — add interface endpoints
    `com.amazonaws.<YOUR_AWS_REGION>.ecr.api` and `…ecr.dkr` (private DNS enabled, in the
    private subnets, SG allowing 443 from the VPC CIDR). This eliminates the
    residual ECR-API NAT traffic; the layer bytes already go via the S3 gateway.
@@ -115,7 +115,7 @@ Concrete changes:
 
 Not required:
 - **Node IAM** — the Karpenter/EKS node role already has
-  `AmazonEC2ContainerRegistryReadOnly` (`terraform/eks.tf:243,302`); private ECR
+  `AmazonEC2ContainerRegistryReadOnly` (`terraform/modules/stack/eks.tf:243,302`); private ECR
   pulls work without change.
 - **`alpine:3.21`** — the only hardcoded third-party public image (5 refs in the
   fastsurfer templates), ~3 MB, negligible NAT. Mirror to private ECR later for

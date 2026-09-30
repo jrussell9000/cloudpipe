@@ -128,6 +128,20 @@ placeholder `NDARINVXXXXXXXX` allowed. As of this ADR the synced paths hold only
 placeholder. Nothing has checked that, and outside contributors raise the risk under
 the ABCD data use agreement.
 
+**Corrected 2026-09-29.** The claim above was wrong, and the pattern was the reason it
+looked right. ABCD subject IDs no longer carry the `NDARINV` prefix — the current NBDC
+form is `sub-` and eight characters — so the pattern matched nothing, passed vacuously,
+and 117 real subject IDs across 57 synced files went to the mirror unflagged. The gate
+now carries both formats, and because a fixed-string `REPLACEMENTS` entry cannot cover
+a family of 11,834 ids, a `REGEX_REPLACEMENTS` pass scrubs them to the placeholder
+before the gate runs.
+
+That scrub is a bridge, not the end state. This section's premise still holds: once the
+public repo is upstream, nothing scrubs it, so the ids have to leave the source. The
+mechanism is already here — `ZERO_LITERAL_DIRS` turns a directory's count into a
+failure once it reaches zero — and the work is to clear `docs/`, `src/`, `scripts/`,
+`argo/` and `images/` and add them to it, one directory per change.
+
 ### 6. Releases are citable
 
 The public repo publishes semantic-versioned GitHub releases, archived to Zenodo so

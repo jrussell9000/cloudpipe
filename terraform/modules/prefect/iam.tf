@@ -34,7 +34,7 @@ data "aws_iam_policy_document" "worker" {
   #
   # PutObject/GetObject but NOT DeleteObject, matching the argo-workflows module:
   # the metrics bucket is the run of record, and nothing that flushes derivatives
-  # should be able to delete from it. See terraform/metrics_bucket.tf.
+  # should be able to delete from it. See terraform/modules/stack/metrics_bucket.tf.
   statement {
     sid       = "ListMetricsBucket"
     actions   = ["s3:ListBucket", "s3:GetBucketLocation"]

@@ -1,8 +1,8 @@
 # Docker Images
 
-Pipeline images live in a private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`). Most are still **dual-pushed** to ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`) as a secondary — a rollback target held over from the NAT-cost migration. The registry prefix actually used is set by Terraform (`local.ecr_registry` in `terraform/argowf.tf`) and passed as the `ecr-registry` parameter to every workflow.
+Pipeline images live in a private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`). Most are still **dual-pushed** to ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`) as a secondary — a rollback target held over from the NAT-cost migration. The registry prefix actually used is set by Terraform (`local.ecr_registry` in `terraform/modules/stack/argowf.tf`) and passed as the `ecr-registry` parameter to every workflow.
 
-**`fmri-first-level-proc` is private-only** as of 2026-08-17: its dual-push and its ECR Public repository are gone, so rollback for that one image would be a rebuild rather than a registry flip. Public repos are being retired image by image via `local.ecr_images_public_retired` in `terraform/ecr.tf` — see `handoffs/ecr-private-registry-migration.md` Step 6 (internal repo only).
+**`fmri-first-level-proc` is private-only** as of 2026-08-17: its dual-push and its ECR Public repository are gone, so rollback for that one image would be a rebuild rather than a registry flip. Public repos are being retired image by image via `local.ecr_images_public_retired` in `terraform/modules/stack/ecr.tf` — see `handoffs/ecr-private-registry-migration.md` Step 6 (internal repo only).
 
 ---
 
@@ -25,7 +25,7 @@ A `changes` job detects which image directories were modified and builds only th
 
 When a path outside an image's own directory changes — `images/shared/…`, `src/…` — every image whose Dockerfile `COPY`s **that file** is rebuilt too. Still self-maintaining: adding a `COPY` line to a Dockerfile automatically enrolls that image, because enrolment is derived from the `COPY` sources themselves. `prefect-flow-runner` also `COPY`s `src/metrics/` but is excluded here and rebuilt by its own workflow instead.
 
-Enrolment is **per file, not per directory** ([#260](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/260)). Five images `COPY` from `images/shared/`, but only two copy `registration_qc.py`; under the old directory rule an edit to it rebuilt all five. The wasted minutes were the smaller half of that: each spurious rebuild pushes `cache-to` and so resets the 30-day expiry on that image's ECR build-cache entry (`terraform/ecr.tf`), keeping `cache-from` warm and a broken dependency resolve unexecuted. That is precisely how [#255](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/255) stayed invisible for months — `fireANTs`' cache was last refreshed by an unrelated `registration_qc.py` change.
+Enrolment is **per file, not per directory** ([#260](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/260)). Five images `COPY` from `images/shared/`, but only two copy `registration_qc.py`; under the old directory rule an edit to it rebuilt all five. The wasted minutes were the smaller half of that: each spurious rebuild pushes `cache-to` and so resets the 30-day expiry on that image's ECR build-cache entry (`terraform/modules/stack/ecr.tf`), keeping `cache-from` warm and a broken dependency resolve unexecuted. That is precisely how [#255](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/255) stayed invisible for months — `fireANTs`' cache was last refreshed by an unrelated `registration_qc.py` change.
 
 Two properties of the matcher are load-bearing and are asserted in `tests/test_image_deps.py`:
 
@@ -270,7 +270,7 @@ Only `fsl` and `diffusion` still exist on disk. The other three rows are kept be
 ## Adding a new image
 
 1. Create `images/<name>/Dockerfile`. Use a minimal base; run as a non-root UID.
-2. **Add `<name>` to `local.ecr_images` in `terraform/ecr.tf` and apply.** (Root-level Terraform; not in the public repo, which publishes only `terraform/modules/`.) The repositories do not autocreate; without this the first build has nowhere to push.
+2. **Add `<name>` to `local.ecr_images` in `terraform/modules/stack/ecr.tf` and apply.** (Root-level Terraform; not in the public repo, which publishes only `terraform/modules/`.) The repositories do not autocreate; without this the first build has nowhere to push.
 3. **If the image uses pixi, generate `pixi.lock` with the pinned builder version — not your workstation's.** See the warning below.
 4. Commit and push to `main` — GitHub Actions detects the new directory and builds it.
 5. The new image tag (`sha-<sha>`) appears in the GitHub Actions job summary.

@@ -32,8 +32,8 @@ spec:
       # Placement. This connector is the only path to the EKS API server once
       # the Client VPN is retired, so it runs only on the stable, on-demand
       # managed nodegroups — never on Karpenter spot capacity:
-      #   backend   — 2x m7g.2xlarge, <YOUR_AWS_REGION>a, taint CriticalAddonsOnly
-      #   karpenter — 1x m7g.xlarge,  <YOUR_AWS_REGION>b, untainted
+      #   backend   — 2x m7g.2xlarge, first AZ,  taint CriticalAddonsOnly
+      #   karpenter — 1x m7g.xlarge,  second AZ, untainted
       # Both carry the node security group that the API server's cluster SG
       # admits ("Node groups to cluster API"), so pinning here is also what
       # guarantees cloudflared can reach the API server without the VPN's
@@ -58,9 +58,9 @@ spec:
       # Hard: at most one replica per node (three eligible nodes, two
       # replicas, so a single node loss or drain always leaves one running).
       # Soft: spread across zones, which with this layout puts one replica in
-      # <YOUR_AWS_REGION>a and one in <YOUR_AWS_REGION>b. matchLabelKeys scopes the counting to
-      # the current ReplicaSet, so a rollout's surge pod is not blocked by the
-      # replicas it is replacing.
+      # each of the two AZs the eligible nodegroups occupy. matchLabelKeys
+      # scopes the counting to the current ReplicaSet, so a rollout's surge pod
+      # is not blocked by the replicas it is replacing.
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname

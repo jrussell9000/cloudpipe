@@ -24,7 +24,7 @@ versioned; anything not listed here is an implementation detail that may change.
 | `globus setup-status --json` | Ordered setup steps with state, what each waits on, and the next action | **now** — `src/globus_admin/setup.py` (see below) |
 | `globus doctor --json` | One record per health check: id, title, severity, message, remedy, detail | **now** (see below) |
 | `globus bootstrap-endpoint`/`cleanup-endpoint` `--json` | The `data` fields and error codes of the two once-per-deployment commands | **now** — `src/globus_admin/commands/` (see below) |
-| Human-gate list | The steps no automation can do: the NDA DUC, an HA subscription, adding the endpoint to it, the browser login | declared **now** in `src/globus_admin/gates.py`; emitted by `setup-status` |
+| Human-gate list | The steps no automation can do: the NBDC DUC, an HA subscription, adding the endpoint to it, the browser login | declared **now** in `src/globus_admin/gates.py`; emitted by `setup-status` |
 | Exit codes | The table below | now |
 
 Each JSON output carries `schema_version`. Within a major version changes are

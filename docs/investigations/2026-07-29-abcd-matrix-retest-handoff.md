@@ -212,7 +212,7 @@ MI ratio       : 1.33× – 1.83× (mean 1.62×)
 18/18 beat identity
 ```
 
-Per-run gains, in `warn_runs.txt` order (XXXXXXXX ses-00A ×6, ses-02A ×6, XXXXXXXX ses-04A ×6):
+Per-run gains, in `warn_runs.txt` order (sub-XXXXXXXX ses-00A ×6, ses-02A ×6, sub-XXXXXXXX ses-04A ×6):
 ```
 0.00821 0.00851 0.00814 0.00853 0.00860 0.00894
 0.00621 0.00622 0.00479 0.00456 0.00622 0.00593

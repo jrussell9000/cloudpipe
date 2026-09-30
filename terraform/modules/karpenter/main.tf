@@ -1,3 +1,11 @@
+locals {
+  # Rendered into the GPU NodePools' zone requirement. Built here rather than in
+  # the YAML so those files stay valid YAML for the tests that parse them, and
+  # formatted to the exact bytes the literal list used to have — a whitespace
+  # difference would rewrite two NodePool objects for no change in meaning.
+  zones_list = "[${join(", ", formatlist("\"%s\"", var.zones))}]"
+}
+
 module "karpenter_infra" {
   source = "terraform-aws-modules/eks/aws//modules/karpenter"
 
@@ -61,7 +69,7 @@ resource "kubectl_manifest" "gpu-nodeclass" {
 resource "kubectl_manifest" "gpu-nodepool" {
   server_side_apply = true
   force_conflicts   = true
-  yaml_body         = file("${path.module}/helm-values/gpu-nodepool.yaml")
+  yaml_body         = templatefile("${path.module}/helm-values/gpu-nodepool.yaml", { zones_list = local.zones_list })
   depends_on = [
     kubectl_manifest.gpu-nodeclass
   ]
@@ -119,7 +127,7 @@ resource "kubectl_manifest" "gpu-dense-timeslice-nodeoverlay" {
 resource "kubectl_manifest" "gpu-dense-nodepool" {
   server_side_apply = true
   force_conflicts   = true
-  yaml_body         = file("${path.module}/helm-values/gpu-dense-nodepool.yaml")
+  yaml_body         = templatefile("${path.module}/helm-values/gpu-dense-nodepool.yaml", { zones_list = local.zones_list })
   depends_on = [
     kubectl_manifest.gpu-nodeclass,
     kubectl_manifest.gpu-dense-timeslice-nodeoverlay

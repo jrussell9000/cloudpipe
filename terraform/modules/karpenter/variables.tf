@@ -63,3 +63,21 @@ variable "eks_version" {
   description = "EKS cluster version (e.g. 1.35). Must match the version used when the GPU AMI was built."
   type        = string
 }
+
+variable "zones" {
+  description = <<-EOT
+    Availability zones the GPU NodePools may provision into. Rendered into
+    gpu-nodepool.yaml and gpu-dense-nodepool.yaml, which named this deployment's
+    zones verbatim until task 4.5 of openspec/changes/public-upstream-readiness.
+
+    Passed rather than derived so it stays the same list the VPC's subnets were
+    built from: a NodePool offering a zone the cluster has no subnet in provisions
+    nodes that never join.
+  EOT
+  type        = list(string)
+
+  validation {
+    condition     = length(var.zones) > 0
+    error_message = "zones must not be empty: a NodePool with no zone requirement can provision anywhere, including a zone with no subnet."
+  }
+}

@@ -112,7 +112,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 
 - [**data-ingress.md**](data-ingress.md) — **Start here for anything ingress-related.** The S3 key contract every processing step actually depends on (exact keys, including the literally-matched T1w filename), where the seam sits in the DAG, and how to choose between Globus, POSIX staging, and pre-staged S3. Globus is one implementation of this contract, not a requirement.
 
-- [**globus-prerequisites.md**](globus-prerequisites.md) — What you must obtain *before* `globus-setup.md` can work: an NDA Data Use Certification, an institutional Globus High Assurance subscription, and a human Globus admin to attach your endpoint to it. Three of the four gates are granted by other organisations and cannot be automated. Includes the recurring manual credential burden and a four-question decision tree for whether to reproduce this at all.
+- [**globus-prerequisites.md**](globus-prerequisites.md) — What you must obtain *before* `globus-setup.md` can work: an NBDC Data Hub Data Use Certification, an institutional Globus High Assurance subscription, and a human Globus admin to attach your endpoint to it. Three of the four gates are granted by other organisations and cannot be automated. Includes the recurring manual credential burden and a four-question decision tree for whether to reproduce this at all.
 
 ### Globus
 
@@ -184,7 +184,7 @@ docs/                 — this documentation
 | Argo namespace | `argo-workflows` |
 | ECR private registry (primary, `ecr-registry` param) | `{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/` |
 | ECR Public prefix (secondary — dual-push, rollback target; being retired per image) | `public.ecr.aws/l9e7l1h1/cloudpipe/` |
-| Globus source collection (DAIRC MMPS) | `<YOUR_GLOBUS_SOURCE_COLLECTION_ID>` |
+| Globus source collection (NBDC Data Hub) | `<YOUR_GLOBUS_SOURCE_COLLECTION_ID>` |
 | Globus destination collection | `<YOUR_GLOBUS_DEST_COLLECTION_ID>` |
 | Prefect server | `https://prefect.<YOUR_DOMAIN>` |
 | Argo server | `https://argo.<YOUR_DOMAIN>` |

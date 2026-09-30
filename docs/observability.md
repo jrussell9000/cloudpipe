@@ -49,7 +49,7 @@ separate from the `<YOUR_S3_BUCKET>` data bucket. Metrics are the run of record 
 survive the derivative flushes that precede every test batch; versioning also
 makes an in-place overwrite recoverable. The Argo controller and runner roles
 have put/get but **no delete** on this bucket. See
-`terraform/metrics_bucket.tf` (root-level Terraform; not part of the public
+`terraform/modules/stack/metrics_bucket.tf` (root-level Terraform; not part of the public
 repo, which publishes only `terraform/modules/`).
 
 The Glue table name is always the prefix's last segment with hyphens replaced by
@@ -256,7 +256,7 @@ folded = reg[reg["jac_det_frac_negative"].astype(float) > 0.01]
 # Cross-domain per-subject summary: one row per BOLD run, with the subject's
 # run-of-record workflow status/duration/total_cost_usd attached. Those three
 # are workflow-grain and repeat on every run row — read one row, don't SUM them.
-summary = m.join_subject("sub-NDARABC123")
+summary = m.join_subject("sub-XXXXXXXX")
 
 # Scope to a known write-date window with dt_from/dt_to whenever you have one
 # (a specific batch, "the last week"). This filters on the dt= partition
@@ -415,7 +415,7 @@ curl -sk "https://kubecost.<YOUR_DOMAIN>/model/allocation?window=<START_RFC3339>
 
 ## Infrastructure
 
-Managed by `terraform/modules/metrics/`, invoked from `terraform/metrics.tf`.
+Managed by `terraform/modules/metrics/`, invoked from `terraform/modules/stack/metrics.tf`.
 
 | Resource | Details |
 |----------|---------|
@@ -517,7 +517,7 @@ original column set** (read back from the existing file's footer, so the
 superset-column Glue table still matches by name and reads it as no rows).
 That is a `PutObject`, not a `DeleteObject` — the key survives as a harmless
 empty file, so this needs **no new IAM grant** and preserves the "nothing may
-delete from the run-of-record bucket" stance in `terraform/metrics_bucket.tf`.
+delete from the run-of-record bucket" stance in `terraform/modules/stack/metrics_bucket.tf`.
 
 Repair stands down whenever the evidence for it is incomplete, because
 inferring absence from a partial read would empty a live partition:

@@ -84,7 +84,7 @@ spec:
       karpenter.sh/nodepool: first-level-nodepool
 
     container:
-      image: "<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/fmri-first-level-proc@sha256:1423bedb9da05e9acea28b547f952037629f54ac7bd125280d17bd2a9a7d4bd5"
+      image: "<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/fmri-first-level-proc@sha256:bd4de4e166c6f9e61f4a39a7a7cf454e46577c4b53d6afd66fa480b45e5a915e"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

@@ -4,11 +4,11 @@
 
 ## Context
 
-The EKS API server has no public endpoint in steady state (`endpoint_public_access = false` after the initial bootstrap apply — see [infrastructure.md → Bootstrap phases](../infrastructure.md)). Today, private access for `kubectl`/`argo`/operator use is provided by an AWS Client VPN endpoint (`terraform/vpn.tf`): a split-tunnel OpenVPN-style connection with Terraform-managed client certificates (1-year validity).
+The EKS API server has no public endpoint in steady state (`endpoint_public_access = false` after the initial bootstrap apply — see [infrastructure.md → Bootstrap phases](../infrastructure.md)). Today, private access for `kubectl`/`argo`/operator use is provided by an AWS Client VPN endpoint (`terraform/modules/stack/vpn.tf`): a split-tunnel OpenVPN-style connection with Terraform-managed client certificates (1-year validity).
 
 The VPN works but has ongoing costs and operational friction: certificate lifecycle management, a per-user VPN client, and an AWS-specific connection profile that doesn't reuse the identity provider already federated for other cloudPipe services.
 
-ArgoCD already federates the UW-Madison NetID OIDC IdP into Dex for its own login (`terraform/argocd.tf`) and for Argo Workflows RBAC (`var.admin_netid`, see `terraform/argowf.tf`, `terraform/grafana.tf`). That same IdP is a natural identity source for gating API-server access, without inventing a second identity system.
+ArgoCD already federates the UW-Madison NetID OIDC IdP into Dex for its own login (`terraform/modules/stack/argocd.tf`) and for Argo Workflows RBAC (`var.admin_netid`, see `terraform/modules/stack/argowf.tf`, `terraform/modules/stack/grafana.tf`). That same IdP is a natural identity source for gating API-server access, without inventing a second identity system.
 
 ## Decision (planned, not yet implemented)
 
@@ -23,9 +23,9 @@ Planned shape, based on the design work already done:
 - **Identity**: register the existing UW-Madison OIDC IdP as a *second*, independent OIDC client in Cloudflare Access (reusing the same login.<YOUR_INSTITUTION_DOMAIN> issuer already used for Dex), rather than standing up a separate identity provider.
 - **Authorization**: an explicit NetID allowlist reusing `var.admin_netid` (the same variable already gating ArgoCD's Dex RBAC admin role and Argo Workflows RBAC), rather than a blanket `@<YOUR_INSTITUTION_DOMAIN>` policy.
 - **Access application**: `self_hosted`, `private` destination type (CIDR + port 443, TCP) — no public hostname exposed.
-- **Credentials**: Cloudflare Access OIDC client ID/secret pre-created manually in Secrets Manager (`cloudpipe/cloudflare-access-oidc`), consistent with this repo's existing convention of never letting Terraform create `aws_secretsmanager_secret` resources (see the `argocd_dex_oidc` data source in `terraform/argocd.tf` for the same pattern). Cloudflare API auth for the provider itself is via the `CLOUDFLARE_API_TOKEN` environment variable, not a Terraform variable — matching how AWS credentials are supplied to this stack.
-- **New Terraform surface**: a `cloudflare` provider (`cloudflare/cloudflare ~> 5.0`), a `var.cloudflare_account_id` variable, and a new `terraform/cloudflare.tf` file holding the tunnel/route/IdP/policy/Access-application/namespace/secret resources described above.
-- `terraform/eks.tf`'s comment on `endpoint_public_access` should be updated to reference the tunnel once it lands, replacing the current "once the VPN is in place" language.
+- **Credentials**: Cloudflare Access OIDC client ID/secret pre-created manually in Secrets Manager (`cloudpipe/cloudflare-access-oidc`), consistent with this repo's existing convention of never letting Terraform create `aws_secretsmanager_secret` resources (see the `argocd_dex_oidc` data source in `terraform/modules/stack/argocd.tf` for the same pattern). Cloudflare API auth for the provider itself is via the `CLOUDFLARE_API_TOKEN` environment variable, not a Terraform variable — matching how AWS credentials are supplied to this stack.
+- **New Terraform surface**: a `cloudflare` provider (`cloudflare/cloudflare ~> 5.0`), a `var.cloudflare_account_id` variable, and a new `terraform/modules/stack/cloudflare.tf` file holding the tunnel/route/IdP/policy/Access-application/namespace/secret resources described above.
+- `terraform/modules/stack/eks.tf`'s comment on `endpoint_public_access` should be updated to reference the tunnel once it lands, replacing the current "once the VPN is in place" language.
 
 ## Why not implemented yet
 

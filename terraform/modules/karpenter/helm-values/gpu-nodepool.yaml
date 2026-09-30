@@ -130,7 +130,7 @@ spec:
       # configs (Option B). g6f was only overflow headroom price-capacity-optimized rarely picked.
       # g7 (RTX PRO 4500, 32 GiB) added 2026-09-04 as DROUGHT OVERFLOW, on capacity
       # grounds — not cost. It is the only GPU family with meaningful spot capacity left
-      # in <YOUR_AWS_REGION>: get-spot-placement-scores reads 3/10 for g7 against 1/10 for every
+      # in this region: get-spot-placement-scores reads 3/10 for g7 against 1/10 for every
       # family previously listed here. CloudTrail over 16 real CreateFleet calls
       # (2026-09-04 00:50-01:19Z) shows g5/g6/g6e offered 16 times and granted ZERO, with
       # per-override InsufficientInstanceCapacity/UnfulfillableCapacity on each — the
@@ -215,8 +215,8 @@ spec:
         minValues: 4
       - key: "topology.kubernetes.io/zone"
         operator: In
-        values: ["<YOUR_AWS_REGION>a", "<YOUR_AWS_REGION>b", "<YOUR_AWS_REGION>c"]
-        # The 2026-09-03 crunch ran the entire surviving fleet into a single AZ (<YOUR_AWS_REGION>b,
+        values: ${zones_list}
+        # The 2026-09-03 crunch ran the entire surviving fleet into a single AZ (the second,
         # then 2b/2c). Requiring 2 AZs in the override list keeps a one-AZ shortage from
         # presenting as a total one.
         minValues: 2

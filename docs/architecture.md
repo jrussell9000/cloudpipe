@@ -80,7 +80,7 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
                         ┌─────────────────────┴────────────────────────────────────────────┐
                         │  Globus Connect Server (EC2, stopped when idle)                  │
                         │  S3 storage gateway → writes directly to <YOUR_S3_BUCKET>                 │
-                        │  Source: DAIRC MMPS Globus endpoint                             │
+                        │  Source: NBDC Data Hub Globus collection                        │
                         │  Instance ID / collection UUID stored in SSM                    │
                         └──────────────────────────────────────────────────────────────────┘
 ```
@@ -107,7 +107,7 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
 
 ## cloudpipe_minproc pipeline (production)
 
-Input: ABCD minimally preprocessed data already on DAIRC MMPS Globus endpoint. Upstream preprocessing already applied (motion correction, B0/SDC, gradient nonlinearity correction, between-scan motion correction, fMRI-T1w registration matrix) — do not re-implement these.
+Input: ABCD minimally preprocessed data already on the NIH Brain Development Cohorts (NBDC) Data Hub Globus collection. Upstream preprocessing already applied (motion correction, B0/SDC, gradient nonlinearity correction, between-scan motion correction, fMRI-T1w registration matrix) — do not re-implement these.
 
 Each workflow processes one subject. The master DAG (`cloudpipe-long-master-workflow-template.yaml`) fans out per-session work using `withParam` over the sessions whose FastSurfer derivatives were actually published — a post-anatomical re-check of the completion markers, not the inventory result (#270).
 
@@ -203,7 +203,7 @@ All infrastructure is in `terraform/`. Run commands from that directory.
 | S3 — `cloudpipe-logging` | Log archive (incl. archived Argo pod logs) |
 | S3 — `cloudpipe-terraform-state` | Terraform remote backend |
 | ECR (private, primary) | `{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/` — layer blobs served via VPC S3 gateway endpoint, no NAT traversal on pull |
-| ECR Public (secondary, being retired) | `public.ecr.aws/l9e7l1h1/cloudpipe/` — most images are dual-pushed here, kept as a one-line rollback target (`local.ecr_public_registry` in `terraform/ecr.tf`). Repos are retired image by image via `local.ecr_images_public_retired`; `fmri-first-level-proc` is already gone |
+| ECR Public (secondary, being retired) | `public.ecr.aws/l9e7l1h1/cloudpipe/` — most images are dual-pushed here, kept as a one-line rollback target (`local.ecr_public_registry` in `terraform/modules/stack/ecr.tf`). Repos are retired image by image via `local.ecr_images_public_retired`; `fmri-first-level-proc` is already gone |
 | Route53 | `<YOUR_DOMAIN>` — Argo UI, Prefect UI, ArgoCD |
 | SSM Parameter Store | Globus instance ID, collection UUIDs, base paths (see below) |
 
@@ -213,7 +213,7 @@ Key SSM parameters:
 |---|---|
 | `/cloudpipe/globus/instance-id` | EC2 instance ID of the Globus Connect Server |
 | `/cloudpipe/globus/collection-id` | Destination GCS collection UUID (updated on instance replacement) |
-| `/cloudpipe/globus/source-collection-id` | Source collection UUID (DAIRC MMPS) |
+| `/cloudpipe/globus/source-collection-id` | Source collection UUID (NBDC Data Hub) |
 | `/cloudpipe/globus/source-base-path` | Root path on source collection |
 
 ---
@@ -224,13 +224,13 @@ ArgoCD uses an app-of-apps pattern. The `cluster-addons` ApplicationSet in `gito
 
 Managed add-ons: `argo-workflows`, `prefect`, `external-secrets`, `cert-manager`, `aws-load-balancer-controller`, `aws-ebs-csi-driver`, `external-dns`, `reloader`, `prometheus-operator-crds`, `cluster-config`.
 
-The separate `workflow-templates` Application (`gitops/apps/pipelines/workflow-templates.yaml`) watches `argo/workflows/` recursively and syncs WorkflowTemplates and ConfigMaps. `selfHeal: true` means any manual `kubectl apply` to `argo-workflows` namespace is reverted within seconds — always commit and push to change WorkflowTemplates.
+The separate `workflow-templates` Application (`gitops/bootstrap/workflow-templates.yaml.tftpl`) watches `argo/workflows/` recursively and syncs WorkflowTemplates and ConfigMaps. `selfHeal: true` means any manual `kubectl apply` to `argo-workflows` namespace is reverted within seconds — always commit and push to change WorkflowTemplates.
 
 ---
 
 ## Docker images
 
-Most images are dual-pushed to both the private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`) and ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`), a holdover from the NAT-cost migration; `fmri-first-level-proc` is private-only as of 2026-08-17. Production WorkflowTemplates resolve the `ecr-registry` parameter from Terraform's `local.ecr_registry`, which now points at the private registry (`terraform/argowf.tf`); rollback to ECR Public is a one-line change (`local.ecr_public_registry`). Every production template pins images by SHA digest — there are no `:latest` refs left anywhere in `argo/workflows/`. The only `:latest` tags are the flow-runner build tag (`.github/workflows/build-prefect-flow-runner.yaml`) and the placeholder a brand-new image carries until its first `ci: pin workflow images to sha-...` commit lands.
+Most images are dual-pushed to both the private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`) and ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`), a holdover from the NAT-cost migration; `fmri-first-level-proc` is private-only as of 2026-08-17. Production WorkflowTemplates resolve the `ecr-registry` parameter from Terraform's `local.ecr_registry`, which now points at the private registry (`terraform/modules/stack/argowf.tf`); rollback to ECR Public is a one-line change (`local.ecr_public_registry`). Every production template pins images by SHA digest — there are no `:latest` refs left anywhere in `argo/workflows/`. The only `:latest` tags are the flow-runner build tag (`.github/workflows/build-prefect-flow-runner.yaml`) and the placeholder a brand-new image carries until its first `ci: pin workflow images to sha-...` commit lands.
 
 | Image | Used by | Purpose |
 |---|---|---|
@@ -296,4 +296,4 @@ See [observability.md](observability.md) for the full schema reference, querying
 
 Would ingest raw DICOMs from a separate Globus base path. Would apply preprocessing from scratch: dcm2niix → despiking → slice timing correction → motion correction → SDC (FSL topup) → between-scan motion correction. Then follow the same registration + functional-preprocessing phases as cloudpipe_minproc. Gradient nonlinearity correction would be omitted (manufacturer files unavailable).
 
-Once implemented, WorkflowTemplates would live in `argo/workflows/cloudpipe_fullproc/`, tracked by the same `workflow-templates` ArgoCD Application. The Application currently excludes that path (`gitops/apps/pipelines/workflow-templates.yaml`) since it doesn't exist; the exclusion should be dropped once templates are added there.
+Once implemented, WorkflowTemplates would live in `argo/workflows/cloudpipe_fullproc/`, tracked by the same `workflow-templates` ArgoCD Application. The Application currently excludes that path (`gitops/bootstrap/workflow-templates.yaml.tftpl`) since it doesn't exist; the exclusion should be dropped once templates are added there.

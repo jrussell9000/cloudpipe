@@ -136,7 +136,7 @@ aggregator:
   # is treated as the peak.
   #
   # RAISED 2026-09-08 to request 6Gi / limit 14Gi, alongside moving the backend
-  # nodegroup to m7g.2xlarge (terraform/eks.tf).
+  # nodegroup to m7g.2xlarge (terraform/modules/stack/eks.tf).
   #
   # The 5Gi/7Gi pair above was sized for a 13.78Gi node and its own advice fired:
   # "If this starts OOMKilling (check restartCount on kubecost-aggregator-0), the
@@ -145,7 +145,7 @@ aggregator:
   # 09-05 until this raise; every stalled rollup rebuilt once the aggregator had
   # headroom, 09-05 included. Nothing was permanently lost — an earlier version
   # of this comment said otherwise and sized a 2,848-subject rerun on it. See
-  # terraform/eks.tf for the correction and how to check reconciliation properly.
+  # terraform/modules/stack/eks.tf for the correction and how to check reconciliation properly.
   #
   # 7Gi was not merely a bit low. The embedded store derives its own ceiling at
   # ~90% of the container limit, so 7Gi meant a hard 6.28 GiB query cap, and the

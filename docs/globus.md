@@ -1,6 +1,6 @@
 # Globus
 
-CloudPipe uses Globus Connect Server (GCS) v5 to transfer ABCD minimally-preprocessed data from the DAIRC MMPS endpoint to the cloudpipe S3 bucket. This document covers the architecture, credentials model, operational procedures, and recovery steps.
+CloudPipe uses Globus Connect Server (GCS) v5 to transfer ABCD minimally-preprocessed data from the NIH Brain Development Cohorts (NBDC) Data Hub collection to the cloudpipe S3 bucket. This document covers the architecture, credentials model, operational procedures, and recovery steps.
 
 For the initial setup walkthrough (endpoint creation, storage gateway, IAM credentials, refresh token), see [globus-setup.md](globus-setup.md).
 
@@ -9,7 +9,7 @@ For the initial setup walkthrough (endpoint creation, storage gateway, IAM crede
 ## Architecture
 
 ```
-DAIRC MMPS Globus endpoint
+NBDC Data Hub Globus collection
   (source collection: <YOUR_GLOBUS_SOURCE_COLLECTION_ID>)
         │
         │  GridFTP data channel (port 50000–51000)
@@ -45,7 +45,7 @@ AWS Mountpoint for S3 only supports sequential writes from byte 0. Globus GridFT
 | S3 storage gateway ID | `<YOUR_GLOBUS_S3_GATEWAY_ID>` |
 | Destination collection ID | `<YOUR_GLOBUS_DEST_COLLECTION_ID>` |
 | Collection name | `cloudpipe-s3` |
-| Source collection (DAIRC MMPS) | `<YOUR_GLOBUS_SOURCE_COLLECTION_ID>` |
+| Source collection (NBDC Data Hub) | `<YOUR_GLOBUS_SOURCE_COLLECTION_ID>` |
 | Source base path | `/abcd/derivatives/mmps_mproc` |
 | Native app client ID | `<YOUR_GLOBUS_NATIVE_APP_CLIENT_ID>` |
 | IAM credential identity | `<YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>` |
@@ -81,7 +81,7 @@ All workflow-accessible Globus config lives in SSM. Terraform creates these para
 | `/cloudpipe/globus/endpoint-id` | `globus bootstrap-endpoint`, written last | GCS endpoint UUID — the marker every tool reads as "this deployment has an endpoint" |
 | `/cloudpipe/globus/gcs-client-id` | `globus register-service-client`, or by hand ([setup step 3.3](globus-setup.md#33-store-the-service-clients-id-and-secret)) | Globus Auth service client UUID (SecureString; see [Service credentials](#service-credentials)) |
 | `/cloudpipe/globus/gcs-client-secret` | `globus register-service-client`, or by hand (setup step 3.3) | Globus Auth service client secret (SecureString). The command is the only place this value exists outside SSM — Globus discloses it once, at creation |
-| `/cloudpipe/globus/source-collection-id` | Terraform | Source collection UUID (DAIRC MMPS) |
+| `/cloudpipe/globus/source-collection-id` | Terraform | Source collection UUID (NBDC Data Hub) |
 | `/cloudpipe/globus/source-base-path` | Terraform | Root path on source collection |
 | `/cloudpipe/globus/node-report` | `cloudpipe-gcs-boot` (on the instance) | The endpoint's node records as of the last registration, for `globus doctor` check 13. Only the node can run `node list`, and it is stopped between batches, so this is the only way a workstation can see leftover records from a replaced host |
 | `/cloudpipe/globus/reconcile-plan` | The reconcile (on the instance), on every `plan` and `apply` | Whether the endpoint matched its configuration, for `globus doctor` check 7 — same reason as `node-report`: the comparison needs listings only the node can make. The report records which gateway it examined, because `globus configure` scopes each run to one; check 7 refuses a plan written for the other environment rather than reading it as clean |

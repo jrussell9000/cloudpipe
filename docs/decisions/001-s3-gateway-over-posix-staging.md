@@ -18,7 +18,7 @@ Use the GCS S3 storage gateway (`globus-connect-server storage-gateway create s3
 
 The POSIX staging path is fully implemented in the WorkflowTemplate (`globus-s3-sync-template`, in `globus-transfer-workflow-template.yaml`) and is controlled by the `globus-use-s3-gateway` workflow parameter (`"true"` skips the sync step, via `when:` on the master DAG's sync task). — *deleted in 2026-09; see the Update below*
 
-`terraform/globus.tf` sets `globus_use_s3_gateway = true`, so the deployed pipeline takes the gateway path and the sync step is always skipped. The POSIX branch is live code but currently unexercised.
+`terraform/modules/stack/globus.tf` sets `globus_use_s3_gateway = true`, so the deployed pipeline takes the gateway path and the sync step is always skipped. The POSIX branch is live code but currently unexercised.
 
 > **The original rationale for keeping the POSIX branch no longer applies as written.** This ADR said `cloudpipe_fullproc` "uses the POSIX path" because it lacked the S3 add-on tier. That pipeline was never implemented — there is no `argo/workflows/cloudpipe_fullproc/` and no `cloudpipe-fullproc` WorkflowTemplate (issue #69). The POSIX branch is therefore retained purely as a fallback if the S3 add-on becomes unavailable, not to serve a second pipeline.
 

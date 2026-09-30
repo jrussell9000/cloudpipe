@@ -1,13 +1,12 @@
 external-dns:
   provider:
     name: aws
-  env:
-    - name: AWS_DEFAULT_REGION
-      value: <YOUR_AWS_REGION>
-    - name: AWS_REGION
-      value: <YOUR_AWS_REGION>
-  domainFilters:
-    - "<YOUR_DOMAIN>"
+  # `env` (AWS_DEFAULT_REGION, AWS_REGION) and `domainFilters` are NOT set here.
+  # They differ between deployments, so Terraform supplies them: the root
+  # ApplicationSet patches them in from local.argocd_app_overrides in
+  # terraform/modules/stack/argocd.tf. Setting either here would shadow nothing — the override
+  # wins — but it would put the value in two places. See "Per-app Helm overrides"
+  # in docs/gitops.md.
   txtOwnerId: "cloudpipe"
   policy: upsert-only
   sources:

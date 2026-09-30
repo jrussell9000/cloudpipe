@@ -1,0 +1,55 @@
+# WorkflowTemplates Application — rendered by terraform/modules/stack/argocd.tf with templatefile().
+#
+# `$${ ... }` is Terraform's delimiter and is expanded once, when the manifest is
+# applied. Unlike root-app.yaml.tftpl this file carries no ArgoCD Go template, so
+# the two languages never meet here.
+#
+# Terraform owns this object, so pushing a change here does nothing until
+# `terraform apply` runs. See "Ownership boundary" in docs/gitops.md.
+#
+# It used to live at gitops/apps/pipelines/workflow-templates.yaml, where ArgoCD
+# read it verbatim and the repository it points at had to be written out. A
+# plain-manifest Application cannot take Helm values, so there was no way to feed
+# it one — the app deliberately has no Chart.yaml, because spec.source.helm on it
+# would make ArgoCD treat the production WorkflowTemplates as a Helm chart under
+# prune: true. Rendering the object instead is what removes the literal (task 3.7
+# of openspec/changes/public-upstream-readiness, ADR 020).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: workflow-templates
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    # Retained when the Application that manages this object is deleted.
+    #
+    # It is what made the handover to Terraform safe: this object was a resource
+    # of the generated `pipelines` Application, which carries ArgoCD's cascading
+    # -delete finalizer, and deleting gitops/apps/pipelines/ deleted that
+    # Application. A resource-level Delete sync option always wins over the
+    # owning Application's policy, so the object survived to be adopted here.
+    #
+    # Kept, rather than dropped once Terraform owned it: it is inert while no
+    # Application manages this object, and it is the one line standing between a
+    # future re-adoption and the same deletion.
+    argocd.argoproj.io/sync-options: Delete=false
+spec:
+  project: default
+  source:
+    repoURL: ${repo_url}
+    path: argo/workflows
+    targetRevision: ${revision}
+    directory:
+      recurse: true
+      # cloudpipe_fullproc is a planned pipeline (raw DICOM input) — no such directory
+      # exists in argo/workflows/ yet. Placeholder exclusion so a future
+      # cloudpipe_fullproc/ directory doesn't get auto-synced mid-development;
+      # drop this once the pipeline is ready to deploy. See docs/architecture.md.
+      exclude: 'cloudpipe_fullproc/**'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argo-workflows
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
