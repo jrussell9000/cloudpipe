@@ -117,17 +117,18 @@
 #
 # USAGE
 #   # smoke — one process, one rep:
-#   argo -n argo-workflows submit scripts/manifests/gpu-t1w-vram-probe.yaml \
-#     -p subject=<sub-XXXX> -p session=<ses-XXX> -p profile=default \
+#   argo -n argo-workflows submit scripts/jobs/gpu-t1w-vram-probe.yaml \
+#     -p subject=sub-XXXXXXXX -p session=<ses-XXX> -p profile=default \
 #     -p run-label=smoke -p concurrency=1 -p reps=1
 #
 #   # the measurement (concurrency 0 = one process per slice):
-#   argo -n argo-workflows submit scripts/manifests/gpu-t1w-vram-probe.yaml \
-#     -p subject=<sub-XXXX> -p session=<ses-XXX> -p profile=default -p run-label=run1
+#   argo -n argo-workflows submit scripts/jobs/gpu-t1w-vram-probe.yaml \
+#     -p subject=sub-XXXXXXXX -p session=<ses-XXX> -p profile=default -p run-label=run1
 #
-#   # results
+#   # results — $CLOUDPIPE_BUCKET comes from `pixi run -e ops`
 #   argo -n argo-workflows logs @latest | tail -60
-#   aws s3 cp s3://<YOUR_S3_BUCKET>/scratch/probe-374-t1w-vram/default/run1/probe-out.tgz - | tar -xz -C /tmp
+#   aws s3 cp "s3://$CLOUDPIPE_BUCKET/scratch/probe-374-t1w-vram/default/run1/probe-out.tgz" - \
+#     | tar -xz -C /tmp
 apiVersion: argoproj.io/v1alpha1
 kind: Workflow
 metadata:
@@ -177,10 +178,27 @@ spec:
         value: "0"
       - name: reps
         value: "2"
+      # Deployment values come from the cloudpipe-config ConfigMap Terraform
+      # writes, exactly as the production WorkflowTemplates default theirs, so a
+      # probe submitted in any deployment reads that deployment's bucket and
+      # registry. Override with `-p` to target something else.
       - name: bucket
-        value: <YOUR_S3_BUCKET>
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
       - name: ecr-registry
-        value: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+      # Declared here, not only in the template, because the `s3:` artifact blocks
+      # below build their endpoint from it.
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
       # The digest the live `registration` WorkflowTemplate serves, so the probe
       # measures production code. Update together with that template.
       - name: fireants-image
@@ -203,9 +221,9 @@ spec:
             archive:
               none: {}
             s3:
-              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
               bucket: '{{workflow.parameters.bucket}}'
-              region: <YOUR_AWS_REGION>
+              region: "{{workflow.parameters.region}}"
               key: 'derivatives/fastsurfer/{{workflow.parameters.subject}}/{{workflow.parameters.session}}/mri/orig.mgz'
 
           - name: fastsurfer-brainmask
@@ -213,17 +231,17 @@ spec:
             archive:
               none: {}
             s3:
-              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
               bucket: '{{workflow.parameters.bucket}}'
-              region: <YOUR_AWS_REGION>
+              region: "{{workflow.parameters.region}}"
               key: 'derivatives/fastsurfer/{{workflow.parameters.subject}}/{{workflow.parameters.session}}/mri/brainmask.mgz'
 
           - name: mni-template
             path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
             s3:
-              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
               bucket: '{{workflow.parameters.bucket}}'
-              region: <YOUR_AWS_REGION>
+              region: "{{workflow.parameters.region}}"
               key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
 
       outputs:
@@ -232,9 +250,9 @@ spec:
           - name: probe-out
             path: /work/probe-out
             s3:
-              endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+              endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
               bucket: '{{workflow.parameters.bucket}}'
-              region: <YOUR_AWS_REGION>
+              region: "{{workflow.parameters.region}}"
               key: 'scratch/probe-374-t1w-vram/{{workflow.parameters.profile}}/{{workflow.parameters.run-label}}/probe-out.tgz'
 
       nodeSelector:

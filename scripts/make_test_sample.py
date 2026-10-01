@@ -44,6 +44,10 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
+
+from metrics import deployment_env  # noqa: E402
+
 NSS = REPO / "tools/nss_volumes.csv"
 ELIGIBLE = REPO / "tools/first-level-subjects.csv"
 # The previous batch, carried into the new draw by default so the two runs differ
@@ -212,8 +216,15 @@ def main() -> int:
         help="exclude only subjects that hold FastSurfer derivatives right now, "
         "read live from the bucket; flushed subjects stay drawable",
     )
-    ap.add_argument("--bucket", default="<YOUR_S3_BUCKET>", help="data bucket read by --exclude-derivatives")
+    ap.add_argument(
+        "--bucket",
+        help="data bucket read by --exclude-derivatives (default: $CLOUDPIPE_BUCKET)",
+    )
     args = ap.parse_args()
+    # Only --exclude-derivatives reads the bucket, so resolve lazily: a plain draw
+    # must not need the cluster.
+    if args.exclude_derivatives and not args.bucket:
+        args.bucket = deployment_env.required("CLOUDPIPE_BUCKET", "the data bucket")
 
     k_by_subject = sessions_by_subject()
     eligible = _read_ids(ELIGIBLE)

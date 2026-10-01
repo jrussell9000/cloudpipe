@@ -6,10 +6,12 @@ Aggregates by cloudpipe.io/step by default, filtered to pods labelled with
 cloudpipe.io/phase (i.e. only cloudpipe pipeline pods — excludes
 fmri-first-level-proc and other co-tenants in argo-workflows namespace).
 
+Run through `pixi run -e ops`, which sets $KUBECOST_BASE_URL from the Kubecost ingress.
+
 Usage
 -----
     # Per-step costs for the last 24 hours:
-    python cloudpipe_minproc_costs.py --window 24h
+    pixi run -e ops python cloudpipe_minproc_costs.py --window 24h
 
     # Per-phase breakdown:
     python cloudpipe_minproc_costs.py --window 360h --by phase
@@ -28,11 +30,15 @@ import argparse
 import csv
 import io
 import sys
+from pathlib import Path
 
 import boto3
 import requests
 
-KUBECOST_URL = "https://kubecost.<YOUR_DOMAIN>"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from metrics import deployment_env  # noqa: E402
+
 DEFAULT_OUTPUT = "cloudpipe_minproc_costs.csv"
 
 # Restrict to the three cloudpipe_minproc phases.  Kubecost v1 treats comma as OR
@@ -101,7 +107,7 @@ SCALAR_FIELDS = [
 def query_kubecost(
     window: str,
     label: str,
-    kubecost_url: str = KUBECOST_URL,
+    kubecost_url: str,
     share_idle: bool = True,
     share_tenancy_costs: bool = True,
 ) -> dict:
@@ -203,7 +209,9 @@ def main() -> None:
         choices=list(BY_LABEL),
         help="Aggregation dimension (default: step)",
     )
-    parser.add_argument("--url", default=KUBECOST_URL, help="Kubecost base URL")
+    # The Kubecost UI ingress, since this runs from a workstation. In-cluster code
+    # uses the service DNS instead (src/metrics/kubecost_scraper.py's KUBECOST_BASE).
+    parser.add_argument("--url", help="Kubecost base URL (default: $KUBECOST_BASE_URL)")
     parser.add_argument(
         "--output", "-o", default=DEFAULT_OUTPUT, help="Output path (local or s3://bucket/key)"
     )
@@ -226,7 +234,10 @@ def main() -> None:
     allocations = query_kubecost(
         window=window,
         label=label,
-        kubecost_url=args.url,
+        kubecost_url=args.url
+        or deployment_env.required(
+            "KUBECOST_BASE_URL", "the Kubecost UI's external URL, https://kubecost.<domain>"
+        ),
         share_idle=not args.no_share_idle,
         share_tenancy_costs=not args.no_share_tenancy,
     )

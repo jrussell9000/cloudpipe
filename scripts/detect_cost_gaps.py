@@ -59,7 +59,10 @@ def main() -> int:
         "The argo-nodes-snapshot cron and one-off probes sit at ~0.000; real unbilled "
         "subject work measured 0.78-22.7.",
     )
-    ap.add_argument("--region", default="<YOUR_AWS_REGION>")
+    ap.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     args = ap.parse_args()
 
     s3 = boto3.client("s3", region_name=args.region)

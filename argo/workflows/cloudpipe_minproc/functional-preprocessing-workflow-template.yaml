@@ -133,7 +133,7 @@ spec:
   # tarball, MNI template and t1w→MNI warp — a dozen times over for a dozen
   # runs — for a few minutes of real compute. Looping inside one pod amortises
   # all of that across the session.
-  # See docs/investigations/2026-07-20-cloudpipe-cost-reduction-deep-dive.md §3.2.
+  # See docs-internal/investigations/2026-07-20-cloudpipe-cost-reduction-deep-dive.md §3.2.
   #
   # Downloads from S3 (once per session, not once per run):
   #   mmps_mproc/{subj}/{ses}/func/     → /data/func   every run's BOLD + sidecar + motion
@@ -436,7 +436,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:e7706aa4a38d3ced4be9f7c04ba31144b71203946ce24a8b21892174dc301f6c"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:b3309b3955b076d02e8fc45191c6286fb0164ae8e408056029d388c0841ca53a"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -494,7 +494,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:e7706aa4a38d3ced4be9f7c04ba31144b71203946ce24a8b21892174dc301f6c"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:b3309b3955b076d02e8fc45191c6286fb0164ae8e408056029d388c0841ca53a"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather

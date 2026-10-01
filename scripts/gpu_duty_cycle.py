@@ -30,10 +30,16 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import boto3
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from metrics import deployment_env  # noqa: E402
 
 # Steps that request nvidia.com/gpu. Anything else has no nvidia-smi output.
 GPU_STEPS = (
@@ -98,8 +104,11 @@ def analyse(s3, bucket: str, item: tuple[str, str]) -> tuple[str, dict] | None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--bucket", default="<YOUR_S3_BUCKET>", help="Data bucket holding logs/.")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument("--bucket", help="Data bucket holding logs/ (default: $CLOUDPIPE_BUCKET).")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     p.add_argument(
         "--workflows",
         required=True,
@@ -108,14 +117,15 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=16)
     args = p.parse_args()
 
+    bucket = args.bucket or deployment_env.required("CLOUDPIPE_BUCKET", "the data bucket")
     s3 = boto3.client("s3", region_name=args.region)
     workflows = [w.strip() for w in args.workflows.split(",") if w.strip()]
-    items = list_gpu_logs(s3, args.bucket, workflows)
+    items = list_gpu_logs(s3, bucket, workflows)
     print(f"{len(items)} GPU pod log(s) across {len(workflows)} workflow(s)\n")
 
     agg: dict[str, list[dict]] = defaultdict(list)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for res in pool.map(lambda i: analyse(s3, args.bucket, i), items):
+        for res in pool.map(lambda i: analyse(s3, bucket, i), items):
             if res:
                 agg[res[0]].append(res[1])
 

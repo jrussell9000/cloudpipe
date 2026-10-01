@@ -16,11 +16,11 @@ Usage
   # pull live from CloudWatch — explicit stream names
   python compileFirstLevelQCmetrics.py \\
       --stream abcdv6/default/<id1> [abcdv6/default/<id2> ...] \\
-      [--log-group /aws/batch/job] [--region <YOUR_AWS_REGION>]
+      [--log-group /aws/batch/job] [--region <aws-region>]
 
   # pull live from CloudWatch — all streams in the log group
   python compileFirstLevelQCmetrics.py --all-streams \\
-      [--log-group /aws/batch/job] [--region <YOUR_AWS_REGION>]
+      [--log-group /aws/batch/job] [--region <aws-region>]
 
   # filter streams by name prefix and/or minimum last-event time
   python compileFirstLevelQCmetrics.py --all-streams \\
@@ -222,7 +222,7 @@ def iter_csv_messages(csv_path):
             yield row['message']
 
 
-def get_streams(log_group, region='<YOUR_AWS_REGION>', prefix=None, after_ms=None):
+def get_streams(log_group, region=None, prefix=None, after_ms=None):
     """Return stream names from log_group, optionally filtered by prefix and/or minimum last-event time.
 
     AWS constraint: orderBy=LastEventTime cannot be combined with logStreamNamePrefix.
@@ -362,7 +362,10 @@ def main():
         metavar='NAME',
         help='CloudWatch log group (default: /aws/batch/fmri-first-level-proc)',
     )
-    ap.add_argument('--region', default='<YOUR_AWS_REGION>', help='AWS region (default: <YOUR_AWS_REGION>)')
+    ap.add_argument(
+        '--region',
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region)",
+    )
     ap.add_argument(
         '--prefix',
         metavar='PREFIX',

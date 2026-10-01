@@ -220,7 +220,7 @@ ArgoCD Applications, so a single commit does not sync them atomically. A pod who
 template names a PriorityClass that does not exist yet is rejected by the Priority
 admission plugin, so the classes must reach the cluster before (or with) the
 template change. It self-heals once `cluster-config` syncs, but the window shows up
-as GPU pods failing to create. Background: `docs/investigations/2026-09-10-gpu-spot-acquisition-review.md` §4.1.
+as GPU pods failing to create. Background: `docs-internal/investigations/2026-09-10-gpu-spot-acquisition-review.md` §4.1.
 
 ### reloader
 
@@ -271,7 +271,7 @@ Helm chart: `nvidia/nvidia-device-plugin` v0.19.1. Advertises GPUs to the schedu
 
 The DaemonSet reaches both pools through a `karpenter.sh/nodepool In` affinity. **A GPU pool missing from that list gets nodes that come up Ready and advertise no GPU**, which is how the g7 nodes were stranded on 2026-09-04.
 
-> **Keep this in sync with Karpenter.** Each profile's `replicas` and the NodeOverlay covering that pool's instance types (`gpu-timeslice-3x`, `gpu-dense-timeslice-4x` in `terraform/modules/karpenter/helm-values/`) describe the same fact in two places. Size a slice count to the *smallest* card in the pool and the *largest* per-pod VRAM, never to the card a batch happened to land on. The largest is t1w-to-mni at a measured **4903 MiB** per process: `nvidia-smi` per-process usage, not PyTorch's own counter, which reads only 3698 MiB because it misses the CUDA context and allocator cache. Re-measure with `scripts/manifests/gpu-t1w-vram-probe.yaml` after any fireANTs image or torch change. The CPU request must also be low enough that N slices fit on one node's vCPUs. `tests/argo/test_gpu_step_resources.py` checks all of this, but CI does not run for a change under `gitops/` alone, so run it locally.
+> **Keep this in sync with Karpenter.** Each profile's `replicas` and the NodeOverlay covering that pool's instance types (`gpu-timeslice-3x`, `gpu-dense-timeslice-4x` in `terraform/modules/karpenter/helm-values/`) describe the same fact in two places. Size a slice count to the *smallest* card in the pool and the *largest* per-pod VRAM, never to the card a batch happened to land on. The largest is t1w-to-mni at a measured **4903 MiB** per process: `nvidia-smi` per-process usage, not PyTorch's own counter, which reads only 3698 MiB because it misses the CUDA context and allocator cache. Re-measure with `scripts/jobs/gpu-t1w-vram-probe.yaml` after any fireANTs image or torch change. The CPU request must also be low enough that N slices fit on one node's vCPUs. `tests/argo/test_gpu_step_resources.py` checks all of this, but CI does not run for a change under `gitops/` alone, so run it locally.
 
 ### aws-ebs-csi-driver / aws-load-balancer-controller
 

@@ -8,6 +8,10 @@
 # file to go stale:
 #
 #   CLOUDPIPE_BUCKET, CLOUDPIPE_METRICS_BUCKET   the cloudpipe-config ConfigMap
+#   CLOUDPIPE_ECR_REGISTRY                       the same ConfigMap — the one
+#     value a Kubernetes manifest cannot read itself, since `image:` takes no
+#     configMapKeyRef (scripts/jobs/anat-stats-aggregate.yaml renders it with
+#     envsubst)
 #   KUBECOST_BASE_URL, PREFECT_API_URL           the UI ingresses' hostnames
 #
 # The region is not here: tools take it from AWS_REGION or the AWS profile
@@ -23,16 +27,17 @@
 # Sourced, not executed: no `set -e`, no `exit`.
 
 _cloudpipe_env() {
-  local ns="${CLOUDPIPE_CONFIG_NAMESPACE:-argo-workflows}" cfg bucket metrics_bucket host
+  local ns="${CLOUDPIPE_CONFIG_NAMESPACE:-argo-workflows}" cfg bucket metrics_bucket registry host
 
   if ! cfg="$(kubectl -n "$ns" get configmap cloudpipe-config \
-    -o 'jsonpath={.data.bucket} {.data.metrics_bucket}' 2>/dev/null)"; then
+    -o 'jsonpath={.data.bucket} {.data.metrics_bucket} {.data.ecr_registry}' 2>/dev/null)"; then
     echo "cloudpipe-env: cannot read cloudpipe-config (is WARP connected?); CLOUDPIPE_* not set" >&2
     return 0
   fi
-  read -r bucket metrics_bucket <<<"$cfg"
+  read -r bucket metrics_bucket registry <<<"$cfg"
   export CLOUDPIPE_BUCKET="${CLOUDPIPE_BUCKET:-$bucket}"
   export CLOUDPIPE_METRICS_BUCKET="${CLOUDPIPE_METRICS_BUCKET:-$metrics_bucket}"
+  export CLOUDPIPE_ECR_REGISTRY="${CLOUDPIPE_ECR_REGISTRY:-$registry}"
 
   host="$(kubectl -n kubecost get ingress kubecost-alb-ingress \
     -o 'jsonpath={.spec.rules[0].host}' 2>/dev/null)"

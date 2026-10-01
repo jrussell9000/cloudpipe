@@ -70,7 +70,7 @@ spec:
   # long_prepare_template.sh then run_fastsurfer.sh --seg_only --base, in ONE
   # pod. Both are gpu-nodepool and strictly sequential, so splitting them cost a
   # second GPU node provision (slow, and the pool is thin — see
-  # docs/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md)
+  # docs-internal/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md)
   # plus an S3 round-trip of the whole template, for no parallelism gain.
   #
   # long_prepare_template.sh handles single-timepoint subjects automatically —
@@ -155,7 +155,8 @@ spec:
     #   0.9992 — not bit-identical (CUDA vs CPU float kernels), far inside
     #   inter-run variance. Per session it is ~1.4x the GPU cost ($0.012 on a
     #   ~$0.11/hr 2xlarge vs $0.0085 on a $0.086/slice-hr T4 slice).
-    # Manifest: scripts/manifests/fastsurfer-cpu-fallback-probe.yaml.
+    # Manifest: scripts/manifests/fastsurfer-cpu-fallback-probe.yaml — a one-off
+    # probe, so it stays in the internal repo and is not published (ADR 020).
     #
     # GPU POOLS (#374). On cuda the pod accepts BOTH GPU NodePools: gpu-nodepool
     # (preferred by weight, 3 slices/GPU) and gpu-dense-nodepool (the drought fallback,
@@ -202,7 +203,7 @@ spec:
 
     initContainers:
       - name: download-t1w-inputs
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:810f9def148557b03c2aef5a668eff203ece4e733a25dab7392f61db866abb1f"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:e319537e801a2f0dd2c64731322eb0e9d6f9e6f8e4b5f1641c24f6cdcc6e0c70"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -247,7 +248,7 @@ spec:
       # slice-hours, and this one fetched a tree FastSurfer never opened.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:db570b9aa47328cd284c7e970517d2609c1604a929e434abe1da727c33d04ba9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:50317282787d76eabcb139c255341ea0317fb71a50cf3f959c8f80390c0a97a9"
       imagePullPolicy: IfNotPresent
       volumeMounts:
       - name: work
@@ -452,7 +453,7 @@ spec:
     # See the fsaverage link in the args block below.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:db570b9aa47328cd284c7e970517d2609c1604a929e434abe1da727c33d04ba9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:50317282787d76eabcb139c255341ea0317fb71a50cf3f959c8f80390c0a97a9"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

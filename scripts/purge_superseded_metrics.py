@@ -53,11 +53,12 @@ Dry run by default; `--write` applies and writes a JSONL audit under data/
 
 Usage
 -----
-    pixi run python scripts/purge_superseded_metrics.py \\
-        --metrics-bucket cloudpipe-metrics --data-bucket <YOUR_S3_BUCKET> \\
+    pixi run -e ops python scripts/purge_superseded_metrics.py \\
+        --metrics-bucket "$CLOUDPIPE_METRICS_BUCKET" --data-bucket "$CLOUDPIPE_BUCKET" \\
         --registration-type t1w_to_mni [--subjects data/reprocess/rescue_pilot.csv] [--write]
-    pixi run python scripts/purge_superseded_metrics.py \\
-        --metrics-bucket cloudpipe-metrics --data-bucket <YOUR_S3_BUCKET> --table func_preproc [--write]
+    pixi run -e ops python scripts/purge_superseded_metrics.py \\
+        --metrics-bucket "$CLOUDPIPE_METRICS_BUCKET" --data-bucket "$CLOUDPIPE_BUCKET" \\
+        --table func_preproc [--write]
 """
 
 from __future__ import annotations
@@ -438,7 +439,10 @@ def main() -> int:
         "--registration-type", choices=REGISTRATION_TYPES, help="Required for --table registration."
     )
     p.add_argument("--subjects", help="CSV of subject IDs (first column) to limit the purge to.")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     p.add_argument("--write", action="store_true", help="Apply the plan (default: dry run).")
     p.add_argument("--audit", help="Audit JSONL path (default: data/purge-superseded-<ts>.jsonl).")
     args = p.parse_args()
