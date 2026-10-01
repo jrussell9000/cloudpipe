@@ -1,6 +1,6 @@
 # Docker Images
 
-Pipeline images live in a private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`). Most are still **dual-pushed** to ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`) as a secondary — a rollback target held over from the NAT-cost migration. The registry prefix actually used is set by Terraform (`local.ecr_registry` in `terraform/modules/stack/argowf.tf`) and passed as the `ecr-registry` parameter to every workflow.
+Pipeline images live in a private ECR registry (`{account-id}.dkr.ecr.{region}.amazonaws.com/cloudpipe/`). Most are still **dual-pushed** to ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`) as a secondary — a rollback target held over from the NAT-cost migration. The registry prefix actually used is set by Terraform (`local.ecr_registry` in `terraform/modules/stack/argowf.tf`) and passed as the `ecr-registry` parameter to every workflow.
 
 **`fmri-first-level-proc` is private-only** as of 2026-08-17: its dual-push and its ECR Public repository are gone, so rollback for that one image would be a rebuild rather than a registry flip. Public repos are being retired image by image via `local.ecr_images_public_retired` in `terraform/modules/stack/ecr.tf` — see `handoffs/ecr-private-registry-migration.md` Step 6 (internal repo only).
 
@@ -25,7 +25,7 @@ A `changes` job detects which image directories were modified and builds only th
 
 When a path outside an image's own directory changes — `images/shared/…`, `src/…` — every image whose Dockerfile `COPY`s **that file** is rebuilt too. Still self-maintaining: adding a `COPY` line to a Dockerfile automatically enrolls that image, because enrolment is derived from the `COPY` sources themselves. `prefect-flow-runner` also `COPY`s `src/metrics/` but is excluded here and rebuilt by its own workflow instead.
 
-Enrolment is **per file, not per directory** ([#260](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/260)). Five images `COPY` from `images/shared/`, but only two copy `registration_qc.py`; under the old directory rule an edit to it rebuilt all five. The wasted minutes were the smaller half of that: each spurious rebuild pushes `cache-to` and so resets the 30-day expiry on that image's ECR build-cache entry (`terraform/modules/stack/ecr.tf`), keeping `cache-from` warm and a broken dependency resolve unexecuted. That is precisely how [#255](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/255) stayed invisible for months — `fireANTs`' cache was last refreshed by an unrelated `registration_qc.py` change.
+Enrolment is **per file, not per directory** (#260). Five images `COPY` from `images/shared/`, but only two copy `registration_qc.py`; under the old directory rule an edit to it rebuilt all five. The wasted minutes were the smaller half of that: each spurious rebuild pushes `cache-to` and so resets the 30-day expiry on that image's ECR build-cache entry (`terraform/modules/stack/ecr.tf`), keeping `cache-from` warm and a broken dependency resolve unexecuted. That is precisely how #255 stayed invisible for months — `fireANTs`' cache was last refreshed by an unrelated `registration_qc.py` change.
 
 Two properties of the matcher are load-bearing and are asserted in `tests/test_image_deps.py`:
 
@@ -44,7 +44,7 @@ Large images free GitHub Actions disk space before building. The condition match
 
 Builds **every** image `build-images.yaml` would build, on a `schedule` (Sundays 09:00 UTC), with `no-cache: true`, `pull: true`, no push, and no AWS credentials. `workflow_dispatch` takes an optional image name.
 
-Main-branch builds always have `cache-from`, so they cannot tell you whether an image still builds *from scratch*: `pixi install --locked`, `pip install`, `apt-get`, and the base-image tag are all served from cached layers instead of re-run. An image can be unbuildable for months while CI stays green — [#255](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/255) is the worked example (NVIDIA withdrew `nvidia-cudnn-cu12==9.1.0.70`, which torch 2.4–2.6 pin by `==`). The PR gate is the only other honest signal, and it fires only when a PR touches image paths; external breakage is exactly the case where nothing of ours changes, so no PR fires.
+Main-branch builds always have `cache-from`, so they cannot tell you whether an image still builds *from scratch*: `pixi install --locked`, `pip install`, `apt-get`, and the base-image tag are all served from cached layers instead of re-run. An image can be unbuildable for months while CI stays green — #255 is the worked example (NVIDIA withdrew `nvidia-cudnn-cu12==9.1.0.70`, which torch 2.4–2.6 pin by `==`). The PR gate is the only other honest signal, and it fires only when a PR touches image paths; external breakage is exactly the case where nothing of ours changes, so no PR fires.
 
 Weekly is chosen against the 30-day cache TTL: a monthly canary could fire only after the cache had already lapsed, which is the situation it exists to pre-empt. On failure an `alert` job files (or comments on) a `needs-triage` issue — a red run in the Actions tab is only a signal to someone already looking there.
 
@@ -112,7 +112,7 @@ Valid scan types: `T1w`, `T2w`, `rest`, `nback`, `sst`, `mid`, `dwi`. Source lay
 **Base**: `nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04`  
 **Contents**: Python 3, PyTorch 2.6.0 (CUDA 12.6), `fireants`, `nibabel`, `numpy`.
 
-Was CUDA 12.1 / torch 2.5.1 until [#255](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/255): NVIDIA withdrew `nvidia-cudnn-cu12==9.1.0.70`, which torch 2.4.0–2.6.0 pins by `==` on both the cu121 and cu124 wheel lines, so the image could not be built from a cold cache. cu126 + torch 2.6.0 is the nearest combination whose cudnn pin (9.5.1.17) still resolves.
+Was CUDA 12.1 / torch 2.5.1 until #255: NVIDIA withdrew `nvidia-cudnn-cu12==9.1.0.70`, which torch 2.4.0–2.6.0 pins by `==` on both the cu121 and cu124 wheel lines, so the image could not be built from a cold cache. cu126 + torch 2.6.0 is the nearest combination whose cudnn pin (9.5.1.17) still resolves.
 
 Script: `fst1w_to_mni.py` — affine + SyN registration of FreeSurfer conformed `orig.mgz` to MNI152NLin2009cAsym using FireANTs. GPU-accelerated. Called by `t1w-to-mni-template`.
 

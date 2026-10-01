@@ -75,7 +75,7 @@ ingress-mode != globus:   verify-staged-input
 The `|| Skipped` arms are what make ingress replaceable: a task that never runs
 satisfies the dependency just as well as one that succeeds. Two properties of
 this shape are easy to break and invisible to `argo lint`
-([#336](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/336)):
+(#336):
 
 - **Every Globus task is guarded, and each accepts a `Skipped` upstream.** Argo
   marks a task whose `when` is false *Skipped*, but a task whose `depends` is

@@ -121,9 +121,11 @@ The pieces most likely to be useful outside this deployment, roughly in order:
 4. **[argo/workflows/](argo/workflows/)** — patterns for GPU steps, artifact passing through
    S3, retry policies, and recording per-step outcomes in a DAG where steps may be skipped.
 
-Deployment-specific values (account IDs, bucket names, domains, collection IDs) are replaced
-with `<YOUR_...>` placeholders in this repository. Anything so marked needs a real value before
-the corresponding component will run.
+Deployment-specific values (account IDs, bucket names, domains, collection IDs) are not in
+this repository. Code reads each from a Terraform variable, the `cloudpipe-config` ConfigMap or
+the environment, and the docs say which; a Terraform variable with no default is one you must
+supply before the corresponding component will run
+(`terraform/modules/stack/example/terraform.tfvars.example`).
 
 ### Caveats before you copy something
 

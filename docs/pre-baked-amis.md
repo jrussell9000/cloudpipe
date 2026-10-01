@@ -1,6 +1,6 @@
 # Pre-baked Node AMIs
 
-Karpenter provisions GPU nodes on-demand from fresh EC2 instances. Without pre-baking, each new node must pull the fastsurfer and fireants images from ECR before any pod can start. Fastsurfer alone is 5.8 GB compressed in ECR (fireants a further 5.3 GB) and roughly 1.5 minutes per fresh node; a 20% cold-node rate across 12,000 subjects wastes ~600 GPU-hours on image pulls alone. Fireants was added to the bake later (#123) after measurement showed its cold pull (~80s) is a much larger fraction of `t1w-to-mni`'s short GPU hold (36% pre-compute) than fastsurfer's pull is of the longer-running FastSurfer steps — see [issue #123](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/123).
+Karpenter provisions GPU nodes on-demand from fresh EC2 instances. Without pre-baking, each new node must pull the fastsurfer and fireants images from ECR before any pod can start. Fastsurfer alone is 5.8 GB compressed in ECR (fireants a further 5.3 GB) and roughly 1.5 minutes per fresh node; a 20% cold-node rate across 12,000 subjects wastes ~600 GPU-hours on image pulls alone. Fireants was added to the bake later (#123) after measurement showed its cold pull (~80s) is a much larger fraction of `t1w-to-mni`'s short GPU hold (36% pre-compute) than fastsurfer's pull is of the longer-running FastSurfer steps.
 
 The solution is a custom AMI that has both images already in containerd's image store. Karpenter selects the pre-baked AMI via `amiSelectorTerms` tags. When a new node starts, the images are already present and kubelet skips the pull.
 
@@ -54,7 +54,7 @@ commands below.
 | Selection key | `fastsurfer-image-digest` + `fireants-image-digest` + `eks-version` AMI tags, matched against `fastsurfer_ami_digest` / `fireants_ami_digest` in `terraform/modules/stack/karpenter.tf` |
 | EKS version | `1.35` |
 | Base AMI | latest `amazon-eks-node-al2023-x86_64-nvidia-1.35-*` — resolved by `source_ami_filter` at build time, **not pinned**, so two builds of the same image tags can sit on different base AMIs |
-| Region | `<YOUR_AWS_REGION>` |
+| Region | Packer's `region` variable — the deployment region |
 | Root volume | 150 GiB gp3 (covers fastsurfer + fireants + runtime pulls of afni/synthmorph) |
 
 Selection is by **digest**, not by the `sha-` tag. A rebuild at an unchanged commit produces
@@ -119,7 +119,7 @@ The build takes ~20-25 minutes: ~5 min to start and connect to the instance, ~2 
 
 The new AMI ID is printed at the end of the build:
 ```
-<YOUR_AWS_REGION>: ami-xxxxxxxxxxxxxxxxx
+<region>: ami-xxxxxxxxxxxxxxxxx
 ```
 
 ### 3. Deploy the new AMI
@@ -201,13 +201,13 @@ AL2023 nodes (unlike Bottlerocket) do not bundle the NVIDIA device plugin in the
 
 ## Gotchas
 
-**An interrupted build can strand its builder, and the builder is expensive at rest.** Packer stops the instance before snapshotting it, so a build killed in that window leaves a *stopped* `g4dn.2xlarge`. That costs nothing for compute but still bills for its 60 GiB root volume at 16000 IOPS / 1000 MB/s, about $105/month. A run cancelled on 2026-08-17 left one behind for three weeks ([#357](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/357)). GitHub delivers a cancel's SIGINT only to the step's entry process, so the workflow `exec`s packer to receive it, and then runs an `always()` cleanup step keyed on the run's key-pair name, `packer_gpu-nodeclass_<run_id>-<attempt>`. Nothing sweeps up after a **local** build, so check by hand after interrupting one:
+**An interrupted build can strand its builder, and the builder is expensive at rest.** Packer stops the instance before snapshotting it, so a build killed in that window leaves a *stopped* `g4dn.2xlarge`. That costs nothing for compute but still bills for its 60 GiB root volume at 16000 IOPS / 1000 MB/s, about $105/month. A run cancelled on 2026-08-17 left one behind for three weeks (#357). GitHub delivers a cancel's SIGINT only to the step's entry process, so the workflow `exec`s packer to receive it, and then runs an `always()` cleanup step keyed on the run's key-pair name, `packer_gpu-nodeclass_<run_id>-<attempt>`. Nothing sweeps up after a **local** build, so check by hand after interrupting one:
 
 ```bash
-aws ec2 describe-instances --region <YOUR_AWS_REGION> \
+aws ec2 describe-instances \
   --filters 'Name=key-name,Values=packer_*' 'Name=instance-state-name,Values=pending,running,stopping,stopped' \
   --query 'Reservations[].Instances[].[InstanceId,State.Name,KeyName]' --output text
-aws ec2 describe-key-pairs --region <YOUR_AWS_REGION> --query 'KeyPairs[?starts_with(KeyName,`packer`)].KeyName' --output text
+aws ec2 describe-key-pairs --query 'KeyPairs[?starts_with(KeyName,`packer`)].KeyName' --output text
 aws iam list-roles --query 'Roles[?starts_with(RoleName,`packer-`)].RoleName' --output text
 ```
 

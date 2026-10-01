@@ -11,13 +11,21 @@ Day-2 reference for submitting pipelines, monitoring progress, handling failures
 
 ## Service URLs
 
+`<domain>` is the Terraform `domain` variable.
+
 | Service | URL |
 |---|---|
-| Argo Workflows UI | https://argo.<YOUR_DOMAIN> |
-| Prefect UI | https://prefect.<YOUR_DOMAIN> |
-| ArgoCD UI | https://argocd.<YOUR_DOMAIN> |
-| Kubecost | https://kubecost.<YOUR_DOMAIN> |
-| Grafana | https://grafana.<YOUR_DOMAIN> |
+| Argo Workflows UI | `https://argo.<domain>` |
+| Prefect UI | `https://prefect.<domain>` |
+| ArgoCD UI | `https://argocd.<domain>` |
+| Kubecost | `https://kubecost.<domain>` |
+| Grafana | `https://grafana.<domain>` |
+
+The commands on this page run in `pixi shell -e ops` (WARP connected), which reads this
+deployment's values from the cluster and exports them: `CLOUDPIPE_BUCKET`,
+`CLOUDPIPE_METRICS_BUCKET`, `CLOUDPIPE_ECR_REGISTRY`, `PREFECT_API_URL` and
+`KUBECOST_BASE_URL` (`scripts/cloudpipe-env.sh`). The `aws` CLI takes the region from your
+AWS profile.
 
 ---
 
@@ -29,7 +37,7 @@ Prefect drip-feeds subjects one at a time and blocks when the `cloudpipe-max-con
 
 ```bash
 prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
-  -p subjects_file=s3://<YOUR_S3_BUCKET>/subjects.csv
+  -p subjects_file="s3://$CLOUDPIPE_BUCKET/subjects.csv"
 ```
 
 Common optional parameters:
@@ -71,7 +79,7 @@ The Variable is capped server-side by the controller's `namespaceParallelism` (`
 prefect variable set cloudpipe-max-submissions-per-minute 5
 ```
 
-The cap limits how many workflows stand at once, not how fast they arrive. Unpaced, a cold start admits the cap's whole width in minutes, and the resulting control-plane throttle leaked the `globus-transfer` semaphore and wedged workflows on 2026-09-14 ([#393](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/393)). So don't ramp `cloudpipe-max-concurrent` by hand to smooth a start; pacing already does it. The default is above the globus-transfer drain (~2.4 subjects/min), so pacing never becomes the bottleneck of a globus batch. It has not yet been calibrated against a cold start. Each `submitted` log line ends with `paced Ns`, how long pacing held that submission; waits on the cap are logged separately as `N active ≥ cap`.
+The cap limits how many workflows stand at once, not how fast they arrive. Unpaced, a cold start admits the cap's whole width in minutes, and the resulting control-plane throttle leaked the `globus-transfer` semaphore and wedged workflows on 2026-09-14 (#393). So don't ramp `cloudpipe-max-concurrent` by hand to smooth a start; pacing already does it. The default is above the globus-transfer drain (~2.4 subjects/min), so pacing never becomes the bottleneck of a globus batch. It has not yet been calibrated against a cold start. Each `submitted` log line ends with `paced Ns`, how long pacing held that submission; waits on the cap are logged separately as `N active ≥ cap`.
 
 Globus destination collection UUID is always read from SSM (`/cloudpipe/globus/collection-id`) at runtime, so instance replacements take effect automatically.
 
@@ -104,7 +112,7 @@ For data already staged in S3, add `-p ingress-mode=presynced` and pass the `glo
 
 ```bash
 prefect deployment run first-level-queue-manager/first-level-queue-manager \
-  -p subjects_file=s3://<YOUR_S3_BUCKET>/first-level-subjects.csv
+  -p subjects_file="s3://$CLOUDPIPE_BUCKET/first-level-subjects.csv"
 ```
 
 Like `cloudpipe-queue-manager`, `max_concurrent` is not a flow parameter. Concurrency is controlled via the Prefect Variable `first-level-max-concurrent` (default `25`):
@@ -115,7 +123,7 @@ prefect variable set first-level-max-concurrent 15
 
 The gate counts all active Argo workflows across both pipelines. If running cloudpipe and first-level simultaneously, set each Variable so the two caps sum to your desired total, and keep that total at or below the controller's `namespaceParallelism` (`400`).
 
-The count is namespace-wide **by design**, not by oversight. `list_active_names()` filters only on `workflows.argoproj.io/completed!=true`, deliberately avoiding the `pipeline` label and `workflows.argoproj.io/phase` — the controller writes both *after* the create call returns, so any positive selector silently misses workflows submitted in the last few seconds. `ConcurrencyGate` additionally counts names it submitted itself until a list response confirms them, closing the informer-cache window ([#206](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/206)).
+The count is namespace-wide **by design**, not by oversight. `list_active_names()` filters only on `workflows.argoproj.io/completed!=true`, deliberately avoiding the `pipeline` label and `workflows.argoproj.io/phase` — the controller writes both *after* the create call returns, so any positive selector silently misses workflows submitted in the last few seconds. `ConcurrencyGate` additionally counts names it submitted itself until a list response confirms them, closing the informer-cache window (#206).
 
 ---
 
@@ -144,7 +152,7 @@ Pod logs are **not** forwarded to CloudWatch. Use the Argo UI or `argo logs` —
 
 **Do not read `status.nodes` through `kubectl`.** `nodeStatusOffLoad: true` is set in the controller's `persistence` config (`terraform/modules/argo-workflows/main.tf`), so once a workflow's packed node status exceeds the controller's size threshold it is written to Postgres and *stripped from the CR*, leaving only `status.offloadNodeStatusVersion` behind. `kubectl get workflow <name> -o json` then reports `status.nodes` as absent — not empty-because-nothing-ran, absent-because-it-moved — and a running workflow with 30 live nodes looks idle. Observed on 2026-08-17 with the controller logging `"Workflow to be dehydrated" "Workflow Size"=168553` for the same workflow whose pods were visibly running.
 
-`argo get` and `argo list -o json` go through the Argo server, which rehydrates from Postgres and drops `offloadNodeStatusVersion`, so they are the only correct readers (this is also why the server's service account is granted read on the `argo-db` secret — without it both fail with `offload node status is not supported`, [#81](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/81)) (verified the same day: 294 of 306 live workflows carried full `status.nodes`, 0 reported as offloaded). `kubectl get workflows` is still the right tool for **phase** across many workflows — that field stays on the CR — just never for per-node detail. Note the volume: that rehydrated listing was ~86 MB for 306 workflows, so redirect it to a file rather than piping it through a terminal.
+`argo get` and `argo list -o json` go through the Argo server, which rehydrates from Postgres and drops `offloadNodeStatusVersion`, so they are the only correct readers (this is also why the server's service account is granted read on the `argo-db` secret — without it both fail with `offload node status is not supported`, #81) (verified the same day: 294 of 306 live workflows carried full `status.nodes`, 0 reported as offloaded). `kubectl get workflows` is still the right tool for **phase** across many workflows — that field stays on the CR — just never for per-node detail. Note the volume: that rehydrated listing was ~86 MB for 306 workflows, so redirect it to a file rather than piping it through a terminal.
 
 ### Counting active workflows
 
@@ -206,21 +214,20 @@ Two readings matter, and one is a trap:
 
 ```bash
 # Final MNI-space BOLD outputs
-aws s3 ls s3://<YOUR_S3_BUCKET>/derivatives/func/NDARINVXXXXXXXX/ --recursive
+aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/func/NDARINVXXXXXXXX/" --recursive
 
 # Registration outputs
-aws s3 ls s3://<YOUR_S3_BUCKET>/derivatives/registration/NDARINVXXXXXXXX/ --recursive
+aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/registration/NDARINVXXXXXXXX/" --recursive
 
 # FastSurfer derivatives
-aws s3 ls s3://<YOUR_S3_BUCKET>/derivatives/fastsurfer/NDARINVXXXXXXXX/ --recursive
+aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/fastsurfer/NDARINVXXXXXXXX/" --recursive
 ```
 
 ### Prefect flow run status
 
 Use the Prefect UI or:
 ```bash
-PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
-  prefect flow-run ls
+prefect flow-run ls
 ```
 
 ---
@@ -231,8 +238,7 @@ PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
 
 Cancel the Prefect flow run from the UI, or:
 ```bash
-PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
-  prefect flow-run cancel <flow-run-id>
+prefect flow-run cancel <flow-run-id>
 ```
 
 Workflows already submitted continue running. To also stop those, terminate them individually (see below) or use the bulk approach.
@@ -256,13 +262,13 @@ argo list -n argo-workflows --running -o json \
 Restart Prefect with `start_index` set to the first unprocessed subject:
 ```bash
 prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
-  -p subjects_file=s3://<YOUR_S3_BUCKET>/subjects_v611.csv \
+  -p subjects_file="s3://$CLOUDPIPE_BUCKET/subjects_v611.csv" \
   -p start_index=150 \
   -p batch_label=leg-2
 ```
 
 Always pass `subjects_file` explicitly. The deployment's stored default is
-`s3://<YOUR_S3_BUCKET>/subjects.csv`, which **404s — it has never existed**; the real cohort CSV is
+`s3://<bucket>/subjects.csv`, which **404s — it has never existed**; the real cohort CSV is
 `subjects_v611.csv`.
 
 Pass `batch_label` on anything you will later want to isolate in the metrics. It is stamped onto
@@ -289,9 +295,9 @@ The inventory step skips any step whose S3 derivative already exists. To force r
 SUBJ=NDARINVXXXXXXXX
 
 # Delete derivatives (forces all pipeline steps to re-run)
-aws s3 rm s3://<YOUR_S3_BUCKET>/derivatives/fastsurfer/${SUBJ}/ --recursive
-aws s3 rm s3://<YOUR_S3_BUCKET>/derivatives/registration/${SUBJ}/ --recursive
-aws s3 rm s3://<YOUR_S3_BUCKET>/derivatives/func/${SUBJ}/ --recursive
+aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/fastsurfer/${SUBJ}/" --recursive
+aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/registration/${SUBJ}/" --recursive
+aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/func/${SUBJ}/" --recursive
 
 # Delete workflow-keyed metric records (clears dashboard rows for this subject)
 for prefix in workflow-runs step-outcomes subject-manifests; do
@@ -306,7 +312,7 @@ done
 > base for publication. Their keys carry no workflow name, so the re-run overwrites each record
 > in place; deleting first gains nothing. `cloudpipe-metrics` *is* versioned, so such a delete is
 > recoverable from delete markers, but only by manual enumeration — don't rely on it.
-> (`<YOUR_S3_BUCKET>`, which holds the derivatives and `logs/`, is **not** versioned; deletes there are
+> (The data bucket, which holds the derivatives and `logs/`, is **not** versioned; deletes there are
 > unrecoverable without reprocessing.) For a full fresh-start batch, where stale QC from earlier
 > batches would pollute the dashboards, use `prep_test_batch.py --flush-qc`.
 
@@ -433,7 +439,7 @@ pixi run python scripts/prep_test_batch.py tools/cloudpipe_test_sample.csv \
 
 `--metrics-bucket` is required and deliberately has no default — metrics are the run
 of record, and a defaulted value is how an operator deletes the wrong thing by reflex.
-Derivatives are flushed from `--bucket` (default `<YOUR_S3_BUCKET>`); metrics from
+Derivatives are flushed from `--bucket` (default `$CLOUDPIPE_BUCKET`); metrics from
 `--metrics-bucket`. Both names are readable from the `cloudpipe-config` ConfigMap:
 
 ```bash
@@ -441,7 +447,7 @@ kubectl get configmap cloudpipe-config -n argo-workflows -o jsonpath='{.data}' |
 ```
 
 The script:
-1. Uploads `cloudpipe_test_sample.csv` to `s3://<YOUR_S3_BUCKET>/config/test_batch_subjects.csv`
+1. Uploads `cloudpipe_test_sample.csv` to `s3://<bucket>/config/test_batch_subjects.csv`
 2. Deletes derivatives (`fastsurfer/`, `registration/`, `func/`, `func_surf/`,
    `subregions/`, `subregions_mni/`) per subject in parallel
 3. Deletes workflow-keyed metrics (`step-outcomes`, `workflow-runs`, `subject-manifests`)
@@ -476,7 +482,7 @@ has its `*_compacted` twin filtered the same way: the batch subjects' rows are r
 each Parquet file in place (one file packs many subjects, so it is rewritten, never deleted),
 and every other subject's history stays. This is what makes a flushed attempt stop counting
 everywhere at once
-([#382](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/382)) — the nightly
+(#382) — the nightly
 compactor rebuilds only its last four days, so without it an older day's compacted copy kept
 the flushed rows while raw and the dashboards did not. (`--flush-qc` used to delete **all**
 of `metrics/compacted/` on the theory that the compactor rebuilds it; it rebuilds four days,
@@ -524,9 +530,8 @@ earlier flush. This runs *before* the workflow-runs flush, which would otherwise
 ### Step 2 — Submit
 
 ```bash
-PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
 prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
-  -p subjects_file=s3://<YOUR_S3_BUCKET>/config/test_batch_subjects.csv
+  -p subjects_file="s3://$CLOUDPIPE_BUCKET/config/test_batch_subjects.csv"
 ```
 
 `max_concurrent` is not a flow parameter; it comes from the live `cloudpipe-max-concurrent` Prefect Variable. **Read it before submitting** — it persists from the previous batch, and `50` is only the fallback for when it is unset:
@@ -556,7 +561,7 @@ argo list -n argo-workflows --field-selector=status.phase=Failed -o json \
 
 # Kubecost mid-run spot-check — count workflows with cost data so far
 # (substitute actual RFC3339 UTC window times)
-curl -sk "https://kubecost.<YOUR_DOMAIN>/model/allocation?window=<START>,<END>&aggregate=label:workflows.argoproj.io/workflow&filterNamespaces=argo-workflows&accumulate=true" \
+curl -sk "$KUBECOST_BASE_URL/model/allocation?window=<START>,<END>&aggregate=label:workflows.argoproj.io/workflow&filterNamespaces=argo-workflows&accumulate=true" \
   | jq '[.data[][]] | map(select(.totalCost > 0)) | length'
 ```
 
@@ -638,7 +643,7 @@ that run as `skipped` with `upstream_failed_step=bold-to-t1w`, logging one line:
 
 Before that it ran `preproc.py` anyway and the run died at the composite-warp stage with an
 `antsApplyTransforms` `CalledProcessError` traceback, which reads exactly like an OOM or an ANTs
-crash — the 2026-08-10 batch needed two pod logs out of `s3://<YOUR_S3_BUCKET>/logs/` and a
+crash — the 2026-08-10 batch needed two pod logs out of the data bucket's `logs/` and a
 `derivatives/registration/` listing to establish otherwise. The validator keys off the
 **bold-to-t1w** row either way, so records written before #222 (`failed`) and after it
 (`skipped`) are reported identically. If you see the old traceback in a recent batch, the pod is
@@ -693,7 +698,6 @@ batch submitted in the evening CDT crosses the UTC midnight boundary (e.g. submi
 trigger manually:
 
 ```bash
-PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
 prefect deployment run kubecost-cost-scraper/kubecost-cost-scraper
 ```
 
@@ -832,9 +836,9 @@ All spot-exposed workflow templates retry automatically on spot interruption (`p
 
 **The budget is sized for infrastructure, not for the workload.** Every nodepool is spot-only, so consecutive reclaims on a single long step are routine and 8 attempts exist to absorb them. Exit **137 is deliberately not retried**: a genuine OOMKill in this pipeline has always been deterministic (#120, #129, #134 each needed a memory or partitioning change, and no number of retries would have helped), so retrying it would burn the budget re-running an identical failure. If you find yourself wanting 137 back in the expression, the real fix is almost certainly a memory request or a step split. See issue #115.
 
-The short `cpu-light` steps (`globus-transfer`, `inventory`) are the exception — they have no expression at all and a limit of 2–3, so they retry on *any* failure. They used `retryPolicy: OnFailure`, which silently dropped every reclaimed pod (phase `Error`, not `Failed`) and cost 4 subjects zero retries; [#269](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/269) moved them to `Always`.
+The short `cpu-light` steps (`globus-transfer`, `inventory`) are the exception — they have no expression at all and a limit of 2–3, so they retry on *any* failure. They used `retryPolicy: OnFailure`, which silently dropped every reclaimed pod (phase `Error`, not `Failed`) and cost 4 subjects zero retries; #269 moved them to `Always`.
 
-**The codes are matched in the node message as well as in `exitCode`, and that is not belt-and-braces — it is load-bearing.** Argo populates `outputs.exitCode` from the **main** container only. A pod that dies in its **init** container (where argoexec's artifact loader runs) has no `exitCode` at all, and one that dies in its `wait` container records `"0"`. Neither is in `["64","75","143"]`, so before [#277](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/277) every artifact-staging failure got exactly one attempt regardless of `limit: "8"` — which is how [#274](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/274) turned a transient staging fault into the permanent loss of all three sessions of one subject. The tell in `status.nodes` is a message reading `init: Error (exit code 64): …` next to an absent `exitCode`; the plain-text `64` in the message is exactly what made the dead arm look live.
+**The codes are matched in the node message as well as in `exitCode`, and that is not belt-and-braces — it is load-bearing.** Argo populates `outputs.exitCode` from the **main** container only. A pod that dies in its **init** container (where argoexec's artifact loader runs) has no `exitCode` at all, and one that dies in its `wait` container records `"0"`. Neither is in `["64","75","143"]`, so before #277 every artifact-staging failure got exactly one attempt regardless of `limit: "8"` — which is how #274 turned a transient staging fault into the permanent loss of all three sessions of one subject. The tell in `status.nodes` is a message reading `init: Error (exit code 64): …` next to an absent `exitCode`; the plain-text `64` in the message is exactly what made the dead arm look live.
 
 **One staging failure is excluded from that widening**: `The specified key does not exist`. An artifact key is absent because its *producer* was skipped or failed, S3 is read-after-write consistent, and retrying the *consumer* never re-runs the producer — so those 8 attempts are ~32 minutes of backoff spent re-failing identically. This is the same rule that keeps 137 out, and the same rule as the exit-66 case in [pipelines.md](pipelines.md). Note the guard is keyed on `key`, not on `does not exist`: a wrong *bucket* is a config fault and still retries.
 
@@ -868,7 +872,7 @@ The inventory step will set `b2t_exists`, `func_exists`, and `fastsurfer-exists`
 
 ### Sweeping a whole batch for resubmittable failures
 
-Doing the above by hand is fine for one subject. For a batch, `src/resubmit_failed.py` ([#234](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/234)) finds every terminally-failed workflow, classifies each one, and re-drives only the ones that can plausibly succeed:
+Doing the above by hand is fine for one subject. For a batch, `src/resubmit_failed.py` (#234) finds every terminally-failed workflow, classifies each one, and re-drives only the ones that can plausibly succeed:
 
 ```bash
 # Always dry-run first — it prints the plan and exits.
@@ -884,9 +888,9 @@ PYTHONPATH=src pixi run python -m resubmit_failed --since ... --apply --max-acti
 Two things about it are worth knowing before you trust the plan:
 
 - **It classifies on repetition, not on the exit code.** Nine `exit 75`s are deterministic and get skipped; one `exit 75` is the `EX_TEMPFAIL` guard working and gets retried. Keying off the code alone gets both wrong, in opposite directions. Spot kills (`143`, `pod deleted`, `imminent node shutdown`) are exempt from the repetition rule entirely, because on spot-only nodepools they repeat *without* being deterministic — that exemption exists because the classifier called a healthy subject deterministic on two SIGTERMs on its first live run.
-- **`The specified key does not exist` is retryable here even though the WorkflowTemplates' retry expression excludes it.** The two operate at different layers: an in-workflow retry of a consumer does not re-run its producer, so the key stays absent, but a *resubmission* re-runs the producer from the top. That was the real shape of [#274](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/274) — a spot kill orphaned a FastSurfer tree and the staging failures downstream were the symptom.
+- **`The specified key does not exist` is retryable here even though the WorkflowTemplates' retry expression excludes it.** The two operate at different layers: an in-workflow retry of a consumer does not re-run its producer, so the key stays absent, but a *resubmission* re-runs the producer from the top. That was the real shape of #274 — a spot kill orphaned a FastSurfer tree and the staging failures downstream were the symptom.
 
-Resubmitting is cheap because every expensive stage gates on a `_complete.json` marker (ADR 017), so a re-driven subject skips whatever already published. Use `--exclude-subjects` for determinism the classifier cannot see, such as a session the [#248](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/248) guard rejects on every run.
+Resubmitting is cheap because every expensive stage gates on a `_complete.json` marker (ADR 017), so a re-driven subject skips whatever already published. Use `--exclude-subjects` for determinism the classifier cannot see, such as a session the #248 guard rejects on every run.
 
 The sweep reads node status via `argo list -o json`, not `kubectl` — see the warning under [Workflow status](#workflow-status).
 
@@ -948,13 +952,11 @@ pixi run -e docs docs-build
 pixi run -e docs docs-serve
 ```
 
-The site is built with [Zensical](https://zensical.org), which reads `mkdocs.yml` unchanged. `zensical build --strict` fails on a broken relative link or a stale anchor — both verified with deliberately broken probes. It does **not** fail on a page that is missing from `nav`: such a page is published but unreachable from the sidebar. `tests/test_docs_boundary.py` checks that every page under `docs/` is in `nav` (and every `nav` entry exists), so the gap is covered by the pytest job rather than the build.
-
-Until `docs-site` task 7.4 removes it, the previous MkDocs build is still available as `pixi run -e docs docs-build-mkdocs`. On 2026-10-01 both produced the same 40 pages with the same 528 heading ids. MkDocs needs the `validation:` block in `mkdocs.yml`: its default severity for an unresolvable link is `INFO`, so without that block a strict MkDocs build exits 0 over dead links.
+The site is built with [Zensical](https://zensical.org), which reads `mkdocs.yml` unchanged; MkDocs itself is no longer installed. `zensical build --strict` fails on a broken relative link or a stale anchor with no extra configuration — both verified with deliberately broken probes. It does **not** fail on a page that is missing from `nav`: such a page is published but unreachable from the sidebar. `tests/test_docs_boundary.py` checks that every page under `docs/` is in `nav` (and every `nav` entry exists), so the gap is covered by the pytest job rather than the build.
 
 Two consequences worth knowing before you edit a doc:
 
-- **In-page anchors follow GitHub's slug algorithm, not the site generator's default.** These docs are read on GitHub as well as on the site, and the two slugify headings differently (GitHub turns an em dash into a *double* hyphen; the MkDocs-family default collapses it to one). `mkdocs.yml` sets `toc.slugify` to `pymdownx.slugs.slugify(case="lower")`, which reproduces GitHub's algorithm so one setting keeps both renderings valid; Zensical honours it, producing ids identical to the MkDocs build. Don't "fix" an anchor link by hand — that fixes the site and breaks GitHub.
+- **In-page anchors follow GitHub's slug algorithm, not the site generator's default.** These docs are read on GitHub as well as on the site, and the two slugify headings differently (GitHub turns an em dash into a *double* hyphen; the MkDocs-family default collapses it to one). `mkdocs.yml` sets `toc.slugify` to `pymdownx.slugs.slugify(case="lower")`, which reproduces GitHub's algorithm so one setting keeps both renderings valid; Zensical honours it (its ids matched the former MkDocs build exactly). Don't "fix" an anchor link by hand — that fixes the site and breaks GitHub.
 - **Links out of `docs/` must be absolute GitHub URLs.** A relative `../terraform/...` link resolves on GitHub but 404s on the published site, which is rooted at `docs/`. Point at `https://github.com/jrussell9000/cloudpipe/blob/main/...` (or `/tree/main/` for a directory) instead. Internal docs are the exception: they live in `docs-internal/`, which is never synced, so there is no URL to link to. Name the path in a code span (`docs-internal/investigations/…`) instead of linking.
 
 Neither job installs pip/conda dependencies outside `pixi.toml` — if a test needs a new package, add it to `pixi.toml` (and regenerate `pixi.lock` with `pixi install`) rather than installing ad hoc.
@@ -1074,7 +1076,7 @@ PRs touching `terraform/` are checked by CI (`terraform fmt`, `terraform validat
 
 ### Syncing to the public repo
 
-[jrussell9000/cloudpipe](https://github.com/jrussell9000/cloudpipe) is the public, institution-neutral version of this repo. It contains the same pipeline code with all deployment-specific values replaced by `<YOUR_*>` placeholders (account IDs, bucket names, domain names, Globus UUIDs, etc.).
+[jrussell9000/cloudpipe](https://github.com/jrussell9000/cloudpipe) is the public, institution-neutral version of this repo. It contains the same pipeline code and docs, and none of this deployment's values: code reads them from configuration, and the docs name where each one comes from (a Terraform variable, an SSM parameter, or a variable `pixi shell -e ops` exports) rather than the value itself.
 
 **Automated sync (normal path)**
 
@@ -1094,15 +1096,15 @@ Two subtrees are on it: `scripts/manifests/` (one-off Kubernetes probe manifests
 
 Names in `SYNC_FILES` that don't exist locally now log a `WARNING` instead of being skipped silently. That silent skip is why the public repo had **no front page for ~75 days**: `README.md` was correctly listed, the file simply didn't exist internally yet, and nothing reported it. Note also that `pixi.lock` must always travel with `pixi.toml` — publishing a current manifest beside a stale lockfile makes `pixi install` resolve to something nobody tested.
 
-**Two kinds of scrub.** `REPLACEMENTS` is a fixed-string map — one entry per deployment literal — and it cannot express a value that is a *format* rather than a list. `REGEX_REPLACEMENTS` handles those with `sed -E`, running after the literal pass so a literal entry still wins where one exists. Both ABCD subject-ID forms are there, and every ID becomes its placeholder. The scrub loop bounds each pattern on the right, so a longer lookalike is left intact for the gate to reject instead of being half-rewritten into something that reads like a placeholder.
+**Two kinds of scrub.** `REPLACEMENTS` is a fixed-string map — one entry per deployment literal — and it cannot express a value that is a *format* rather than a list. Since every synced directory reached zero literals it holds a single entry (see the retirement rule below). `REGEX_REPLACEMENTS` handles formats with `sed -E`, running after the literal pass so a literal entry still wins where one exists. Both ABCD subject-ID forms are there, and every ID becomes its placeholder. The scrub loop bounds each pattern on the right, so a longer lookalike is left intact for the gate to reject instead of being half-rewritten into something that reads like a placeholder.
 
 Use `sub-XXXXXXXX` — and only that form — when writing an NBDC-form subject ID into a synced path. A placeholder of any other shape — a longer run of `X`s, or one carrying a prefix — fails the gate on its first 8 characters, because the verify pattern cannot tell a placeholder prefix from a real ID. This sentence is itself the demonstration: the first draft spelled such a placeholder out, and the sync refused to publish the paragraph.
 
 **The sync fails closed.** After scrubbing, three gates run before anything is published; any one exiting non-zero aborts the sync (and, in CI, fails the job before the PR is opened):
 
-1. **Content verifier** (in `sync-public.sh`): scans the staged tree's *contents* for known-sensitive patterns — the AWS account ID, the institution domain, data-bucket names (`abcd-v*`), any Globus UUID, personal (`@gmail.com`) emails, ABCD subject IDs in both the legacy `NDARINV…` and the current `sub-XXXXXXXX` form, and RDS instance endpoints (whether or not the region was scrubbed). A surviving match prints `file:line:match` and the fix hint, then exits 1. Exact matches listed in `VERIFY_ALLOWED_MATCHES` are placeholders and pass: the two subject-ID placeholders `NDARINVXXXXXXXX` and `sub-XXXXXXXX`.
+1. **Content verifier** (in `sync-public.sh`): scans the staged tree's *contents* for known-sensitive patterns — the AWS account ID, the institution and deployment domains, the deployment region, the operator's NetID, the internal repository's name, data-bucket names, any Globus UUID, personal (`@gmail.com`) emails, ABCD subject IDs in both the legacy `NDARINV…` and the current `sub-XXXXXXXX` form, and RDS instance endpoints (whether or not the region was scrubbed). A surviving match prints `file:line:match` and the fix hint, then exits 1. Exact matches listed in `VERIFY_ALLOWED_MATCHES` are placeholders and pass: the two subject-ID placeholders `NDARINVXXXXXXXX` and `sub-XXXXXXXX`.
 
-   Subject IDs are the one pattern the verifier cannot expect the scrub map to satisfy. `REPLACEMENTS` is fixed-string, one entry per value, which suits an account ID or a collection UUID but not a family of 11,834 ids that a pasted log excerpt may introduce at any time. They are handled by `REGEX_REPLACEMENTS`, an extended-regex pass that runs after the literal one and rewrites the whole family to its placeholder. **The internal repo is expected to contain real subject IDs** — it is private and covered by the DUA, and the docs are more useful with real examples. The gate's job is to guarantee none of them reach the mirror, not to keep them out of here.
+   Subject IDs are the one pattern the verifier cannot expect the scrub map to satisfy. `REPLACEMENTS` is fixed-string, one entry per value, which suits an account ID or a collection UUID but not a family of 11,834 ids that a pasted log excerpt may introduce at any time. They are handled by `REGEX_REPLACEMENTS`, an extended-regex pass that runs after the literal one and rewrites the whole family to its placeholder. **`docs-internal/` is expected to contain real subject IDs** — it is private, covered by the DUA, never synced, and investigations are more useful with real examples. `docs/` uses `sub-XXXXXXXX`, or "subject A", "subject B" where a passage compares subjects. The gate's job is to guarantee no real ID reaches the mirror whichever way one slips into a synced path.
 2. **Filename verifier** (in `sync-public.sh`): the same patterns, against every staged *path*. The content scan cannot cover this — it skips images and archives entirely, and no scrub can rewrite a filename. That is how nine brain montages named after real subjects stayed published for weeks with every content check green. Subject-named files are excluded from the sync outright (`--exclude="sub-*"`); this gate is the backstop for a naming form the excludes don't know about, and it fails rather than silently dropping a file someone meant to publish.
 3. **Secret scanner** (CI): `gitleaks detect --no-git` over the staged tree, as a backstop for keys/tokens/high-entropy strings the pattern list doesn't anticipate.
 
@@ -1114,13 +1116,13 @@ Use `sub-XXXXXXXX` — and only that form — when writing an NBDC-form subject 
 
 The gates above all run on the *staged public tree, after* the scrub, and answer one question: did the scrub reach everything? `bash scripts/sync-public.sh --check-source` asks a different one — is the literal in *this* repo at all? It scans the tracked files the sync would publish, as committed and before any rewriting, and prints a count per directory and per pattern. It publishes nothing. The `checks` job in `.github/workflows/ci.yaml` runs it on every PR, reading its path and pattern lists from the arrays in the script itself so the two cannot drift.
 
-Most of its output is a report. The teeth are `ZERO_LITERAL_DIRS`: for a directory on that list, any match fails the run, naming the file, line and pattern. Every directory the sync publishes as code is on it — `argo/`, `gitops/`, `images/`, `prefect/`, `scripts/`, `src/` and `terraform/modules/` — so those directories hold no deployment value as a literal; each reads it from a Terraform `variable`, the `cloudpipe-config` ConfigMap, or an environment variable. Each entry carries a comment naming its source, so a reader finds the mechanism from the gate.
+Most of its output is a report. The teeth are `ZERO_LITERAL_DIRS`: for a directory on that list, any match fails the run, naming the file, line and pattern. Every directory the sync publishes is on it — `argo/`, `gitops/`, `images/`, `prefect/`, `scripts/`, `src/`, `terraform/modules/` and `docs/` — so those directories hold no deployment value as a literal; code reads each from a Terraform `variable`, the `cloudpipe-config` ConfigMap, or an environment variable. Each entry carries a comment naming its source, so a reader finds the mechanism from the gate. Only the root files (`README.md`, `pixi.toml`, …) are report-only, and they hold none either.
 
-`docs/` is deliberately **not** gated, and is where every remaining literal lives (25 files as of 2026-09-30). Prose earns its keep by citing the deployment it was measured on, so a doc that names this deployment's data bucket is doing its job; the scrub map and the fail-closed gate are the control there, not a ban. Prefer configuration over a literal in code, and evidence over a placeholder in prose.
+`docs/` joined the list last (docs-site task 5.3, 2026-10-01). Prose names where a value comes from instead of the value: `s3://$CLOUDPIPE_BUCKET/…` in a command, "the data bucket" or `<bucket>` in a sentence, `https://argo.<domain>` for a hostname, an SSM parameter for a Globus ID, and plain `#NNN` for an internal issue. A page that has to name this deployment — an investigation write-up, say — belongs in `docs-internal/`, which is never synced.
 
 Add a directory to the list **in the same change that clears it**. Gating first fails CI on `main` and blocks every unrelated PR; clearing first without the gate lets the directory regress before the follow-up lands.
 
-**Retire a scrub entry when its literal is gone.** `REPLACEMENTS` is a map of what the synced tree holds, not a catalogue of everything this deployment uses — a map padded with values nothing cites reads as if they were still published. Retiring is not a no-op, though, and that is the point: `REPLACEMENTS` rewrites silently while `VERIFY_PATTERNS` fails the sync, so a retired value that reappears aborts the sync under its pattern's label. Only retire an entry while a pattern still covers its class, and re-add one when a loud failure is the wrong answer — a new doc citing a Prefect flow-run UUID, say, which the UUID pattern cannot tell apart from a Globus collection ID. `tests/test_sync_public_check_source.py` keeps the map honest in the other direction: every entry must still appear in the census. One entry is exempt and says so — the `clusterName` one has no occurrence left and no pattern can back it up, because the pattern would have to be the bare word `cloudpipe`, which is the public repo's own name.
+**Retire a scrub entry when its literal is gone.** `REPLACEMENTS` is a map of what the synced tree holds, not a catalogue of everything this deployment uses — a map padded with values nothing cites reads as if they were still published. Retiring is not a no-op, though, and that is the point: `REPLACEMENTS` rewrites silently while `VERIFY_PATTERNS` fails the sync, so a retired value that reappears aborts the sync under its pattern's label. Only retire an entry while a pattern still covers its class, and re-add one when a loud failure is the wrong answer — a new doc citing a Prefect flow-run UUID, say, which the UUID pattern cannot tell apart from a Globus collection ID. `tests/test_sync_public_check_source.py` keeps the map honest in the other direction: every entry must still appear in the census. One entry is exempt and says so — the `clusterName` one has no occurrence left and no pattern can back it up, because the pattern would have to be the bare word `cloudpipe`, which is the public repo's own name. It is also the only entry left: clearing `docs/` retired all the others at once, and the three with no pattern behind them (the region, the NetID and the internal repository's name) each gained one first.
 
 **The published documentation site**
 
@@ -1177,10 +1179,10 @@ git push
 
 If you add a new hardcoded value (account ID, domain, email, bucket, UUID, etc.) to any synced file:
 
-1. **In code, remove it at the source** — read it from a Terraform `variable`/`local`, the `cloudpipe-config` ConfigMap, or an environment variable, so the public copy carries a reference and not a literal. In a gated directory this is not advice, it is the only option: `--check-source` fails the PR. Nothing to scrub is the strongest guarantee.
-2. In `docs/`, or in the root files, add a `"literal|<YOUR_PLACEHOLDER>"` entry to the ordered `REPLACEMENTS` array in `scripts/sync-public.sh`. **Order matters** — put any pattern that is a substring of a more general one *before* that general one.
-3. If the value is genuinely sensitive (not just deployment-specific), also add a matching pattern to `VERIFY_PATTERNS` in the same script so the fail-closed gate catches future omissions.
-4. When you *remove* the last occurrence of a value, remove its `REPLACEMENTS` entry in the same change and leave the pattern in place — see the retirement rule above.
+1. **In code, remove it at the source** — read it from a Terraform `variable`/`local`, the `cloudpipe-config` ConfigMap, or an environment variable, so the public copy carries a reference and not a literal. Every synced directory is gated, so this is not advice, it is the only option: `--check-source` fails the PR. Nothing to scrub is the strongest guarantee.
+2. **In `docs/`, name the source instead of the value** — the variable, parameter or placeholder conventions above. If the page genuinely needs the value, it belongs in `docs-internal/`.
+3. If the value is a new kind (not just a new instance of a known one), add a matching pattern to `VERIFY_PATTERNS` in the same script, so the gates catch it next time. Check the pattern matches the form the repo actually uses — see above.
+4. A `"literal|<YOUR_PLACEHOLDER>"` entry in `REPLACEMENTS` is now only for a root file that has to carry the value. **Order matters** there — put any literal that is a substring of a more general one *before* that general one — and the entry is retired with the value's last occurrence.
 
 **A gate fired — what now?** The script names the offending `file:line`. Apply step 1 or 2 above for that value, then re-run. The public repo is not updated until every gate passes.
 
@@ -1194,7 +1196,7 @@ bash scripts/sync-public.sh --check-source
 
 This scans the tracked files the sync would publish (the same `SYNC_DIRS`, `SYNC_FILES` and rsync excludes) for every `REPLACEMENTS` literal and every `VERIFY_PATTERNS` pattern. It prints a count per directory and pattern, and syncs nothing. The CI `checks` job runs it on every PR that touches a synced path.
 
-It fails only for a directory listed in `ZERO_LITERAL_DIRS`, in the same script. That list is a ratchet: when a change removes a directory's last literal, add the directory to the list in the same change, and from then on any new literal there fails CI with its `file:line:match`. `docs/` is never added; its prose stays under the scrub until the docs are sorted into public and private.
+It fails only for a directory listed in `ZERO_LITERAL_DIRS`, in the same script. That list is a ratchet: when a change removes a directory's last literal, add the directory to the list in the same change, and from then on any new literal there fails CI with its `file:line:match`. Every synced directory is now on it, `docs/` last.
 
 `gitops` is the first directory on the list. Every deployment value under it now comes from Terraform — the apps read `local.argocd_app_overrides` through the ApplicationSet's `templatePatch`, and the two bootstrap objects are rendered from `gitops/bootstrap/*.tftpl` — so a literal appearing there again means a value has acquired a second source, which is the thing ADR 020 removes. Adding a hostname, region or account ID to a chart's `values.yaml` now fails CI; put it in the override map instead (see "Per-app Helm overrides" in [gitops.md](gitops.md#per-app-helm-overrides)).
 
@@ -1259,7 +1261,7 @@ across every pod in a scrape — it cannot be used to reconstruct concurrency.
 
 ### Grafana dashboards
 
-Open **https://grafana.<YOUR_DOMAIN>**. Eight dashboards are provisioned — six Athena-backed and two Prometheus-backed:
+Open **`https://grafana.<domain>`**. Eight dashboards are provisioned — six Athena-backed and two Prometheus-backed:
 
 | Dashboard | Datasource | What to check |
 |-----------|-----------|--------------|
@@ -1337,11 +1339,11 @@ See [observability.md](observability.md) for the full querying guide, schema ref
 
 ### Grafana Cost Overview dashboard
 
-The **Cost Overview** dashboard at https://grafana.<YOUR_DOMAIN> shows daily spend, mean cost per subject, and a cost-by-subject table. Data is populated nightly by the Kubecost scraper (Prefect flow `kubecost-cost-scraper`, 02:00 UTC) once the `subjectid` pod labeling work is confirmed.
+The **Cost Overview** dashboard at `https://grafana.<domain>` shows daily spend, mean cost per subject, and a cost-by-subject table. Data is populated nightly by the Kubecost scraper (Prefect flow `kubecost-cost-scraper`, 02:00 UTC) once the `subjectid` pod labeling work is confirmed.
 
 ### Live Kubecost UI
 
-For real-time or intra-day cost breakdowns, use the Kubecost UI at https://kubecost.<YOUR_DOMAIN> (Allocations → Group by `subjectid` or namespace).
+For real-time or intra-day cost breakdowns, use the Kubecost UI at `https://kubecost.<domain>` (Allocations → Group by `subjectid` or namespace).
 
 ---
 

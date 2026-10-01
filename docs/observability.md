@@ -33,7 +33,7 @@ cloudpipe_metrics Glue database — tables hand-declared in Terraform,
 Athena workgroup: cloudpipe_metrics_workgroup
 DuckDB — same API locally, no billing, no infra
         │
-Grafana (https://grafana.<YOUR_DOMAIN>)
+Grafana (https://grafana.<domain>)
   — 8 dashboards: Pipeline Throughput, Functional QC, Anatomical QC, Registration QC,
     Cost Overview, Infrastructure Health, Karpenter Autoscaler, Failure Triage
 ```
@@ -45,7 +45,7 @@ Metrics are written to local disk by the pipeline scripts themselves — no boto
 ## S3 layout
 
 All under `s3://cloudpipe-metrics/metrics/` — a dedicated, **versioned** bucket
-separate from the `<YOUR_S3_BUCKET>` data bucket. Metrics are the run of record and must
+separate from the data bucket. Metrics are the run of record and must
 survive the derivative flushes that precede every test batch; versioning also
 makes an in-place overwrite recoverable. The Argo controller and runner roles
 have put/get but **no delete** on this bucket. See
@@ -105,13 +105,13 @@ Separate from the structured metrics above, Argo archives **every pod's full std
 
 | | |
 |---|---|
-| Location | `s3://<YOUR_S3_BUCKET>/logs/{workflow.name}/{pod.name}/main.log` |
-| Bucket | The **`<YOUR_S3_BUCKET>` data bucket** — *not* `cloudpipe-metrics` |
+| Location | `s3://<bucket>/logs/{workflow.name}/{pod.name}/main.log` |
+| Bucket | The **data bucket** (`CLOUDPIPE_BUCKET`) — *not* `cloudpipe-metrics` |
 | Enabled by | `archiveLogs: true` in both Terraform-managed ConfigMaps: [`modules/argo-workflows/main.tf`](https://github.com/jrussell9000/cloudpipe/blob/main/terraform/modules/argo-workflows/main.tf) keys `artifactRepository` and `cloudpipe-artifacts` |
-| Retention | Indefinite — no lifecycle rule (the only `<YOUR_S3_BUCKET>` rule targets `derivatives/`), and `logs/` is absent from `prep_test_batch.py`'s `METRIC_PREFIXES` |
+| Retention | Indefinite — no lifecycle rule (the data bucket's only rule targets `derivatives/`), and `logs/` is absent from `prep_test_batch.py`'s `METRIC_PREFIXES` |
 | Scale | 13,445 workflow prefixes as of 2026-07-26, 1,728 of them `cloudpipe-*` |
 
-Because logs are keyed by workflow and pod name — not by subject — a subject-glob delete can never match them, which is why they survive the derivative flushes that precede every test batch. The tradeoff is the inverse of the [metrics bucket rationale](#s3-layout): `<YOUR_S3_BUCKET>` is **unversioned**, so an accidental recursive delete on this prefix is unrecoverable.
+Because logs are keyed by workflow and pod name — not by subject — a subject-glob delete can never match them, which is why they survive the derivative flushes that precede every test batch. The tradeoff is the inverse of the [metrics bucket rationale](#s3-layout): the data bucket is **unversioned**, so an accidental recursive delete on this prefix is unrecoverable.
 
 ### Retrieving GPU VRAM history
 
@@ -121,10 +121,11 @@ Find the pods for a given step, then read one:
 
 ```bash
 # All archived t1w-to-mni pods, newest last
-aws s3api list-objects-v2 --bucket <YOUR_S3_BUCKET> --prefix logs/cloudpipe \
+# In `pixi shell -e ops`, which exports CLOUDPIPE_BUCKET from the cluster
+aws s3api list-objects-v2 --bucket "$CLOUDPIPE_BUCKET" --prefix logs/cloudpipe \
   --query 'Contents[?contains(Key, `t1w-to-mni`)].[LastModified,Key]' --output text | sort
 
-aws s3 cp s3://<YOUR_S3_BUCKET>/logs/<workflow>/<pod>/main.log -
+aws s3 cp "s3://$CLOUDPIPE_BUCKET/logs/<workflow>/<pod>/main.log" -
 ```
 
 Three caveats when parsing:
@@ -156,7 +157,7 @@ objects](metrics_data_dictionary.md#non-schema-s3-objects) section.
 
 ## Grafana dashboards
 
-Grafana is at **https://grafana.<YOUR_DOMAIN>**, deployed via ArgoCD (`gitops/apps/grafana/`). The six Athena-backed dashboards (Pipeline Throughput, QC × 3, Cost, Failure Triage) query `cloudpipe_metrics_workgroup`; results are cached in `s3://cloudpipe-finops/grafana-query-results/`. Infrastructure Health and Karpenter Autoscaler query the in-cluster Prometheus (`cloudpipe-prometheus` datasource).
+Grafana is at **`https://grafana.<domain>`**, deployed via ArgoCD (`gitops/apps/grafana/`). The six Athena-backed dashboards (Pipeline Throughput, QC × 3, Cost, Failure Triage) query `cloudpipe_metrics_workgroup`; results are cached in `s3://cloudpipe-finops/grafana-query-results/`. Infrastructure Health and Karpenter Autoscaler query the in-cluster Prometheus (`cloudpipe-prometheus` datasource).
 
 | Dashboard | UID | What it shows |
 |-----------|-----|--------------|
@@ -365,7 +366,7 @@ The nightly scraper queries the in-cluster Kubecost Allocation API aggregated by
 **Schedule**: Prefect deployment `kubecost-cost-scraper`, nightly at 02:00 UTC. To run manually:
 
 ```bash
-PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
+PREFECT_API_URL=https://prefect.<domain>/api \
   prefect deployment run kubecost-cost-scraper/kubecost-cost-scraper
 ```
 
@@ -397,15 +398,15 @@ is 4) so the re-scraped day gets re-compacted. Otherwise the Parquet copy keeps 
 numbers while the raw JSON holds settled ones, and `compacted=True` queries — which read Parquet
 for every closed day — would silently disagree with raw ones.
 
-**Direct API access**: The Kubecost Allocation API is externally accessible at `https://kubecost.<YOUR_DOMAIN>` (HTTPS only — port 80 times out). Use `accumulate=true` to collapse hourly buckets into a single row per entity over the full query window:
+**Direct API access**: The Kubecost Allocation API is externally accessible at `https://kubecost.<domain>` — `pixi shell -e ops` exports it as `KUBECOST_BASE_URL` — (HTTPS only — port 80 times out). Use `accumulate=true` to collapse hourly buckets into a single row per entity over the full query window:
 
 ```bash
 # Cost for a batch of workflows over a specific window
-curl -sk "https://kubecost.<YOUR_DOMAIN>/model/allocation?window=<START_RFC3339>,<END_RFC3339>&aggregate=label:workflows.argoproj.io/workflow&filterNamespaces=argo-workflows&accumulate=true" \
+curl -sk "$KUBECOST_BASE_URL/model/allocation?window=<START_RFC3339>,<END_RFC3339>&aggregate=label:workflows.argoproj.io/workflow&filterNamespaces=argo-workflows&accumulate=true" \
   | jq '[.data[] | to_entries[] | select(.key != "__idle__" and .key != "__unallocated__") | {workflow: .key, totalCost: .value.totalCost}] | sort_by(.totalCost) | reverse'
 
 # Cost by pipeline phase
-curl -sk "https://kubecost.<YOUR_DOMAIN>/model/allocation?window=<START_RFC3339>,<END_RFC3339>&aggregate=label:cloudpipe.io/phase&filterNamespaces=argo-workflows&accumulate=true" \
+curl -sk "$KUBECOST_BASE_URL/model/allocation?window=<START_RFC3339>,<END_RFC3339>&aggregate=label:cloudpipe.io/phase&filterNamespaces=argo-workflows&accumulate=true" \
   | jq '[.data[] | to_entries[] | select(.key != "__idle__" and .key != "__unallocated__") | {phase: .key, totalCost: .value.totalCost}]'
 ```
 
@@ -502,7 +503,7 @@ bump landing between a date's day+1 write and its age-3 settled re-scrape, i.e.
 a routine deploy inside the 3-day window — the old partition has nobody left to
 overwrite it, and since the Glue table unions every `schema_version` under a
 `dt=`, that date double-counts from then on. This actually happened
-([#180](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/180)):
+(#180):
 `costs` `dt=2026-07-29` held a `schema_version=1.1` partition ($5.075) beside a
 `schema_version=1.2` one ($2.755) for the *same 15 workflows*, and
 `costs_compacted` reported `$7.83` against a raw truth of `$2.755` — a 2.8×
@@ -544,7 +545,7 @@ overlap) has both versions present in raw, so neither is an orphan.
 run rebuilds only its `lookback_days` window from raw, so a subject flushed by
 `prep_test_batch.py` from an older day used to vanish from raw and stay in
 `*_compacted` indefinitely
-([#382](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/382): 83
+(#382: 83
 failed step outcomes of reprocessed subjects, visible to
 `CloudpipeMetrics(compacted=True)` and invisible to every dashboard). The
 decision there was that **a flushed attempt no longer counts**: raw stays
@@ -577,10 +578,12 @@ compacted yet, whose final fail supersedes an earlier pass, or whose derivative
 contradicts the final verdict:
 
 ```bash
-pixi run python scripts/purge_superseded_metrics.py --metrics-bucket cloudpipe-metrics \
-  --data-bucket <YOUR_S3_BUCKET> --registration-type t1w_to_mni            # dry run
-pixi run python scripts/purge_superseded_metrics.py --metrics-bucket cloudpipe-metrics \
-  --data-bucket <YOUR_S3_BUCKET> --registration-type t1w_to_mni --write
+pixi run -e ops bash -c 'python scripts/purge_superseded_metrics.py \
+  --metrics-bucket "$CLOUDPIPE_METRICS_BUCKET" --data-bucket "$CLOUDPIPE_BUCKET" \
+  --registration-type t1w_to_mni'            # dry run
+pixi run -e ops bash -c 'python scripts/purge_superseded_metrics.py \
+  --metrics-bucket "$CLOUDPIPE_METRICS_BUCKET" --data-bucket "$CLOUDPIPE_BUCKET" \
+  --registration-type t1w_to_mni --write'
 ```
 
 Only `registration` is wired up. Each other table needs its own scan key and
