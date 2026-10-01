@@ -181,7 +181,7 @@ ORDER BY avg_nmi;
 --     driver discards them), so a 'fail' record with NO downstream func output is
 --     expected. The gate bounds are operator-set plausibility limits, not yet
 --     batch-calibrated — revisit against a distribution + a known-broken run
---     (sub-XXXXXXXX, 2655eea).
+--     (the one recorded at commit 2655eea).
 --
 --     nmi / rigid_disp_mean_mm / mhd_mm are recorded-only (ungated). Inspect
 --     their distributions here to decide future thresholds. A genuinely broken

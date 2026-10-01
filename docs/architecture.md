@@ -249,7 +249,7 @@ Most images are dual-pushed to both the private ECR registry (`{account-id}.dkr.
 
 Flow code is baked into the `cloudpipe-flow-runner` Docker image. Changing flow code requires:
 1. Push to `main` → GitHub Actions rebuilds and pushes the image.
-2. If `prefect/prefect.yaml` changed, also run `prefect deploy --all` manually (GitHub Actions posts a warning in the job summary when this is needed).
+2. If `prefect/prefect.yaml` changed, also run `pixi run prefect-deploy` manually (GitHub Actions posts a warning in the job summary when this is needed).
 
 Prefect API is at `https://prefect.<YOUR_DOMAIN>/api`.
 

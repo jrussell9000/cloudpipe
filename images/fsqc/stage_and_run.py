@@ -59,8 +59,6 @@ from pathlib import Path
 import boto3
 import fs_derivatives
 
-REGION = "<YOUR_AWS_REGION>"
-
 # The subregion tree fsqc actually reads. Session directories are still located
 # after staging rather than assumed: the trees nest as `{region}/{ses}/mri/...`,
 # but merge_subregion tolerates either shape and the cost of being wrong is a
@@ -88,7 +86,7 @@ def discover_sessions(s3, bucket: str, subj: str) -> list[str]:
     """Return the sessions with a COMPLETE FastSurfer tree in S3.
 
     Read from the S3 listing rather than the long-template's `base-tps` file:
-    that file is empty for at least some subjects (confirmed on sub-XXXXXXXX),
+    that file is empty for at least some subjects (confirmed on a test-batch subject),
     and trusting it would silently QC zero sessions.
 
     Enumerates `_complete.json` markers, not session prefixes (ADR 017). A
@@ -279,7 +277,7 @@ def build_command(
     not need to be: fsqc catches the per-session, per-module failure, writes a
     non-zero code for that module into status/{ses}/status.txt, records NaN for
     the fields, and exits 0 with every other metric intact (verified — a real run
-    on sub-XXXXXXXX/ses-00A reported `hypothalamus:1` and still produced a
+    on that same subject's ses-00A reported `hypothalamus:1` and still produced a
     complete core+hippocampus record). So the flag is passed whenever ANY session
     has the input, and per-session absence degrades to a flagged NaN row.
 
@@ -649,7 +647,9 @@ def main() -> None:
     for d in (subjects_dir, scratch, output_dir, shots_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    s3 = boto3.client("s3", region_name=REGION)
+    # No region_name: boto3 takes it from the pod, which Pod Identity sets on
+    # the runner service account (see fs_derivatives.py for the full note).
+    s3 = boto3.client("s3")
 
     coverage = stage(s3, args.bucket, args.subject, subjects_dir, scratch, args.hippocampus_label)
     # Metrics first, screenshots second, in two invocations with two output dirs:

@@ -74,6 +74,15 @@ spec:
           configMapKeyRef:
             name: cloudpipe-config
             key: ecr_registry
+      # Read by every `s3:` artifact block below, which needs a regional
+      # endpoint and the region itself. Same #212 shape as metrics-bucket: the
+      # default is for a standalone submission, and under the master the
+      # master's workflow-scope value wins.
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
       # Required by the metrics-emission steps. Declared here so a standalone
       # submission resolves it; under the master this default is ignored (a
       # templateRef inherits `templates` only) and the master's own
@@ -217,17 +226,17 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'mmps_mproc/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/func'
 
         - name: mni-template
           path: /data/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii
 
         # The session's registration outputs: t1w_to_mni/ (shared by every run)
@@ -239,9 +248,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/registration/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}'
 
         # FastSurfer outputs. Supplies mri/aseg.auto.mgz (WM/CSF masks for
@@ -272,9 +281,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/aseg.auto.mgz'
 
         - name: fastsurfer-surf
@@ -282,9 +291,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/surf'
 
         # The link manifest itself: ~1 KB, and restore_links.py needs it to
@@ -302,9 +311,9 @@ spec:
         - name: fastsurfer-links
           path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/_links.json'
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/_links.json'
 
         # Existing volumetric derivatives, for the grayordinate-only short
@@ -318,9 +327,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/func/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}'
 
     outputs:
@@ -343,9 +352,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.metrics-bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
         # Per-run tarballs, built by the driver rather than by Argo's archiver:
         # one static artifact declaration cannot emit N differently-named
@@ -359,9 +368,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/func/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/'
 
         # Per-run QC JSONs, collected flat by the driver. Filenames are
@@ -372,10 +381,10 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             # Metrics artifact → versioned metrics bucket, not the data bucket.
             bucket: "{{workflow.parameters.metrics-bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'metrics/func-preproc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
 
         # Per-run grayordinate components (Stage 1): per-hemisphere fsnative
@@ -388,9 +397,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/components/'
 
         # Session-level surface geometry (sphere.reg + midthickness as GIFTI),
@@ -402,9 +411,9 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             bucket: "{{workflow.parameters.bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/anat/'
 
         # Grayordinate QC — the durable surface QC record, written by BOTH
@@ -417,17 +426,17 @@ spec:
           archive:
             none: {}
           s3:
-            endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
             # Metrics artifact → versioned metrics bucket, not the data bucket.
             bucket: "{{workflow.parameters.metrics-bucket}}"
-            region: <YOUR_AWS_REGION>
+            region: "{{workflow.parameters.region}}"
             key: 'metrics/surface-sample/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:ea2fd29ea38c4f0c43c7115817030ae65b4afade49e85f8c66126d3a0eede71d"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:e7706aa4a38d3ced4be9f7c04ba31144b71203946ce24a8b21892174dc301f6c"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -485,7 +494,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:ea2fd29ea38c4f0c43c7115817030ae65b4afade49e85f8c66126d3a0eede71d"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:e7706aa4a38d3ced4be9f7c04ba31144b71203946ce24a8b21892174dc301f6c"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather

@@ -38,9 +38,10 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-# The Pricing API has no regional endpoint in <YOUR_AWS_REGION>. Querying it from
-# <YOUR_AWS_REGION> fails to connect; the `regionCode` filter is what selects the
-# region being priced, not the client's region.
+# The Pricing API is served from only a few regions, and not from this
+# deployment's. Querying it from the deployment's own region fails to connect;
+# the `regionCode` filter is what selects the region being priced, not the
+# client's region. This is an AWS fact, not a deployment value.
 PRICING_API_REGION = "us-east-1"
 
 # Shared-tenancy Linux, no pre-installed software, and capacitystatus=Used —
@@ -88,7 +89,7 @@ def _extract_hourly(price_list_entry: str) -> float | None:
 
 def ondemand_hourly_usd(
     instance_type: str,
-    region: str = "<YOUR_AWS_REGION>",
+    region: str | None = None,
     client: Any = None,
 ) -> float | None:
     """On-demand list price in USD/hour, or None if it cannot be determined.
@@ -102,9 +103,20 @@ def ondemand_hourly_usd(
     Results are memoized per (instance_type, region) for the life of the
     process, including negative results: a type AWS does not price will not be
     re-queried on every node that used it.
+
+    `region=None` prices in this deployment's own region; an unresolvable one
+    is one more failure mode that collapses to None.
     """
     if not instance_type:
         return None
+    if region is None:
+        import deployment_env
+
+        try:
+            region = deployment_env.region()
+        except RuntimeError as exc:
+            log.warning("cannot price %s: %s", instance_type, exc)
+            return None
 
     cache_key = (instance_type, region)
     if cache_key in _cache:

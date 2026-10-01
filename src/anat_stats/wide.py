@@ -15,7 +15,7 @@ absences exist in this data:
                                           non-empty segmentations", so a small
                                           structure can be absent in one session
                                           and present in the next
-    the whole file missing                e.g. sub-XXXXXXXX ses-04A has a HypVINN
+    the whole file missing                e.g. one subject's ses-04A has a HypVINN
                                           segmentation but no stats file
 
 In a per-source table the second case is a MISSING ROW, so a NULL cell only

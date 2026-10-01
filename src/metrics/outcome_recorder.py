@@ -64,6 +64,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import deployment_env
 from schemas import StepOutcome
 from writer import emit_to_s3
 
@@ -373,8 +374,10 @@ def parse_args() -> argparse.Namespace:
         help="Metrics bucket — where the StepOutcome record is written.",
     )
     p.add_argument("--pipeline", default="cloudpipe_minproc")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
-    return p.parse_args()
+    p.add_argument("--region", default=None, help="default: the pod's own AWS_REGION")
+    args = p.parse_args()
+    args.region = args.region or deployment_env.region()
+    return args
 
 
 def record_one_step(args: argparse.Namespace, step: str) -> None:

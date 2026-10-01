@@ -38,7 +38,7 @@ cannot carry the batch (lib/globus_session.py). Two Prefect variables tune it:
 Usage
 -----
     prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \\
-        -p subjects_file=s3://<YOUR_S3_BUCKET>/subjects_v611.csv
+        -p subjects_file=s3://<bucket>/subjects.csv
 """
 
 import json
@@ -56,6 +56,7 @@ from lib.argo import (
     wait_for_pace,
     wait_for_slot,
 )
+from lib.config import deployment_region
 from lib.gpu_drought import (
     DEFAULT_MIN_PENDING_AGE_S,
     DEVICE_AUTO,
@@ -71,7 +72,6 @@ from prefect import flow, get_run_logger, task
 SSM_COLLECTION_PARAM = "/cloudpipe/globus/collection-id"
 SSM_SOURCE_COLLECTION_PARAM = "/cloudpipe/globus/source-collection-id"
 SSM_SOURCE_BASE_PATH_PARAM = "/cloudpipe/globus/source-base-path"
-REGION = "<YOUR_AWS_REGION>"
 
 MAX_CONCURRENT_VARIABLE = "cloudpipe-max-concurrent"
 DEFAULT_MAX_CONCURRENT = 50
@@ -89,7 +89,9 @@ FASTSURFER_DEVICE_VARIABLE = "cloudpipe-fastsurfer-device"
 
 
 def _read_ssm(name: str) -> str:
-    return boto3.client("ssm", region_name=REGION).get_parameter(Name=name)["Parameter"]["Value"]
+    return boto3.client("ssm", region_name=deployment_region()).get_parameter(Name=name)[
+        "Parameter"
+    ]["Value"]
 
 
 def _read_ssm_optional(name: str) -> str | None:
@@ -115,7 +117,7 @@ def _read_ssm_optional(name: str) -> str | None:
 
 
 def _read_secret(secret_id: str) -> dict:
-    payload = boto3.client("secretsmanager", region_name=REGION).get_secret_value(
+    payload = boto3.client("secretsmanager", region_name=deployment_region()).get_secret_value(
         SecretId=secret_id
     )
     return json.loads(payload["SecretString"])

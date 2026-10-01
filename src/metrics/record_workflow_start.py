@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import deployment_env
 from writer import emit_to_s3
 
 
@@ -24,8 +25,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Record the workflow's first-step start time to S3")
     p.add_argument("--workflow-name", required=True)
     p.add_argument("--metrics-bucket", required=True)
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
-    return p.parse_args()
+    p.add_argument("--region", default=None, help="default: the pod's own AWS_REGION")
+    args = p.parse_args()
+    args.region = args.region or deployment_env.region()
+    return args
 
 
 def s3_key(workflow_name: str, dt: str) -> str:

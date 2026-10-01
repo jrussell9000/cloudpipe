@@ -75,9 +75,9 @@ spec:
       - name: template-base
         path: '/work/subjects/{{workflow.parameters.subjID}}_template'
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/template-base.tar.gz'
 
     outputs:
@@ -89,9 +89,9 @@ spec:
           tar:
             compressionLevel: 1
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-00A.tar.gz'
 
       - name: ses-02A-seg
@@ -101,9 +101,9 @@ spec:
           tar:
             compressionLevel: 1
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-02A.tar.gz'
 
       - name: ses-04A-seg
@@ -113,9 +113,9 @@ spec:
           tar:
             compressionLevel: 1
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-04A.tar.gz'
 
       - name: ses-06A-seg
@@ -125,9 +125,9 @@ spec:
           tar:
             compressionLevel: 1
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-06A.tar.gz'
 
       - name: ses-08A-seg
@@ -137,9 +137,9 @@ spec:
           tar:
             compressionLevel: 1
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-08A.tar.gz'
 
       - name: ses-10A-seg
@@ -149,9 +149,9 @@ spec:
           tar:
             compressionLevel: 1
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-10A.tar.gz'
 
     # DEVICE SWITCH (#373) — same mechanism and the same reasoning as
@@ -321,9 +321,9 @@ spec:
       - name: fslicense
         path: '/opt/freesurfer/.license'
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'config/fslicense'
 
       # The scratch/ handoffs below stay TARBALLS, deliberately (ADR 017).
@@ -342,63 +342,63 @@ spec:
       - name: template-parcellated
         path: '/work/subjects/{{workflow.parameters.subjID}}_template'
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/template-parcellated.tar.gz'
 
       - name: ses-00A-seg
         path: '/work/subjects/ses-00A'
         optional: true
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-00A.tar.gz'
 
       - name: ses-02A-seg
         path: '/work/subjects/ses-02A'
         optional: true
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-02A.tar.gz'
 
       - name: ses-04A-seg
         path: '/work/subjects/ses-04A'
         optional: true
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-04A.tar.gz'
 
       - name: ses-06A-seg
         path: '/work/subjects/ses-06A'
         optional: true
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-06A.tar.gz'
 
       - name: ses-08A-seg
         path: '/work/subjects/ses-08A'
         optional: true
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-08A.tar.gz'
 
       - name: ses-10A-seg
         path: '/work/subjects/ses-10A'
         optional: true
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'scratch/{{workflow.name}}/anat/sessions-seg/ses-10A.tar.gz'
 
     outputs:
@@ -431,9 +431,9 @@ spec:
         archive:
           none: {}
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.metrics-bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-00A_anat_qc.json'
 
       - name: ses-02A-anat-qc
@@ -442,9 +442,9 @@ spec:
         archive:
           none: {}
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.metrics-bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-02A_anat_qc.json'
 
       - name: ses-04A-anat-qc
@@ -453,9 +453,9 @@ spec:
         archive:
           none: {}
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.metrics-bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-04A_anat_qc.json'
 
       - name: ses-06A-anat-qc
@@ -464,9 +464,9 @@ spec:
         archive:
           none: {}
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.metrics-bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-06A_anat_qc.json'
 
       - name: ses-08A-anat-qc
@@ -475,9 +475,9 @@ spec:
         archive:
           none: {}
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.metrics-bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-08A_anat_qc.json'
 
       - name: ses-10A-anat-qc
@@ -486,9 +486,9 @@ spec:
         archive:
           none: {}
         s3:
-          endpoint: s3.<YOUR_AWS_REGION>.amazonaws.com
+          endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
           bucket: "{{workflow.parameters.metrics-bucket}}"
-          region: <YOUR_AWS_REGION>
+          region: "{{workflow.parameters.region}}"
           key: 'metrics/anat-qc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/{{workflow.parameters.subjID}}_ses-10A_anat_qc.json'
 
     # CPU request is the TOTAL thread count: max(4, 2k) for k sessions, spent as
@@ -590,8 +590,8 @@ spec:
     # one. All six over-request k=3 pods Succeeded — they were surviving on burst,
     # which is precisely the node-pressure exposure this request is meant to remove.
     #
-    # Peak is SUBJECT-DETERMINISTIC, not random: sub-XXXXXXXX peaked 13.26G/13.19G
-    # and sub-XXXXXXXX 13.16G/13.09G on the two batches two days apart. So a retry
+    # Peak is SUBJECT-DETERMINISTIC, not random: one subject peaked 13.26G/13.19G
+    # and a second 13.16G/13.09G on the two batches two days apart. So a retry
     # cannot heal an under-request here; only the request can.
     #
     # Each tier clears its measured max with headroom and still fits the instance
@@ -644,7 +644,7 @@ spec:
     # not what happened either.
     #
     # RULED OUT — intensity scaling. mri_info-level and intensity-statistics checks on
-    # all four sessions of sub-XXXXXXXX come back clean: every volume is 256^3 uchar
+    # all four sessions of the #235 repro come back clean: every volume is 256^3 uchar
     # (aseg int16), 0-255, no float and no out-of-range values, and the FIRST
     # mri_normalize in the same pod (nu.mgz -> T1.mgz) prints "white matter peak found
     # at 110" for all four and exits 0 at ~572 MB max RSS. Measured WM mode is
@@ -815,8 +815,8 @@ spec:
           echo "[mem] K=${K} surface-stage peak=$(awk '{printf "%.2f", $1/1e9}' /sys/fs/cgroup/memory.peak 2>/dev/null || echo n/a)G" >&2
 
           # PER-SESSION COMPLETION GUARD (#245). brun_fastsurfer.sh EXITS 0 EVEN WHEN
-          # A SESSION FAILED. Measured directly on sub-XXXXXXXX (the #235 repro,
-          # 2026-08-12): ses-04A died in 3d normalization with
+          # A SESSION FAILED. Measured directly on the #235 repro subject
+          # (2026-08-12): ses-04A died in 3d normalization with
           #
           #   error: HISTOalloc(2001892225): could not allocate histogram
           #   recon-all -s ses-04A exited with ERRORS
@@ -876,7 +876,8 @@ spec:
 
           # DETECTION ONLY ABOVE — THE DIRECTORIES ARE REMOVED LATER, AND THE ORDER IS
           # LOAD-BEARING. Removing them here cost two whole workflows in the 300-subject
-          # batch of 2026-08-12 (sub-XXXXXXXX, sub-XXXXXXXX): long_compat_segmentHA.py
+          # batch of 2026-08-12 (the #235 repro subject and one other):
+          # long_compat_segmentHA.py
           # below tolerates an INCOMPLETE session directory — it ran fine against these
           # very sessions before the guard existed — but not a MISSING one. It exited 1,
           # base-tps was never written, and the exit-75 guard then retried a
@@ -1011,7 +1012,7 @@ spec:
           # purpose — so a publish that CRASHED was permanently unretryable.
           #
           # That cost a subject. In the 300-subject batch of 2026-08-14,
-          # sub-XXXXXXXX (cloudpipe-jzdk8) segfaulted inside publish after ~3h of
+          # workflow cloudpipe-jzdk8 segfaulted inside publish after ~3h of
           # successful FastSurfer compute, with zero objects written:
           #
           #   11288 Segmentation fault (core dumped) python3 /app/fs_derivatives.py publish ...
