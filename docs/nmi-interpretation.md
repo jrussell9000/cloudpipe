@@ -241,4 +241,4 @@ are durable (`prep_test_batch.py` excludes per-scan QC prefixes from flushing).
   to prevent, plus the corruption ladder.
 - `images/shared/registration_qc.py` — implementation and the `_BOLD_T1W_THRESHOLDS`
   rationale block.
-- `docs/decisions/002-synthmorph-over-bbregister.md` — why BOLD→T1w is a SynthMorph rigid fit.
+- `docs-internal/decisions/002-synthmorph-over-bbregister.md` — why BOLD→T1w is a SynthMorph rigid fit.

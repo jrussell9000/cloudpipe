@@ -127,7 +127,7 @@ Node pool: `cpu-light-nodepool`
 
 Template: `inventory` → `subject-data-inventory-template`
 
-Scans S3 `mmps_mproc/{subj}/` to discover sessions and BOLD runs (task-rest, task-nback only). For each run, checks whether `b2t_exists` and `func_exists` in `derivatives/`. Checks `t1w_to_mni.tar.gz` per session. Checks FastSurfer derivatives for all sessions and the long-template, by each tree's `_complete.json` marker and nothing else ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)). Attaches `nss_frames` from `config/nss_volumes.csv`. Outputs a JSON array describing the subject's **inputs**.
+Scans S3 `mmps_mproc/{subj}/` to discover sessions and BOLD runs (task-rest, task-nback only). For each run, checks whether `b2t_exists` and `func_exists` in `derivatives/`. Checks `t1w_to_mni.tar.gz` per session. Checks FastSurfer derivatives for all sessions and the long-template, by each tree's `_complete.json` marker and nothing else (ADR 017). Attaches `nss_frames` from `config/nss_volumes.csv`. Outputs a JSON array describing the subject's **inputs**.
 
 A second template in the same WorkflowTemplate, `published-sessions-template`, narrows that array to the sessions the anatomical phase actually published, and it is that narrowed list the per-session fan-out iterates. The two are not interchangeable: the first is about inputs, the second about outputs, and they diverge whenever the completion guard rejects one timepoint.
 
@@ -148,7 +148,7 @@ fastsurfer-template-parcellation     fastsurfer-long-segmentation
 
 Templates: `fast-tmpl` and `fast-long` WorkflowTemplates.
 
-No shared volume — each pod uses a private `emptyDir` and passes `SUBJECTS_DIR` through `scratch/{workflow.name}/anat/` in S3 (still tarballs: write-once, read-once, invisible outside the owning workflow). Final outputs are published **in-pod** to `derivatives/fastsurfer/{subj}/{ses}/` as one object per file, with a `_links.json` symlink manifest and a `_complete.json` marker written last ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)).
+No shared volume — each pod uses a private `emptyDir` and passes `SUBJECTS_DIR` through `scratch/{workflow.name}/anat/` in S3 (still tarballs: write-once, read-once, invisible outside the owning workflow). Final outputs are published **in-pod** to `derivatives/fastsurfer/{subj}/{ses}/` as one object per file, with a `_links.json` symlink manifest and a `_complete.json` marker written last (ADR 017).
 
 ### Phase 4 — Per-session (parallel across sessions, `failFast: false`)
 
@@ -163,7 +163,7 @@ T1w-to-MNI and BOLD-to-T1w run in parallel. BOLD-to-T1w is **one pod per session
 | T1w → MNI152NLin2009cAsym | FireANTs (GPU) affine + SyN | `gpu-nodepool` | `t1w-to-mni-exists == "true"` (per inventory) |
 | BOLD reference → T1w | SynthMorph (deep learning rigid) | `cpu-heavy-nodepool` | `b2t_exists == "true"` (per run, per inventory) |
 
-T1w→MNI uses FreeSurfer conformed `orig.mgz` (not BIDS `T1w.nii.gz`) to ensure the source space matches BOLD→T1w. SynthMorph receives `T1.mgz` as its fixed image, so the transform it writes is referenced to the 256³ conformed frame; registering T1w→MNI from the same frame lets `antsApplyTransforms` compose BOLD→conformed→MNI in a **single interpolation**. See [ADR 003](decisions/003-orig-mgz-for-t1w-registration.md).
+T1w→MNI uses FreeSurfer conformed `orig.mgz` (not BIDS `T1w.nii.gz`) to ensure the source space matches BOLD→T1w. SynthMorph receives `T1.mgz` as its fixed image, so the transform it writes is referenced to the 256³ conformed frame; registering T1w→MNI from the same frame lets `antsApplyTransforms` compose BOLD→conformed→MNI in a **single interpolation**. See ADR 003.
 
 Outputs stored in `derivatives/registration/{subj}/{ses}/`:
 - `t1w_to_mni.tar.gz` — affine.mat, warp, invwarp (reused across reruns)
@@ -270,7 +270,7 @@ Prefect API is at `https://prefect.<YOUR_DOMAIN>/api`.
 | Argo workflow max runtime | 12 hours | `activeDeadlineSeconds: 43200` |
 | Argo workflow TTL after completion | 24 hours | `ttlStrategy.secondsAfterCompletion: 86400` |
 
-The Prefect Variables are the working caps; `namespaceParallelism` is the backstop that cannot be raced by a submission burst. It is deliberately set above the sum of the *live* Variables, not their code fallbacks — `400` = cloudpipe's 300 target + first-level's 25 + headroom — because it applies namespace-wide across pipelines, so setting it to either pipeline's cap would silently hold the *other* pipeline's workflows `Pending` whenever the first was at capacity. See [ADR 008](decisions/008-prefect-as-queue-manager.md). Note that the two Argo controller settings above are set in **Terraform**, not in the Helm chart's `values.yaml`: the chart renders them only into the controller ConfigMap, which Terraform owns (`controller.configMap.create: false`), so values placed in the chart are silently inert (#206).
+The Prefect Variables are the working caps; `namespaceParallelism` is the backstop that cannot be raced by a submission burst. It is deliberately set above the sum of the *live* Variables, not their code fallbacks — `400` = cloudpipe's 300 target + first-level's 25 + headroom — because it applies namespace-wide across pipelines, so setting it to either pipeline's cap would silently hold the *other* pipeline's workflows `Pending` whenever the first was at capacity. See ADR 008. Note that the two Argo controller settings above are set in **Terraform**, not in the Helm chart's `values.yaml`: the chart renders them only into the controller ConfigMap, which Terraform owns (`controller.configMap.create: false`), so values placed in the chart are silently inert (#206).
 
 ---
 

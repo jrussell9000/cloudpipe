@@ -9,7 +9,8 @@
 # The root holds exactly what a module may not: the backend, the provider
 # configurations, the variable declarations `terraform.tfvars` binds to, and the
 # re-exported outputs. Everything that is actually created lives in the module.
-# See design D4 and D5 of openspec/changes/public-upstream-readiness, and
+# See design D4 and D5 of
+# openspec/changes/archive/2026-10-01-public-upstream-readiness, and
 # ../../../../docs/infrastructure.md.
 #
 # CI runs `terraform init -backend=false && terraform validate` here, so this
@@ -21,7 +22,7 @@ terraform {
   # No backend here, deliberately: CI validates this root with
   # `-backend=false`, and a backend block would send it looking for state.
   # A real deployment uses S3 with a lock file — see
-  # ../../../../docs/decisions/015-s3-backend-after-state-loss.md, which exists
+  # ../../../../docs-internal/decisions/015-s3-backend-after-state-loss.md, which exists
   # because local state was lost once. Uncomment and fill in before the first
   # apply:
   #

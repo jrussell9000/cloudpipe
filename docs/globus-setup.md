@@ -124,7 +124,7 @@ where there is something to send, attaches the text to send.
 **Nothing in this table is an AWS credential.** Earlier versions of this guide asked
 you to obtain an IAM user and an access key for the storage gateway. That is no
 longer required — see [how the gateway reaches S3](#how-the-gateway-reaches-s3-and-why-there-is-no-aws-key)
-below, and [ADR 019](decisions/019-signing-proxy-for-globus-ingress.md).
+below, and ADR 019.
 
 ---
 
@@ -358,7 +358,7 @@ secret.
 > it somewhere safer or by making the proxy reachable from off the instance. The
 > proxy's only protection is that it listens on `127.0.0.1` alone, so anything that
 > widens its reach trades a real control for a decorative one. Full reasoning:
-> [ADR 019](decisions/019-signing-proxy-for-globus-ingress.md).
+> ADR 019.
 
 Type `exit` twice to leave the instance.
 
@@ -500,7 +500,7 @@ Three things follow, and they are the whole reason this is better than a stored 
 can reach it — not another host, not the internet, regardless of security groups.
 That single property is doing the work of the discarded signature, which is why
 widening it would be a mistake rather than a hardening. If you need convincing, the
-verification is in [ADR 019](decisions/019-signing-proxy-for-globus-ingress.md).
+verification is in ADR 019.
 
 **Who builds it.** Terraform creates the roles; the machine image installs the proxy
 and its certificate and starts one instance of it per gateway. You do not install or
@@ -618,7 +618,7 @@ globus-connect-server storage-gateway create s3 "cloudpipe-s3" \
 | `--admin-managed-credentials` | Allows the admin to register one key pair for all identities via CLI — a placeholder, since the proxy discards it |
 | `--no-allow-multiple-keys` | **Critical.** Without this flag (`s3_allow_multi_keys: true` is the default), Globus treats the first component of every path as a bucket name. Transferring to `/mmps_mproc/sub-xxx` would try to write to a bucket named `mmps_mproc` and fail with `550-Globus-S3-Error: Bucket not allowed`. With this flag, the bucket is fixed by `--bucket` and collection paths are relative to the bucket root. |
 | `--high-assurance` | Required because the ABCD source collection is HA |
-| `--authentication-timeout-mins` | How long before a human must re-authenticate. **No 30-day HA ceiling exists** — the ABCD source collection is High Assurance and set to `525600` (1 year), measured 2026-09-15. Our 7-day cadence is self-imposed; see [ADR 010's Correction](decisions/010-globus-ha-subscription.md). |
+| `--authentication-timeout-mins` | How long before a human must re-authenticate. **No 30-day HA ceiling exists** — the ABCD source collection is High Assurance and set to `525600` (1 year), measured 2026-09-15. Our 7-day cadence is self-imposed; see ADR 010's Correction. |
 
 ### Collection
 
@@ -692,7 +692,7 @@ endpoint by name or UUID, confirm it is active, and browse the collection root.
 > how the system once worked, because the Terraform resources, the Argo sync
 > template, the `globus_use_s3_gateway` variable and the `user_data` branches
 > described below were all deleted — see
-> [ADR 001's Update](decisions/001-s3-gateway-over-posix-staging.md). **Nothing in
+> ADR 001's Update. **Nothing in
 > this appendix can be enabled by setting a variable.** Rebuilding it would mean
 > writing it again from scratch.
 >

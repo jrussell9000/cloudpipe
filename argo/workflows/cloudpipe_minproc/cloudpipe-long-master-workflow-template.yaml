@@ -70,7 +70,7 @@ spec:
 
   # No workflow-scoped PVC (GitHub #77): subregion-seg, the last consumer of
   # the shared EFS volume, moved to per-pod emptyDirs + S3 checkpointing. See
-  # docs/decisions/004-s3-artifacts-for-inter-step-data.md.
+  # docs-internal/decisions/004-s3-artifacts-for-inter-step-data.md.
 
   # Workflow pods should be deleted when they succeed, leaving only failed pods for debugging.
   # This is the default behavior, but we explicitly specify it here for clarity.

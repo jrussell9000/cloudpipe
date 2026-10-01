@@ -42,7 +42,7 @@ The file is a Terraform template, rendered by `templatefile()` in `terraform/mod
 
 ### Per-app Helm overrides
 
-Values that differ between deployments of this stack — the region, the base domain, hostnames — come from Terraform rather than from `gitops/apps/<app>/values.yaml`, so that each one has a single input surface ([ADR 020](decisions/020-public-repo-as-upstream.md)). The mechanism is the ApplicationSet's `templatePatch`, a Go template evaluated **per generated Application** and applied to it as a strategic-merge patch. Each branch is guarded on `.path.basename`, so an override reaches one app and leaves the others byte-identical:
+Values that differ between deployments of this stack — the region, the base domain, hostnames — come from Terraform rather than from `gitops/apps/<app>/values.yaml`, so that each one has a single input surface (ADR 020). The mechanism is the ApplicationSet's `templatePatch`, a Go template evaluated **per generated Application** and applied to it as a strategic-merge patch. Each branch is guarded on `.path.basename`, so an override reaches one app and leaves the others byte-identical:
 
 ```yaml
 templatePatch: |
@@ -119,7 +119,7 @@ syncPolicy:
 
 **Terraform owns the object; ArgoCD owns what it syncs.** Editing this template and pushing does nothing until `terraform apply` runs — the same ownership boundary as `root-app.yaml.tftpl`. Editing a WorkflowTemplate under `argo/workflows/` needs no apply at all; this Application picks it up on its own.
 
-It is rendered rather than read verbatim because `repoURL` and `targetRevision` are deployment values ([ADR 020](decisions/020-public-repo-as-upstream.md)), and it reads the same `var.gitops_repo_url` / `var.gitops_revision` as the ApplicationSet, so the generated apps and the WorkflowTemplates cannot end up tracking different repositories. The override mechanism could not be used here: this was the one app with no `Chart.yaml`, and `spec.source.helm` on a plain-manifest Application makes ArgoCD treat these WorkflowTemplates as a Helm chart under `prune: true`.
+It is rendered rather than read verbatim because `repoURL` and `targetRevision` are deployment values (ADR 020), and it reads the same `var.gitops_repo_url` / `var.gitops_revision` as the ApplicationSet, so the generated apps and the WorkflowTemplates cannot end up tracking different repositories. The override mechanism could not be used here: this was the one app with no `Chart.yaml`, and `spec.source.helm` on a plain-manifest Application makes ArgoCD treat these WorkflowTemplates as a Helm chart under `prune: true`.
 
 The manifest also carries `argocd.argoproj.io/sync-options: Delete=false`. That is a leftover of the handover with teeth: the object used to be a resource of the generated `pipelines` Application, which carries ArgoCD's cascading-delete finalizer, and deleting `gitops/apps/pipelines/` deleted that Application. A resource-level Delete sync option always overrides the owning Application's policy, which is what let the live object survive to be adopted by Terraform. Keep it — it is inert while Terraform owns the object, and it is what a future re-adoption would need.
 
@@ -324,7 +324,7 @@ Terraform single-sources the base domain from `var.domain` (`terraform/modules/s
 The **gitops** side used to keep literals of its own as a deliberate decision (GitHub #17), on the
 argument that a subchart value has no interpolator to read a variable with.
 
-**That policy is retired.** [ADR 020](decisions/020-public-repo-as-upstream.md) makes the
+**That policy is retired.** ADR 020 makes the
 public repo the upstream, so no synced path may hold a deployment literal. The mechanism is the
 `templatePatch` in `root-app.yaml.tftpl`, which sets `spec.source.helm.valuesObject` per app from
 values Terraform renders. That answers the "why it can't be parameterized" argument below — an

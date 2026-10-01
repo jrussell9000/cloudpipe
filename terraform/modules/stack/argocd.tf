@@ -410,7 +410,7 @@ locals {
   # directory name under gitops/apps. Terraform owns the values that differ
   # between deployments of this stack; gitops/apps/<app>/values.yaml keeps
   # everything that does not (design D2 of
-  # openspec/changes/public-upstream-readiness).
+  # openspec/changes/archive/2026-10-01-public-upstream-readiness).
   #
   # Each entry is that app's Helm values, so where the app wraps an upstream
   # chart its top-level keys are subchart names and must match the dependency
@@ -556,8 +556,8 @@ resource "kubectl_manifest" "argocd_root_app" {
   # Rendered, not read verbatim: the repository the ApplicationSet reads, the
   # revision it tracks, and each app's Helm overrides come from Terraform, so a
   # deployment value has one input surface (ADR 020, design D2 of
-  # openspec/changes/public-upstream-readiness). Terraform's `${ }` and ArgoCD's
-  # `{{ }}` do not collide, so one file can carry both.
+  # openspec/changes/archive/2026-10-01-public-upstream-readiness). Terraform's
+  # `${ }` and ArgoCD's `{{ }}` do not collide, so one file can carry both.
   yaml_body = templatefile("${path.module}/../../../gitops/bootstrap/root-app.yaml.tftpl", {
     repo_url      = var.gitops_repo_url
     revision      = var.gitops_revision
@@ -574,7 +574,8 @@ resource "kubectl_manifest" "argocd_workflow_templates" {
   # Rendered here rather than read from gitops/apps/, for the same reason as the
   # root ApplicationSet above: its repoURL and targetRevision are deployment
   # values, and a fork has to be able to set them without editing a manifest
-  # (ADR 020, task 3.7 of openspec/changes/public-upstream-readiness). It reads
+  # (ADR 020, task 3.7 of
+  # openspec/changes/archive/2026-10-01-public-upstream-readiness). It reads
   # the same two variables, so the generated apps and this one can never track
   # different repositories.
   #

@@ -26,9 +26,9 @@ GCS v5 endpoint — EC2 c5n.xlarge, Elastic IP, Ubuntu 22.04
 s3://<YOUR_S3_BUCKET>/mmps_mproc/{subject}/{session}/...
 ```
 
-The S3 storage gateway writes GridFTP data directly to S3 via multipart upload. No local staging volume or EFS is involved. The alternative POSIX+EBS staging approach was removed in 2026-09 ([ADR 001](decisions/001-s3-gateway-over-posix-staging.md)); the non-Globus ingress path is `presynced` ([data-ingress.md](data-ingress.md)).
+The S3 storage gateway writes GridFTP data directly to S3 via multipart upload. No local staging volume or EFS is involved. The alternative POSIX+EBS staging approach was removed in 2026-09 (ADR 001); the non-Globus ingress path is `presynced` ([data-ingress.md](data-ingress.md)).
 
-The listener step is what removes the long-lived AWS access key from this path: the gateway's `s3_endpoint` is a loopback address, and the credentials that actually reach S3 are hourly role credentials the listener obtains on the instance ([ADR 019](decisions/019-signing-proxy-for-globus-ingress.md)). **Both gateways are cut over** as of `retire-globus-s3-access-keys` 8.3, and section 9 then deleted the production IAM user and its key ([globus-setup.md → Current deployment](globus-setup.md#current-deployment)). **This account now contains no IAM users at all**, so there is no long-lived AWS credential anywhere in the ingress path.
+The listener step is what removes the long-lived AWS access key from this path: the gateway's `s3_endpoint` is a loopback address, and the credentials that actually reach S3 are hourly role credentials the listener obtains on the instance (ADR 019). **Both gateways are cut over** as of `retire-globus-s3-access-keys` 8.3, and section 9 then deleted the production IAM user and its key ([globus-setup.md → Current deployment](globus-setup.md#current-deployment)). **This account now contains no IAM users at all**, so there is no long-lived AWS credential anywhere in the ingress path.
 
 ### Why S3 gateway and not mountpoint-s3
 
@@ -104,7 +104,7 @@ Globus transfers require two independent credentials:
 
 **1. The S3 gateway's registered key pair (admin-managed)**
 
-Every S3 storage gateway needs one key pair registered against it with `globus-connect-server user-credentials s3-create`, because the GCS S3 connector's credential schema holds only a key id and a secret — it has no field for a session token, so it cannot hold role credentials ([ADR 019](decisions/019-signing-proxy-for-globus-ingress.md)). Whatever is registered is stored in Globus's infrastructure, not on the instance and not in SSM.
+Every S3 storage gateway needs one key pair registered against it with `globus-connect-server user-credentials s3-create`, because the GCS S3 connector's credential schema holds only a key id and a secret — it has no field for a session token, so it cannot hold role credentials (ADR 019). Whatever is registered is stored in Globus's infrastructure, not on the instance and not in SSM.
 
 What that key pair *is* depends on whether the gateway has been cut over to its signing listener:
 
@@ -249,7 +249,7 @@ needs one whenever your security policy says — until the cutover removes it.
 
 **Production only, and only until the cutover.** A cut-over gateway has no key to
 rotate: its listener assumes a role and the credentials expire hourly on their own
-([ADR 019](decisions/019-signing-proxy-for-globus-ingress.md)). Staging is already
+(ADR 019). Staging is already
 in that state.
 
 The IAM user key registered with the production S3 gateway is a long-lived
@@ -752,7 +752,7 @@ had never actually been exercised.
 There is no longer a variable to flip. The Argo template, the EBS volume and
 attachment, the `runner_globus_ssm` policy, the `globus_use_s3_gateway` variable
 and the `user_data` branches are all deleted —
-[ADR 001's Update](decisions/001-s3-gateway-over-posix-staging.md) records what
+ADR 001's Update records what
 went and why the removal was safe.
 
 **If you need ingress without the S3 add-on**, stage the data into the bucket by

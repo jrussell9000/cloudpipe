@@ -1128,7 +1128,7 @@ spec:
                 f"{3.9 * JOBS:.1f}G; verify the resources block was raised too"
             )
 
-        # See ADR 016 (docs/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
+        # See ADR 016 (docs-internal/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
         # this pod records its own StepOutcome facts instead of exposing them
         # as a DAG output parameter for a sibling recorder task to read.
         STEP_OUTCOMES_DIR = Path("/tmp/step_outcomes")

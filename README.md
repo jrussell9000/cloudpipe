@@ -37,9 +37,8 @@ re-implemented:
 
 ABCD also ships a precomputed fMRI→T1w affine in each BOLD sidecar. CloudPipe **does not use
 it** — BOLD→T1w is re-derived with SynthMorph rigid registration. The reasoning, including the
-measurements behind it, is in
-[ADR 002](docs/decisions/002-synthmorph-over-bbregister.md) and
-[ADR 012](docs/decisions/012-abcd-matrix-rejected.md).
+measurements behind it, is recorded in ADR 002 and ADR 012; the decision records are not
+published yet.
 
 One consequence is worth stating up front for anyone reading the QC output: the BOLD is never
 resampled out of native scanner space, so the BOLD↔T1w offset reflects field-of-view
@@ -74,8 +73,7 @@ queried through Athena and Grafana. That record — not the pod logs — is the 
 for whether a run is usable.
 
 **Full documentation: [docs/index.md](docs/index.md).** Start there for the system map,
-step-by-step pipeline walkthroughs, QC interpretation, operational runbooks, and the design
-decisions.
+step-by-step pipeline walkthroughs, QC interpretation, and operational runbooks.
 
 ---
 
@@ -113,17 +111,14 @@ changed.
 
 The pieces most likely to be useful outside this deployment, roughly in order:
 
-1. **[docs/decisions/](docs/decisions/README.md)** — sixteen ADRs recording *why* each
-   non-obvious choice was made, including the ones that were measured and rejected. If you are
-   designing something similar, the rejections are the valuable part.
-2. **[images/](images/)** — reproducible container builds for the neuroimaging toolchain
+1. **[images/](images/)** — reproducible container builds for the neuroimaging toolchain
    (FreeSurfer/FastSurfer, AFNI, FSL, FireANTs, Connectome Workbench).
-3. **[src/metrics/](src/metrics/README.md)** — the QC/cost observability layer: schemas, S3
+2. **[src/metrics/](src/metrics/README.md)** — the QC/cost observability layer: schemas, S3
    layout, nightly Parquet compaction, and a Python query API with interchangeable Athena and
    DuckDB backends.
-4. **[terraform/modules/](terraform/modules/)** — EKS with GPU node pools, Karpenter, S3 +
+3. **[terraform/modules/](terraform/modules/)** — EKS with GPU node pools, Karpenter, S3 +
    Glue + Athena, and IAM wiring for pod-level credentials.
-5. **[argo/workflows/](argo/workflows/)** — patterns for GPU steps, artifact passing through
+4. **[argo/workflows/](argo/workflows/)** — patterns for GPU steps, artifact passing through
    S3, retry policies, and recording per-step outcomes in a DAG where steps may be skipped.
 
 Deployment-specific values (account IDs, bucket names, domains, collection IDs) are replaced

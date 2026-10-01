@@ -97,7 +97,7 @@ workflow built from the template's own `when`/`depends` strings.
 ## Choosing an ingress path
 
 There are two, not three. The POSIX/EBS staging variant was removed in 2026-09
-([ADR 001's Update](decisions/001-s3-gateway-over-posix-staging.md)) — if you have
+(ADR 001's Update) — if you have
 a Globus endpoint without the S3 add-on, stage the data yourself and use
 `presynced` rather than a second GridFTP write path.
 
@@ -186,13 +186,13 @@ In `presynced` mode the validator warns about it; in `globus` mode nothing does.
 Globus is not a convenience here. The ABCD minimally preprocessed data is
 distributed by the NBDC Data Hub through a Globus **High Assurance** collection, and
 Globus requires *both* sides of a transfer to be HA
-([ADR 010](decisions/010-globus-ha-subscription.md)). For a deployment pulling
+(ADR 010). For a deployment pulling
 directly from the NBDC Data Hub, there is no non-Globus alternative — the constraint comes
 from the data provider, not from CloudPipe.
 
 What *is* CloudPipe's choice is writing straight to S3 through the GCS native S3
 storage gateway instead of staging to a POSIX volume first
-([ADR 001](decisions/001-s3-gateway-over-posix-staging.md)).
+(ADR 001).
 
 ---
 
