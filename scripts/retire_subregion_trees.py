@@ -17,7 +17,7 @@ while its `_complete.json` claims a whole tree. Nothing reads them any more (the
 subregion gate and fsqc both stopped), so deleting them removes the one way left
 to use bad data by accident.
 
-`<YOUR_S3_BUCKET>` has versioning DISABLED, so a delete cannot be undone. Hence:
+The data bucket has versioning DISABLED, so a delete cannot be undone. Hence:
 
   - dry run is the DEFAULT; deleting takes an explicit `--execute`
   - a preflight refuses `--execute` while any Running workflow still carries a
@@ -38,12 +38,15 @@ import json
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import boto3
 from botocore.config import Config
 
-BUCKET = "<YOUR_S3_BUCKET>"
-REGION = "<YOUR_AWS_REGION>"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from metrics import deployment_env  # noqa: E402
+
 SUBREGIONS_ROOT = "derivatives/subregions/"
 NAMESPACE = "argo-workflows"
 
@@ -103,28 +106,28 @@ def preflight(region: str, strict: bool) -> None:
     print(f"preflight WARNING: {msg} — --execute will refuse until they finish")
 
 
-def list_subjects(s3) -> list[str]:
+def list_subjects(s3, bucket: str) -> list[str]:
     subjects = []
     for page in s3.get_paginator("list_objects_v2").paginate(
-        Bucket=BUCKET, Prefix=SUBREGIONS_ROOT, Delimiter="/"
+        Bucket=bucket, Prefix=SUBREGIONS_ROOT, Delimiter="/"
     ):
         subjects += [p["Prefix"].split("/")[2] for p in page.get("CommonPrefixes", [])]
     return subjects
 
 
-def list_keys(s3, prefix: str) -> list[str]:
+def list_keys(s3, bucket: str, prefix: str) -> list[str]:
     keys = []
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix):
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         keys += [o["Key"] for o in page.get("Contents", [])]
     return keys
 
 
-def delete_keys(s3, keys: list[str]) -> int:
+def delete_keys(s3, bucket: str, keys: list[str]) -> int:
     """Bulk-delete keys, 1000 per call, exiting on any per-key error."""
     for i in range(0, len(keys), 1000):
         chunk = keys[i : i + 1000]
         resp = s3.delete_objects(
-            Bucket=BUCKET,
+            Bucket=bucket,
             Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True},
         )
         if resp.get("Errors"):
@@ -137,18 +140,24 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--region", required=True, choices=sorted(RETIRED_TOOLS))
+    # Named --bucket, not --aws-region-and-bucket: `--region` above is the BRAIN
+    # region, and the AWS region is not an argument at all — boto3 takes it from
+    # AWS_REGION or the active profile.
+    p.add_argument("--bucket", help="data bucket to delete from (default: $CLOUDPIPE_BUCKET)")
     p.add_argument("--execute", action="store_true", help="actually delete (default: dry run)")
     p.add_argument("--workers", type=int, default=32)
     args = p.parse_args()
 
+    bucket = args.bucket or deployment_env.required("CLOUDPIPE_BUCKET", "the data bucket")
+
     preflight(args.region, strict=args.execute)
 
-    s3 = boto3.client("s3", region_name=REGION, config=Config(max_pool_connections=args.workers))
-    subjects = list_subjects(s3)
-    print(f"{len(subjects)} subjects under s3://{BUCKET}/{SUBREGIONS_ROOT}")
+    s3 = boto3.client("s3", config=Config(max_pool_connections=args.workers))
+    subjects = list_subjects(s3, bucket)
+    print(f"{len(subjects)} subjects under s3://{bucket}/{SUBREGIONS_ROOT}")
 
     def collect(subj: str) -> list[str]:
-        return list_keys(s3, f"{SUBREGIONS_ROOT}{subj}/{args.region}/")
+        return list_keys(s3, bucket, f"{SUBREGIONS_ROOT}{subj}/{args.region}/")
 
     with ThreadPoolExecutor(args.workers) as pool:
         per_subject = list(pool.map(collect, subjects))
@@ -167,7 +176,7 @@ def main() -> None:
     # complete, so nothing can mistake a half-deleted tree for a whole one.
     marker_keys = [k for k in keys if k.endswith("/_complete.json")]
     other_keys = [k for k in keys if not k.endswith("/_complete.json")]
-    deleted = delete_keys(s3, marker_keys) + delete_keys(s3, other_keys)
+    deleted = delete_keys(s3, bucket, marker_keys) + delete_keys(s3, bucket, other_keys)
     print(f"deleted {deleted} objects")
 
     with ThreadPoolExecutor(args.workers) as pool:

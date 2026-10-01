@@ -5,7 +5,7 @@ near 1.0 is not evidence of poor registration. The metric is bounded `[1, 2]` wi
 better**, and on cross-contrast EPI↔T1w data the entire reachable range is ~1.011 (no
 registration at all) to ~1.020 (a good registration). If you came here because 1.02 looked
 like a failure on a "1.0 = independent, 2.0 = perfect" scale, read §2 — that reasoning has
-already produced one false alarm (`docs/investigations/2026-07-29-bold-to-t1w-qc-handoff.md`).
+already produced one false alarm (`docs-internal/investigations/2026-07-29-bold-to-t1w-qc-handoff.md`).
 
 ---
 
@@ -111,7 +111,7 @@ optimum:
 ## 3. The empirical reachable range
 
 This is not only a theory argument. The corruption ladder in
-`docs/investigations/2026-07-29-bold-to-t1w-qc-handoff.md` §0 measured the full range on this
+`docs-internal/investigations/2026-07-29-bold-to-t1w-qc-handoff.md` §0 measured the full range on this
 exact data by deliberately misaligning a known-good registration:
 
 | transform applied to the BOLD reference | NMI | MI (nats) |
@@ -228,7 +228,7 @@ PY
 ```
 
 The corruption ladder in §3 is reproduced from surviving S3 artifacts — see
-`docs/investigations/2026-07-29-bold-to-t1w-qc-handoff.md` §4 for the command. Those objects
+`docs-internal/investigations/2026-07-29-bold-to-t1w-qc-handoff.md` §4 for the command. Those objects
 are durable (`prep_test_batch.py` excludes per-scan QC prefixes from flushing).
 
 ---
@@ -237,7 +237,7 @@ are durable (`prep_test_batch.py` excludes per-scan QC prefixes from flushing).
 
 - `docs/metrics_data_dictionary.md` — field-level reference for `nmi`, `nmi_identity`,
   `nmi_gain`, and the `verdict` gate.
-- `docs/investigations/2026-07-29-bold-to-t1w-qc-handoff.md` — the false alarm this doc exists
+- `docs-internal/investigations/2026-07-29-bold-to-t1w-qc-handoff.md` — the false alarm this doc exists
   to prevent, plus the corruption ladder.
 - `images/shared/registration_qc.py` — implementation and the `_BOLD_T1W_THRESHOLDS`
   rationale block.

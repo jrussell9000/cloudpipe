@@ -164,7 +164,7 @@ def collect(day: _date, base_url: str, pipeline: str, verify_ssl: bool = True):
     return list(agg.values()), stats
 
 
-def stored_workflows(bucket: str, region: str, day: _date) -> set[str]:
+def stored_workflows(bucket: str, region: str | None, day: _date) -> set[str]:
     """Workflow names that already have a cost record for `day` in S3.
 
     Keys look like metrics/costs/dt=<date>/<date>_<workflow>_cost_allocation.json
@@ -197,7 +197,10 @@ def main() -> int:
     )
     p.add_argument("--date", required=True, help="UTC report date to rebuild, YYYY-MM-DD")
     p.add_argument("--bucket", default="cloudpipe-metrics")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     p.add_argument("--base-url", default=KUBECOST_BASE)
     p.add_argument("--pipeline", default="cloudpipe_minproc")
     p.add_argument("--write", action="store_true", help="actually emit to S3 (default: dry run)")

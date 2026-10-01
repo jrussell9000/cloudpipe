@@ -25,7 +25,7 @@ prefect-deploy = "bash prefect/deploy.sh"
 
 # --- Code-health / lint tooling (dev-only) ---
 # Lives in the `lint` feature/environment so runtime image builds don't pull it.
-# See docs/code-health-plan.md. All tasks are read-only / report-only by default;
+# See docs-internal/code-health-plan.md (internal; not in the public repository). All tasks are read-only / report-only by default;
 # `format` and `lint-fix` are the only ones that modify files.
 [feature.lint.dependencies]
 ruff = ">=0.14,<0.15"
@@ -50,7 +50,7 @@ lint = { depends-on = ["ruff-check", "fmt-check"] }
 # vulture can't see are used. Exclude nested pixi envs (e.g. images/workbench/.pixi).
 deadcode = "vulture src images scripts prefect tests .vulture-whitelist.py --exclude '*/.pixi/*' --min-confidence 60 --ignore-names 'side_effect,Bucket,kw,self_inner'"
 # NOTE: deptry cannot read pixi.toml deps — it needs a pyproject.toml [project] or
-# requirements.txt. Blocked pending a decision on adding one (see code-health-plan.md).
+# requirements.txt. Blocked pending a decision on adding one (see docs-internal/code-health-plan.md).
 # Until then, stale-dep detection uses the manual import audit in the plan doc.
 deps = "deptry ."
 complexity = "ruff check --select C901 --statistics ."

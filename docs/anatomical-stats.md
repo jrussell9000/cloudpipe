@@ -165,7 +165,7 @@ network. Run from a laptop, the download also counts as about 4 GB of
 internet egress. In-region it is free.
 
 The Job is in
-[`scripts/manifests/anat-stats-aggregate.yaml`](https://github.com/jrussell9000/cloudpipe/blob/main/scripts/manifests/anat-stats-aggregate.yaml).
+[`scripts/jobs/anat-stats-aggregate.yaml`](https://github.com/jrussell9000/cloudpipe/blob/main/scripts/jobs/anat-stats-aggregate.yaml).
 It uses the `cloudpipe-flow-runner` image, which already has boto3 and
 pyarrow, and the `argo-workflows-runner` service account. The code is mounted
 from ConfigMaps, so nothing needs building:
@@ -178,13 +178,20 @@ kubectl -n argo-workflows create configmap anat-stats-src \
   --from-file=src/anat_stats/qc.py
 kubectl -n argo-workflows create configmap anat-stats-script \
   --from-file=scripts/aggregate_anat_stats.py
-kubectl apply -f scripts/manifests/anat-stats-aggregate.yaml
+
+# envsubst fills $CLOUDPIPE_ECR_REGISTRY in `image:`, the one field Kubernetes
+# cannot read from a ConfigMap itself. `pixi run -e ops` exports it, and the
+# bucket, from the cloudpipe-config ConfigMap.
+pixi run -e ops bash -c \
+  'envsubst < scripts/jobs/anat-stats-aggregate.yaml | kubectl apply -f -'
 
 # follow progress: one line per shard, with its row and error counts
 kubectl -n argo-workflows logs job/anat-stats-aggregate -f
 
-# when the Job completes, copy the shards down
-aws s3 sync s3://<YOUR_S3_BUCKET>/scratch/anat-stats-aggregate/ data/anat-stats/
+# when the Job completes, copy the shards down. The bash -c is not optional:
+# your own shell would expand $CLOUDPIPE_BUCKET to nothing before pixi sets it.
+pixi run -e ops bash -c \
+  'aws s3 sync "s3://$CLOUDPIPE_BUCKET/scratch/anat-stats-aggregate/" data/anat-stats/'
 
 # then clean up (the Job itself deletes itself a day after finishing)
 kubectl -n argo-workflows delete configmap anat-stats-src anat-stats-script

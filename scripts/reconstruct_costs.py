@@ -390,7 +390,10 @@ def main() -> int:
         help="Only write rows for workflow-days that have no cost row at all.",
     )
     ap.add_argument("--pipeline", default="cloudpipe_minproc")
-    ap.add_argument("--region", default="<YOUR_AWS_REGION>")
+    ap.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     ap.add_argument("--write", action="store_true", help="Apply (default: dry run).")
     args = ap.parse_args()
 

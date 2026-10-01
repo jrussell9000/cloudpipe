@@ -3,7 +3,7 @@
 Enumerates candidate readings of the sidecar-shipped registration_matrix_T1 (direction,
 RAS/LPS frame, conformed-vs-native T1w space) and scores each with the same NMI-gain
 metric used for the SynthMorph reference, per the decision rule in
-docs/investigations/2026-07-29-abcd-matrix-retest-handoff.md.
+docs-internal/investigations/2026-07-29-abcd-matrix-retest-handoff.md.
 
 Usage:
     pixi run python scripts/abcd_matrix_sweep.py --runs-file runs.txt --out sweep_results.csv

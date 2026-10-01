@@ -6,8 +6,8 @@ multi-line JSON causes HIVE_CURSOR_ERROR. This script downloads each file,
 re-serializes without indentation, and puts it back.
 
 Usage:
-  python scripts/compact_metrics_json.py --bucket <YOUR_S3_BUCKET> --dry-run
-  python scripts/compact_metrics_json.py --bucket <YOUR_S3_BUCKET>
+  pixi run -e ops python scripts/compact_metrics_json.py --bucket "$CLOUDPIPE_BUCKET" --dry-run
+  pixi run -e ops python scripts/compact_metrics_json.py --bucket "$CLOUDPIPE_BUCKET"
 """
 
 import argparse
@@ -55,7 +55,10 @@ def compact_prefix(s3, bucket: str, prefix: str, dry_run: bool) -> tuple[int, in
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--bucket", required=True)
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 

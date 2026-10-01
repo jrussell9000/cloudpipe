@@ -59,7 +59,6 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 | Get FastSurfer and subregion stats for the whole cohort as tables | [anatomical-stats.md](anatomical-stats.md) |
 | Understand why `bold_to_t1w` NMI is ~1.02 and not ~2.0 | [nmi-interpretation.md](nmi-interpretation.md) |
 | Update `preproc.py` | [operations.md → Updating code](operations.md#updating-code) |
-| Simplify / clean up the code and remove stale code | [code-health-plan.md](https://github.com/jrussell9000/cloudpipe/blob/main/docs/code-health-plan.md) |
 | Run tests or check what CI validates on a PR | [operations.md → Running tests and CI checks](operations.md#running-tests-and-ci-checks) |
 | Rotate a Globus credential | [globus.md → Credential rotation](globus.md#credential-rotation) |
 | Replace the GCS EC2 instance | [globus.md → Instance replacement](globus.md#instance-replacement) |
@@ -83,8 +82,6 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 ### Pipelines
 
 - [**pipelines.md**](pipelines.md) — Step-by-step execution walkthrough for cloudpipe_minproc (production) and fmri-first-level-proc, plus the design for cloudpipe_fullproc (planned, not implemented). Covers what each step reads from S3, what it writes, skip conditions, and failure modes.
-
-- [**code-health-plan.md**](https://github.com/jrussell9000/cloudpipe/blob/main/docs/code-health-plan.md) — Staged plan for walking through, simplifying, and de-staling the codebase without regressing functionality: layered toolchain (ruff, vulture, deptry, mypy, coverage), recommended sequence, and verified dependency leads.
 
 ### Observability
 
@@ -159,16 +156,15 @@ tools/                — data & reference files (subject-id CSVs, cost CSVs, NI
                         internal-only; not published to the public repo
 docs/                 — this documentation
   decisions/          — Architecture Decision Records
-  investigations/     — dated deep-dives and handoffs (point-in-time, not maintained)
-  agents/             — conventions for agent-assisted work (issue tracker, triage labels)
-  superpowers/        — openspec change specs, plans, artifacts
+docs-internal/        — dated investigations and handoffs, agent notes, plans
+                        internal-only; not published to the public repo or this site
 ```
 
-> `docs/investigations/` is a different kind of document from everything above it. Each file
-> is a snapshot of what was true on its date, kept for the reasoning trail — it is **not**
+> `docs-internal/` holds a different kind of document from `docs/`. Its investigations are
+> snapshots of what was true on their date, kept for the reasoning trail — they are **not**
 > de-staled as the system moves. When an investigation's conclusion becomes durable it gets
-> promoted into a reference doc or an ADR; until then, prefer the reference docs for current
-> behaviour.
+> promoted into a reference doc here or an ADR; until then, prefer the reference docs for
+> current behaviour. Pages here cite them by repository path.
 
 ## Key identifiers
 

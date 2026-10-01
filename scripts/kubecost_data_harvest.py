@@ -2,31 +2,39 @@
 """
 Query the Kubecost allocation API and write per-subject cost data to CSV.
 
+Run through `pixi run -e ops`, which sets $KUBECOST_BASE_URL from the Kubecost
+ingress and $CLOUDPIPE_BUCKET from the cloudpipe-config ConfigMap.
+
 Usage
 -----
     # Explicit window:
-    python kubecost_data_harvest.py 2026-05-08T18:00:00Z 2026-05-08T20:00:00Z
+    pixi run -e ops python kubecost_data_harvest.py 2026-05-08T18:00:00Z 2026-05-08T20:00:00Z
 
     # Relative window:
-    python kubecost_data_harvest.py --window today
+    pixi run -e ops python kubecost_data_harvest.py --window today
 
     # Write to S3:
-    python kubecost_data_harvest.py 2026-05-08T18:00:00Z 2026-05-08T20:00:00Z \
-        --output s3://<YOUR_S3_BUCKET>/kubecost-first-level-costs.csv
+    pixi run -e ops python kubecost_data_harvest.py --window today \
+        --output "s3://$CLOUDPIPE_BUCKET/kubecost-first-level-costs.csv"
 
     # Aggregate by workflow name instead of subjectid:
-    python kubecost_data_harvest.py --window today --label workflows.argoproj.io/workflow
+    pixi run -e ops python kubecost_data_harvest.py --window today \
+        --label workflows.argoproj.io/workflow
 """
 
 import argparse
 import csv
 import io
 import sys
+from pathlib import Path
 
 import boto3
 import requests
 
-KUBECOST_URL = "https://kubecost.<YOUR_DOMAIN>"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from metrics import deployment_env  # noqa: E402
+
 DEFAULT_OUTPUT = "kubecost_costs.csv"
 
 SCALAR_FIELDS = [
@@ -80,7 +88,7 @@ SCALAR_FIELDS = [
 
 def query_kubecost(
     window: str,
-    kubecost_url: str = KUBECOST_URL,
+    kubecost_url: str,
     namespace: str = "argo-workflows",
     label: str = "subjectid",
     share_idle: bool = True,
@@ -144,7 +152,9 @@ def main() -> None:
     parser.add_argument(
         "--window", help="Relative window (e.g. today, yesterday, 1h, 2d); overrides start/end"
     )
-    parser.add_argument("--url", default=KUBECOST_URL, help="Kubecost base URL")
+    # The Kubecost UI ingress, since this runs from a workstation. In-cluster code
+    # uses the service DNS instead (src/metrics/kubecost_scraper.py's KUBECOST_BASE).
+    parser.add_argument("--url", help="Kubecost base URL (default: $KUBECOST_BASE_URL)")
     parser.add_argument("--namespace", default="argo-workflows", help="Namespace filter")
     parser.add_argument("--label", default="subjectid", help="Pod label to aggregate by")
     parser.add_argument(
@@ -170,7 +180,10 @@ def main() -> None:
 
     allocations = query_kubecost(
         window=window,
-        kubecost_url=args.url,
+        kubecost_url=args.url
+        or deployment_env.required(
+            "KUBECOST_BASE_URL", "the Kubecost UI's external URL, https://kubecost.<domain>"
+        ),
         namespace=args.namespace,
         label=args.label,
         share_idle=not args.no_share_idle,

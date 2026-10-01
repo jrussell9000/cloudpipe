@@ -464,7 +464,10 @@ def rollback(s3, audit_path: Path) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--bucket", default="cloudpipe-metrics")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--write", action="store_true", help="apply the plan (default: dry run)")
     mode.add_argument("--rollback", type=Path, metavar="AUDIT_JSONL")

@@ -1,27 +1,23 @@
-# GitHub Pages deploy for the PUBLIC repo (jrussell9000/cloudpipe).
+# Deploys the documentation site to GitHub Pages from the public repository.
 #
-# ─── This file is INERT here. It is a template, not a live workflow. ───
+# One file in two places, kept byte-identical:
 #
-# It lives in scripts/ rather than .github/workflows/ for two reasons:
+#   - scripts/public-pages-workflow.yaml — the source of truth. Inert there:
+#     nothing under scripts/ runs as a workflow.
+#   - .github/workflows/pages.yaml in the public repository — the live copy.
 #
-#   1. sync-public.sh does not sync `.github/` — the public repo's Actions are
-#      deliberately not a mirror of the internal ones (the internal CI needs
-#      AWS credentials and private runners; the public repo needs neither).
-#   2. Even if it did, the sync pushes with a PAT (`secrets.PUBLIC_REPO_TOKEN`).
-#      GitHub rejects a push that creates or edits a file under
-#      `.github/workflows/` unless that token carries the `workflow` scope, so
-#      auto-syncing this file would break the whole sync job, not just itself.
+# The live copy cannot be synced. sync-public.sh does not sync `.github/` (the
+# internal CI needs AWS credentials and private runners; the public repository
+# needs neither), and the sync's token lacks the `workflow` scope GitHub requires
+# for any write under `.github/workflows/` — syncing this file would fail the
+# whole sync, not just this file. So the live copy is installed by hand (the
+# operations runbook has the procedure), and every sync warns when the two
+# copies differ. Edit the source of truth, then re-install; never edit the live
+# copy alone.
 #
-# INSTALL (one time, by hand, in the public repo):
-#
-#   cp scripts/public-pages-workflow.yaml \
-#      /path/to/cloudpipe-public/.github/workflows/pages.yaml
-#   # then in the public repo: Settings → Pages → Source: "GitHub Actions"
-#
-# After that it is self-maintaining: every sync that touches docs/ or
-# mkdocs.yml lands on the public main and this workflow rebuilds the site.
-# Broken links are already caught upstream by the internal CI's docs_build job,
-# so this deploy should never be the first place a docs problem shows up.
+# Once installed, every sync that touches docs/ or mkdocs.yml rebuilds the site.
+# The internal CI's docs_build job runs the same strict build first, so this
+# deploy should never be the first place a docs problem shows up.
 
 name: Deploy docs to GitHub Pages
 

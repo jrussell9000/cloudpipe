@@ -204,7 +204,7 @@ spec:
     # so 312 sequential S3 GETs were billed as slice time.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:db570b9aa47328cd284c7e970517d2609c1604a929e434abe1da727c33d04ba9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:50317282787d76eabcb139c255341ea0317fb71a50cf3f959c8f80390c0a97a9"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -701,7 +701,7 @@ spec:
     # $FREESURFER_HOME/subjects/fsaverage — see the args block below.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:db570b9aa47328cd284c7e970517d2609c1604a929e434abe1da727c33d04ba9"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:50317282787d76eabcb139c255341ea0317fb71a50cf3f959c8f80390c0a97a9"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

@@ -19,11 +19,11 @@ module "karpenter" {
   #
   # Updated automatically by build-gpu-nodeclass-ami.yaml after each AMI build;
   # a terraform apply is still required to roll the nodeclass to the new AMI.
-  fastsurfer_ami_digest = "sha256:db570b9aa47328cd284c7e970517d2609c1604a929e434abe1da727c33d04ba9"
-  fireants_ami_digest   = "sha256:78e95ce1263d98485c55eab70c8f36bf91f734cc83f210eda09abbd860a51e38"
+  fastsurfer_ami_digest = "sha256:50317282787d76eabcb139c255341ea0317fb71a50cf3f959c8f80390c0a97a9"
+  fireants_ami_digest   = "sha256:721e4e6d0487fb892b4ad8a21c719559dd7bc48bc613d64cebe1e6dd2983e804"
 
   # Git-sha tags corresponding to the digests above. Informational: nothing
   # selects or pulls on these, they exist so a digest can be traced to a commit.
-  fastsurfer_ami_tag = "sha-0b0aaaaa9c27915b8e742144b2b8c3b71d2a23d4"
-  fireants_ami_tag   = "sha-a6c5d8f8ac47dd1e9cffcf54ffda0d0b6d34fc1a"
+  fastsurfer_ami_tag = "sha-8621ce52cbf8b8097f9681cb9440476efe672441"
+  fireants_ami_tag   = "sha-8621ce52cbf8b8097f9681cb9440476efe672441"
 }

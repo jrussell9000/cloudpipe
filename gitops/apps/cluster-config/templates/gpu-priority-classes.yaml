@@ -6,7 +6,7 @@
 # — and every `template-build` that wins goes on to spawn another GPU pod. Left
 # alone the batch maximises work-in-progress instead of draining it. Ranking
 # completion above starts shrinks WIP and the batch tail.
-# See docs/investigations/2026-09-10-gpu-spot-acquisition-review.md §4.1.
+# See docs-internal/investigations/2026-09-10-gpu-spot-acquisition-review.md §4.1.
 #
 # NOTHING IS EVER EVICTED. All three carry `preemptionPolicy: Never`. These
 # classes reorder the *pending* queue only; a running pod is never displaced by

@@ -20,6 +20,13 @@ Split by role:
   > `pullsamplestats.py`, `workflow_steps.py`. The *split by role* this ADR decided is unchanged —
   > only the file list moved on.
 - `scripts/` — runnable helpers: shell scripts, one-off Python scripts, the `computeNumNSS.ipynb` notebook, and `scripts/manifests/` for ad-hoc k8s debug manifests
+
+  > **Two subdirectories were added later.** `scripts/investigations/` holds the analysis
+  > toolkits that read a probe's output back, and `scripts/jobs/` the standing Kubernetes
+  > manifests the docs tell a reader to run. The split matters to the public sync: `jobs/`
+  > travels and reads its values from `cloudpipe-config`, while `manifests/` and
+  > `investigations/` are withheld as records of this deployment's own history
+  > ([ADR 020](020-public-repo-as-upstream.md)).
 - `tools/` — retained temporarily as a data-only directory (CSVs, NIST assessment doc); moving these to S3 `config/` is deferred
 
 `pytest.ini`'s `pythonpath` block now points at `src` and `src/metrics` instead of `tools` and `tools/metrics`.

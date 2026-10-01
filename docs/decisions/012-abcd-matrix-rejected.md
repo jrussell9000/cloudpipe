@@ -20,16 +20,16 @@
 > 2026-07-29 10-subject batch, legitimate BOLD→T1w corrections span **16–97 mm (mean 39 mm)**,
 > because the ABCD BOLD stays in native scanner space and the offset is field-of-view prescription.
 > The sidecar matrix's own magnitude (13.0 mm / 2.05°) is the same order as a real SynthMorph LTA
-> (8.3 mm / 7.79°). See `docs/investigations/2026-07-29-bold-to-t1w-qc-handoff.md` §0.
+> (8.3 mm / 7.79°). See `docs-internal/investigations/2026-07-29-bold-to-t1w-qc-handoff.md` §0.
 >
 > **2. This rejected our ability to consume the matrix, not the matrix itself.** Per the closing
 > line of the Investigation section, its true convention "could not be reconstructed". The
 > evaluation was also **n = 1 subject** (sub-XXXXXXXX ses-00A).
 >
-> A re-test was specified in `docs/investigations/2026-07-29-abcd-matrix-retest-handoff.md`
+> A re-test was specified in `docs-internal/investigations/2026-07-29-abcd-matrix-retest-handoff.md`
 > (pre-registered decision rule, systematic enumeration of conventions, 18 runs with measured
 > SynthMorph baselines) and has since been **run**. Result: **Cross-check only** — see
-> `docs/investigations/2026-07-29-abcd-matrix-retest-results.md`. The best-scoring convention beats
+> `docs-internal/investigations/2026-07-29-abcd-matrix-retest-results.md`. The best-scoring convention beats
 > identity on 18/18 runs but reaches ≥90% of SynthMorph's gain on only 8/18, well short of the
 > pre-registered adoption bar. **The rejection stands: SynthMorph remains the BOLD→T1w method.**
 

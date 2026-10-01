@@ -5,7 +5,7 @@ Day-2 reference for submitting pipelines, monitoring progress, handling failures
 **Prerequisite**: connect **Cloudflare WARP** before using any CLI or web UI listed below — `kubectl`, `argo`, every Service URL, `pixi run prefect-deploy` / `PREFECT_API_URL=https://prefect.…`, and the Kubecost scripts (`scripts/kubecost_data_harvest.py`, `scripts/cloudpipe_minproc_costs.py`, `src/validate_test_batch.py`). The EKS API endpoint and the web-UI load balancer are both private; without WARP every hostname resolves but **times out**. See [infrastructure.md → Remote access](infrastructure.md#remote-access-cloudflare-warp).
 
 - WARP's session lasts 24h. A *TLS handshake timeout* (kubectl) or a hanging page usually means it lapsed: `warp-cli debug access-reauth` (PowerShell: `& "C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe" debug access-reauth`).
-- The AWS Client VPN still works as a fallback until it is decommissioned. For VPN-specific trouble, see [docs/investigations/2026-07-16-vpn-remote-access-troubleshooting.md](https://github.com/jrussell9000/cloudpipe/blob/main/docs/investigations/2026-07-16-vpn-remote-access-troubleshooting.md).
+- The AWS Client VPN still works as a fallback until it is decommissioned. For VPN-specific trouble, see `docs-internal/investigations/2026-07-16-vpn-remote-access-troubleshooting.md` (internal).
 
 ---
 
@@ -672,7 +672,7 @@ memory request that is too small, the second is spot capacity in the nodepool. S
 up in response to a reclaim is wasted work.
 The check fails (not warns) once a step's non-zero attempts reach 25% of at least 4 attempts.
 This exists because the 2026-08-01 01:58Z batch reported an unqualified `PASS` while
-OOMKilling `bold-to-t1w` (issue #114, `docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md`).
+OOMKilling `bold-to-t1w` (issue #114, `docs-internal/investigations/2026-08-01-bold-to-t1w-oom-handoff.md`).
 
 Warnings do **not** change the exit code — only a failed check exits non-zero. If you gate
 automation on this script, read the verdict line, not just `$?`.
@@ -953,7 +953,7 @@ pixi run -e docs docs-serve
 Two consequences worth knowing before you edit a doc:
 
 - **In-page anchors follow GitHub's slug algorithm, not MkDocs'.** These docs are read on GitHub as well as on the site, and the two slugify headings differently (GitHub turns an em dash into a *double* hyphen; MkDocs' default collapses it to one). `mkdocs.yml` sets `toc.slugify` to `pymdownx.slugs.slugify(case="lower")`, which reproduces GitHub's algorithm so one setting keeps both renderings valid. Don't "fix" an anchor link by hand — that fixes the site and breaks GitHub.
-- **Links out of `docs/` must be absolute GitHub URLs.** A relative `../terraform/...` link resolves on GitHub but 404s on the published site, which is rooted at `docs/`. Point at `https://github.com/jrussell9000/cloudpipe/blob/main/...` (or `/tree/main/` for a directory) instead. The same applies to the internal-only docs listed in `exclude_docs` — they are still synced to the public repo, so a published page linking to one needs the absolute form.
+- **Links out of `docs/` must be absolute GitHub URLs.** A relative `../terraform/...` link resolves on GitHub but 404s on the published site, which is rooted at `docs/`. Point at `https://github.com/jrussell9000/cloudpipe/blob/main/...` (or `/tree/main/` for a directory) instead. Internal docs are the exception: they live in `docs-internal/`, which is never synced, so there is no URL to link to. Name the path in a code span (`docs-internal/investigations/…`) instead of linking.
 
 Neither job installs pip/conda dependencies outside `pixi.toml` — if a test needs a new package, add it to `pixi.toml` (and regenerate `pixi.lock` with `pixi install`) rather than installing ad hoc.
 
@@ -1086,6 +1086,10 @@ Not synced: root-level Terraform files (contain account-specific resource defini
 
 So dropping a path from `SYNC_DIRS` is a **two-step** change: remove it there *and* add it to `SYNC_ORPHANS`, which is force-deleted from the public tree on every run. (Entries are validated against absolute paths and `..` traversal before deletion — the loop runs `rm -rf` unattended in CI with a write token.)
 
+**Withholding one subtree of a synced directory** is a third list, `SYNC_EXCLUDED_PATHS`, and it needs no `SYNC_ORPHANS` entry: each path still sits inside a transfer root, so `--delete-excluded` reaches a copy an earlier run published. What it must be is *anchored* — `RSYNC_EXCLUDES` entries are globs matched against every path component, so a bare `--exclude=investigations` would withhold every directory of that name anywhere in the sync. Entries are repo-relative, and the script refuses to run if one names no `SYNC_DIRS` entry, because an anchored exclude outside every transfer root withholds nothing and would publish the subtree it was added to stop.
+
+Two subtrees are on it: `scripts/manifests/` (one-off Kubernetes probe manifests) and `scripts/investigations/` (the analysis toolkits that read a probe's output back). Each records how one past decision was measured, wired to this deployment's bucket, registry and region and — in the manifests' S3 keys — to real subject IDs. Rewriting the values would leave a file nobody can run and a record that no longer says what was measured, so they are not published at all. The two manifests the docs tell a reader to *run* live in `scripts/jobs/`, which does travel and reads `cloudpipe-config` for its values.
+
 Names in `SYNC_FILES` that don't exist locally now log a `WARNING` instead of being skipped silently. That silent skip is why the public repo had **no front page for ~75 days**: `README.md` was correctly listed, the file simply didn't exist internally yet, and nothing reported it. Note also that `pixi.lock` must always travel with `pixi.toml` — publishing a current manifest beside a stale lockfile makes `pixi install` resolve to something nobody tested.
 
 **Two kinds of scrub.** `REPLACEMENTS` is a fixed-string map — one entry per deployment literal — and it cannot express a value that is a *format* rather than a list. `REGEX_REPLACEMENTS` handles those with `sed -E`, running after the literal pass so a literal entry still wins where one exists. Both ABCD subject-ID forms are there, and every ID becomes its placeholder. The scrub loop bounds each pattern on the right, so a longer lookalike is left intact for the gate to reject instead of being half-rewritten into something that reads like a placeholder.
@@ -1106,16 +1110,29 @@ Use `sub-XXXXXXXX` — and only that form — when writing an NBDC-form subject 
 
 **The published documentation site**
 
-The public repo builds `docs/` into a GitHub Pages site with MkDocs Material. `mkdocs.yml` is synced, so the site's structure and its curation boundary (`exclude_docs`) are maintained here, in this repo, alongside the docs themselves — there is no second copy to keep in step.
+The public repo builds `docs/` into a GitHub Pages site with MkDocs Material. `mkdocs.yml` is synced, so the site's structure is maintained here, alongside the docs themselves. The curation boundary is the directory: everything under `docs/` is published, and internal material lives in `docs-internal/`, which is neither synced nor built. `tests/test_docs_boundary.py` fails if an internal path reappears under `docs/`.
 
-The Pages workflow itself is **not** synced, and can't be. Two reasons: `.github/` is outside `SYNC_DIRS` on purpose (the internal CI needs AWS credentials and the public repo needs none of it), and GitHub rejects a PAT-authenticated push that touches `.github/workflows/` unless the token carries the `workflow` scope — so auto-syncing it would break the entire sync job, not just itself. It is therefore installed once, by hand, from a template kept in `scripts/`:
+The Pages workflow itself is **not** synced, and can't be. Two reasons: `.github/` is outside `SYNC_DIRS` on purpose (the internal CI needs AWS credentials and the public repo needs none of it), and GitHub rejects a PAT-authenticated push that touches `.github/workflows/` unless the token carries the `workflow` scope — so auto-syncing it would break the entire sync job, not just itself. Its source of truth is `scripts/public-pages-workflow.yaml`, which *is* synced (byte-for-byte; a test pins that the scrub leaves it alone), and the live copy is installed by hand from it, inside a clone of the public repo:
 
 ```bash
-cp scripts/public-pages-workflow.yaml /tmp/cloudpipe-public/.github/workflows/pages.yaml
-# then in the public repo: Settings → Pages → Source: "GitHub Actions"
+cd /tmp/cloudpipe-public && git pull
+cp scripts/public-pages-workflow.yaml .github/workflows/pages.yaml
+git add .github/workflows/pages.yaml && git commit -m "ci: re-install pages.yaml from its template" && git push
 ```
 
-After that it is self-maintaining — any sync touching `docs/` or `mkdocs.yml` rebuilds the site on merge. It runs the *same* `pixi run -e docs docs-build` as the internal `docs_build` CI job, so the published site can't be produced by a different toolchain than the one that gated it, and a docs problem should always surface internally first.
+This needs a token with the `workflow` scope (a `gh auth login` token has it; the sync's `PUBLIC_REPO_TOKEN` does not). Every sync compares the two copies and prints `⚠ PAGES WORKFLOW DRIFT` — a `::warning::` annotation on the CI run — when they differ, so re-install whenever that appears. It is a warning, not a gate: an older deploy workflow is no reason to stop publishing everything else.
+
+Once installed, any sync touching `docs/` or `mkdocs.yml` rebuilds the site on merge. It runs the *same* `pixi run -e docs docs-build` as the internal `docs_build` CI job, so the published site can't be produced by a different toolchain than the one that gated it, and a docs problem should always surface internally first.
+
+**Recreating the public repository**
+
+Deleting and recreating the public repo is the only way to remove data from its pull-request refs (`refs/pull/N/head`), which a force-push cannot touch. It was done on 2026-09-30 for that reason. Two things break silently on a recreated repo, so the procedure is:
+
+1. Create the repo (public, no auto-initialised files) and push `main` from a clean clone that holds only branches — a clone that has fetched `refs/pull/*` would push the old objects straight back.
+2. **Enable Pages before anything triggers the workflow**, with build type `workflow`:
+   `gh api -X POST repos/<owner>/<repo>/pages -f build_type=workflow`. A run that starts first waits forever in `waiting`: its `deploy` job needs the `github-pages` environment, which does not exist yet and which nobody can approve. If that has happened, cancel the run and re-dispatch: `gh workflow run pages.yaml --repo <owner>/<repo> --ref main`. The 2026-09-30 recreation sat 33 minutes in that state.
+3. **Re-select the repository on `PUBLIC_REPO_TOKEN`.** It is a fine-grained token, which binds to a repository's *id*, not its name; a recreated repo has a new id. Until it is updated, every sync passes all its gates and then fails at push with `Permission to <owner>/<repo>.git denied` (403).
+4. Run a sync (push to `main` touching a synced path, or dispatch `sync-public.yaml`) and confirm it opens a PR and reports no Pages workflow drift.
 
 **Manual sync**
 

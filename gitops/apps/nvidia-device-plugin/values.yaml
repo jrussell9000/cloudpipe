@@ -64,7 +64,7 @@ nvidia-device-plugin:
           # Duty cycle is what makes extra slices worth anything at all: the GPU
           # steps compute for ~17% of their wall time while holding a slice for
           # 100% of it (43 pod logs, 2026-07-31 — see
-          # docs/investigations/2026-07-31-gpu-vram-duty-cycle-handoff.md). At 3
+          # docs-internal/investigations/2026-07-31-gpu-vram-duty-cycle-handoff.md). At 3
           # slices that is ~51%, still clear of continuous saturation.
           #
           # g6f (a ~5.59 GiB 1/4-L4 slice) stays dropped from the gpu-nodepool
@@ -82,7 +82,7 @@ nvidia-device-plugin:
                 replicas: 3
       # gpu-dense-nodepool only: g5/g6/g6e 2xlarge. The binding ceiling is A10G/L4 VRAM
       # against the LARGEST tenant, t1w-to-mni, MEASURED at 4903 MiB per process
-      # (scripts/manifests/gpu-t1w-vram-probe.yaml, 2026-09-15): 4 x 4903 = 19612 MiB fits
+      # (scripts/jobs/gpu-t1w-vram-probe.yaml, 2026-09-15): 4 x 4903 = 19612 MiB fits
       # the ~22731 usable with ~3.1 GiB to spare, whatever mix of steps lands on the card.
       # It was 5 until that measurement: 5 x 4903 = 24515 overflows as soon as four
       # t1w-to-mni pods share a card — and a fresh dense node after a drought is filled
