@@ -1115,10 +1115,17 @@ The public repo builds `docs/` into a GitHub Pages site with MkDocs Material. `m
 The Pages workflow itself is **not** synced, and can't be. Two reasons: `.github/` is outside `SYNC_DIRS` on purpose (the internal CI needs AWS credentials and the public repo needs none of it), and GitHub rejects a PAT-authenticated push that touches `.github/workflows/` unless the token carries the `workflow` scope — so auto-syncing it would break the entire sync job, not just itself. Its source of truth is `scripts/public-pages-workflow.yaml`, which *is* synced (byte-for-byte; a test pins that the scrub leaves it alone), and the live copy is installed by hand from it, inside a clone of the public repo:
 
 ```bash
-cd /tmp/cloudpipe-public && git pull
-cp scripts/public-pages-workflow.yaml .github/workflows/pages.yaml
-git add .github/workflows/pages.yaml && git commit -m "ci: re-install pages.yaml from its template" && git push
+# One && chain into a fresh clone, so a failed step stops everything. The first
+# version of this snippet began with a separate `cd` into an existing clone; when
+# that clone was missing, the remaining lines ran in the internal repository and
+# committed the workflow there.
+D="$(mktemp -d)" && git clone https://github.com/<owner>/<public-repo>.git "$D" && cd "$D" \
+  && cp scripts/public-pages-workflow.yaml .github/workflows/pages.yaml \
+  && git add .github/workflows/pages.yaml \
+  && git commit -m "ci: re-install pages.yaml from its template" && git push
 ```
+
+Run it only after the sync PR carrying the template change has merged in the public repo — until then the clone holds the previous template, and the install would reproduce the drift.
 
 This needs a token with the `workflow` scope (a `gh auth login` token has it; the sync's `PUBLIC_REPO_TOKEN` does not). Every sync compares the two copies and prints `⚠ PAGES WORKFLOW DRIFT` — a `::warning::` annotation on the CI run — when they differ, so re-install whenever that appears. It is a warning, not a gate: an older deploy workflow is no reason to stop publishing everything else.
 
