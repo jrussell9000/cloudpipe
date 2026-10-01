@@ -65,6 +65,25 @@ spec:
     parameters:
       - name: subjID
 
+      # Private ECR registry prefix — set by Terraform in cloudpipe-config,
+      # the same ConfigMap the cloudpipe_minproc templates read. This template
+      # carried the registry host inline until then, which pinned the pipeline
+      # to one account and one region.
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+      # Data bucket — the image's orch_config_final.yaml carries a placeholder
+      # (__CLOUDPIPE_BUCKET__) that the container command below replaces with
+      # this before the orchestrator reads it.
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+
   volumes:
     - name: scratch
       emptyDir:
@@ -84,7 +103,7 @@ spec:
       karpenter.sh/nodepool: first-level-nodepool
 
     container:
-      image: "<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/fmri-first-level-proc@sha256:bd4de4e166c6f9e61f4a39a7a7cf454e46577c4b53d6afd66fa480b45e5a915e"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:bd4de4e166c6f9e61f4a39a7a7cf454e46577c4b53d6afd66fa480b45e5a915e"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -103,14 +122,31 @@ spec:
       # Override the image ENTRYPOINT to strip the "sub-" prefix before
       # passing the NDAR ID to orchestrate_first_level.py, which expects
       # a bare ID (e.g. "NDARABC123") and prepends "sub-" itself.
+      #
+      # The orchestrator is external code that reads its bucket from
+      # orch_config_final.yaml, so the image ships a placeholder there and this
+      # renders it into /scratch (every path in that file is absolute, so the
+      # copy's location does not matter). The grep refuses to start on a config
+      # that still names no bucket. An image built before the placeholder has
+      # nothing to replace and runs unchanged, so the order in which this
+      # template and the re-pinned image reach the cluster does not matter.
       command: ["/bin/bash", "-c"]
       args:
         - |
-          cd /app/ABCD_fmri_orchestrator_S3 && \
+          set -euo pipefail
+          cd /app/ABCD_fmri_orchestrator_S3
+          sed "s|__CLOUDPIPE_BUCKET__|${CLOUDPIPE_BUCKET}|g" orch_config_final.yaml \
+            > /scratch/orch_config.yaml
+          if grep -q '__CLOUDPIPE_BUCKET__' /scratch/orch_config.yaml; then
+            echo "orch_config.yaml still names no bucket; is cloudpipe-config's bucket set?" >&2
+            exit 1
+          fi
           python3 orchestrate_first_level.py \
-            --orchestrate_config orch_config_final.yaml \
+            --orchestrate_config /scratch/orch_config.yaml \
             --proc_config proc_config_final.yaml \
             --subj_id "${SUBJ_ID#sub-}"
       env:
         - name: SUBJ_ID
           value: "{{workflow.parameters.subjID}}"
+        - name: CLOUDPIPE_BUCKET
+          value: "{{workflow.parameters.bucket}}"

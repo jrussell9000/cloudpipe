@@ -273,7 +273,7 @@ def split_published_sessions(
     branch that dies at stage time on a missing input artifact, which surfaces as
     workflow phase `Error` and an `overall_status` of failed. The subject is then
     indistinguishable from one where nothing worked, when in the observed case
-    (cloudpipe-knwr6 / sub-XXXXXXXX) 25 of 27 pods succeeded.
+    (workflow cloudpipe-knwr6) 25 of 27 pods succeeded.
     """
     candidates = [item for item in inventory if item.get("t1w_available")]
     names = [item["session"] for item in candidates]

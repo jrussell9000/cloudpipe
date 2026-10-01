@@ -57,7 +57,11 @@ from botocore.exceptions import ClientError
 from restore_links import COMPLETE_SIDECAR, LINKS_SIDECAR, SUPPORTED_SCHEMA
 from restore_links import restore as restore_links
 
-REGION = "<YOUR_AWS_REGION>"
+# No region is named here. boto3 resolves it from the pod: EKS Pod Identity
+# injects AWS_REGION and AWS_DEFAULT_REGION on the argo-workflows-runner service
+# account every workflow runs as (probed, task 6.3). On a workstation the AWS
+# profile supplies it. Unset everywhere, botocore raises NoRegionError rather
+# than reaching another deployment's bucket.
 
 # Objects transferred concurrently, per tree. A tree is ~270 small objects and a
 # single-object round trip against S3 in-region is ~84 ms, so a serial loop is
@@ -108,7 +112,7 @@ def _client(s3=None):
         return s3
     client = getattr(_LOCAL, "s3", None)
     if client is None:
-        client = boto3.client("s3", region_name=REGION)
+        client = boto3.client("s3")  # region from the pod; see the note at the top
         _LOCAL.s3 = client
     return client
 

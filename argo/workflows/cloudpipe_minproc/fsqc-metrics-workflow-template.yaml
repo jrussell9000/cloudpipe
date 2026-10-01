@@ -162,7 +162,7 @@ spec:
     # step with no internal timeout: createScreenshots() can stall indefinitely in
     # matplotlib on a bad surface overlay, emitting no further output and never
     # returning, so the pod produces no exit code and the retryStrategy above never
-    # fires. Observed on sub-XXXXXXXX (cloudpipe-jtb6s, 2026-08-18): 288 minutes and
+    # fires. Observed in workflow cloudpipe-jtb6s (2026-08-18): 288 minutes and
     # still running, last line
     #     UserWarning: WARNING: a problem occurred with the surface overlays
     # Every other step in that workflow had already succeeded, so the subject was
@@ -203,8 +203,8 @@ spec:
         # sampled RSS:
         #
         #                        sessions   memory.peak   wall    /work disk
-        #   sub-XXXXXXXX            3          3.93 G     172 s     863 M
-        #   sub-XXXXXXXX            4          3.97 G     225 s    1070 M
+        #   subject 1               3          3.93 G     172 s     863 M
+        #   subject 2               4          3.97 G     225 s    1070 M
         #
         # The two axes behave DIFFERENTLY, which is the whole basis for the
         # numbers below: +33% sessions moved peak memory by +1% but disk by

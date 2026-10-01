@@ -17,6 +17,12 @@ test = "pytest"
 # the CLI never takes keys. See docs/globus-setup.md.
 globus = { cmd = "python -m globus_admin", env = { PYTHONPATH = "src" } }
 
+# Register the Prefect deployments: `PREFECT_API_URL=… pixi run prefect-deploy`.
+# Fills prefect.yaml's bucket and registry placeholders from the cloudpipe-config
+# ConfigMap, then reads every deployment back from the server. A bare
+# `prefect deploy --all` stores "" for each of them and still succeeds.
+prefect-deploy = "bash prefect/deploy.sh"
+
 # --- Code-health / lint tooling (dev-only) ---
 # Lives in the `lint` feature/environment so runtime image builds don't pull it.
 # See docs/code-health-plan.md. All tasks are read-only / report-only by default;
@@ -93,10 +99,19 @@ mkdocs-material = ">=9.5,<10"
 docs-build = "mkdocs build --strict"
 docs-serve = "mkdocs serve"
 
+# --- Operator workstation (needs WARP) ---
+# `pixi run -e ops <tool>` exports this deployment's buckets and UI URLs from the
+# cluster (scripts/cloudpipe-env.sh), so src/ tools such as validate_test_batch.py
+# need no literal and no flags. Its own environment rather than the default so
+# `pixi run test` and CI never reach for kubectl. No packages of its own.
+[feature.ops.activation]
+scripts = ["scripts/cloudpipe-env.sh"]
+
 [environments]
 lint = { features = ["lint"], solve-group = "default" }
 imaging = { features = ["imaging"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
+ops = { features = ["ops"], solve-group = "default" }
 
 [dependencies]
 numpy = ">=2.5.1,<3"

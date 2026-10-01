@@ -1,2 +1,0 @@
-# See /userinfo on the Argo Server website
-argo list -n argo-workflows -s argo.<YOUR_DOMAIN>:443 --argo-http1

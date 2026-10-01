@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import deployment_env
 from schemas import StepSummary, SubjectManifest, WorkflowRun
 from writer import emit_to_s3
 
@@ -42,8 +43,10 @@ def parse_args() -> argparse.Namespace:
     # name. Optional: an unlabelled submission emits "" rather than failing, so
     # ad-hoc single-subject reruns need not invent one.
     p.add_argument("--batch-label", default="")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
-    return p.parse_args()
+    p.add_argument("--region", default=None, help="default: the pod's own AWS_REGION")
+    args = p.parse_args()
+    args.region = args.region or deployment_env.region()
+    return args
 
 
 def _pending_duration_s(submitted_at: str, started_at: str) -> float | None:

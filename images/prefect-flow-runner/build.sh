@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
+# Build and push the flow runner by hand, then re-register the deployments.
+# CI (build-prefect-flow-runner.yaml) does the build on every push to main; this
+# is the manual path.
+#
+#   PREFECT_API_URL=https://prefect.<your-domain>/api images/prefect-flow-runner/build.sh
+#
 # Run from anywhere — always builds from the repo root so COPY flows/ works.
 set -euo pipefail
 
+: "${PREFECT_API_URL:?set PREFECT_API_URL to the Prefect server API, e.g. https://prefect.example.org/api}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-# Hand-kept in sync with the IMAGE env in
-# .github/workflows/build-prefect-flow-runner.yaml and the four job_variables.image
-# refs in prefect/prefect.yaml. Nothing enforces that.
-IMAGE="<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest"
+
+# The registry comes from the same ConfigMap prefect/deploy.sh reads, so the image
+# pushed here is the image the deployments it registers will pull.
+REGISTRY="$(kubectl -n "${CLOUDPIPE_CONFIG_NAMESPACE:-argo-workflows}" \
+  get configmap cloudpipe-config -o 'jsonpath={.data.ecr_registry}')"
+: "${REGISTRY:?cloudpipe-config has no ecr_registry}"
+IMAGE="$REGISTRY/cloudpipe/cloudpipe-flow-runner:latest"
 
 docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
@@ -18,6 +28,5 @@ docker buildx build \
   -t "$IMAGE" \
   "$REPO_ROOT"
 
-cd "$REPO_ROOT/prefect"
-PREFECT_API_URL=https://prefect.<YOUR_DOMAIN>/api \
-  pixi run --manifest-path "$REPO_ROOT/pixi.toml" prefect deploy --all
+# Never a bare `prefect deploy --all` — see prefect/deploy.sh for why.
+pixi run --manifest-path "$REPO_ROOT/pixi.toml" prefect-deploy

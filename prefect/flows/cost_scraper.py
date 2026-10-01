@@ -24,7 +24,7 @@ Requires:
     new prefix needed no IAM change)
 
 Deployment:
-  Scheduled via Prefect deployment (see images/prefect-flow-runner/prefect.yaml).
+  Scheduled via Prefect deployment (see prefect/prefect.yaml).
   Must be run from inside the EKS cluster to reach the Kubecost in-cluster URL.
 """
 
@@ -37,6 +37,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import boto3
+from lib.config import deployment_region
 
 from prefect import flow, get_run_logger, task
 
@@ -226,8 +227,8 @@ def detect_gaps_task(
 
 @flow(name="kubecost-cost-scraper", log_prints=True)
 def kubecost_cost_scraper(
-    bucket: str = "cloudpipe-metrics",
-    region: str = "<YOUR_AWS_REGION>",
+    bucket: str,
+    region: str | None = None,
     base_url: str = KUBECOST_BASE,
     pipeline: str = "cloudpipe_minproc",
     date: str = "",
@@ -253,9 +254,13 @@ def kubecost_cost_scraper(
     Parameters
     ----------
     bucket:
-        S3 bucket name (default: <YOUR_S3_BUCKET>, the main cloudpipe bucket).
+        The metrics bucket, where the Glue `costs` table reads metrics/costs/ —
+        NOT the data bucket, which silently orphans the records from Athena. No
+        default: the deployment stores cloudpipe-config's `metrics_bucket` here
+        when prefect/deploy.sh registers it.
     region:
-        AWS region for S3 writes.
+        AWS region for S3 writes. Omit to use the pod's own AWS_REGION (see
+        lib/config.py).
     base_url:
         Kubecost cost-analyzer base URL (in-cluster default).
     pipeline:
@@ -291,6 +296,7 @@ def kubecost_cost_scraper(
     Returns the workflow-grain record count (not the pod count), so the flow's
     return value keeps its existing meaning for anything reading it.
     """
+    region = region or deployment_region()
     report_date = _date.fromisoformat(date) if date else None
 
     # return_state=True so a failure here does NOT abort the rest of the flow.
