@@ -65,7 +65,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 | Add a new Docker image | [images.md → Adding a new image](images.md#adding-a-new-image) |
 | Rebuild or deploy a pre-baked GPU AMI | [pre-baked-amis.md](pre-baked-amis.md) |
 | Change Terraform infrastructure | [infrastructure.md](infrastructure.md) |
-| Sync changes to the public repo | [operations.md → Syncing to the public repo](operations.md#syncing-to-the-public-repo) |
+| Sync changes to the public repo (maintainers only) | `docs-internal/public-mirror.md`, in the internal repository |
 
 ---
 
