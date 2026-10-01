@@ -69,7 +69,7 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 | `metrics_bucket.tf` | The `cloudpipe-metrics` bucket (versioned) that holds all QC/cost records |
 | `grafana.tf` | Grafana's Terraform-owned Secrets (Dex SSO client, local admin, image-renderer token) + OIDC ConfigMap. The release itself, its Ingress and the image renderer are GitOps (`gitops/apps/grafana/`) |
 | `logging.tf` | S3 log bucket, CloudTrail |
-| `dns.tf` | Route53 zone lookup, ACM certificates (us-east-1 + <YOUR_AWS_REGION>) |
+| `dns.tf` | Route53 zone lookup, ACM certificates (us-east-1 + the deployment region) |
 | `ecr.tf` | ECR private repositories (primary registry for pipeline images) |
 | `s3_lifecycle.tf` | S3 lifecycle rules for data bucket |
 | `kube-system-network-policy.tf` | Default-deny/allow network policies in `kube-system` |
@@ -79,7 +79,7 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 | `example/` | A minimal root that calls this module, for an outside deployment to copy. Validated by CI, deployed by nothing — see [The example root](#the-example-root) |
 | `../<name>/` | Reusable sub-modules, siblings of `stack/` (see module reference below) |
 | `terraform/versions.tf` + `terraform/providers.tf` | Provider pins, AWS provider aliases, S3 backend config — in the root, see above |
-| `terraform/abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix — in the root |
+| `terraform/abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the data bucket's retired `metrics/*` prefix — in the root |
 | `bootstrap/` | Separate Terraform root that creates the `cloudpipe-terraform-state` S3 bucket itself — its own local backend, not part of the main stack's state. Rarely touched; see ADR 015. |
 
 ---
@@ -97,7 +97,7 @@ This replaced a local-only backend (no remote state at all) after a 2026-07 inci
 | Resource | Value |
 |---|---|
 | Primary CIDR | `10.0.0.0/16` — the only CIDR in use. `var.secondary_cidr_blocks` is declared, and the VPN has routes/auth rules that iterate over it, but `vpc.tf` never associates it, so it is empty in practice. |
-| Private subnets | Three AZs (<YOUR_AWS_REGION>a/b/c), `/20` each — EKS nodes. Upper 3/4 of each is a `prefix` CIDR reservation for pod prefix delegation, see [pod IP address space](#pod-ip-address-space) |
+| Private subnets | Three AZs (`a`/`b`/`c` in the deployment region), `/20` each — EKS nodes. Upper 3/4 of each is a `prefix` CIDR reservation for pod prefix delegation, see [pod IP address space](#pod-ip-address-space) |
 | Public subnets | Three AZs, `/24` each — ALBs, Globus EC2 |
 | NAT gateway | Single (cost optimisation) — private subnets route through it |
 | S3 VPC Gateway endpoint | All route tables — S3 traffic stays on AWS backbone |
@@ -116,7 +116,7 @@ while hundreds of addresses are free, because none of them form an aligned block
 
 1. **Per-node warm capacity.** `WARM_PREFIX_TARGET=1` alone makes each node hold one
    whole *spare* `/28` beyond current need. Measured during the 2026-08-10
-   200-subject batch (GitHub #218): <YOUR_AWS_REGION>c had 113 nodes running just 268 pods
+   200-subject batch (GitHub #218): the `c` zone had 113 nodes running just 268 pods
    but held 204 prefixes = **3,264 addresses reserved**, a 12× overprovision, with 99
    nodes holding 2 prefixes apiece and only **one** fully-free aligned `/28` left in
    the whole `/20`. Pods stalled in `Init:0/1` for up to 93 min on `failed to assign
@@ -136,7 +136,7 @@ while hundreds of addresses are free, because none of them form an aligned block
    addresses = **192 `/28` slots per AZ**, against the 113 nodes the 300-concurrent
    batch peaked at in one AZ.
 
-   Verified live on 2026-08-11: a fresh Karpenter node in <YOUR_AWS_REGION>c took primary
+   Verified live on 2026-08-11: a fresh Karpenter node in the `c` zone took primary
    IP `10.0.32.34` (unreserved `10.0.32.0/22`) and exactly one delegated prefix,
    `10.0.45.0/28` (reserved `10.0.40.0/21`) — the two patterns no longer interleave.
 
@@ -180,7 +180,7 @@ The EKS API (no public endpoint in steady state) and all five web UIs are **priv
 
 ### Client VPN (fallback, pending decommission)
 
-AWS Client VPN predates WARP and still works as a fallback: it source-NATs clients into the VPC CIDR, which the EKS API and the shared UI ALB's security groups trust. It is scheduled for removal after a soak with the VPN disconnected ([#359](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/359), plan 012 §6).
+AWS Client VPN predates WARP and still works as a fallback: it source-NATs clients into the VPC CIDR, which the EKS API and the shared UI ALB's security groups trust. It is scheduled for removal after a soak with the VPN disconnected (#359, plan 012 §6).
 
 - Client CIDR: `10.3.0.0/22`
 - **Full tunnel** (`var.split_tunnel` defaults to `false`). This was load-bearing while the web UIs had **public** ALBs: with split tunnel, traffic to their public IPs never entered the VPN, so it was never NAT'd into an address the ALB security groups trusted. With the UIs on an internal ALB, split tunnel would also work, but the setting is left alone until the VPN is removed.
@@ -193,7 +193,7 @@ AWS Client VPN predates WARP and still works as a fallback: it source-NATs clien
 | Attribute | Value |
 |---|---|
 | Name | `cloudpipe` |
-| Region | `<YOUR_AWS_REGION>` |
+| Region | `var.region` |
 | Kubernetes version | `1.35` |
 | Public endpoint | Disabled in steady state (enabled only during `install.sh` bootstrap) |
 | Private endpoint | Always enabled |
@@ -219,11 +219,11 @@ These run system services and are not used for pipeline workloads.
 
 | Node group | Instance | AMI | Size | Taint | Purpose |
 |---|---|---|---|---|---|
-| `backend` | `m7g.xlarge` | Bottlerocket ARM64 | 1 node, AZ-pinned to <YOUR_AWS_REGION>a | `CriticalAddonsOnly=true:NoSchedule` | CoreDNS, metrics-server, CloudWatch agent, Kubecost |
+| `backend` | `m7g.xlarge` | Bottlerocket ARM64 | 1 node, pinned to the region's `a` zone | `CriticalAddonsOnly=true:NoSchedule` | CoreDNS, metrics-server, CloudWatch agent, Kubecost |
 | `karpenter` | `m7g.xlarge` | Bottlerocket ARM64 | 1 node | — | Karpenter controller |
 | `argo` | `m7g.xlarge` | Bottlerocket ARM64 | 1 node | `argoproj.io/backend=true:NoSchedule` | ArgoCD, Argo server, Prefect |
 
-The `backend` group is pinned to <YOUR_AWS_REGION>a so it is always co-located with the EBS PVCs (Kubecost, Prefect) provisioned in that AZ.
+The `backend` group is pinned to the `a` zone so it is always co-located with the EBS PVCs (Kubecost, Prefect) provisioned in that AZ.
 
 ### Karpenter node pools (on-demand provisioning for pipeline workloads)
 
@@ -234,8 +234,8 @@ There are **five** node pools. All are **spot-only** — no pool allows on-deman
 | `cpu-light-nodepool` | category `t` | spot | 160 CPU / 640 Gi | Globus control, inventory, S3 sync |
 | `cpu-heavy-nodepool` | category `c`,`m`; sizes 2xlarge, 4xlarge; nitro | spot | 2560 CPU / 10240 Gi | BOLD→T1w registration, functional preprocessing |
 | `first-level-nodepool` | families `m6gd`/`m7gd`/`r6gd`/`r7gd`/`c6gd`/`c7gd` (**Graviton/ARM64**, local NVMe); sizes xlarge–4xlarge | spot | 512 CPU / 4096 Gi | First-level (task-based) analysis |
-| `gpu-nodepool` | families `g4dn`/`g5`/`g6`/`g6e`; sizes xlarge, 2xlarge, **except** `g5`/`g6`/`g6e.2xlarge`; nitro; zones <YOUR_AWS_REGION>a/b/c; weight 10 (preferred) | spot | 512 CPU / 2048 Gi | T1w→MNI registration (FireANTs), FastSurfer template-build + long-segmentation |
-| `gpu-dense-nodepool` | types `g5.2xlarge`/`g6.2xlarge`/`g6e.2xlarge`; nitro; zones <YOUR_AWS_REGION>a/b/c; no weight (fallback) | spot | 512 CPU / 2048 Gi | The same three GPU steps, when every `gpu-nodepool` offering is out of capacity |
+| `gpu-nodepool` | families `g4dn`/`g5`/`g6`/`g6e`; sizes xlarge, 2xlarge, **except** `g5`/`g6`/`g6e.2xlarge`; nitro; zones `a`/`b`/`c`; weight 10 (preferred) | spot | 512 CPU / 2048 Gi | T1w→MNI registration (FireANTs), FastSurfer template-build + long-segmentation |
+| `gpu-dense-nodepool` | types `g5.2xlarge`/`g6.2xlarge`/`g6e.2xlarge`; nitro; zones `a`/`b`/`c`; no weight (fallback) | spot | 512 CPU / 2048 Gi | The same three GPU steps, when every `gpu-nodepool` offering is out of capacity |
 
 The `Pool limits` column is the Karpenter `spec.limits` ceiling on aggregate provisioned capacity — a safety stop, not a reservation and not a statement of what a pool typically runs.
 
@@ -253,7 +253,7 @@ There is no shared cluster filesystem. All inter-step data passes through S3 art
 
 ### EBS
 
-Default StorageClass `ebs-sc` — gp3, encrypted, `WaitForFirstConsumer` binding. Used by Kubecost and Prefect for persistent volumes pinned to <YOUR_AWS_REGION>a.
+Default StorageClass `ebs-sc` — gp3, encrypted, `WaitForFirstConsumer` binding. Used by Kubecost and Prefect for persistent volumes pinned to the `a` zone.
 
 ---
 
@@ -303,15 +303,15 @@ The `ClusterSecretStore` and `ExternalSecret` resources are gated behind `crds_a
 
 | Bucket | Versioned | Purpose |
 |---|---|---|
-| `<YOUR_S3_BUCKET>` | **No** | Primary data — input BOLD, derivatives, first-level subject CSVs, config files (see architecture.md for key layout), plus archived pod logs under `logs/` |
+| Data bucket (`var.globus_s3_destination_bucket`) | **No** | Primary data — input BOLD, derivatives, first-level subject CSVs, config files (see architecture.md for key layout), plus archived pod logs under `logs/` |
 | `cloudpipe-metrics` | **Yes** | All QC/cost metric records (`metrics/*`) and their compacted Parquet copies |
 | `cloudpipe-finops` | — | CUR cost-and-usage reports, Athena query results (`grafana-query-results/`) |
 | `cloudpipe-logging` | — | Aggregated log archive: VPC flow logs, CloudTrail, ALB access logs, S3 access logs |
 | `cloudpipe-terraform-state` | **Yes** | Terraform remote state (managed by `terraform/bootstrap/`) |
 
-Metrics live on their own **versioned** bucket, deliberately separated from the derivative data: `<YOUR_S3_BUCKET>` derivative prefixes are flushed before each test batch, which previously destroyed QC history along with them. Writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix are now actively **denied** by bucket policy (`terraform/abcd_v7_metrics_retire.tf`) so a misconfigured writer fails loudly instead of silently orphaning records from Athena.
+Metrics live on their own **versioned** bucket, deliberately separated from the derivative data: the data bucket's derivative prefixes are flushed before each test batch, which previously destroyed QC history along with them. Writes to its retired `metrics/*` prefix are now actively **denied** by bucket policy (`terraform/abcd_v7_metrics_retire.tf`) so a misconfigured writer fails loudly instead of silently orphaning records from Athena.
 
-Note that `<YOUR_S3_BUCKET>` is **not** versioned — deletes there are unrecoverable without reprocessing. Several earlier data buckets still exist in the account; they are historical and not written by the current pipeline.
+Note that the data bucket is **not** versioned — deletes there are unrecoverable without reprocessing. Several earlier data buckets still exist in the account; they are historical and not written by the current pipeline.
 
 `cloudpipe-logging` lifecycle: → Glacier after 90 days → expire after 3 years (satisfies NIST 800-171 3.3.1 log retention).
 
@@ -325,12 +325,12 @@ All pod-level AWS permissions use EKS Pod Identity (not IRSA). Each service acco
 
 | Service account | Namespace | Key permissions |
 |---|---|---|
-| `argo-workflows-controller` | `argo-workflows` | S3 read/write on `<YOUR_S3_BUCKET>` (artifact storage) |
-| `argo-workflows-runner` | `argo-workflows` | S3 read/write on `<YOUR_S3_BUCKET>`, SSM read on `/cloudpipe/globus/*`, EC2 start/stop (via globus module), `workflowtaskresults` create/patch |
-| `argo-workflows-server` | `argo-workflows` | S3 read on `<YOUR_S3_BUCKET>` (serve archived logs) |
-| `prefect-worker` | `prefect` | S3 read/write on `<YOUR_S3_BUCKET>`, SSM read on Globus params; K8s RBAC to create/manage Jobs in `prefect` ns and list/create Workflows in `argo-workflows` ns |
+| `argo-workflows-controller` | `argo-workflows` | S3 read/write on the data bucket (artifact storage) |
+| `argo-workflows-runner` | `argo-workflows` | S3 read/write on the data bucket, SSM read on `/cloudpipe/globus/*`, EC2 start/stop (via globus module), `workflowtaskresults` create/patch |
+| `argo-workflows-server` | `argo-workflows` | S3 read on the data bucket (serve archived logs) |
+| `prefect-worker` | `prefect` | S3 read/write on the data bucket, SSM read on Globus params; K8s RBAC to create/manage Jobs in `prefect` ns and list/create Workflows in `argo-workflows` ns |
 | `ebs-csi-controller-sa` | `aws-ebs-csi-driver` | EBS CSI managed policy |
-| `external-dns` | `external-dns` | Route53 record management on `<YOUR_DOMAIN>` zone |
+| `external-dns` | `external-dns` | Route53 record management on the `var.domain` zone |
 | `external-secrets` | `external-secrets` | Secrets Manager `GetSecretValue` (for ClusterSecretStore) |
 | `grafana` | `grafana` | Athena query on `cloudpipe_metrics_workgroup` + Glue read on the `cloudpipe_metrics` catalog/database/tables; S3 read on `cloudpipe-metrics/metrics/*`; S3 read+write on `cloudpipe-finops/grafana-query-results/*` |
 
@@ -347,7 +347,7 @@ ArgoCD uses Dex as an OIDC broker. All three web UIs authenticate through it.
 
 | UI | SSO path |
 |---|---|
-| ArgoCD | UW-Madison NetID OIDC (`login.<YOUR_INSTITUTION_DOMAIN>`) → Dex |
+| ArgoCD | Institution OIDC (Terraform `institution_oidc_issuer`) → Dex |
 | Argo Workflows | Dex static client `argo-workflows` → oauth2-proxy |
 | Prefect | Dex static client `prefect` → oauth2-proxy |
 
@@ -359,27 +359,27 @@ Dex OIDC client credentials for UW-Madison are stored in Secrets Manager and rea
 
 ## DNS and TLS
 
-Route53 hosted zone: `<YOUR_DOMAIN>`
+Route53 hosted zone: `var.domain`, written `<domain>` below.
 
 Service hostnames are derived from `var.domain` in `locals.tf` — changing the domain variable propagates to all service URLs.
 
 | Hostname | Service |
 |---|---|
-| `argo.<YOUR_DOMAIN>` | Argo Workflows UI |
-| `argocd.<YOUR_DOMAIN>` | ArgoCD UI |
-| `prefect.<YOUR_DOMAIN>` | Prefect UI |
-| `kubecost.<YOUR_DOMAIN>` | Kubecost |
-| `grafana.<YOUR_DOMAIN>` | Grafana (pipeline QC and cost dashboards) |
+| `argo.<domain>` | Argo Workflows UI |
+| `argocd.<domain>` | ArgoCD UI |
+| `prefect.<domain>` | Prefect UI |
+| `kubecost.<domain>` | Kubecost |
+| `grafana.<domain>` | Grafana (pipeline QC and cost dashboards) |
 
 Two ACM certificates:
 - `us-east-1` — required by services that use CloudFront
-- `<YOUR_AWS_REGION>` — the `*.<YOUR_DOMAIN>` wildcard, used by the web-UI ALB's HTTPS listener for all five hostnames above
+- the deployment region — the `*.<domain>` wildcard, used by the web-UI ALB's HTTPS listener for all five hostnames above
 
 External DNS (running in `external-dns` namespace, managed by ArgoCD) automatically creates Route53 records for Kubernetes Ingress objects.
 
 ### Web-UI load balancer
 
-All five hostnames are aliases for **one `internal` ALB**, shared through the AWS Load Balancer Controller IngressGroup `cloudpipe-ui` ([#360](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/360), plan 012). Each UI keeps its own Ingress (host rule, backend, health check); the ALB-level settings are shared.
+All five hostnames are aliases for **one `internal` ALB**, shared through the AWS Load Balancer Controller IngressGroup `cloudpipe-ui` (#360, plan 012). Each UI keeps its own Ingress (host rule, backend, health check); the ALB-level settings are shared.
 
 - **Group-level annotations must be byte-identical on every member**, or the controller stops reconciling the *whole* ALB. Four members are Terraform (`argocd.tf` and the `argo-workflows`, `prefect`, `finops` modules), which all merge `local.ui_alb_group_annotations` from `terraform/modules/stack/ui_alb.tf`. Grafana's Ingress is GitOps-managed (`gitops/apps/grafana/values.yaml`) and repeats the same values; a precondition on the ArgoCD Ingress **fails `terraform plan`** if they differ, so change both together. That precondition reads `values.yaml` merged under Grafana's entry in `local.argocd_app_overrides`, because the hostname annotation comes from Terraform now and either source can carry an annotation — reading the file alone would let the `wafv2-acl-arn` check pass on an Ingress that does set the key.
 - **Security group** `cloudpipe-ui-alb-sg` (`ui_alb.tf`) admits 443/80 from `var.vpc_cidr` only. Members reference it by its Name tag, because Grafana's values cannot take a Terraform ID.
@@ -397,9 +397,9 @@ All five hostnames are aliases for **one `internal` ALB**, shared through the AW
 |---|---|---|
 | EKS control plane (api, audit, authenticator) | CloudWatch log group `/aws/eks/cloudpipe/cluster` | 365 days, KMS encrypted |
 | Container Insights **metrics** | *removed 2026-09-08* — cluster metrics come from Prometheus → Grafana | — |
-| Container **logs** (pod stdout/stderr) | S3 `<YOUR_S3_BUCKET>/logs/{workflow}/{pod}/main.log` — *not* CloudWatch | Bucket lifecycle |
+| Container **logs** (pod stdout/stderr) | S3 `<bucket>/logs/{workflow}/{pod}/main.log` — *not* CloudWatch | Bucket lifecycle |
 | VPC flow logs | `cloudpipe-logging/vpc-flow-logs/` | 90d → Glacier → 3y expiry |
-| CloudTrail (all regions, all mgmt events + S3 data events on `<YOUR_S3_BUCKET>`) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
+| CloudTrail (all regions, all mgmt events + S3 data events on the data bucket) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
 | ALB access logs | `cloudpipe-logging/*/AWSLogs/` | 90d → Glacier → 3y expiry |
 | Web-UI WAF (BLOCK/COUNT records only; `authorization` and `cookie` redacted) | CloudWatch log group `aws-waf-logs-cloudpipe-ui` | 365 days, KMS encrypted |
 
@@ -418,9 +418,9 @@ The Globus Connect Server runs on a standalone EC2 instance in a public subnet, 
 | Attribute | Value |
 |---|---|
 | AMI | Ubuntu 22.04 LTS x86_64 (Canonical) |
-| Subnet | Public (<YOUR_AWS_REGION>a) |
+| Subnet | Public (`a` zone) |
 | Public IP | Elastic IP (fixed — used for endpoint registration) |
-| Storage | S3 storage gateway — GridFTP writes directly to `<YOUR_S3_BUCKET>`, with no staging volume |
+| Storage | S3 storage gateway — GridFTP writes directly to the data bucket, with no staging volume |
 
 Security group inbound rules (mandated by Globus Connect Server v5 architecture):
 
@@ -481,7 +481,7 @@ Both scripts share their `-target` lists via `terraform/targets.sh`, which also 
 address against the `.tf` sources before Terraform is invoked. `terraform apply -target=` on an
 address declared nowhere is a hard error, not a no-op, so one stale entry used to abort the
 bootstrap partway through — which is what a deleted-but-still-referenced
-`module.aws_efs_csi_pod_identity` did for three months ([#211](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/211)),
+`module.aws_efs_csi_pod_identity` did for three months (#211),
 unnoticed because the running cluster predates the removal and never re-runs the bootstrap. The
 preflight reports *every* bad address at once instead of failing at the first; cleanup.sh derives
 its teardown order by reversing the same list rather than keeping a second copy.
@@ -498,8 +498,8 @@ its teardown order by reversing the same list rather than keeping a second copy.
 | `endpoint_public_access` | `false` | Set `true` only during `install.sh` bootstrap |
 | `crds_available` | `false` | Set `true` after ArgoCD has installed CRDs (Phase 5) |
 | `vpc_cni_strict_mode` | `false` | Set `true` after kube-system NetworkPolicies are in place (Phase 6) |
-| `admin_netid` | — | NetID (without @<YOUR_INSTITUTION_DOMAIN>) granted ArgoCD + Argo admin access |
+| `admin_netid` | — | Institution username (without `@<institution_domain>`) granted ArgoCD + Argo admin access |
 | `globus_client_id` | — | Globus service account app client ID (no default — must be provided) |
-| `globus_s3_destination_bucket` | `<YOUR_S3_BUCKET>` | Change to target a different S3 bucket |
+| `globus_s3_destination_bucket` | — | The data bucket (no default — must be provided) |
 | `kubernetes_version` | `1.35` | Bump for EKS version upgrades |
-| `domain` | `<YOUR_DOMAIN>` | Change for different deployment environments |
+| `domain` | — | Base domain for every service hostname (no default — must be provided) |

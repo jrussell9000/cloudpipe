@@ -22,7 +22,7 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
 
 ```
                         ┌──────────────────────────────────────────────────────────────────┐
-                        │  GitHub (<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>)                        │
+                        │  GitHub (this repository)                                        │
                         │  push to main                                                    │
                         │    ├── images/prefect-flow-runner/** ─► GitHub Actions ─► ECR   │
                         │    ├── prefect/flows/**               ─► GitHub Actions ─► ECR   │
@@ -32,7 +32,7 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
                                               │ ArgoCD pull/sync
                                               ▼
                         ┌──────────────────────────────────────────────────────────────────┐
-                        │  EKS cluster: cloudpipe  (<YOUR_AWS_REGION>)                            │
+                        │  EKS cluster: cloudpipe  (<region>)                             │
                         │                                                                  │
                         │  ┌──────────────┐   ┌──────────────────────────────────────┐   │
                         │  │ Prefect       │   │ Argo Workflows (argo-workflows ns)   │   │
@@ -56,7 +56,7 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
                                               │ reads/writes
                                               ▼
                         ┌──────────────────────────────────────────────────────────────────┐
-                        │  S3 bucket: <YOUR_S3_BUCKET>  (primary data)                             │
+                        │  S3 bucket: <bucket>  (primary data)                            │
                         │   mmps_mproc/{subj}/{ses}/func/      ← Globus lands here        │
                         │   derivatives/fastsurfer/{subj}/                                │
                         │   derivatives/registration/{subj}/{ses}/                        │
@@ -72,14 +72,14 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
                         │                                                                  │
                         │  ┌──────────────────────────────────────────────────────────┐   │
                         │  │ Grafana (grafana ns)                                     │   │
-                        │  │   grafana.<YOUR_DOMAIN>                 │   │
+                        │  │   grafana.<domain>                                       │   │
                         │  │   Pipeline Throughput / Functional QC / Anat QC / Costs  │   │
                         │  └──────────────────────────────────────────────────────────┘   │
                         └──────────────────────────────────────────────────────────────────┘
                                               ▲
                         ┌─────────────────────┴────────────────────────────────────────────┐
                         │  Globus Connect Server (EC2, stopped when idle)                  │
-                        │  S3 storage gateway → writes directly to <YOUR_S3_BUCKET>                 │
+                        │  S3 storage gateway → writes directly to <bucket>                │
                         │  Source: NBDC Data Hub Globus collection                        │
                         │  Instance ID / collection UUID stored in SSM                    │
                         └──────────────────────────────────────────────────────────────────┘
@@ -119,7 +119,7 @@ Each workflow processes one subject. The master DAG (`cloudpipe-long-master-work
 | Globus transfer | `globus-transfer` → `globus-transfer-template` | `ingress-mode != globus` (i.e. `presynced`) |
 | Verify staged input | `ingress-verify` → `verify-staged-input-template` | `ingress-mode == globus` |
 
-The transfer step writes directly to `<YOUR_S3_BUCKET>` through the S3 storage gateway. Exactly one of the two rows above runs; the other is Skipped, and the inventory gate accepts either. Semaphore caps concurrent transfers at 8.
+The transfer step writes directly to the data bucket through the S3 storage gateway. Exactly one of the two rows above runs; the other is Skipped, and the inventory gate accepts either. Semaphore caps concurrent transfers at 8.
 
 Node pool: `cpu-light-nodepool`
 
@@ -197,14 +197,14 @@ All infrastructure is in `terraform/`. Run commands from that directory.
 | Karpenter — `gpu-nodepool` | g4dn/g5/g6/g6e, xlarge–2xlarge only, NVIDIA GPU, spot only, for registration + FastSurfer GPU steps. GPUs are time-sliced 3 ways (`nvidia.com/gpu: 3` per node). Limits 512 CPU / 2048 Gi |
 | Karpenter — `first-level-nodepool` | Graviton `{c,m,r}{6,7}gd` xl–4xl, spot only, for the first-level GLM pipeline. Limits 512 CPU / 4096 Gi |
 | RDS PostgreSQL | `cloudpipe-argo` (`db.m7g.large`, Argo metadata, fronted by PgBouncer) and `cloudpipe-prefect` (`db.t4g.micro`, Prefect metadata) |
-| S3 — `<YOUR_S3_BUCKET>` | Primary data bucket (unversioned; derivative prefixes are flushed per test batch) |
-| S3 — `cloudpipe-metrics` | QC + cost metrics, **versioned** — kept separate from `<YOUR_S3_BUCKET>` so records survive derivative flushes |
+| S3 — data bucket (`var.globus_s3_destination_bucket`) | Primary data bucket (unversioned; derivative prefixes are flushed per test batch) |
+| S3 — `cloudpipe-metrics` | QC + cost metrics, **versioned** — kept separate from the data bucket so records survive derivative flushes |
 | S3 — `cloudpipe-finops` | Cost & usage reports, Athena/Grafana query results |
 | S3 — `cloudpipe-logging` | Log archive (incl. archived Argo pod logs) |
 | S3 — `cloudpipe-terraform-state` | Terraform remote backend |
-| ECR (private, primary) | `{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/` — layer blobs served via VPC S3 gateway endpoint, no NAT traversal on pull |
+| ECR (private, primary) | `{account-id}.dkr.ecr.{region}.amazonaws.com/cloudpipe/` — layer blobs served via VPC S3 gateway endpoint, no NAT traversal on pull |
 | ECR Public (secondary, being retired) | `public.ecr.aws/l9e7l1h1/cloudpipe/` — most images are dual-pushed here, kept as a one-line rollback target (`local.ecr_public_registry` in `terraform/modules/stack/ecr.tf`). Repos are retired image by image via `local.ecr_images_public_retired`; `fmri-first-level-proc` is already gone |
-| Route53 | `<YOUR_DOMAIN>` — Argo UI, Prefect UI, ArgoCD |
+| Route53 | `var.domain` — Argo UI, Prefect UI, ArgoCD |
 | SSM Parameter Store | Globus instance ID, collection UUIDs, base paths (see below) |
 
 Key SSM parameters:
@@ -230,7 +230,7 @@ The separate `workflow-templates` Application (`gitops/bootstrap/workflow-templa
 
 ## Docker images
 
-Most images are dual-pushed to both the private ECR registry (`{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/`) and ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`), a holdover from the NAT-cost migration; `fmri-first-level-proc` is private-only as of 2026-08-17. Production WorkflowTemplates resolve the `ecr-registry` parameter from Terraform's `local.ecr_registry`, which now points at the private registry (`terraform/modules/stack/argowf.tf`); rollback to ECR Public is a one-line change (`local.ecr_public_registry`). Every production template pins images by SHA digest — there are no `:latest` refs left anywhere in `argo/workflows/`. The only `:latest` tags are the flow-runner build tag (`.github/workflows/build-prefect-flow-runner.yaml`) and the placeholder a brand-new image carries until its first `ci: pin workflow images to sha-...` commit lands.
+Most images are dual-pushed to both the private ECR registry (`{account-id}.dkr.ecr.{region}.amazonaws.com/cloudpipe/`) and ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`), a holdover from the NAT-cost migration; `fmri-first-level-proc` is private-only as of 2026-08-17. Production WorkflowTemplates resolve the `ecr-registry` parameter from Terraform's `local.ecr_registry`, which now points at the private registry (`terraform/modules/stack/argowf.tf`); rollback to ECR Public is a one-line change (`local.ecr_public_registry`). Every production template pins images by SHA digest — there are no `:latest` refs left anywhere in `argo/workflows/`. The only `:latest` tags are the flow-runner build tag (`.github/workflows/build-prefect-flow-runner.yaml`) and the placeholder a brand-new image carries until its first `ci: pin workflow images to sha-...` commit lands.
 
 | Image | Used by | Purpose |
 |---|---|---|
@@ -251,7 +251,7 @@ Flow code is baked into the `cloudpipe-flow-runner` Docker image. Changing flow 
 1. Push to `main` → GitHub Actions rebuilds and pushes the image.
 2. If `prefect/prefect.yaml` changed, also run `pixi run prefect-deploy` manually (GitHub Actions posts a warning in the job summary when this is needed).
 
-Prefect API is at `https://prefect.<YOUR_DOMAIN>/api`.
+Prefect API is at `https://prefect.<domain>/api`, where `<domain>` is the Terraform `domain` variable; `pixi run -e ops` exports it as `PREFECT_API_URL`.
 
 ---
 

@@ -2,12 +2,16 @@
 
 This document walks through each pipeline in execution order: what triggers it, what each step does, what it reads and writes, and what can go wrong. Every claim here is verified against the current WorkflowTemplate YAML files.
 
-| Pipeline | WorkflowTemplate | Submitter | Input | Output bucket |
-|---|---|---|---|---|
-| `cloudpipe_minproc` | `cloudpipe` | `cloudpipe-queue-manager` Prefect flow | ABCD minimally preprocessed | `<YOUR_S3_BUCKET>` |
-| `cloudpipe_fullproc` | — (planned, not implemented) | — | Raw ABCD DICOMs | `<YOUR_S3_BUCKET>` |
-| `subregion-seg` | `subregion-seg` | `cloudpipe` DAG (or standalone) | FastSurfer longitudinal outputs | `<YOUR_S3_BUCKET>` |
-| `fmri-first-level-proc` | (separate repo) | `first-level-queue-manager` Prefect flow | cloudpipe_minproc outputs | `<YOUR_S3_BUCKET>` |
+Every pipeline reads from and writes to the one data bucket (Terraform
+`globus_s3_destination_bucket`, exported as `CLOUDPIPE_BUCKET` by `pixi shell -e ops`, in
+which the commands on this page run).
+
+| Pipeline | WorkflowTemplate | Submitter | Input |
+|---|---|---|---|
+| `cloudpipe_minproc` | `cloudpipe` | `cloudpipe-queue-manager` Prefect flow | ABCD minimally preprocessed |
+| `cloudpipe_fullproc` | — (planned, not implemented) | — | Raw ABCD DICOMs |
+| `subregion-seg` | `subregion-seg` | `cloudpipe` DAG (or standalone) | FastSurfer longitudinal outputs |
+| `fmri-first-level-proc` | (separate repo) | `first-level-queue-manager` Prefect flow | cloudpipe_minproc outputs |
 
 ### What this pipeline does not do
 
@@ -36,19 +40,20 @@ Production pipeline. Ingests ABCD minimally preprocessed data (Hagler et al. 201
 **Production (Prefect flow):**
 ```bash
 prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
-  -p subjects_file=s3://<YOUR_S3_BUCKET>/config/subjects.csv
+  -p subjects_file="s3://$CLOUDPIPE_BUCKET/config/subjects.csv"
 ```
 
 The flow gates concurrency: `ConcurrencyGate.count()` counts active Argo workflows and waits until below `max_concurrent` before submitting the next subject. `max_concurrent` is **not** a flow parameter — it's read live from the Prefect Variable `cloudpipe-max-concurrent` (fallback `50` when unset) on every poll cycle, so it can be changed mid-run with `prefect variable set cloudpipe-max-concurrent <N>` without restarting the flow. Use `start_index`/`end_index` to resume after a pause. The controller's `namespaceParallelism` (`400`) is the server-side backstop — see ADR 008 for why a client-side gate alone cannot enforce the cap (#206). Arrivals are also paced to at most `cloudpipe-max-submissions-per-minute` (fallback `5`, `0` disables, read live), so a cold start ramps up instead of creating the cap's whole width at once (#393).
 
-**Direct single-subject submission:**
+**Direct single-subject submission** (the two collection IDs are in SSM — see
+[globus.md → Deployment values](globus.md#deployment-values)):
 ```bash
 argo submit --from workflowtemplate/cloudpipe \
   -n argo-workflows \
   -p subjID=NDARINVXXXXXXXX \
-  -p globus-source-collection-id=<YOUR_GLOBUS_SOURCE_COLLECTION_ID> \
+  -p globus-source-collection-id=<source-collection-id> \
   -p globus-source-base-path=/abcd/derivatives/mmps_mproc \
-  -p globus-dest-collection-id=<YOUR_GLOBUS_DEST_COLLECTION_ID> \
+  -p globus-dest-collection-id=<collection-id> \
   -p globus-dest-base-path=/mmps_mproc \
   -p globus-scan-types='["T1w","T2w","rest","nback"]'
 ```
@@ -231,7 +236,7 @@ Failure modes:
 
 Four steps run as a DAG. All FastSurfer steps use image `cloudpipe/fastsurfer`. Steps A and C run on `gpu-nodepool`; B and D on `cpu-heavy-nodepool`.
 
-**GPU spot-drought fallback ([#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373)).** When the workflow parameter `fastsurfer-device` is `cpu` (default `cuda`), A and C run on `cpu-heavy-nodepool` too: each pod is re-sized to 7 CPU / 8G by `podSpecPatch`, its `nvidia.com/gpu` limit is zeroed, and `--device cpu --threads 7` is appended to every FastSurfer call. Measured on one session (probe `fastsurfer-cpu-probe-lmkgg`, 2026-09-10, manifest in `scripts/manifests/`, internal repo only): 396 s on CPU against 357 s on a 3-way time-sliced T4 — inference itself is 172 s vs 35 s, but the bias-field, sub-segmentation and stats work that follows is CPU-bound on both paths — with Dice 0.9998 against the GPU segmentation and a 3.96G memory peak. About 1.4x the per-session cost, and it cannot be stalled by a GPU pool that grants no nodes — which happened for hours on 2026-09-03 and 2026-09-10. The queue manager chooses the value per submission from how many GPU pods have been Pending 15+ minutes (Prefect variable `cloudpipe-fastsurfer-device` overrides it), and the workflow records it as the label `cloudpipe.io/fastsurfer-device`. `t1w-to-mni` stays GPU-only.
+**GPU spot-drought fallback (#373).** When the workflow parameter `fastsurfer-device` is `cpu` (default `cuda`), A and C run on `cpu-heavy-nodepool` too: each pod is re-sized to 7 CPU / 8G by `podSpecPatch`, its `nvidia.com/gpu` limit is zeroed, and `--device cpu --threads 7` is appended to every FastSurfer call. Measured on one session (probe `fastsurfer-cpu-probe-lmkgg`, 2026-09-10, manifest in `scripts/manifests/`, internal repo only): 396 s on CPU against 357 s on a 3-way time-sliced T4 — inference itself is 172 s vs 35 s, but the bias-field, sub-segmentation and stats work that follows is CPU-bound on both paths — with Dice 0.9998 against the GPU segmentation and a 3.96G memory peak. About 1.4x the per-session cost, and it cannot be stalled by a GPU pool that grants no nodes — which happened for hours on 2026-09-03 and 2026-09-10. The queue manager chooses the value per submission from how many GPU pods have been Pending 15+ minutes (Prefect variable `cloudpipe-fastsurfer-device` overrides it), and the workflow records it as the label `cloudpipe.io/fastsurfer-device`. `t1w-to-mni` stays GPU-only.
 
 **There is no shared volume.** Each step works in a private `emptyDir` at `/work`, with `SUBJECTS_DIR=/work/subjects`, and hands state to the next step through S3 per ADR 004. Intermediates go to `scratch/{workflow.name}/anat/` and are reaped by the `scratch-expiration` lifecycle rule (7 days) in `terraform/modules/stack/s3_lifecycle.tf`. They are not derivatives — nothing outside the owning workflow may read them.
 
@@ -365,15 +370,15 @@ What the raised *request* buys is the thing a limit was wanted for: the schedule
 2. **Nothing on this path allocates more than a volume.** `MRInormGentlyFindControlPoints` (`mrinorm.cpp:1096`) is O(1) memory: one 256³ uchar `MRIalloc` plus a fixed 7×7×7 window scan. The only `count`-scaled heap allocations in `mrinorm.cpp` (lines 2852, 2913–15, 2965–67) live in `MRI3dUseFileControlPoints` / `MRI3dUseLabelControlPoints` — the `-f` and label paths, which this command does not take. Everything else is a 256³ MRI, ≤67 MB as float. **Reaching 25.97 GiB needs ~400 simultaneous volume-sized allocations**, which no legitimate branch here performs — consistent with an allocation fault (runaway loop or corruption), not with data-scaled demand.
 3. **There is a real leak, but it is two orders of magnitude too small.** `MRIbuildBiasImage` (`mrinorm.cpp:1347`) takes `mri_bias` as an output parameter, then unconditionally does `mri_bias = MRIclone(mri_src, NULL)` at line 1358 — discarding the caller's buffer without freeing it. `MRI3dNormalize:1446` passes `mri_bias` expecting reuse, so every call leaks a full volume. At `num_3d_iter = 2` that is ~134 MB. Real, worth reporting upstream, **not** the 26 GiB.
 
-**Intensity scaling is ruled out; do not add an `mri_info` pre-flight gate.** `mri_info`-level and intensity-statistics checks on all four sessions of `sub-XXXXXXXX` come back clean: every volume is 256³ uchar (`aseg` int16), range 0–255, no float and no out-of-range values, and the *first* `mri_normalize` in the same pod (`nu.mgz → T1.mgz`) prints `white matter peak found at 110` for all four sessions and exits 0 at ~572 MB max RSS. Measured WM mode is 110/110/109/109 and WM mean 104.5/104.5/103.1/104.5 — a header check would be a no-op. The one real outlier in the victim session (`ses-04A`) is **segmentation extent**, not intensity: 313,587 WM voxels vs 404–441k in its siblings, and 1211 control points removed vs 292/593/366.
+**Intensity scaling is ruled out; do not add an `mri_info` pre-flight gate.** `mri_info`-level and intensity-statistics checks on all four sessions of subject A come back clean: every volume is 256³ uchar (`aseg` int16), range 0–255, no float and no out-of-range values, and the *first* `mri_normalize` in the same pod (`nu.mgz → T1.mgz`) prints `white matter peak found at 110` for all four sessions and exits 0 at ~572 MB max RSS. Measured WM mode is 110/110/109/109 and WM mean 104.5/104.5/103.1/104.5 — a header check would be a no-op. The one real outlier in the victim session (`ses-04A`) is **segmentation extent**, not intensity: 313,587 WM voxels vs 404–441k in its siblings, and 1211 control points removed vs 292/593/366.
 
-> **Neither of those two numbers generalises to the other victims** (checked 2026-08-15 against the third victim, `sub-XXXXXXXX` `ses-06A`; see the rate paragraph below). Control points removed there were 461/866/464/**809** — the victim is *not* the outlier, and the passing `ses-02A` removed **more**. A different signal does stand out on that subject, and it too fails to generalise: the first `mri_normalize`'s paired peak detection reports `110, 92` for `ses-06A` against `110, 110` or `110, 109` for every sibling, while `sub-XXXXXXXX` `ses-04A` reports `110` in all five of its detections. Each victim looks abnormal on a *different* axis and normal on the axes that flagged the others, so **do not build a data-side gate on any of them.** Segmentation extent survives only as untested on the third victim, not as confirmed.
+> **Neither of those two numbers generalises to the other victims** (checked 2026-08-15 against the third victim, subject B `ses-06A`; see the rate paragraph below). Control points removed there were 461/866/464/**809** — the victim is *not* the outlier, and the passing `ses-02A` removed **more**. A different signal does stand out on that subject, and it too fails to generalise: the first `mri_normalize`'s paired peak detection reports `110, 92` for `ses-06A` against `110, 110` or `110, 109` for every sibling, while subject A `ses-04A` reports `110` in all five of its detections. Each victim looks abnormal on a *different* axis and normal on the axes that flagged the others, so **do not build a data-side gate on any of them.** Segmentation extent survives only as untested on the third victim, not as confirmed.
 >
-> Intensity is ruled out on the raw inputs too, not just the intermediates: `nibabel` on the source T1w of both victims and both matched passing siblings gives 256³ float32, range 0–255, **zero NaN and zero Inf** in all four. Saturation is explicitly *not* the discriminator — `sub-XXXXXXXX` `ses-00A` **passes** with 1.262% of voxels at 255, 14× the 0.091% of the failing `sub-XXXXXXXX` `ses-06A`. A clipping pass would break passing sessions without fixing failing ones.
+> Intensity is ruled out on the raw inputs too, not just the intermediates: `nibabel` on the source T1w of both victims and both matched passing siblings gives 256³ float32, range 0–255, **zero NaN and zero Inf** in all four. Saturation is explicitly *not* the discriminator — subject C `ses-00A` **passes** with 1.262% of voxels at 255, 14× the 0.091% of the failing subject B `ses-06A`. A clipping pass would break passing sessions without fixing failing ones.
 
 The container also emits cgroup v2 `memory.peak` and a 30 s `anon`/`file` split to the archived log, so the next batch replaces the sizing table above with a figure that separates real demand from reclaimable page cache (`pod_memory_working_set` folds the two together, making those numbers an upper bound).
 
-**The runaway is now identified: a garbage histogram bin count.** Re-running `sub-XXXXXXXX` under the cap on 2026-08-12 (49m48s, container `memory.peak` **10.95 G** against the 18G request, no OOM kill, workflow `Succeeded`) produced the error the `SIGKILL` had been destroying:
+**The runaway is now identified: a garbage histogram bin count.** Re-running subject A under the cap on 2026-08-12 (49m48s, container `memory.peak` **10.95 G** against the 18G request, no OOM kill, workflow `Succeeded`) produced the error the `SIGKILL` had been destroying:
 
 ```
 ses-04A: 3d normalization pass 1 of 2
@@ -389,9 +394,9 @@ ses-04A: recon-all -s ses-04A exited with ERRORS
 
 | subject / session | 2026-08-12 | 2026-08-14 |
 |---|---|---|
-| `sub-XXXXXXXX` `ses-04A` | 2001892225 | **2001892225** — identical |
-| `sub-XXXXXXXX` `ses-02A` | 2109135873 | **2128137089** — differs by ~19M |
-| `sub-XXXXXXXX` `ses-06A` | — | 2001891713 |
+| subject A `ses-04A` | 2001892225 | **2001892225** — identical |
+| subject C `ses-02A` | 2109135873 | **2128137089** — differs by ~19M |
+| subject B `ses-06A` | — | 2001891713 |
 
 **The same source T1w produced a different `nbins` on a different day**, and **two unrelated subjects landed 512 apart** out of 2×10⁹. That killed "deterministic function of this session's anatomy" and made an uninitialized read look attractive — the values reinterpreted as float32 bit patterns are plausible garbage, and they cluster just under `INT_MAX`. **The uninitialized-read reading is nevertheless refuted, by arithmetic.** `nbins` is computed at `utils/mrihisto.cpp:121` as
 
@@ -425,19 +430,19 @@ So the mitigation set is down to two: **status quo** — the #245 guard rejects 
 
 One correction for the upstream issue that follows from this: the memory figure is **31.7 GiB for the pair**, not the 15.9 GiB quoted for a single histogram, and a bound has to land *before* `:3371` to help.
 
-`scripts/manifests/histoalloc-confirm-probe.yaml` (internal repo only) answers exactly that. `scratch/{workflow.name}/anat/` survives on a 7-day lifecycle, so the `sessions-seg/{ses}.tar.gz` and `template-parcellated.tar.gz` that fed a known failure can be re-staged byte-identically. It targets `sub-XXXXXXXX` `ses-02A` (`cloudpipe-knwr6`, k=2 — the cheapest victim) with `ses-00A` as a passing in-subject control, pins the failing batch's image tags rather than today's, and runs three stages: reproduce at the production 8G cap; report dtype/min/max/min-positive/NaN/Inf/`voxels>255`/implied-`nbins` for `nu T1 norm brainmask aseg.presurf brain` on victim **and** control; then re-run the failing command standalone under a 24G cap with `-W /tmp/cp.mgz /tmp/bias.mgz` to capture the fitted bias field. It publishes nothing and exits 0 regardless, so a successful experiment is not recorded as a failed workflow. **Its inputs expire ~2026-08-21**, so a re-run after that needs a fresh victim.
+`scripts/manifests/histoalloc-confirm-probe.yaml` (internal repo only) answers exactly that. `scratch/{workflow.name}/anat/` survives on a 7-day lifecycle, so the `sessions-seg/{ses}.tar.gz` and `template-parcellated.tar.gz` that fed a known failure can be re-staged byte-identically. It targets subject C `ses-02A` (`cloudpipe-knwr6`, k=2 — the cheapest victim) with `ses-00A` as a passing in-subject control, pins the failing batch's image tags rather than today's, and runs three stages: reproduce at the production 8G cap; report dtype/min/max/min-positive/NaN/Inf/`voxels>255`/implied-`nbins` for `nu T1 norm brainmask aseg.presurf brain` on victim **and** control; then re-run the failing command standalone under a 24G cap with `-W /tmp/cp.mgz /tmp/bias.mgz` to capture the fitted bias field. It publishes nothing and exits 0 regardless, so a successful experiment is not recorded as a failed workflow. **Its inputs expire ~2026-08-21**, so a re-run after that needs a fresh victim.
 
 Two operational notes from running it, both now fixed in the manifest. Run 1 (`histoalloc-confirm-lqzql`) passed *both* sessions to `brun_fastsurfer.sh`, so although the victim crashed in ~2 min the step then waited ~45 min on the healthy control's full surf run — and it was spot-reclaimed at 16m29s with stages 2–3 unrun. Stage 1 needs the victim only; stage 2 reads the control's `norm.mgz` straight out of the staged tarball and never needed stage 1 to touch it. Run 2 finished in **6m22s**. Separately, stage 1 redirects to `/tmp/stage1.log` and only `cat`s it at the end, so `argo logs` shows nothing while it runs and the S3 archive of the reclaimed pod is **197 bytes** — an archived log is not the same as a useful one. To watch it live, `kubectl exec` into the pod and grep that file; that is the only reason run 1 yielded the reproduction at all.
 
-**It is not a one-subject curiosity.** The 300-subject batch of 2026-08-12 hit it twice — `sub-XXXXXXXX` `ses-04A` (`HISTOalloc(2001892225)`) and `sub-XXXXXXXX` `ses-02A` (`HISTOalloc(2109135873)`) — a 2/300 (0.67%) subject-level rate. All bin counts are ~2.0–2.1 × 10⁹, the same failure class rather than unrelated accidents. Under the cap neither OOM-killed its pod: across **356** parcellation attempts in that batch there were **zero** `137 OOMKilled` (both 137s carry `pod deleted`, i.e. spot).
+**It is not a one-subject curiosity.** The 300-subject batch of 2026-08-12 hit it twice — subject A `ses-04A` (`HISTOalloc(2001892225)`) and subject C `ses-02A` (`HISTOalloc(2109135873)`) — a 2/300 (0.67%) subject-level rate. All bin counts are ~2.0–2.1 × 10⁹, the same failure class rather than unrelated accidents. Under the cap neither OOM-killed its pod: across **356** parcellation attempts in that batch there were **zero** `137 OOMKilled` (both 137s carry `pod deleted`, i.e. spot).
 
 **The 2026-08-14 batch raises the rate to 3/300 (1.0%).** All **330** archived `fastsurfer-long-parcellation` logs from that batch were scanned for the guard's own `REJECTED ses-` line; there are exactly three, and every one is `HISTOalloc`:
 
 | workflow | subject | session | `nbins` |
 |---|---|---|---|
-| `cloudpipe-knwr6` | `sub-XXXXXXXX` | `ses-02A` | 2128137089 |
-| `cloudpipe-72cq2` | `sub-XXXXXXXX` | `ses-06A` | 2001891713 |
-| `cloudpipe-tgmnx` | `sub-XXXXXXXX` | `ses-04A` | 2001892225 |
+| `cloudpipe-knwr6` | subject C | `ses-02A` | 2128137089 |
+| `cloudpipe-72cq2` | subject B | `ses-06A` | 2001891713 |
+| `cloudpipe-tgmnx` | subject A | `ses-04A` | 2001892225 |
 
 At 1.0% that is roughly **116 sessions** across the 11,628-subject cohort — sessions, not subjects, and that distinction is now load-bearing. The per-session guard rejects the bad timepoint and publishes the rest, and since #273 drives the session fan-out from published derivatives rather than from the inventory's `t1w_available` list, an affected subject lands `partial` with its remaining sessions delivered instead of `Error` with the whole subject lost.
 
@@ -449,7 +454,7 @@ So the container validates each session before publishing it, rejecting any that
 
 Since ADR 017 the guard works **positively**: the publish loop iterates the sessions that passed, so a rejected session is never written and never gets a `_complete.json`. It no longer depends on deleting a directory so that an `optional: true` artifact is skipped. The directory is still removed — for ephemeral-storage reclaim, and so that a future edit iterating the directory listing rather than the guard's verdict cannot publish a rejected session — but removal is no longer what enforces the guard.
 
-> **The deletion order is load-bearing.** Removing the directory at detection time cost two whole workflows in the 300-subject batch of 2026-08-12 (`sub-XXXXXXXX`, `sub-XXXXXXXX`). `long_compat_segmentHA.py` tolerates an *incomplete* session directory — it had been running against these very sessions before the guard existed — but not a *missing* one. It exited 1, `base-tps` was never written, and the exit-75 guard then retried a **deterministic** failure until the 8-attempt budget was gone (`retryStrategy.expression evaluated to false`), taking each subject's three-plus good sessions with it. Detection therefore runs before the bridge and removal after it. The derivative of a rejected session is genuinely absent — the existence check correctly reports the session missing and the next submission re-runs the phase. Self-healing is restored by making the failure legible, not by adding a second source of truth. Rejected sessions are also pruned from `base-tps` (written from the template's timepoint list, not from what is on disk), so one bad session does not fail `segment-subregions` for the whole subject. If *no* session survives, the step exits **1** — not 75 — because a deterministic allocation failure re-run is an identical failure, the same reasoning that keeps 137 out of the retry expression (#115).
+> **The deletion order is load-bearing.** Removing the directory at detection time cost two whole workflows in the 300-subject batch of 2026-08-12 (subject A, subject C). `long_compat_segmentHA.py` tolerates an *incomplete* session directory — it had been running against these very sessions before the guard existed — but not a *missing* one. It exited 1, `base-tps` was never written, and the exit-75 guard then retried a **deterministic** failure until the 8-attempt budget was gone (`retryStrategy.expression evaluated to false`), taking each subject's three-plus good sessions with it. Detection therefore runs before the bridge and removal after it. The derivative of a rejected session is genuinely absent — the existence check correctly reports the session missing and the next submission re-runs the phase. Self-healing is restored by making the failure legible, not by adding a second source of truth. Rejected sessions are also pruned from `base-tps` (written from the template's timepoint list, not from what is on disk), so one bad session does not fail `segment-subregions` for the whole subject. If *no* session survives, the step exits **1** — not 75 — because a deterministic allocation failure re-run is an identical failure, the same reasoning that keeps 137 out of the retry expression (#115).
 
 This is the output-side counterpart to the input-side `find "$SD" -name '*IsRunning*' -delete` guard: the same marker, applied to what the pod produces rather than to what it inherits.
 
@@ -545,7 +550,7 @@ A single `cpu-light` pod, `inventory` → `published-sessions-template`, sits be
 | `rejected-sessions` | `/tmp/rejected_sessions.json` | session IDs expected to be published and absent |
 | `rejected-count` | `/tmp/rejected_count.txt` | `len(rejected)`, for a `when:` guard |
 
-**Why this is not inventory's job.** Inventory runs *before* the anatomical phase, and `t1w_available` means "there is a T1w for this session in `mmps_mproc`" — a statement about the subject's inputs. This phase needs the opposite: "did the anatomical phase publish derivatives for this session". The two agree until the [#248](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/248) completion guard rejects one timepoint and passes the others, which is exactly what that guard exists to do. Fanning out on the input list then starts a branch whose first pod dies in *init* loading an artifact nothing wrote — `sub-XXXXXXXX` / `cloudpipe-knwr6` reported workflow phase `Error` with 25 of 27 pods green ([#270](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/270)).
+**Why this is not inventory's job.** Inventory runs *before* the anatomical phase, and `t1w_available` means "there is a T1w for this session in `mmps_mproc`" — a statement about the subject's inputs. This phase needs the opposite: "did the anatomical phase publish derivatives for this session". The two agree until the #248 completion guard rejects one timepoint and passes the others, which is exactly what that guard exists to do. Fanning out on the input list then starts a branch whose first pod dies in *init* loading an artifact nothing wrote — subject C / `cloudpipe-knwr6` reported workflow phase `Error` with 25 of 27 pods green (#270).
 
 **Why it is a separate task and not part of the anatomical phase.** That phase is `when:`-skipped on every reprocess, and a fan-out may not reference a skipped producer's output parameters — the DAG deadlocks (ADR 016). As an always-runs sibling on the same gate it costs a few seconds, and it re-checks the markers on the reprocess path too.
 
@@ -631,7 +636,7 @@ Runs `bold_to_t1w.py` — **SynthMorph rigid only** (`mri_synthmorph register -m
 
 The LTA output is converted to an ANTs/ITK `.txt` affine for `antsApplyTransforms` during functional preprocessing. The conversion is **hand-rolled in Python**, not `lta_convert --outitk`: that flag crashes with `munmap_chunk` on SynthMorph LTAs (FreeSurfer 7.4.1 heap corruption when `--src`/`--trg` are passed with a geometry-less LTA). The equivalent is a basis flip, `A_lps = D·R·D` and `t_lps = D·t` with `D = diag(-1,-1,1)`, and **no inversion** — ITK affines are pullbacks (fixed → moving) and the SynthMorph matrix already is one.
 
-Resources: 3G memory request / **12G** limit, 2 CPU, 20G ephemeral-storage request / 30G limit. Memory was 16G request = 16G limit on the stale BBR rationale but used only ~1.3 GB (`ram_efficiency` 0.083 across 25 pods), so [#97](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/97) cut it — then a 6G limit OOM-killed 27 pods in one batch, because a lifetime *average* cannot see the peak. The peak turned out to be a property of the **host**, not the workload: pinning instance types gave 8.67 G anon on `c6i.4xlarge` (Ice Lake) against 2.90–4.57 G elsewhere, and `cpu-heavy-nodepool` pins no family. The limit is that peak plus ~38%. Setting `TF_ENABLE_ONEDNN_OPTS=0` then cut the peak to 3.87 G with byte-identical output ([#120](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/120)); the headroom is retained anyway. `mri_synthmorph` is TensorFlow-based and previously had no thread cap, so it sized its pool from the host core count and consumed ~3.3 cores against a 2-core request; `OMP_NUM_THREADS`, `TF_NUM_INTRAOP_THREADS`, `TF_NUM_INTEROP_THREADS` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` are now all projected from `requests.cpu` via the downward API, so CPU request and thread count cannot diverge. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`).
+Resources: 3G memory request / **12G** limit, 2 CPU, 20G ephemeral-storage request / 30G limit. Memory was 16G request = 16G limit on the stale BBR rationale but used only ~1.3 GB (`ram_efficiency` 0.083 across 25 pods), so #97 cut it — then a 6G limit OOM-killed 27 pods in one batch, because a lifetime *average* cannot see the peak. The peak turned out to be a property of the **host**, not the workload: pinning instance types gave 8.67 G anon on `c6i.4xlarge` (Ice Lake) against 2.90–4.57 G elsewhere, and `cpu-heavy-nodepool` pins no family. The limit is that peak plus ~38%. Setting `TF_ENABLE_ONEDNN_OPTS=0` then cut the peak to 3.87 G with byte-identical output (#120); the headroom is retained anyway. `mri_synthmorph` is TensorFlow-based and previously had no thread cap, so it sized its pool from the host core count and consumed ~3.3 cores against a 2-core request; `OMP_NUM_THREADS`, `TF_NUM_INTRAOP_THREADS`, `TF_NUM_INTEROP_THREADS` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` are now all projected from `requests.cpu` via the downward API, so CPU request and thread count cannot diverge. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`).
 
 > **Known gap.** The request is deliberately left at 3G because requests drive bin-packing and limits do not, so the headroom costs nothing in node size. But on Ice Lake the step can really use ~8.67 G against that 3G request, so the scheduler under-counts it — a co-tenant eviction risk, tracked in the OOM investigation (internal: `docs-internal/investigations/2026-08-01-bold-to-t1w-oom-handoff.md` §9.8.1).
 
@@ -696,15 +701,15 @@ Three things about that order are deliberate and easy to get wrong:
 
 **Masking happens after the warp, not before.** A hard binary mask applied in native space creates a steep edge that sinc-family interpolation treats as high-frequency content, producing Gibbs ringing just inside and outside the cortex. So the *unmasked* BOLD is warped, the mask is warped separately with nearest-neighbour, and stage 5 zeroes non-brain voxels in MNI space.
 
-**There is no bandpass filter and no spatial smoothing.** Neither stage exists — outputs are unsmoothed and unfiltered by design. High-pass filtering is available *implicitly* instead, as a discrete cosine basis in the confounds TSV (1/128 Hz, `floor(2·T·TR/128)` regressors, the fMRIPrep convention), so drift is removed inside the analyst's model rather than baked into the data. Slice timing correction is likewise absent, and deliberately: ABCD ships neither a `SliceTiming` sidecar field nor the NIfTI header slice fields, so the stage that once existed here detected no timing on every run ever processed and was removed (see [#119](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/119)). It would have to be reinstated as a native-space step *before* this script; it cannot be applied after the stage-3 warp.
+**There is no bandpass filter and no spatial smoothing.** Neither stage exists — outputs are unsmoothed and unfiltered by design. High-pass filtering is available *implicitly* instead, as a discrete cosine basis in the confounds TSV (1/128 Hz, `floor(2·T·TR/128)` regressors, the fMRIPrep convention), so drift is removed inside the analyst's model rather than baked into the data. Slice timing correction is likewise absent, and deliberately: ABCD ships neither a `SliceTiming` sidecar field nor the NIfTI header slice fields, so the stage that once existed here detected no timing on every run ever processed and was removed (see #119). It would have to be reinstated as a native-space step *before* this script; it cannot be applied after the stage-3 warp.
 
 **Float16 output rationale:** MNI BOLD is written as float16 NIfTI (`DT_FLOAT16`, datatype 512). This halves the in-memory allocation (~6.3 GB vs ~12.6 GB for a 400-frame run). FSL, AFNI, and FreeSurfer all upcast float16 to float32 on load. Confound regressors are derived entirely from native-space float32 data. Quantization error at typical BOLD baseline (~1000 units) is ~0.5 units, negligible for GLM/FC/ICA analyses. tSNR is computed with float32 accumulators before writing (required to avoid overflow when summing 300+ frames).
 
-Resources: 4G memory request, 6G limit (TODO(perf): validate limit empirically against observed peak usage — intermediate ANTs warp operations may exceed 6G on longer runs; check `metrics/func-preproc` QC JSONs for `peak_memory_gb` before adjusting), 2 CPU, 20G ephemeral-storage request, 30G limit. CPU was cut 6 → 3 in [#96](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/96) — mean `cpu_efficiency` across 26 pods was 0.347, ~2.1 of 6 cores — then 3 → 2 after a live re-measurement over 65 pods mid-batch at 200 concurrent (2026-08-11) showed median 1.15 CPU and p90 3.19, i.e. 38% of the request, the step being largely S3-I/O-bound. At 2 CPU three pods share a `c*.2xlarge` where only two fit at 3. The request must stay an integer: `resourceFieldRef` rounds a fractional CPU request up, which would decouple the thread count from the reservation. The driver derives `--threads` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` from the pod's own CPU request (downward API `resourceFieldRef`, env `CPU_REQUEST`) rather than a hardcoded constant, so the request is the single source of truth and cannot drift from the thread count. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`); ephemeral storage grew because the pod holds the session's whole `func/` and `registration/` prefixes plus the staged FastSurfer `mri/aseg.auto.mgz` and `surf/`. The driver deletes each run's working directory once it is tarred, so intermediates do not accumulate across runs.
+Resources: 4G memory request, 6G limit (TODO(perf): validate limit empirically against observed peak usage — intermediate ANTs warp operations may exceed 6G on longer runs; check `metrics/func-preproc` QC JSONs for `peak_memory_gb` before adjusting), 2 CPU, 20G ephemeral-storage request, 30G limit. CPU was cut 6 → 3 in #96 — mean `cpu_efficiency` across 26 pods was 0.347, ~2.1 of 6 cores — then 3 → 2 after a live re-measurement over 65 pods mid-batch at 200 concurrent (2026-08-11) showed median 1.15 CPU and p90 3.19, i.e. 38% of the request, the step being largely S3-I/O-bound. At 2 CPU three pods share a `c*.2xlarge` where only two fit at 3. The request must stay an integer: `resourceFieldRef` rounds a fractional CPU request up, which would decouple the thread count from the reservation. The driver derives `--threads` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` from the pod's own CPU request (downward API `resourceFieldRef`, env `CPU_REQUEST`) rather than a hardcoded constant, so the request is the single source of truth and cannot drift from the thread count. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`); ephemeral storage grew because the pod holds the session's whole `func/` and `registration/` prefixes plus the staged FastSurfer `mri/aseg.auto.mgz` and `surf/`. The driver deletes each run's working directory once it is tarred, so intermediates do not accumulate across runs.
 
 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` is set by the driver per run (to `CPU_REQUEST // jobs`, floored at 1) rather than on the container, so raising `jobs` splits the CPU request across concurrent runs instead of letting each grab the whole request and over-subscribe the node. `jobs` is `1`, and with the CPU request now at 2, `jobs=2` already leaves one thread per run and anything above 2 floors at 1 while still multiplying peak memory.
 
-Retry limit: 8, as a per-template override of the same spec-level budget. This is the pipeline's bottleneck step and it runs on the spot-only `cpu-heavy-nodepool`, making it the most reclaim-exposed pod in the workflow — two back-to-back reclaims on one step were observed 2026-08-03 ([#115](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/115)). The policy is `Always` with an expression filtering to infrastructure causes; `OnFailure` only half-honoured that filter, since a node shutdown lands in phase `Failed` but a reclaimed pod lands in phase `Error`. A retry re-runs the whole session, so a reclaim costs a session's in-flight work rather than a single run's.
+Retry limit: 8, as a per-template override of the same spec-level budget. This is the pipeline's bottleneck step and it runs on the spot-only `cpu-heavy-nodepool`, making it the most reclaim-exposed pod in the workflow — two back-to-back reclaims on one step were observed 2026-08-03 (#115). The policy is `Always` with an expression filtering to infrastructure causes; `OnFailure` only half-honoured that filter, since a node shutdown lands in phase `Failed` but a reclaimed pod lands in phase `Error`. A retry re-runs the whole session, so a reclaim costs a session's in-flight work rather than a single run's.
 
 S3 output — one tarball per run, built by the driver (`tar` rooted at `{task}_{run}/`) and uploaded via a single directory artifact keyed on `derivatives/func/{subj}/{ses}/`. The filename is inventory's `func_exists` marker, so it is unchanged:
 ```
@@ -913,23 +918,23 @@ To force a step to re-run, delete the marker key, then resubmit:
 
 ```bash
 # Force re-run of anatomical phase for a subject
-aws s3 rm --recursive s3://<YOUR_S3_BUCKET>/derivatives/fastsurfer/NDARINVXXXXXXXX/
+aws s3 rm --recursive "s3://$CLOUDPIPE_BUCKET/derivatives/fastsurfer/NDARINVXXXXXXXX/"
 
 # Force re-run of t1w-to-mni for one session
-aws s3 rm s3://<YOUR_S3_BUCKET>/derivatives/registration/NDARINVXXXXXXXX/ses-00A/t1w_to_mni/NDARINVXXXXXXXX_ses-00A_desc-t1w2mni_affine.mat
+aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/registration/NDARINVXXXXXXXX/ses-00A/t1w_to_mni/NDARINVXXXXXXXX_ses-00A_desc-t1w2mni_affine.mat"
 
 # Force re-run of bold-to-t1w for one run
-aws s3 rm s3://<YOUR_S3_BUCKET>/derivatives/registration/NDARINVXXXXXXXX/ses-00A/bold_to_t1w_task-rest_run-01/NDARINVXXXXXXXX_ses-00A_task-rest_run-01_desc-bold2t1w_itk.txt
+aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/registration/NDARINVXXXXXXXX/ses-00A/bold_to_t1w_task-rest_run-01/NDARINVXXXXXXXX_ses-00A_task-rest_run-01_desc-bold2t1w_itk.txt"
 
 # Force re-run of func-preproc for one run
-aws s3 rm s3://<YOUR_S3_BUCKET>/derivatives/func/NDARINVXXXXXXXX/ses-00A/NDARINVXXXXXXXX_ses-00A_task-rest_run-01_space-MNI152NLin2009cAsym_bold.tar.gz
+aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/func/NDARINVXXXXXXXX/ses-00A/NDARINVXXXXXXXX_ses-00A_task-rest_run-01_space-MNI152NLin2009cAsym_bold.tar.gz"
 
 # Force re-run of surface-resample for one run (leaves the grayordinate
 # components in place, so only the fsLR32k assembly repeats)
-aws s3 rm s3://<YOUR_S3_BUCKET>/derivatives/func_surf/NDARINVXXXXXXXX/ses-00A/fsLR32k/NDARINVXXXXXXXX_ses-00A_task-rest_run-01_space-fsLR32k_bold.dtseries.nii
+aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/func_surf/NDARINVXXXXXXXX/ses-00A/fsLR32k/NDARINVXXXXXXXX_ses-00A_task-rest_run-01_space-fsLR32k_bold.dtseries.nii"
 ```
 
-> **QC metrics live in a different bucket and are not deleted by any of the above.** The derivative keys are in `<YOUR_S3_BUCKET>`; the QC records are under `metrics/` in the versioned `cloudpipe-metrics` bucket. Re-running a step appends a new QC record rather than replacing the old one, so a re-run subject legitimately has more than one record per run — see [observability.md](observability.md).
+> **QC metrics live in a different bucket and are not deleted by any of the above.** The derivative keys are in the data bucket; the QC records are under `metrics/` in the versioned `cloudpipe-metrics` bucket. Re-running a step appends a new QC record rather than replacing the old one, so a re-run subject legitimately has more than one record per run — see [observability.md](observability.md).
 
 Then resubmit with the standard `argo submit` command.
 
@@ -978,12 +983,12 @@ partial upload and reads as absent.
 argo submit --from workflowtemplate/subregion-seg \
   -n argo-workflows \
   -p subjID=NDARINVXXXXXXXX \
-  -p bucket=<YOUR_S3_BUCKET> \
-  -p ecr-registry=public.ecr.aws/l9e7l1h1 \
+  -p bucket="$CLOUDPIPE_BUCKET" \
+  -p ecr-registry="$CLOUDPIPE_ECR_REGISTRY" \
   -p T1w_sessions='["ses-00A","ses-02A"]'
 ```
 
-There is no longer a `fastsurfer-exists` parameter, and no `hydrate` step. Both used to gate/perform staging of FastSurfer outputs onto the shared EFS volume; both are gone as of [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77) — each segmentation pod now declares the FastSurfer S3 derivatives trees (exploded per ADR 017) as its own input artifacts and stages them onto a private `emptyDir`, so standalone submission needs no extra flag either way.
+There is no longer a `fastsurfer-exists` parameter, and no `hydrate` step. Both used to gate/perform staging of FastSurfer outputs onto the shared EFS volume; both are gone as of #77 — each segmentation pod now declares the FastSurfer S3 derivatives trees (exploded per ADR 017) as its own input artifacts and stages them onto a private `emptyDir`, so standalone submission needs no extra flag either way.
 
 `T1w_sessions` controls which S3 artifact inputs are declared. Sessions beyond `ses-00A` are declared `optional: true`; the template reads `base-tps` from the long-template tarball at runtime to determine which timepoints to actually process.
 
@@ -1091,14 +1096,14 @@ Subregion labels are left in native T1w space: the subcortical structures are sm
 
 **Note:** This pipeline lives in a separate repository (`jrussell9000/fmri-first-level-proc`). There is no WorkflowTemplate for it in this repo. The submission is managed by the `first-level-queue-manager` Prefect flow in `ABCD_fmri_orchestrator_S3`.
 
-Runs after cloudpipe_minproc has finished processing a subject. Requires cloudpipe_minproc outputs in `<YOUR_S3_BUCKET>` and writes results back to `<YOUR_S3_BUCKET>`.
+Runs after cloudpipe_minproc has finished processing a subject. Requires cloudpipe_minproc outputs in the data bucket and writes results back to it.
 
-Reads from `<YOUR_S3_BUCKET>`:
+Reads from the data bucket:
 ```
 derivatives/func/{subjID}/{session}/{subjID}_{session}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
 ```
 
-Writes to `<YOUR_S3_BUCKET>`:
+Writes to the data bucket:
 ```
 derivatives/first_levels/{subjID}/...
 ```
@@ -1111,7 +1116,7 @@ derivatives/first_levels/{subjID}/...
 
 ```bash
 # Sessions with complete functional preprocessing outputs
-aws s3 ls s3://<YOUR_S3_BUCKET>/derivatives/func/ --recursive \
+aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/func/" --recursive \
   | grep 'space-MNI152NLin2009cAsym_bold.tar.gz' \
   | awk '{print $4}' | cut -d/ -f3 | sort -u
 
@@ -1121,8 +1126,8 @@ aws s3 ls s3://<YOUR_S3_BUCKET>/derivatives/func/ --recursive \
 # Workflow run summaries
 # s3://cloudpipe-metrics/metrics/workflow-runs/dt=YYYY-MM-DD/
 #
-# Metrics live in their own versioned bucket, not <YOUR_S3_BUCKET> — writes to
-# <YOUR_S3_BUCKET>/metrics/* are denied. Every object is under a dt= partition;
+# Metrics live in their own versioned bucket, not the data bucket — writes to
+# its metrics/* prefix are denied. Every object is under a dt= partition;
 # an object at a prefix root is invisible to Athena and DuckDB alike.
 ```
 

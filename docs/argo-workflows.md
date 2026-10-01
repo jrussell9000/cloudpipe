@@ -46,7 +46,7 @@ All files are synced from git by the `workflow-templates` ArgoCD Application. `s
 | `namespaceParallelism` | `400` | Max active workflows in `argo-workflows`; the server-side backstop for the Prefect queue gate (#206). Raised from `100` for the 300-concurrent run — at `100` it was itself the binding cap |
 | `resourceRateLimit.limit` | `50` | Max pod create calls per second to the K8s API |
 | `resourceRateLimit.burst` | `90` | Burst ceiling above the rate limit |
-| Artifact repository | S3 bucket from `var.globus_s3_destination_bucket` | All artifacts stored in `<YOUR_S3_BUCKET>` |
+| Artifact repository | S3 bucket from `var.globus_s3_destination_bucket` | All artifacts stored in the data bucket |
 | `persistence.postgresql.host` | `pgbouncer` | DB connections go through PgBouncer, not directly to RDS |
 
 The controller and server deployments carry two Reloader annotations:
@@ -82,7 +82,7 @@ These settings appear at the top level of the `cloudpipe` master WorkflowTemplat
 | `podGC.strategy` | `OnWorkflowCompletion` (pods deleted when workflow finishes) |
 | `podDisruptionBudget.minAvailable` | `100%` (prevents voluntary disruption of workflow pods) |
 | `securityContext` | `runAsUser/Group/fsGroup: 1000` (required for artifact file permissions across containers) |
-| `retryStrategy` | Limit 8, retry on spot interruption (`pod deleted`, `imminent node shutdown`) and exit codes 64/75/143, exponential backoff from 1 min capped at 5 min. The codes are matched in the node **message** as well as in `exitCode`, because an init- or wait-container death never populates `exitCode` ([#277](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/277)). Exit 137 is **not** retried — the budget is for infrastructure churn, not workload failures (see [operations.md](operations.md#retries)) |
+| `retryStrategy` | Limit 8, retry on spot interruption (`pod deleted`, `imminent node shutdown`) and exit codes 64/75/143, exponential backoff from 1 min capped at 5 min. The codes are matched in the node **message** as well as in `exitCode`, because an init- or wait-container death never populates `exitCode` (#277). Exit 137 is **not** retried — the budget is for infrastructure churn, not workload failures (see [operations.md](operations.md#retries)) |
 
 All pods get `karpenter.sh/do-not-disrupt: "true"` annotation to block Karpenter from draining nodes with active workflow pods.
 
@@ -90,14 +90,14 @@ All pods get `karpenter.sh/do-not-disrupt: "true"` annotation to block Karpenter
 
 ## Artifact storage
 
-All inter-step data is passed via S3 artifacts, not the Argo artifact repository default. Each template declares its own `inputs.artifacts` (S3 download on start) and `outputs.artifacts` (S3 upload on completion), pointing directly to keys in `<YOUR_S3_BUCKET>`.
+All inter-step data is passed via S3 artifacts, not the Argo artifact repository default. Each template declares its own `inputs.artifacts` (S3 download on start) and `outputs.artifacts` (S3 upload on completion), pointing directly to keys in the data bucket.
 
 This means:
 - Steps can be re-run independently (artifacts are already in S3)
 - The workflow does not need a shared PVC to pass data between steps that run on different nodes
 - Artifacts are persisted across workflow retries (no re-work on retry)
 
-There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregion-seg` was the last consumer (its segmentation pod — originally two, the DL pod was removed in #401 — now stages FastSurfer outputs onto a private `emptyDir` and checkpoint per-region progress to S3 instead — see [pipelines.md](pipelines.md#subregion-seg), tracked in [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77)). The EFS filesystem, StorageClass, and CSI driver have since been removed from the cluster entirely.
+There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregion-seg` was the last consumer (its segmentation pod — originally two, the DL pod was removed in #401 — now stages FastSurfer outputs onto a private `emptyDir` and checkpoint per-region progress to S3 instead — see [pipelines.md](pipelines.md#subregion-seg), tracked in #77). The EFS filesystem, StorageClass, and CSI driver have since been removed from the cluster entirely.
 
 ---
 
@@ -108,13 +108,13 @@ There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregi
 | `master-pipeline-dag.parallelism` | `3` | Max pods running simultaneously within one workflow. This is the only `parallelism` setting in the whole template set — sessions fan out simultaneously but are throttled by it. |
 | `globus-transfer` semaphore | `8` | Max concurrent Globus transfers cluster-wide (ConfigMap `cloudpipe-semaphores`) |
 | Prefect Variable `cloudpipe-max-concurrent` / `first-level-max-concurrent` | `50` (cloudpipe) / `25` (first-level), when the Variable is unset | Max active Argo workflows submitted by Prefect; set live with `prefect variable set <name> <N>`, not a deployment-run parameter |
-| Prefect Variable `cloudpipe-max-submissions-per-minute` | `5` when unset; `0` disables | Arrival rate of cloudpipe submissions, independent of the cap, so a cold start ramps up instead of creating the cap's whole width at once. Re-read live; see [#393](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/393) |
-| Prefect Variable `cloudpipe-fastsurfer-device` | `auto` when unset | Where new workflows run FastSurfer segmentation (workflow parameter `fastsurfer-device`). `auto`: the queue manager submits `cpu` while ≥10 GPU pods have been Pending ≥15 min and returns to `cuda` at ≤3 (hysteresis). `cpu` / `cuda` force it. Re-read every submission; see [#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373) |
+| Prefect Variable `cloudpipe-max-submissions-per-minute` | `5` when unset; `0` disables | Arrival rate of cloudpipe submissions, independent of the cap, so a cold start ramps up instead of creating the cap's whole width at once. Re-read live; see #393 |
+| Prefect Variable `cloudpipe-fastsurfer-device` | `auto` when unset | Where new workflows run FastSurfer segmentation (workflow parameter `fastsurfer-device`). `auto`: the queue manager submits `cpu` while ≥10 GPU pods have been Pending ≥15 min and returns to `cuda` at ≤3 (hysteresis). `cpu` / `cuda` force it. Re-read every submission; see #373 |
 | `namespaceParallelism` | `400` | Max active workflows in `argo-workflows`, **all pipelines combined**; enforced by the controller, excess workflows held `Pending` |
 | `parallelism` | `1000` | Max active workflows cluster-wide — a second, looser ceiling above `namespaceParallelism` |
 | `resourceRateLimit` | `50/s`, burst `90` | Rate at which the controller creates pods, cluster-wide |
 
-These three live in `terraform/modules/argo-workflows/main.tf`, **not** in the Helm values. The chart renders them only via `templates/controller/workflow-controller-config-map.yaml`, and `controller.configMap.create` is `false` because Terraform owns that ConfigMap — so setting them under `controller:` in `values.yaml` is silently inert. That is exactly how this repo shipped a documented pod-creation rate limit that was never in effect, and no namespace cap at all, until [#206](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/206).
+These three live in `terraform/modules/argo-workflows/main.tf`, **not** in the Helm values. The chart renders them only via `templates/controller/workflow-controller-config-map.yaml`, and `controller.configMap.create` is `false` because Terraform owns that ConfigMap — so setting them under `controller:` in `values.yaml` is silently inert. That is exactly how this repo shipped a documented pod-creation rate limit that was never in effect, and no namespace cap at all, until #206.
 
 Semaphores are defined in `cloudpipe-semaphores-configmap.yaml` and referenced by name in the `globus-transfer-template`. Adding a new semaphore requires adding a key to that ConfigMap and a `synchronization.semaphore.configMapKeyRef` block in the relevant template.
 
@@ -233,9 +233,9 @@ Node pool: `cpu-light` for both. Image: `python` (pinned SHA).
 
 Two templates for the longitudinal template phase:
 
-**`fastsurfer-template-build-template`** — Runs `long_prepare_template.sh` and then, only if that succeeded, `run_fastsurfer.sh --seg_only --base --threads 1`. Downloads T1w inputs from S3 via one init container (`cloudpipe/python`); `fsaverage` is not downloaded at all — it ships in the image and is symlinked into `SUBJECTS_DIR` ([#372](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/372)). Creation and segmentation share this pod because both are GPU-bound and strictly sequential. Node pool: `gpu-nodepool`. Image: `fastsurfer`.
+**`fastsurfer-template-build-template`** — Runs `long_prepare_template.sh` and then, only if that succeeded, `run_fastsurfer.sh --seg_only --base --threads 1`. Downloads T1w inputs from S3 via one init container (`cloudpipe/python`); `fsaverage` is not downloaded at all — it ships in the image and is symlinked into `SUBJECTS_DIR` (#372). Creation and segmentation share this pod because both are GPU-bound and strictly sequential. Node pool: `gpu-nodepool`. Image: `fastsurfer`.
 
-Both this template and `fastsurfer-long-segmentation-template` take a `device` input (`cuda`, the default, or `cpu`), fed from the workflow parameter `fastsurfer-device`. With `cpu` the pod moves to `cpu-heavy-nodepool`, a `podSpecPatch` re-sizes it to 7 CPU / 8G and **zeroes** `nvidia.com/gpu` (a strategic-merge patch cannot delete the key; the scheduler ignores a 0-quantity extended resource), and the script appends `--device cpu --threads <cpu request>` to every FastSurfer call. This is the GPU spot-drought fallback from [#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373); the queue manager sets it automatically (see [Concurrency controls](#concurrency-controls)). The static resources block remains the GPU truth, and the workflow carries the device as the label `cloudpipe.io/fastsurfer-device`.
+Both this template and `fastsurfer-long-segmentation-template` take a `device` input (`cuda`, the default, or `cpu`), fed from the workflow parameter `fastsurfer-device`. With `cpu` the pod moves to `cpu-heavy-nodepool`, a `podSpecPatch` re-sizes it to 7 CPU / 8G and **zeroes** `nvidia.com/gpu` (a strategic-merge patch cannot delete the key; the scheduler ignores a 0-quantity extended resource), and the script appends `--device cpu --threads <cpu request>` to every FastSurfer call. This is the GPU spot-drought fallback from #373; the queue manager sets it automatically (see [Concurrency controls](#concurrency-controls)). The static resources block remains the GPU truth, and the workflow carries the device as the label `cloudpipe.io/fastsurfer-device`.
 
 **`fastsurfer-template-parcellation-template`** — Surface reconstruction (`--surf_only --base --3T --fsaparc`). Node pool: `cpu-heavy-nodepool`, 3G/4CPU. `--threads` is **derived from the cpu request** via the downward API (`resourceFieldRef` on `requests.cpu`) rather than written into the master template, so the resources block is the single source of truth and the two cannot drift. Cut 6→4 threads from measured `cpu_efficiency` 0.577; do not cut below 2 — `recon-surf.sh` runs the hemispheres serially at `threads == 1`, which roughly *doubles* the surface stage.
 
@@ -290,11 +290,12 @@ Subcortical subregion segmentation. Runs as a phase inside the master pipeline D
 
 **Standalone submission:**
 ```bash
+# In `pixi shell -e ops`, which exports CLOUDPIPE_* from the cluster
 argo submit --from workflowtemplate/subregion-seg \
   -n argo-workflows \
   -p subjID=NDARINVXXXXXXXX \
-  -p bucket=<YOUR_S3_BUCKET> \
-  -p ecr-registry=<account-id>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com \
+  -p bucket="$CLOUDPIPE_BUCKET" \
+  -p ecr-registry="$CLOUDPIPE_ECR_REGISTRY" \
   -p T1w_sessions='["ses-00A","ses-02A"]'
 ```
 
@@ -312,7 +313,7 @@ The pod then runs `/app/restore_links.py` over every staged tree **before** read
 
 **`segment-subregions-gems-template`** — `segment_subregions {thalamus,brainstem,hippo-amygdala} --long-base`, GEMS/Bayesian, CPU-only, ~50 min at 4 threads. Symlinks FastSurfer bare session IDs (`ses-00A`) to the `{tp}.long.{base}` naming `--long-base` expects; `segment_subregions` writes through the symlinks into the real directories. Before each region runs, the script checks S3 for that region's final prefix (`derivatives/subregions/{subjID}/{region}/`) and stages it instead of recomputing if its `_complete.json` is present; after a region completes it publishes to that same prefix immediately, so a pod retry or workflow resubmit resumes per-region rather than redoing completed work. Outputs → `derivatives/subregions/{subjID}/{thalamus,brainstem,hippoamyg}/`. **4.5G/3.5CPU** (provisional — see pipelines.md).
 
-**Removed 2026-09-16: `segment-subregions-dl-template`.** A second, concurrent pod ran FreeSurfer's TensorFlow tools `mri_segment_hypothalamic_subunits` (superseded by FastSurfer's HypVINN, `stats/hypothalamus.HypVINN.stats`) and `mri_sclimbic_seg` (its structures covered by aseg and HypVINN except basal forebrain and septal nuclei, which were not needed). Both had published last-session-only trees for every subject; the legacy `hypothalamic/` and `sclimbic/` prefixes are retired. The pod's sizing history ([#129](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/129), [#134](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/134)) and memory lessons are in pipelines.md.
+**Removed 2026-09-16: `segment-subregions-dl-template`.** A second, concurrent pod ran FreeSurfer's TensorFlow tools `mri_segment_hypothalamic_subunits` (superseded by FastSurfer's HypVINN, `stats/hypothalamus.HypVINN.stats`) and `mri_sclimbic_seg` (its structures covered by aseg and HypVINN except basal forebrain and septal nuclei, which were not needed). Both had published last-session-only trees for every subject; the legacy `hypothalamic/` and `sclimbic/` prefixes are retired. The pod's sizing history (#129, #134) and memory lessons are in pipelines.md.
 
 ### fmri-first-level-proc (`fmri-first-level-proc-workflow-template.yaml`)
 
@@ -320,9 +321,9 @@ Separate pipeline for first-level GLM analysis. Submitted by `first-level-queue-
 
 - `activeDeadlineSeconds: 7200` (2 hour cap)
 - Scratch volume: 300 Gi emptyDir (no EFS PVC)
-- Retry: limit 8 with `retryPolicy: Always`, filtered to infrastructure causes by expression (spot reclaim, exit codes 64/75/143 in either `exitCode` or the node message — see [#277](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/277)). `Always` is deliberate: a reclaimed pod lands in phase **Error**, not Failed, so the earlier `OnFailure` policy could never honour the spot clause it was paired with. The 2 h deadline is the real ceiling — retries cannot extend it, so the limit is an upper bound the cap may cut short ([#115](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/115)).
+- Retry: limit 8 with `retryPolicy: Always`, filtered to infrastructure causes by expression (spot reclaim, exit codes 64/75/143 in either `exitCode` or the node message — see #277). `Always` is deliberate: a reclaimed pod lands in phase **Error**, not Failed, so the earlier `OnFailure` policy could never honour the spot clause it was paired with. The 2 h deadline is the real ceiling — retries cannot extend it, so the limit is an upper bound the cap may cut short (#115).
 - Input: `subjID` parameter; reads its own config
-- Output: `derivatives/first_levels/{subj}/` in `<YOUR_S3_BUCKET>` bucket
+- Output: `derivatives/first_levels/{subj}/` in the data bucket
 
 ---
 
@@ -353,7 +354,7 @@ TLS is terminated at the ALB; the Argo server runs `--secure=false` internally.
 Commands that hit the Kubernetes API directly (`argo submit`, `argo delete`, `argo list`, ...) work via kubeconfig with no extra setup. Commands that must go through the Argo Server itself (`argo archive list`, `argo archive delete`, ...) need explicit auth — SSO tokens copied from the browser session are not reliable for this. Use the client service-account token instead:
 
 ```bash
-export ARGO_SERVER=argo.<YOUR_DOMAIN>:443
+export ARGO_SERVER=argo.<domain>:443   # <domain> is the Terraform `domain` variable
 export ARGO_HTTP1=true   # ALB in front of the server doesn't support gRPC (HTTP/2)
 export ARGO_TOKEN="Bearer $(kubectl get secret -n argo-workflows argo-admin.service-account-token -o=jsonpath='{.data.token}' | base64 --decode)"
 ```

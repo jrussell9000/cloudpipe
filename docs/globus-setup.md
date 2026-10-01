@@ -51,8 +51,8 @@ It asks four things you need to have ready:
 | `SSO registration scopes` | Press Enter to accept the default | — |
 
 A browser opens; approve the request. Then pick the account and role you were
-given, set the **default region to the region you are deploying to** (this
-deployment uses `<YOUR_AWS_REGION>`), and accept the default profile name or choose one.
+given, set the **default region to the region you are deploying to** (the same
+value as Terraform's `region` variable), and accept the default profile name or choose one.
 If you named a profile, make it the one commands use:
 
 ```bash
@@ -143,7 +143,7 @@ with `--answers PATH` or `GLOBUS_ANSWERS`). The required fields:
 ```yaml
 deployment_name: cloudpipe          # short, lowercase; most names derive from it
 aws_account_id: "123456789012"      # the account you logged in to — a safety check
-aws_region: <YOUR_AWS_REGION>
+aws_region: us-east-1               # the region you are deploying to
 bucket: my-transfer-bucket          # where transferred data lands
 contact_email: lab-admin@example.edu
 owner_email: globus-admin@example.edu
@@ -283,8 +283,8 @@ It refuses if the deployment already records an endpoint. It ends by printing th
 
 Send the request text from step 3.4 to your institution's Globus subscription
 manager. If you have lost it, `pixi run globus setup-status` attaches it to this
-step. For UW–Madison the address is `<YOUR_GLOBUS_SUBSCRIPTION_ADMIN_EMAIL>` and the subscription
-is `<YOUR_GLOBUS_SUBSCRIPTION_UUID>`.
+step. Your institution's Globus administrators can tell you the address and
+which subscription the endpoint will join.
 
 Nothing else can proceed until they reply: a High Assurance storage gateway
 cannot be created on an unsubscribed endpoint. `setup-status` shows this step as
@@ -424,15 +424,16 @@ anything did.
 
 ## Current deployment
 
-| Resource | Value |
+Where each value lives, rather than the value itself:
+
+| Resource | Where to find it |
 |---|---|
-| Endpoint ID | `<YOUR_GLOBUS_ENDPOINT_ID>` |
-| S3 gateway ID | `<YOUR_GLOBUS_S3_GATEWAY_ID>` |
-| Collection ID | `<YOUR_GLOBUS_DEST_COLLECTION_ID>` |
+| Endpoint ID | SSM `/cloudpipe/globus/endpoint-id` |
+| S3 gateway ID | `globus-connect-server storage-gateway list` on the instance |
+| Collection ID | SSM `/cloudpipe/globus/collection-id` |
 | Collection name | `cloudpipe-s3` |
-| SSM parameter | `/cloudpipe/globus/collection-id` |
-| Registered credential identity (both gateways) | `<YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>` |
-| Native app client ID | `<YOUR_GLOBUS_NATIVE_APP_CLIENT_ID>` |
+| Registered credential identity (both gateways) | The admin's own identity, `<netid>@<institution_domain>` |
+| Native app client ID | Secrets Manager `globus/refresh-token`, property `native-app-client-id` |
 
 This endpoint predates `bootstrap-endpoint`: it was created by hand with the
 older interactive `endpoint setup` flow, not by the commands in section 3.
@@ -475,7 +476,7 @@ Globus — the thing this setup no longer has.
 machine, and let that program do the signing:
 
 ```
-GridFTP  ──►  https://127.0.0.1:8444  ──►  https://s3.<YOUR_AWS_REGION>.amazonaws.com
+GridFTP  ──►  https://127.0.0.1:8444  ──►  https://s3.<region>.amazonaws.com
  (writes)      the signing proxy             (real S3)
                • ignores the key pair Globus sent
                • signs again, with credentials it gets
@@ -595,11 +596,11 @@ globus-connect-server node setup \
 Run by hand in step 3.6, with the values from `terraform/globus-config.json`:
 
 ```bash
-S3_BUCKET="<YOUR_S3_BUCKET>"
+S3_BUCKET="<bucket>"
 
 globus-connect-server storage-gateway create s3 "cloudpipe-s3" \
   --bucket "$S3_BUCKET" \
-  --domain <YOUR_INSTITUTION_DOMAIN> \
+  --domain <institution_domain> \
   --s3-endpoint https://127.0.0.1:8444 \
   --s3-user-credential \
   --admin-managed-credentials \
@@ -612,7 +613,7 @@ globus-connect-server storage-gateway create s3 "cloudpipe-s3" \
 | Flag | Purpose |
 |---|---|
 | `--bucket` | Locks the gateway to a single S3 bucket — required with `--no-allow-multiple-keys` |
-| `--domain <YOUR_INSTITUTION_DOMAIN>` | Restricts access to <YOUR_INSTITUTION_DOMAIN> Globus identities |
+| `--domain <institution_domain>` | Restricts access to Globus identities from that domain |
 | `--s3-endpoint` | **The signing proxy on this instance, not AWS** — `https://127.0.0.1:8444` for production, `https://127.0.0.1:8443` for staging. One listener per gateway, each assuming a prefix-scoped role. GCS stores this under `policies.s3_endpoint`. `doctor` check 14 FAILs when the last recorded reconcile plan saw the live value pointing anywhere but the listener (#539); check 12 checks only the role. The plan is a snapshot, so a gateway repointed by hand reads as pointed until the next `globus configure --plan-only`, and check 14's PASS line says when it was compared. See [how the gateway reaches S3](#how-the-gateway-reaches-s3-and-why-there-is-no-aws-key) |
 | `--s3-user-credential` | Enables per-identity credential slots |
 | `--admin-managed-credentials` | Allows the admin to register one key pair for all identities via CLI — a placeholder, since the proxy discards it |
@@ -636,8 +637,8 @@ globus-connect-server collection create \
 > `KeyError: 'data'`.
 
 > **Path semantics**: the GCS S3 connector always treats the first path component as
-> the bucket name. Root the collection at `/<bucket-name>` (e.g., `/<YOUR_S3_BUCKET>`); then a
-> collection path of `/mmps_mproc/sub-xxx` maps to `s3://<YOUR_S3_BUCKET>/mmps_mproc/sub-xxx`.
+> the bucket name. Root the collection at `/<bucket-name>`; then a
+> collection path of `/mmps_mproc/sub-xxx` maps to `s3://<bucket-name>/mmps_mproc/sub-xxx`.
 > Rooting it at `/` makes every transfer path's first component (e.g. `mmps_mproc`)
 > a bucket name, and every transfer fails with
 > `550-Globus-S3-Error: Bucket not allowed`.
@@ -660,7 +661,7 @@ globus-connect-server collection create \
 ```bash
 globus-connect-server user-credentials s3-create \
   "${GATEWAY_ID}" \
-  --globus-identity <YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>
+  --globus-identity <netid>@<institution_domain>
 # Prompts: AWS Access Key ID, then AWS Secret Access Key.
 # For a gateway pointed at its signing proxy, answer with the published example pair
 # (AKIAIOSFODNN7EXAMPLE / wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY). The proxy discards
@@ -712,7 +713,7 @@ registration was required.
 ```bash
 # POSIX storage gateway (maps any authenticated identity to the local cloudpipe user)
 GATEWAY_ID=$(globus-connect-server storage-gateway create posix "cloudpipe-s3" \
-  --domain <YOUR_INSTITUTION_DOMAIN> \
+  --domain <institution_domain> \
   --high-assurance \
   --authentication-timeout-mins $((60 * 24 * 7)) \
   --identity-mapping "external:/usr/local/bin/gcs-identity-map.py" \
