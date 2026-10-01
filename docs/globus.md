@@ -10,7 +10,7 @@ For the initial setup walkthrough (endpoint creation, storage gateway, IAM crede
 
 ```
 NBDC Data Hub Globus collection
-  (source collection: <YOUR_GLOBUS_SOURCE_COLLECTION_ID>)
+  (source collection: <source-collection-id>)
         │
         │  GridFTP data channel (port 50000–51000)
         ▼
@@ -23,7 +23,7 @@ GCS v5 endpoint — EC2 c5n.xlarge, Elastic IP, Ubuntu 22.04
     re-signs with a prefix-scoped role the instance assumes
         │
         ▼
-s3://<YOUR_S3_BUCKET>/mmps_mproc/{subject}/{session}/...
+s3://<bucket>/mmps_mproc/{subject}/{session}/...
 ```
 
 The S3 storage gateway writes GridFTP data directly to S3 via multipart upload. No local staging volume or EFS is involved. The alternative POSIX+EBS staging approach was removed in 2026-09 (ADR 001); the non-Globus ingress path is `presynced` ([data-ingress.md](data-ingress.md)).
@@ -36,20 +36,23 @@ AWS Mountpoint for S3 only supports sequential writes from byte 0. Globus GridFT
 
 ---
 
-## Current deployment values
+## Deployment values
 
-| Resource | Value |
-|---|---|
-| EC2 instance type | `c5n.xlarge` |
-| Endpoint ID | `<YOUR_GLOBUS_ENDPOINT_ID>` |
-| S3 storage gateway ID | `<YOUR_GLOBUS_S3_GATEWAY_ID>` |
-| Destination collection ID | `<YOUR_GLOBUS_DEST_COLLECTION_ID>` |
-| Collection name | `cloudpipe-s3` |
-| Source collection (NBDC Data Hub) | `<YOUR_GLOBUS_SOURCE_COLLECTION_ID>` |
-| Source base path | `/abcd/derivatives/mmps_mproc` |
-| Native app client ID | `<YOUR_GLOBUS_NATIVE_APP_CLIENT_ID>` |
-| IAM credential identity | `<YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>` |
-| UW-Madison HA subscription ID | `<YOUR_GLOBUS_SUBSCRIPTION_UUID>` |
+Where each value lives, rather than the value itself. The commands below use the
+placeholder in the last column.
+
+| Resource | Where to find it | Placeholder |
+|---|---|---|
+| EC2 instance type | `c5n.xlarge` | |
+| Endpoint ID | SSM `/cloudpipe/globus/endpoint-id` | `<endpoint-id>` |
+| S3 storage gateway ID | `globus-connect-server storage-gateway list` on the instance | `<gateway-id>` |
+| Destination collection ID | SSM `/cloudpipe/globus/collection-id` | `<collection-id>` |
+| Collection name | Terraform `globus_collection_name` (`cloudpipe-s3`) | |
+| Source collection (NBDC Data Hub) | Terraform `globus_source_collection_id`, mirrored to SSM `/cloudpipe/globus/source-collection-id` | `<source-collection-id>` |
+| Source base path | Terraform `globus_source_base_path` (`/abcd/derivatives/mmps_mproc`) | |
+| Native app client ID | Secrets Manager `globus/refresh-token`, property `native-app-client-id` | |
+| IAM credential identity | The admin's own Globus identity | `<netid>@<institution_domain>` |
+| HA subscription ID | Issued by the institution's Globus subscription administrators | `<subscription-id>` |
 
 ---
 
@@ -57,7 +60,7 @@ AWS Mountpoint for S3 only supports sequential writes from byte 0. Globus GridFT
 
 ### EC2 instance
 
-`c5n.xlarge` (4 vCPU, 10.5 GB RAM) in the public subnet (<YOUR_AWS_REGION>a) with an Elastic IP. The fixed IP is required for Globus endpoint registration and must not change between instance replacements.
+`c5n.xlarge` (4 vCPU, 10.5 GB RAM) in the public subnet (first availability zone) with an Elastic IP. The fixed IP is required for Globus endpoint registration and must not change between instance replacements.
 
 The instance is **stopped when idle** and started automatically at the beginning of each cloudpipe workflow by `start-globus-instance-template`. A nightly EventBridge schedule (cron `0 0 * * ? *` UTC) stops it as a safety net in case a workflow completes without triggering an explicit stop.
 
@@ -91,7 +94,7 @@ All workflow-accessible Globus config lives in SSM. Terraform creates these para
 
 | Role | Used by | Permissions |
 |---|---|---|
-| `cloudpipe-globus-*` (instance profile) | GCS EC2 instance | S3 read/write on `<YOUR_S3_BUCKET>`, SSM core, SSM write to collection-id + deployment-key + endpoint-id + node-report + reconcile-plan + listener-report (a list of named ARNs, so a new host-written parameter needs its ARN added or the write is a silent AccessDenied); SSM read of everything under `/cloudpipe/globus/` and nothing outside it (a Deny overrides the managed policy's `Resource: "*"`) |
+| `cloudpipe-globus-*` (instance profile) | GCS EC2 instance | S3 read/write on the data bucket, SSM core, SSM write to collection-id + deployment-key + endpoint-id + node-report + reconcile-plan + listener-report (a list of named ARNs, so a new host-written parameter needs its ARN added or the write is a silent AccessDenied); SSM read of everything under `/cloudpipe/globus/` and nothing outside it (a Deny overrides the managed policy's `Resource: "*"`) |
 | `cloudpipe-argo-runner` | `argo-workflows-runner` SA | EC2 `StartInstances` (scoped to Globus instance ID), `DescribeInstanceStatus` + `DescribeInstances` (not resource-scoped), SSM `GetParameter` for instance-id + collection-id |
 
 The runner role gets EC2 and SSM permissions from `terraform/modules/globus/main.tf` (`runner_globus_ec2` inline policy), not from the base runner IAM module.
@@ -146,7 +149,7 @@ Transfer paths: each file is added as `{source-base-path}/{subject-id}/{session}
 
 ## High Assurance
 
-The ABCD source collection is Globus High Assurance (HA). The cloudpipe destination collection must also be HA for Globus to allow transfers between them. The cloudpipe endpoint is subscribed to the UW-Madison HA subscription (`<YOUR_GLOBUS_SUBSCRIPTION_UUID>`).
+The ABCD source collection is Globus High Assurance (HA). The cloudpipe destination collection must also be HA for Globus to allow transfers between them. The cloudpipe endpoint is subscribed to the institution's HA subscription (see [Deployment values](#deployment-values)).
 
 HA implications:
 - `--authentication-timeout-mins` governs how often a human must re-authenticate.
@@ -269,8 +272,8 @@ it is done by hand:
 4. Replace the credential in Globus — it **prompts** for the new key:
    ```bash
    globus-connect-server user-credentials s3-create \
-     <YOUR_GLOBUS_S3_GATEWAY_ID> \
-     --globus-identity <YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN> \
+     <gateway-id> \
+     --globus-identity <netid>@<institution_domain> \
      --replace-existing
    ```
 5. Confirm with `pixi run globus doctor` — the destination listing check exercises
@@ -285,15 +288,15 @@ The failure is **not** reported as an expired token. `transfer.py`'s destination
 
 ```json
 {"code": "permission_denied",
- "detail": {"DATA_TYPE": "not_from_allowed_domain#1.0.0", "allowed_domains": ["<YOUR_INSTITUTION_DOMAIN>"]},
+ "detail": {"DATA_TYPE": "not_from_allowed_domain#1.0.0", "allowed_domains": ["<institution_domain>"]},
  "authorization_parameters": {"session_message": "Session reauthentication required (Globus Transfer)",
-                              "session_required_single_domain": ["<YOUR_INSTITUTION_DOMAIN>"]}}
+                              "session_required_single_domain": ["<institution_domain>"]}}
 ```
 
-`not_from_allowed_domain` invites the wrong diagnosis — it looks like the `--domain <YOUR_INSTITUTION_DOMAIN>`
-gateway policy rejecting a non-<YOUR_INSTITUTION_DOMAIN> identity, i.e. a misconfiguration. It is not. The
+`not_from_allowed_domain` invites the wrong diagnosis — it looks like the `--domain <institution_domain>`
+gateway policy rejecting an identity from another institution, i.e. a misconfiguration. It is not. The
 identity is correct; its **session** has aged past `--authentication-timeout-mins`, so the HA
-gateway stops counting it and is left with no <YOUR_INSTITUTION_DOMAIN> identity in the session. The
+gateway stops counting it and is left with no identity from the institution's domain in the session. The
 `session_required_single_domain` key in `authorization_parameters` is what distinguishes the two:
 a genuine wrong-domain identity has a policy problem and no session requirement to satisfy.
 The preceding `Token not valid for 'openid' scope` warning from `userinfo()` is unrelated
@@ -405,8 +408,7 @@ Needs the AWS
 aws ssm start-session \
   --target $(aws ssm get-parameter \
     --name /cloudpipe/globus/instance-id \
-    --query Parameter.Value --output text) \
-  --region <YOUR_AWS_REGION>
+    --query Parameter.Value --output text)
 sudo -i
 ```
 
@@ -415,14 +417,15 @@ sudo -i
 All `globus-connect-server` management commands can authenticate non-interactively using a Globus Auth service account stored in SSM, eliminating the 30-day login session expiry problem. Load the three environment variables before any management command:
 
 ```bash
+REGION=<region>   # the deployment region; the instance's shell does not set one
 export GCS_CLI_CLIENT_ID=$(aws ssm get-parameter \
-  --region <YOUR_AWS_REGION> --name /cloudpipe/globus/gcs-client-id \
+  --region "$REGION" --name /cloudpipe/globus/gcs-client-id \
   --with-decryption --query Parameter.Value --output text)
 export GCS_CLI_CLIENT_SECRET=$(aws ssm get-parameter \
-  --region <YOUR_AWS_REGION> --name /cloudpipe/globus/gcs-client-secret \
+  --region "$REGION" --name /cloudpipe/globus/gcs-client-secret \
   --with-decryption --query Parameter.Value --output text)
 export GCS_CLI_ENDPOINT_ID=$(aws ssm get-parameter \
-  --region <YOUR_AWS_REGION> --name /cloudpipe/globus/endpoint-id \
+  --region "$REGION" --name /cloudpipe/globus/endpoint-id \
   --query Parameter.Value --output text)
 ```
 
@@ -437,7 +440,7 @@ With these set, `globus-connect-server` commands authenticate as the service acc
 > including [Endpoint recovery](#endpoint-recovery-after-accidental-deletion), where it is
 > only evidence of a deleted endpoint when the variables *are* loaded.
 
-> **`user-credentials list` with service credentials**: The list only shows credentials owned by the service account identity — not the `<YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>` credential registered in [setup step 3.6a](globus-setup.md#36a-register-the-gateways-placeholder-key-pair). An empty list is expected; it does not mean the registration is missing. Use `globus ls <collection-id>:/` to confirm S3 access is working.
+> **`user-credentials list` with service credentials**: The list only shows credentials owned by the service account identity — not the `<netid>@<institution_domain>` credential registered in [setup step 3.6a](globus-setup.md#36a-register-the-gateways-placeholder-key-pair). An empty list is expected; it does not mean the registration is missing. Use `globus ls <collection-id>:/` to confirm S3 access is working.
 
 ### Checks by hand
 
@@ -512,7 +515,7 @@ means nothing there either (see [Recognising an expired session](#recognising-an
 
 **Symptom**: Globus transfer fails with `550-Globus-S3-Error: Bucket not allowed`.
 
-**Cause**: The S3 gateway was created with `s3_allow_multi_keys: true` (the default). In multi-key mode, the first component of every path is treated as a bucket name — so a path like `/mmps_mproc/sub-xxx` tells Globus to write to a bucket named `mmps_mproc`, not `<YOUR_S3_BUCKET>`. The fix is `--no-allow-multiple-keys` at gateway creation time.
+**Cause**: The S3 gateway was created with `s3_allow_multi_keys: true` (the default). In multi-key mode, the first component of every path is treated as a bucket name — so a path like `/mmps_mproc/sub-xxx` tells Globus to write to a bucket named `mmps_mproc`, not the data bucket. The fix is `--no-allow-multiple-keys` at gateway creation time.
 
 **Verify the flag**:
 ```bash
@@ -528,16 +531,16 @@ If `s3_allow_multi_keys: True`, recreate the gateway (see below). An in-place up
 
 **Symptom**: Transfer fails with `530-GridFTP-Message: Your credential requires some initial setup. code=invalid_credential`.
 
-**Cause**: The IAM access key registered with the gateway is invalid — wrong key, rotated key, or key without S3 access to `<YOUR_S3_BUCKET>`.
+**Cause**: The IAM access key registered with the gateway is invalid — wrong key, rotated key, or key without S3 access to the data bucket.
 
 **Fix**:
 ```bash
 # On GCS instance
 globus-connect-server user-credentials list
 globus-connect-server user-credentials delete <credential-id>
-globus-connect-server user-credentials s3-create <YOUR_GLOBUS_S3_GATEWAY_ID> \
-  --globus-identity <YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>
-# Enter a valid IAM access key with permissions to s3://<YOUR_S3_BUCKET>
+globus-connect-server user-credentials s3-create <gateway-id> \
+  --globus-identity <netid>@<institution_domain>
+# Enter a valid IAM access key with permissions to s3://<bucket>
 ```
 
 ### Gateway and collection recreation
@@ -550,13 +553,13 @@ If the gateway needs to be recreated (e.g., to change `s3_allow_multi_keys`), th
 # 1. Load the service credentials — see "Service credentials"; no browser login needed
 
 # 2. Delete user credentials (required before gateway deletion)
-GATEWAY_ID="<YOUR_GLOBUS_S3_GATEWAY_ID>"
+GATEWAY_ID="<gateway-id>"
 globus-connect-server user-credentials list
 # For each credential ID in the output:
 globus-connect-server user-credentials delete <credential-id>
 
 # 3. Remove delete protection from collection, then delete it
-COLLECTION_ID="<YOUR_GLOBUS_COLLECTION_ID>"
+COLLECTION_ID="<collection-id>"
 globus-connect-server collection update "$COLLECTION_ID" --no-delete-protected
 globus-connect-server collection delete "$COLLECTION_ID"
 
@@ -565,9 +568,9 @@ globus-connect-server storage-gateway delete "$GATEWAY_ID"
 
 # 5. Recreate gateway with --no-allow-multiple-keys
 GATEWAY_ID=$(globus-connect-server storage-gateway create s3 "cloudpipe-s3" \
-  --bucket <YOUR_S3_BUCKET> \
-  --s3-endpoint https://s3.<YOUR_AWS_REGION>.amazonaws.com \
-  --domain <YOUR_INSTITUTION_DOMAIN> \
+  --bucket <bucket> \
+  --s3-endpoint https://s3.<region>.amazonaws.com \
+  --domain <institution_domain> \
   --high-assurance \
   --authentication-timeout-mins $((60 * 24 * 7)) \
   --s3-user-credential \
@@ -576,10 +579,10 @@ GATEWAY_ID=$(globus-connect-server storage-gateway create s3 "cloudpipe-s3" \
   --format json | python3 -c "import sys,json; d=json.load(sys.stdin); r=d[0] if isinstance(d,list) else d; print(r.get('id') or r.get('data',[{}])[0].get('id'))")
 echo "New gateway: $GATEWAY_ID"
 
-# 6. Create collection (rooted at /<YOUR_S3_BUCKET> — bucket name is always the first path component)
+# 6. Create collection (rooted at /<bucket> — bucket name is always the first path component)
 # Note: collection create returns the object directly; gateway create wraps in {"data":[...]}
 COLLECTION_ID=$(globus-connect-server collection create \
-  "$GATEWAY_ID" "/<YOUR_S3_BUCKET>" "cloudpipe-s3" \
+  "$GATEWAY_ID" "/<bucket>" "cloudpipe-s3" \
   --allow-guest-collections \
   --enable-https \
   --format json | python3 -c "import sys,json; d=json.load(sys.stdin); r=d[0] if isinstance(d,list) else d; print(r.get('id') or r.get('data',[{}])[0].get('id'))")
@@ -587,12 +590,12 @@ echo "New collection: $COLLECTION_ID"
 
 # 7. Register IAM credentials
 globus-connect-server user-credentials s3-create "$GATEWAY_ID" \
-  --globus-identity <YOUR_NETID>@<YOUR_INSTITUTION_DOMAIN>
-# Enter IAM access key with s3://<YOUR_S3_BUCKET> permissions at the prompts
+  --globus-identity <netid>@<institution_domain>
+# Enter IAM access key with s3://<bucket> permissions at the prompts
 
 # 8. Update SSM — by hand: `globus configure` records a collection id only over the
 #    placeholder, and never replaces the old collection's id with a new one
-aws ssm put-parameter --region <YOUR_AWS_REGION> \
+aws ssm put-parameter --region <region> \
   --name /cloudpipe/globus/collection-id \
   --type String --value "$COLLECTION_ID" --overwrite
 ```
@@ -634,7 +637,7 @@ List first — this reaches every task the token owns, not just the colliding on
 pixi run python - <<'EOF'
 import boto3, json, globus_sdk
 secret = json.loads(
-    boto3.client("secretsmanager", region_name="<YOUR_AWS_REGION>")
+    boto3.client("secretsmanager")  # region from AWS_REGION or the AWS profile
     .get_secret_value(SecretId="globus/refresh-token")["SecretString"]
 )
 client = globus_sdk.NativeAppAuthClient(secret["native-app-client-id"])
@@ -728,8 +731,7 @@ the end of step 6 anyway.
    new UUID and deployment key, and prints the subscription request.
 
 5. **Re-subscribe.** The HA subscription is tied to the endpoint UUID, so send the
-   request text to your institution's Globus subscription administrator (for
-   UW–Madison, `<YOUR_GLOBUS_SUBSCRIPTION_ADMIN_EMAIL>`)
+   request text to your institution's Globus subscription administrator
    ([setup step 3.5](globus-setup.md#35-ask-for-the-subscription)).
 
 6. **Rebuild the rest:** [setup steps 3.6–3.9](globus-setup.md#36-create-the-storage-gateway-and-collection)

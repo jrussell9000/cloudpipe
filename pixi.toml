@@ -89,13 +89,7 @@ test-imaging = "pytest -o addopts= tests/images/fireants"
 # Builds docs/ into the public site with Zensical, the successor to Material for
 # MkDocs (in maintenance mode since 2025-11). Zensical reads mkdocs.yml as-is.
 # Pinned below 0.1: it is pre-1.0 and a minor bump may change behaviour.
-#
-# mkdocs + mkdocs-material stay for one sync cycle so the old build can be
-# compared or restored (docs-site task 7.4 removes them); `docs-build-mkdocs`
-# is that fallback.
 [feature.docs.dependencies]
-mkdocs = ">=1.6,<2"
-mkdocs-material = ">=9.5,<10"
 zensical = ">=0.0.67,<0.1"
 
 [feature.docs.tasks]
@@ -105,7 +99,6 @@ zensical = ">=0.0.67,<0.1"
 # instead. CI runs this.
 docs-build = "zensical build --strict"
 docs-serve = "zensical serve"
-docs-build-mkdocs = "mkdocs build --strict"
 
 # --- Operator workstation (needs WARP) ---
 # `pixi run -e ops <tool>` exports this deployment's buckets and UI URLs from the

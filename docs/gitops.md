@@ -240,7 +240,7 @@ Installs CRDs and all three components (controller, webhook, cainjector) on the 
 
 ### external-dns
 
-Watches Ingress and Service objects for hostnames in `<YOUR_DOMAIN>` and creates Route53 records. `policy: upsert-only` — will not delete records. `txtOwnerId: cloudpipe` prevents collisions if a second External DNS instance is deployed.
+Watches Ingress and Service objects for hostnames in the deployment's domain (Terraform `domain` variable) and creates Route53 records. `policy: upsert-only` — will not delete records. `txtOwnerId: cloudpipe` prevents collisions if a second External DNS instance is deployed.
 
 The domain it filters on and the AWS region are **not** in its `values.yaml`. They come from `var.domain` and `var.region` through the ApplicationSet — see [Per-app Helm overrides](#per-app-helm-overrides). A Deployment here with no `--domain-filter` arg at all is the signature of the override not arriving: external-dns then manages every hosted zone it can reach.
 
@@ -284,7 +284,7 @@ Standard AWS CSI and networking add-ons. Helm-managed by ArgoCD; IAM is managed 
 > **Deleting an Application does not always delete everything it created.** Removing
 > `aws-efs-csi-driver` left its `efs.csi.aws.com` CSIDriver object and its
 > `aws-efs-csi-driver` namespace behind for three months, unowned by any Application
-> ([#213](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/213), cleaned up by hand).
+> (#213, cleaned up by hand).
 > The CSIDriver carried `helm.sh/resource-policy: keep`, which tells Helm — and therefore
 > ArgoCD — to leave the resource in place when the release goes. That annotation exists so a
 > driver *upgrade* cannot yank the CSIDriver out from under mounted volumes; the cost is that a
@@ -419,4 +419,4 @@ kubectl patch application <name> -n argocd \
   --type=merge -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
 ```
 
-Use the ArgoCD UI at `https://argocd.<YOUR_DOMAIN>` for a visual diff between live state and git (requires VPN + UW-Madison NetID).
+Use the ArgoCD UI at `https://argocd.<domain>` for a visual diff between live state and git (requires VPN + UW-Madison NetID).

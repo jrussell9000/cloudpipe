@@ -1,6 +1,5 @@
 # Site config for the PUBLIC documentation site, built by Zensical (which reads
-# mkdocs.yml as-is). MkDocs can still build it for comparison until docs-site
-# task 7.4 removes it: `pixi run -e docs docs-build-mkdocs`.
+# mkdocs.yml as-is; the file name is MkDocs' heritage, not a dependency).
 #
 # This builds the whole docs/ tree — everything under it is published, ordered
 # by `nav` below. Internal-only material (agent instructions, dated
@@ -12,8 +11,10 @@
 #   pixi run -e docs docs-build   — strict build; CI runs this to fail on broken
 #                                   internal links (see .github/workflows/ci.yaml)
 #
-# `zensical build --strict` fails on a broken link or anchor. It does not fail
-# on a page missing from `nav`; tests/test_docs_boundary.py checks that.
+# `zensical build --strict` fails on a broken link or anchor with no
+# `validation:` block here (verified 2026-10-01 with broken-link and
+# broken-anchor probes). It does not fail on a page missing from `nav`;
+# tests/test_docs_boundary.py checks that.
 
 site_name: CloudPipe
 site_description: >-
@@ -90,23 +91,6 @@ markdown_extensions:
 # of exclusions is a boundary only for generators that honour it — Zensical does
 # not — whereas a directory is a boundary for all of them.
 # tests/test_docs_boundary.py fails if an internal path reappears under docs/.
-
-# MkDocs' validation keys, kept while `docs-build-mkdocs` exists. Zensical uses
-# its own (`invalid_links`, `invalid_link_anchors`) and does not document these.
-# Its --strict was verified against a broken link and a broken anchor with this
-# block in place; re-verify when the block is replaced or dropped in task 7.4.
-#
-# Under MkDocs, `unrecognized_links: warn` turns a typo'd relative link into a
-# --strict failure, and `nav.omitted_files: warn` does the same for a page not
-# in `nav`. Zensical has no equivalent for the second; the nav test in
-# tests/test_docs_boundary.py covers it for both generators.
-validation:
-  omitted_files: warn
-  absolute_links: warn
-  unrecognized_links: warn
-  anchors: warn
-  nav:
-    omitted_files: warn
 
 # Curated structure. Order is deliberate: a newcomer reads top to bottom (what
 # it is -> how to run it -> what the science is -> how it is built -> how to

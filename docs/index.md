@@ -32,7 +32,7 @@ Two things here took real measurement to establish, and both are worth stating p
 
 ## Reusing this
 
-CloudPipe is MIT-licensed and deliberately institution-neutral: deployment-specific values (account IDs, bucket names, domains, Globus UUIDs) appear as `<YOUR_*>` placeholders throughout. It is **not** a turnkey product — it is a working, documented reference deployment. The parts most likely to be useful outside this project, in rough order:
+CloudPipe is MIT-licensed and deliberately institution-neutral: deployment-specific values (account IDs, bucket names, domains, Globus UUIDs) never appear as literals. Code reads them from Terraform variables, the `cloudpipe-config` ConfigMap or the environment, and the docs name where each comes from. It is **not** a turnkey product — it is a working, documented reference deployment. The parts most likely to be useful outside this project, in rough order:
 
 1. The **metrics/QC layer** ([observability.md](observability.md)) — the pattern generalises to any batch pipeline.
 2. The **Argo + Karpenter execution model** ([argo-workflows.md](argo-workflows.md)).
@@ -162,21 +162,21 @@ docs-internal/        — Architecture Decision Records, dated investigations an
 
 ## Key identifiers
 
-> On the public repo and documentation site every value in this table is scrubbed to a
-> `<YOUR_*>` placeholder by `scripts/sync-public.sh`. The table's usefulness there is as a
-> **checklist of what a fresh deployment must supply** — one line per value you need to own
-> before anything runs — not as a set of live identifiers.
+> The table names where each value comes from, not the value itself: a Terraform variable,
+> an SSM parameter, or a variable that `pixi run -e ops` exports from the cluster. Read
+> that way, it is also a **checklist of what a fresh deployment must supply** — one line per
+> value you need to own before anything runs.
 
 | Resource | Value |
 |---|---|
-| EKS cluster | `cloudpipe` (<YOUR_AWS_REGION>) |
-| S3 data bucket | `<YOUR_S3_BUCKET>` |
+| EKS cluster | `cloudpipe`, in the region set by the Terraform `region` variable |
+| S3 data bucket | Terraform `globus_s3_destination_bucket`; `CLOUDPIPE_BUCKET` under `pixi run -e ops` |
 | Argo namespace | `argo-workflows` |
-| ECR private registry (primary, `ecr-registry` param) | `{account-id}.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/` |
+| ECR private registry (primary, `ecr-registry` param) | `{account-id}.dkr.ecr.{region}.amazonaws.com/cloudpipe/`; `CLOUDPIPE_ECR_REGISTRY` under `pixi run -e ops` |
 | ECR Public prefix (secondary — dual-push, rollback target; being retired per image) | `public.ecr.aws/l9e7l1h1/cloudpipe/` |
-| Globus source collection (NBDC Data Hub) | `<YOUR_GLOBUS_SOURCE_COLLECTION_ID>` |
-| Globus destination collection | `<YOUR_GLOBUS_DEST_COLLECTION_ID>` |
-| Prefect server | `https://prefect.<YOUR_DOMAIN>` |
-| Argo server | `https://argo.<YOUR_DOMAIN>` |
-| ArgoCD | `https://argocd.<YOUR_DOMAIN>` |
-| Grafana | `https://grafana.<YOUR_DOMAIN>` |
+| Globus source collection (NBDC Data Hub) | SSM `/cloudpipe/globus/source-collection-id` |
+| Globus destination collection | SSM `/cloudpipe/globus/collection-id` |
+| Prefect server | `https://prefect.<domain>`, where `<domain>` is the Terraform `domain` variable |
+| Argo server | `https://argo.<domain>` |
+| ArgoCD | `https://argocd.<domain>` |
+| Grafana | `https://grafana.<domain>` |

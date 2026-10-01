@@ -79,12 +79,12 @@ S3 key: `metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json`
 | `peak_memory_gb` | float | Peak RSS for **this run only** (`RUSAGE_SELF`/`RUSAGE_CHILDREN` max) — resets per run |
 | `container_peak_memory_gb` | float | Peak RSS over the **container's lifetime** — climbs across a multi-run session even when runs are identically sized; size pod memory limits against this one, not `peak_memory_gb` |
 | `pipeline`, `image_tag` | str | Provenance: pipeline name and image SHA |
-| `schema_version` | str | `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that [#119] showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
+| `schema_version` | str | `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that #119 showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
 
 **`gcor`/`aor`/`aqi` are computed in-process in `preproc.py`, at the same definitions as AFNI's
 `@compute_gcor`, `3dToutcount -fraction` and `3dTqual`** — the tools MRIQC wraps for the same
 three metrics, so the values stay comparable with published MRIQC norms. They were originally
-shelled out to those binaries, but the calls never ran ([#119]): the image took AFNI from
+shelled out to those binaries, but the calls never ran (#119): the image took AFNI from
 conda-forge then, whose package ships 71 of AFNI's ~600 programs, and none of these three were
 among them. The image now installs AFNI from upstream, where all three exist, but ships only an
 allow-listed set of binaries (`AFNI_PROGRAMS` in `images/afni/Dockerfile`), so they remain absent
@@ -97,8 +97,6 @@ Recorded but not gated — no thresholds are calibrated yet for any of these fou
 means "not computed", not "computed as zero"**: these three are descriptive metrics derived after
 the run's derivatives are already on disk, so a failure to compute them downgrades to the schema
 default and logs a warning rather than costing the run.
-
-[#119]: https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/119
 
 **Present only on runs that also emit grayordinates** (`--emit both`, i.e. surface output was
 requested for that run) — merged in via `qc.update(surf_metrics)` in `preproc.py`, absent
@@ -119,7 +117,7 @@ These same fields, plus a provenance envelope (`emit`, `stage_timings_s`, `total
 `metrics/surface-sample/` — see [SurfaceSampleQC](#surfacesampleqc--per-bold-run). That copy is
 the durable one; the copy folded in here is the one that is sometimes absent and sometimes stale.
 
-**`pending_duration_s` was removed from this schema in [#147]**: it was always `0.0` — the
+**`pending_duration_s` was removed from this schema in #147**: it was always `0.0` — the
 `POD_CREATION_TIMESTAMP` env var its docstring described was never set, and *couldn't* be, since
 the Kubernetes Downward API's `fieldRef` doesn't expose `metadata.creationTimestamp` (only
 `name`/`namespace`/`uid`/`labels`/`annotations`, plus a few `spec`/`status` fields) — no per-pod
@@ -129,8 +127,6 @@ from Argo DAG node timing, but from a marker file a dedicated no-`depends`
 `record-workflow-start-dagtask` writes to `metrics/workflow-starts/`, which the exit handler reads
 back. Argo's own `workflow.outputs.parameters` can't be used for this: `argo lint --offline`
 cannot statically resolve it from an `onExit` template even though it works at runtime.
-
-[#147]: https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/147
 
 ---
 
@@ -180,8 +176,8 @@ therefore defaults these to `None`.
 **Nothing on this table is gated.** No threshold is calibrated for any surface field yet; the
 `surface-sample` step's pass/fail comes from `outputs_verified`, not from these numbers.
 
-**`schema_version` is `"1.0"`, and records written before 2026-08-11 have none at all.** Until
-[#241] the artifact key had no `dt=` component and the emitter stamped neither `schema_version` nor
+**`schema_version` is `"1.0"`, and records written before 2026-08-11 have none at all.** Until #241
+the artifact key had no `dt=` component and the emitter stamped neither `schema_version` nor
 `completed_at`. Both were fixed together, because the compactor maps a missing `schema_version` to
 the literal `"unknown"` and that value is a *projected partition key* on
 `surface_sample_compacted` — a value outside the enum returns zero rows with a **successful** query
@@ -192,8 +188,6 @@ those partitions are gone.
 Adding a field here is the same **five-place change** as `FuncQC` — the dataclass,
 `_UNION_COLUMNS["surface_sample"]`, both Terraform `columns` blocks, and the raw table's SerDe
 `paths` — all pinned by `tests/metrics/test_surface_sample_schema_sync.py`.
-
-[#241]: https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/241
 
 ---
 
@@ -225,7 +219,7 @@ this pairs **23 of 23**. The Grafana combined panel does the same thing, one-sid
 
 **Both tables accumulate a record per re-run, so raw row counts are not scan counts.** As of
 2026-08-09 (pre-flush) `anat_qc` held **962 rows for 271 subject×session** — up to 9 records for one scan,
-spread across 9 `dt=` partitions, and their values genuinely differ (`sub-XXXXXXXX`/`ses-02A`
+spread across 9 `dt=` partitions, and their values genuinely differ (one subject's `ses-02A`
 has 7 distinct `total_brain_vol_mm3` across its 9 runs, so this is FastSurfer non-determinism,
 not duplicate copies). Deduplicate on `subject`+`session` taking the latest `completed_at`
 before averaging or plotting a distribution; cohort means barely move (mean eTIV 1,515,449 raw
@@ -339,7 +333,7 @@ and the driver maps `NaN` to JSON `null`, never `0.0`, because `0` is a legitima
 |---|---|---|
 | `subject`, `session` | str | Identity. `session` is what fsqc itself calls the subject |
 | `wm_snr_orig`, `gm_snr_orig` | float? | WM/GM signal-to-noise from `mri/orig.mgz` (uncorrected) |
-| `wm_snr_norm`, `gm_snr_norm` | float? | WM/GM SNR from the bias-corrected `mri/norm.mgz` — **prefer these**, and use them in place of `AnatQC`'s removed `snr_wm`/`snr_gm`. Expect them close to the `_orig` pair, not systematically above it: ABCD minimally preprocessed input is already intensity-normalized upstream (Hagler et al. 2019), so the bias correction has little left to remove (`sub-XXXXXXXX`/`ses-00A`: 26.01 orig vs 25.69 norm). Both `_norm` and `_orig` read *much higher* than `AnatQC`'s old `snr_wm` — that gap is the eroded masks and broader WM label set, and makes neither comparable to the pre-1.2 numbers |
+| `wm_snr_norm`, `gm_snr_norm` | float? | WM/GM SNR from the bias-corrected `mri/norm.mgz` — **prefer these**, and use them in place of `AnatQC`'s removed `snr_wm`/`snr_gm`. Expect them close to the `_orig` pair, not systematically above it: ABCD minimally preprocessed input is already intensity-normalized upstream (Hagler et al. 2019), so the bias correction has little left to remove (one subject's `ses-00A`: 26.01 orig vs 25.69 norm). Both `_norm` and `_orig` read *much higher* than `AnatQC`'s old `snr_wm` — that gap is the eroded masks and broader WM label set, and makes neither comparable to the pre-1.2 numbers |
 | `cc_size` | float? | Corpus callosum size as a fraction of eTIV — fsqc's proxy for a failed or truncated talairach registration |
 | `holes_lh`, `holes_rh`, `defects_lh`, `defects_rh`, `topo_lh`, `topo_rh` | float? | Surface topology. **`NULL` on every row today**: FastSurfer writes no `surf/[lr]h.orig.nofix`, and its `scripts/recon-all.log` carries no defect counts (it runs `mris_fix_topology -all-info`, which emits structured output instead). Declared so a future FreeSurfer-based run needs no schema change |
 | `con_snr_lh`, `con_snr_rh` | float? | White/gray contrast-to-noise per hemisphere, from `surf/[lr]h.w-g.pct.mgh` |
@@ -504,7 +498,7 @@ S3 key: `metrics/workflow-runs/dt={dt}/{workflow_name}__{subject}_run_summary.js
 | `status` | str | `Succeeded` \| `Failed` \| `Error` |
 | `started_at`, `finished_at` | str | ISO 8601 UTC |
 | `total_duration_s` | int | Wall time, from `workflow.duration` |
-| `pending_duration_s` | float \| null | Seconds from workflow submission (`creationTimestamp`) to the wall-clock time a dedicated `record-workflow-start-dagtask` (no `depends`, starts immediately alongside the real first step) actually ran — queue + node-provision wait. That task writes its own start time to `metrics/workflow-starts/dt={dt}/{workflow_name}.json`, which the exit handler reads back; it isn't threaded through Argo's `workflow.outputs.parameters`, because `argo lint --offline` can't statically resolve that from an `onExit` template even though it works at runtime. **`null` means unmeasured, never a confident `0.0`** ([#147]): the two source timestamps are treated as equal/inverted whenever they can't be trusted, which is exactly what the pre-#147 wiring bug produced on every record |
+| `pending_duration_s` | float \| null | Seconds from workflow submission (`creationTimestamp`) to the wall-clock time a dedicated `record-workflow-start-dagtask` (no `depends`, starts immediately alongside the real first step) actually ran — queue + node-provision wait. That task writes its own start time to `metrics/workflow-starts/dt={dt}/{workflow_name}.json`, which the exit handler reads back; it isn't threaded through Argo's `workflow.outputs.parameters`, because `argo lint --offline` can't statically resolve that from an `onExit` template even though it works at runtime. **`null` means unmeasured, never a confident `0.0`** (#147): the two source timestamps are treated as equal/inverted whenever they can't be trusted, which is exactly what the pre-#147 wiring bug produced on every record |
 | `message` | str | Argo failure message; empty on success. In practice usually empty even on failure — Argo has no `{{tasks.<name>.message}}` DAG variable, see `docs-internal/decisions/` — `failed_step`/`failure_category` are the reliable failure signal, not this field |
 | `failed_step` | str | Canonical name of the first failed step; `""` on success |
 | `failure_category` | str | `infrastructure` \| `algorithm` \| `data` \| `dependency` \| `qc_rejected` \| `unknown` \| `""`; see the `StepOutcome` taxonomy below — it's the same classifier |
@@ -858,9 +852,7 @@ wrong in a way that's hard to notice (the dataclass silently accepts and default
 doesn't recognize via `from_dict`'s `known` filter — a stale reader doesn't error, it just
 drops columns):
 
-[#236]: https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/236
-
-1. **`FuncQC`** — *resolved 2026-08-11 ([#236])*, kept here as the worked example. The dataclass
+1. **`FuncQC`** — *resolved 2026-08-11 (#236)*, kept here as the worked example. The dataclass
    had no `surf_*`/`subcort_*` fields at all while the live emitter added eleven of them on every
    run that also produced grayordinates. Nothing failed: the eleven were written to S3 correctly
    the whole time, and the drift lived entirely in the readers. `export_batch_metrics.py`
@@ -890,7 +882,7 @@ drops columns):
 3. **`RegistrationQC` / `t1w_to_mni`** — live schema is `"2.1"`, matching the dataclass's
    documented 2.1 comments reasonably closely (this one drifted the least).
 4. **`SurfaceSampleQC`** — the dataclass was written *from* the live emitter dict on 2026-08-11
-   ([#241]) and agrees with it today, but the emitter is still a raw dict, so it can drift the same
+   (#241) and agrees with it today, but the emitter is still a raw dict, so it can drift the same
    way `FuncQC` did. Two of its fields exist only because the dataclass forced the question:
    `schema_version` and `completed_at` were absent from every record written before that date.
 5. Every other table (`AnatQC`, `WorkflowRun`, `CostAllocation`, `StepOutcome`,
@@ -908,7 +900,7 @@ the `CloudpipeMetrics` query classes do not read either of these.
 
 `metrics/surface-sample/` was the third until 2026-08-11 — it is now a first-class table, see
 [SurfaceSampleQC](#surfacesampleqc--per-bold-run). Its unreadability was not merely a missing
-Glue declaration but a missing `dt=` component in the artifact key itself ([#241]), which put it
+Glue declaration but a missing `dt=` component in the artifact key itself (#241), which put it
 out of reach of *both* engines at once: partition projection is the only thing publishing
 partitions since the crawlers were removed, and `duckdb_query._s3_glob` restricts to `dt=*/`
 deliberately. 3,031 records were written that neither engine could read.
@@ -932,7 +924,7 @@ deliberately. 3,031 records were written that neither engine could read.
   Written by `src/metrics/record_workflow_start.py`, a dedicated no-`depends` DAG task that
   starts alongside the real first pipeline step and records nothing but the wall-clock time it
   ran (`{"first_step_started_at": ...}`). `exit_handler.py` reads it back to compute
-  `WorkflowRun.pending_duration_s` ([#147]) — a marker file rather than an Argo
+  `WorkflowRun.pending_duration_s` (#147) — a marker file rather than an Argo
   `workflow.outputs.parameters` pass-through, since `argo lint --offline` cannot statically
   resolve the latter from an `onExit` template.
 
