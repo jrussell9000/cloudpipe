@@ -172,7 +172,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     # Required, never defaulted — the same stance as prep_test_batch.py.
     p.add_argument("--metrics-bucket", required=True)
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     p.add_argument("--write", action="store_true", help="Apply the plan (default: dry run).")
     args = p.parse_args()
 

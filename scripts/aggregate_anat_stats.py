@@ -13,9 +13,12 @@ except to write output.
 Output is LONG format — one row per (subject, session, source, structure,
 measure) — sharded so an interrupted run resumes. Pivot to wide at query time:
 
-  pixi run python scripts/aggregate_anat_stats.py --out data/anat-stats
-  pixi run python scripts/aggregate_anat_stats.py --out /tmp/x --subject sub-XXXXXXXX
-  pixi run python scripts/aggregate_anat_stats.py --out data/anat-stats --with-qc
+The bucket comes from $CLOUDPIPE_BUCKET, which the `ops` environment sets from the
+cloudpipe-config ConfigMap; --bucket overrides it.
+
+  pixi run -e ops python scripts/aggregate_anat_stats.py --out data/anat-stats
+  pixi run -e ops python scripts/aggregate_anat_stats.py --out /tmp/x --subject sub-XXXXXXXX
+  pixi run -e ops python scripts/aggregate_anat_stats.py --out data/anat-stats --with-qc
 
   -- then, e.g.
   SELECT subject, session,
@@ -30,6 +33,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -44,9 +48,6 @@ from anat_stats.aggregate import (  # noqa: E402
     plan_shards,
 )
 from anat_stats.discovery import list_subjects  # noqa: E402
-
-DEFAULT_BUCKET = "<YOUR_S3_BUCKET>"
-REGION = "<YOUR_AWS_REGION>"
 
 log = logging.getLogger("aggregate_anat_stats")
 
@@ -111,8 +112,11 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--out", required=True, type=Path, help="Output directory for the shard files.")
-    p.add_argument("--bucket", default=DEFAULT_BUCKET, help="Derivatives bucket.")
-    p.add_argument("--region", default=REGION)
+    p.add_argument("--bucket", help="Derivatives bucket (default: $CLOUDPIPE_BUCKET).")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     p.add_argument(
         "--subject",
         action="append",
@@ -141,6 +145,16 @@ def main() -> None:
     p.add_argument("--dt-from", help="Restrict QC to scans from this dt (YYYY-MM-DD).")
     p.add_argument("--dt-to", help="Restrict QC to scans up to this dt (YYYY-MM-DD).")
     args = p.parse_args()
+
+    # Read straight from the environment rather than through
+    # src/metrics/deployment_env.py: the in-region Job mounts src/anat_stats/ and this
+    # file only, so an import of another package would fail there and nowhere else.
+    args.bucket = args.bucket or os.environ.get("CLOUDPIPE_BUCKET", "")
+    if not args.bucket:
+        raise SystemExit(
+            "No bucket: pass --bucket, or set CLOUDPIPE_BUCKET (which `pixi run -e ops` "
+            "sets from the cloudpipe-config ConfigMap)."
+        )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     s3 = boto3.client("s3", region_name=args.region)

@@ -484,7 +484,10 @@ def main() -> None:
         "--out-dir", required=True, help="Directory to write CSVs into (created if absent)."
     )
     p.add_argument("--bucket", default="cloudpipe-metrics", help="Metrics bucket.")
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     p.add_argument(
         "--engine",
         choices=["duckdb", "athena"],

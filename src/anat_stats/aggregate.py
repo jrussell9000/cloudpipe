@@ -98,7 +98,7 @@ def _client(s3=None):
         # No region_name: boto3 resolves it the way this job runs — from the
         # AWS_DEFAULT_REGION Pod Identity injects in-cluster, or the AWS profile
         # on a workstation. Not metrics/deployment_env.py, deliberately: the
-        # in-region run mounts only src/anat_stats/ (scripts/manifests/
+        # in-region run mounts only src/anat_stats/ (scripts/jobs/
         # anat-stats-aggregate.yaml), so importing `metrics` would fail there.
         client = boto3.client("s3")
         _LOCAL.s3 = client

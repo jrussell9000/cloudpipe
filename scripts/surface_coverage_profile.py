@@ -14,9 +14,9 @@ This bins coverage by decile along each axis of the midthickness surface. A
 large range on one axis with a flat left-right profile means clipping; broadly
 flat-but-depressed profiles mean look at the transform.
 
-Observed 2026-07-22 on sub-XXXXXXXX (coverage 0.59, clipped) against
-sub-XXXXXXXX (0.97, clean) — see the validation findings in
-openspec/changes/add-surface-func-processing/tasks.md.
+Observed 2026-07-22 on a clipped session (coverage 0.59) against a clean one
+(0.97) — the two subjects are named, with the per-axis profiles, in the
+validation findings in openspec/changes/add-surface-func-processing/tasks.md.
 
 Inputs are Stage 1 outputs: the per-hemisphere fsnative timeseries from a
 components tarball, and the session midthickness from the sibling anat/ prefix.

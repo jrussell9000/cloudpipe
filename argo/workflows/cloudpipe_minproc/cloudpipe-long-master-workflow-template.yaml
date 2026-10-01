@@ -237,7 +237,7 @@ spec:
       # ~10% slower per session than a time-sliced T4 slice and ~1.4x its cost
       # (see fast-tmpl), but immune to the GPU spot droughts that
       # left 80+ GPU pods Pending for hours on 2026-09-03 and 2026-09-10
-      # (docs/investigations/2026-09-10-gpu-spot-acquisition-review.md §5.1).
+      # (docs-internal/investigations/2026-09-10-gpu-spot-acquisition-review.md §5.1).
       # The queue manager sets this per submission from the Pending-GPU-pod
       # signal (prefect/flows/lib/gpu_drought.py); force it with
       # `prefect variable set cloudpipe-fastsurfer-device cpu|cuda|auto`.
@@ -1217,7 +1217,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:810f9def148557b03c2aef5a668eff203ece4e733a25dab7392f61db866abb1f"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:e319537e801a2f0dd2c64731322eb0e9d6f9e6f8e4b5f1641c24f6cdcc6e0c70"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

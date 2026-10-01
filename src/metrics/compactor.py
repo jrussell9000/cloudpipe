@@ -375,7 +375,7 @@ def drop_rows(
 
 
 def compact_prefix_dt(
-    s3_client, bucket: str, region: str, table_name: str, dt: str
+    s3_client, bucket: str, region: str | None, table_name: str, dt: str
 ) -> dict[str, int]:
     """Compact one (table_name, dt): list -> read -> group -> write one
     Parquet file per schema_version present, then neutralize any compacted
@@ -418,7 +418,7 @@ def compact_prefix_dt(
 
 
 def compact_date(
-    s3_client, bucket: str, region: str, dt: str, tables: list[str] | None = None
+    s3_client, bucket: str, region: str | None, dt: str, tables: list[str] | None = None
 ) -> dict[str, dict[str, int]]:
     """Compact every table in `tables` (default: all RAW_PREFIXES) for one
     dt. Flow-facing entry point."""

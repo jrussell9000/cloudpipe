@@ -16,7 +16,7 @@ spec:
   # WHICH TYPES, AND WHY 4. Slice count is min(CPU, VRAM, duty cycle) per node:
   #   CPU    2xlarge = 7910m allocatable, every GPU step requests cpu: 1  -> 7
   #   VRAM   A10G / L4 ~22731 MiB usable. The worst tenant is t1w-to-mni, MEASURED at
-  #          4903 MiB per process (scripts/manifests/gpu-t1w-vram-probe.yaml, 2026-09-15:
+  #          4903 MiB per process (scripts/jobs/gpu-t1w-vram-probe.yaml, 2026-09-15:
   #          solo and under three-way concurrency alike). 4 x 4903 = 19612 fits any mix
   #          of steps with ~3.1 GiB spare; 5 x 4903 = 24515 does not.           -> 4
   #   duty   ~17% per FastSurfer pod                                          -> 5 (~85%)

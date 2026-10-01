@@ -1,10 +1,9 @@
 # MkDocs config for the PUBLIC documentation site.
 #
-# This builds from the same docs/ tree the internal repo uses, but publishes a
-# deliberately CURATED subset — see `nav` below. Internal-only material
-# (agent instructions, dated investigation handoffs, superpowers plans, the
-# code-health plan) stays in the repo for contributors and is excluded here via
-# `exclude_docs`, not deleted.
+# This builds the whole docs/ tree — everything under it is published, ordered
+# by `nav` below. Internal-only material (agent instructions, dated
+# investigation handoffs, superpowers plans, the code-health plan) lives in
+# docs-internal/ at the repository root instead, which is never built or synced.
 #
 # Two commands matter:
 #   pixi run -e docs docs-serve   — live preview on :8000
@@ -84,34 +83,28 @@ markdown_extensions:
   - pymdownx.tabbed:
       alternate_style: true
 
-# Internal-only material. Kept in the repo for contributors, excluded from the
-# published site. These are also the files whose links are NOT checked, so keep
-# this list and the nav in agreement.
-#
-# `investigations/` is dated point-in-time handoff material — deliberately
-# unmaintained once its question is answered, and full of links to source paths
-# that only resolve when read on GitHub. Publishing it would put prose that was
-# never meant to stay true in front of outside readers. It stays in the repo.
-exclude_docs: |
-  agents/
-  superpowers/
-  code-health-plan.md
-  investigations/
+# There is deliberately no `exclude_docs`. Everything under docs/ is meant to be
+# published; internal material lives in docs-internal/ at the repository root,
+# which is outside docs_dir and never synced (docs-internal/README.md). A list
+# of exclusions is a boundary only for generators that honour it — Zensical does
+# not — whereas a directory is a boundary for all of them.
+# tests/test_docs_boundary.py fails if an internal path reappears under docs/.
 
 # What makes --strict worth running. `unrecognized_links: warn` is the setting
 # that turns a typo'd relative link into a build failure; without it MkDocs only
 # emits INFO and CI stays green over broken navigation.
 #
-# `not_in_nav` is explicitly ignored: investigations/ is intentionally published
-# but not in the nav (it is linked from index.md and would bloat the sidebar with
-# a dozen dated handoffs). Without this, --strict would fail on every one.
+# `nav.omitted_files: warn` makes a page that is not in `nav` below fail
+# --strict. With nothing excluded, every file under docs/ is published, so a new
+# page must be placed in the navigation deliberately rather than shipping
+# orphaned.
 validation:
   omitted_files: warn
   absolute_links: warn
   unrecognized_links: warn
   anchors: warn
   nav:
-    omitted_files: ignore
+    omitted_files: warn
 
 # Curated five-section structure. Order is deliberate: a newcomer reads top to
 # bottom (what it is -> how to run it -> what the science is -> how it is built ->

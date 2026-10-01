@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-List subjects under s3://<YOUR_S3_BUCKET>/derivatives/fmriprep/ and write a CSV of
+List subjects under `derivatives/fmriprep/` in the data bucket and write a CSV of
 subject IDs (sub-XXXXXXXX format) for use with the first-level Prefect flow.
+
+The bucket comes from $CLOUDPIPE_BUCKET, which `pixi run -e ops` sets from the
+cloudpipe-config ConfigMap; --bucket and --output override it.
 
 Usage
 -----
-    # Write to S3 (default):
-    python generate_first_level_subjects.py
+    # Write to the data bucket's first-level-subjects.csv (default):
+    pixi run -e ops python generate_first_level_subjects.py
 
     # Write locally:
     python generate_first_level_subjects.py --output /tmp/first-level-subjects.csv
@@ -19,12 +22,17 @@ import argparse
 import csv
 import io
 import sys
+from pathlib import Path
 
 import boto3
 
-BUCKET = "<YOUR_S3_BUCKET>"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from metrics import deployment_env  # noqa: E402
+
 PREFIX = "derivatives/fmriprep/"
-DEFAULT_OUTPUT = "s3://<YOUR_S3_BUCKET>/first-level-subjects.csv"
+# Appended to s3://{bucket}/ when --output is not given.
+DEFAULT_OUTPUT_KEY = "first-level-subjects.csv"
 
 
 def list_subjects(s3, bucket: str, prefix: str) -> list[str]:
@@ -72,11 +80,14 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--bucket", default=BUCKET, help="S3 bucket containing fmriprep derivatives"
+        "--bucket",
+        help="S3 bucket containing fmriprep derivatives (default: $CLOUDPIPE_BUCKET)",
     )
     parser.add_argument("--prefix", default=PREFIX, help="S3 key prefix for fmriprep output")
     parser.add_argument(
-        "--output", default=DEFAULT_OUTPUT, help="Destination path (local or s3://bucket/key)"
+        "--output",
+        help=f"Destination path (local or s3://bucket/key; "
+        f"default: s3://$CLOUDPIPE_BUCKET/{DEFAULT_OUTPUT_KEY})",
     )
     parser.add_argument(
         "--require-session",
@@ -90,6 +101,12 @@ def main() -> None:
         help="Cap the output at N subjects (applied after all filtering)",
     )
     args = parser.parse_args()
+
+    bucket = args.bucket or deployment_env.required("CLOUDPIPE_BUCKET", "the data bucket")
+    # Defaulted from the resolved bucket, not from --bucket: --bucket alone must not
+    # leave the output pointing at a different deployment's bucket.
+    output = args.output or f"s3://{bucket}/{DEFAULT_OUTPUT_KEY}"
+    args.bucket = bucket
 
     s3 = boto3.client("s3")
 
@@ -114,7 +131,7 @@ def main() -> None:
         subjects = subjects[: args.limit]
         print(f"  Limited to {len(subjects)} subjects", file=sys.stderr)
 
-    write_csv(subjects, args.output, s3)
+    write_csv(subjects, output, s3)
 
 
 if __name__ == "__main__":

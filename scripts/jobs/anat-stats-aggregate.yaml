@@ -14,12 +14,18 @@
 #     --from-file=src/anat_stats/qc.py
 #   kubectl -n argo-workflows create configmap anat-stats-script \
 #     --from-file=scripts/aggregate_anat_stats.py
-#   kubectl apply -f scripts/manifests/anat-stats-aggregate.yaml
+#   pixi run -e ops bash -c 'envsubst < scripts/jobs/anat-stats-aggregate.yaml | kubectl apply -f -'
 #
-# Output lands in s3://<YOUR_S3_BUCKET>/scratch/anat-stats-aggregate/, which the bucket's
-# scratch/ lifecycle rule DELETES AFTER 7 DAYS. Copy it down (or elsewhere) when
-# the Job completes. QC (--with-qc) is deliberately not run here: it is an
-# Athena query, which runs in AWS wherever it is issued from.
+# `image:` is the one value Kubernetes cannot read from a ConfigMap, so it is a
+# ${CLOUDPIPE_ECR_REGISTRY} placeholder that envsubst fills; `pixi run -e ops`
+# exports that variable from the same cloudpipe-config ConfigMap the bucket comes
+# from (scripts/cloudpipe-env.sh). The bucket and region are read in-cluster —
+# see the env block below.
+#
+# Output lands in s3://$CLOUDPIPE_BUCKET/scratch/anat-stats-aggregate/, which the
+# bucket's scratch/ lifecycle rule DELETES AFTER 7 DAYS. Copy it down (or
+# elsewhere) when the Job completes. QC (--with-qc) is deliberately not run here:
+# it is an Athena query, which runs in AWS wherever it is issued from.
 #
 # Clean up after: the Job removes itself a day after finishing
 # (ttlSecondsAfterFinished); delete the two ConfigMaps by hand.
@@ -47,12 +53,20 @@ spec:
         kubernetes.io/arch: arm64
       containers:
         - name: aggregate
-          image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_AWS_REGION>.amazonaws.com/cloudpipe/cloudpipe-flow-runner:latest
+          image: ${CLOUDPIPE_ECR_REGISTRY}/cloudpipe/cloudpipe-flow-runner:latest
           imagePullPolicy: Always
           workingDir: /work
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            # Read by scripts/aggregate_anat_stats.py and by the upload step below,
+            # from the ConfigMap Terraform writes — the same source the production
+            # WorkflowTemplates default their `bucket` parameter from.
+            - name: CLOUDPIPE_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: cloudpipe-config
+                  key: bucket
             # ConfigMap files are symlinks into a hidden ..<timestamp>/ directory,
             # so the script's own Path(__file__).resolve().parent.parent lands in
             # the wrong place and `import anat_stats` fails. Set the path directly.
@@ -63,12 +77,15 @@ spec:
             - |
               python scripts/aggregate_anat_stats.py --out /out --workers 64
               python - <<'EOF'
-              import boto3, pathlib
-              s3 = boto3.client("s3", region_name="<YOUR_AWS_REGION>")
+              import os, pathlib
+              import boto3
+              # No region_name: Pod Identity sets AWS_REGION on this pod.
+              s3 = boto3.client("s3")
+              bucket = os.environ["CLOUDPIPE_BUCKET"]
               files = sorted(pathlib.Path("/out").iterdir())
               for f in files:
-                  s3.upload_file(str(f), "<YOUR_S3_BUCKET>", f"scratch/anat-stats-aggregate/{f.name}")
-              print(f"uploaded {len(files)} files to s3://<YOUR_S3_BUCKET>/scratch/anat-stats-aggregate/")
+                  s3.upload_file(str(f), bucket, f"scratch/anat-stats-aggregate/{f.name}")
+              print(f"uploaded {len(files)} files to s3://{bucket}/scratch/anat-stats-aggregate/")
               EOF
           # Measured: ~1 core (the parse is GIL-bound) and ~725 MiB.
           resources:

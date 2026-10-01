@@ -32,6 +32,7 @@ import boto3
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "metrics"))
 
 from compactor import RAW_PREFIXES, UnattributableRows, drop_rows  # noqa: E402
+from deployment_env import required  # noqa: E402
 
 # Subject-keyed derivative prefixes — one subject maps to exactly one prefix.
 #
@@ -495,7 +496,7 @@ def check_cluster() -> None:
             print(f"[WARN] command failed (check VPN/cluster access): {' '.join(cmd)}")
 
 
-def check_globus(region: str) -> None:
+def check_globus(region: str | None) -> None:
     print("\n=== Globus instance ===")
     try:
         iid = boto3.client("ssm", region_name=region).get_parameter(
@@ -519,7 +520,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("subjects_csv", help="Path to CSV with a subject_id column header.")
     p.add_argument(
-        "--bucket", default="<YOUR_S3_BUCKET>", help="Data bucket — derivatives are flushed here."
+        "--bucket",
+        help="Data bucket — derivatives are flushed here (default: $CLOUDPIPE_BUCKET).",
     )
     # Required, never defaulted: the metrics bucket is the run of record, and a
     # defaulted value is how an operator deletes the wrong thing by reflex. The
@@ -530,7 +532,10 @@ def main() -> None:
         required=True,
         help="Metrics bucket — workflow-keyed metric records are flushed here.",
     )
-    p.add_argument("--region", default="<YOUR_AWS_REGION>")
+    p.add_argument(
+        "--region",
+        help="AWS region (default: AWS_REGION, or the active AWS profile's region).",
+    )
     p.add_argument("--workers", type=int, default=20, help="Max concurrent list/delete threads.")
     p.add_argument("--dry-run", action="store_true", help="Print counts without deleting.")
     p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
@@ -550,6 +555,10 @@ def main() -> None:
         ),
     )
     args = p.parse_args()
+
+    # Resolved once, before anything prints or deletes, so the bucket named in the
+    # confirmation prompt is the bucket every later call uses.
+    args.bucket = args.bucket or required("CLOUDPIPE_BUCKET", "the data bucket")
 
     subjects = read_subjects(args.subjects_csv)
     if not subjects:

@@ -411,7 +411,7 @@ resource "aws_iam_role" "github_actions_ecr" {
   description        = "Assumed by GitHub Actions to push images to private ECR"
 }
 
-# No ecr-public statements. The ECRPublicAuth and ECRPublicPush statements were
+# No ecr-public PUSH grant. The ECRPublicAuth and ECRPublicPush statements were
 # removed 2026-08-17 with the transitional dual-push (Step 6, push side). Dropping
 # the workflow refs alone would not have stopped a public push -- any future edit
 # could have re-added one and it would have succeeded silently. Revoking the grant
@@ -419,12 +419,34 @@ resource "aws_iam_role" "github_actions_ecr" {
 # publish is inside the Inspector scanning configuration") true by construction
 # rather than by convention. The 13 public repositories still exist as a frozen
 # rollback target; nothing can write to them.
+#
+# ECRPublicPullAuth below is NOT that grant coming back. It lets build-images.yaml
+# log Docker in to public.ecr.aws so the base-image pulls (`FROM public.ecr.aws/
+# docker/library/...`) are authenticated: anonymous ones are metered per source
+# IP, GitHub-hosted runners share their IPs, and builds were failing with
+# `429 Too Many Requests ... toomanyrequests: Data limit exceeded`. The token
+# only identifies the caller. Every push API -- InitiateLayerUpload,
+# UploadLayerPart, CompleteLayerUpload, PutImage -- is still authorized per call
+# against this role, and none is granted, so a push with this token is denied
+# exactly as before.
 data "aws_iam_policy_document" "github_actions_ecr" {
   statement {
     sid    = "ECRPrivateAuth"
     effect = "Allow"
     actions = [
       "ecr:GetAuthorizationToken",
+    ]
+    resources = ["*"]
+  }
+  # Both are account-level calls that cannot be resource-scoped, and ECR Public
+  # serves them only from us-east-1 (amazon-ecr-login handles that itself).
+  # These two are the whole of what an authenticated PULL needs.
+  statement {
+    sid    = "ECRPublicPullAuth"
+    effect = "Allow"
+    actions = [
+      "ecr-public:GetAuthorizationToken",
+      "sts:GetServiceBearerToken",
     ]
     resources = ["*"]
   }

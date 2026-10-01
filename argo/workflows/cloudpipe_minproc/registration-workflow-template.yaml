@@ -454,7 +454,7 @@ spec:
 
     # Either GPU pool (#374): gpu-nodepool is preferred by weight, gpu-dense-nodepool
     # is the drought fallback at 4 slices/GPU. This step's 4903 MiB (measured,
-    # scripts/manifests/gpu-t1w-vram-probe.yaml) is the largest per-pod VRAM of the
+    # scripts/jobs/gpu-t1w-vram-probe.yaml) is the largest per-pod VRAM of the
     # three GPU steps and is what sets that 4 — see
     # terraform/modules/karpenter/helm-values/gpu-dense-nodepool.yaml.
     affinity:
@@ -487,7 +487,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:78e95ce1263d98485c55eab70c8f36bf91f734cc83f210eda09abbd860a51e38"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:721e4e6d0487fb892b4ad8a21c719559dd7bc48bc613d64cebe1e6dd2983e804"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -598,7 +598,7 @@ spec:
   # compute. With a dozen runs in a session that tarball was fetched a dozen
   # times. Looping inside one pod amortises image pull, node spin-up and the
   # shared downloads across the whole session.
-  # See docs/investigations/2026-07-20-cloudpipe-cost-reduction-deep-dive.md §3.2.
+  # See docs-internal/investigations/2026-07-20-cloudpipe-cost-reduction-deep-dive.md §3.2.
   #
   # Per-run inputs arrive as ONE directory artifact (the session's whole func/
   # prefix) because Argo resolves inputs.artifacts statically when the pod spec
@@ -832,7 +832,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:985e30bfc07718fe134762ab57b0708aaa2a0abc391773eb2045f0cdc987f49a"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:005e176238eb88cf4afaf78f79e195e95a10a9b4dcedadfeb31cf1f419f0f7e0"
       imagePullPolicy: IfNotPresent
 
       # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the
@@ -943,7 +943,7 @@ spec:
           # maximum) fit any permitted node. The 12G limit stays as defence in depth,
           # now well above peak; it costs nothing because requests drive bin-packing.
           #
-          # See docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.8-§9.9.
+          # See docs-internal/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.8-§9.9.
           memory: 12G
           ephemeral-storage: 30G
 
@@ -994,7 +994,7 @@ spec:
         # NOTE this contradicts an earlier draft of the investigation (§8.4
         # item 4), which argued oneDNN's fusion REDUCES peak so disabling it
         # might make things worse. Sound reasoning, wrong here — hence the A/B.
-        # See docs/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.9.
+        # See docs-internal/investigations/2026-08-01-bold-to-t1w-oom-handoff.md §9.9.
         #
         # Read by TensorFlow at import, so this is env-only: no image rebuild
         # and no `ci: pin workflow images to sha-...` commit.
