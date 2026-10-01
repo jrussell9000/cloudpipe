@@ -127,7 +127,7 @@ whose keys hold **many** records (newline-delimited JSON).
 ### `StepOutcome` — per-step (and per-run) success/failure
 Written mostly **in-pod** now rather than by recorder pods; per-run status comes from
 `outputs_verified`, not from the producing task's aggregate status. See
-[ADR 016](../../docs/decisions/016-skipped-producer-deadlock-in-dag-recording.md).
+[ADR 016](../../docs-internal/decisions/016-skipped-producer-deadlock-in-dag-recording.md).
 
 ### `SubjectManifest` — per subject per workflow
 What the workflow found and decided to process (sessions, tasks, runs, skip reasons).
@@ -250,7 +250,7 @@ returns **zero rows, silently** — not NULL columns. `anat_qc_compacted` shippe
 way for real (emitter `1.2`, enum `"1.0,1.1"`) and nothing surfaced it: the query
 status is `ok`, so it reads as "no data for that window" rather than as a fault.
 
-See [ADR 011](../../docs/decisions/011-s3-athena-for-metrics.md) for the full
+See [ADR 011](../../docs-internal/decisions/011-s3-athena-for-metrics.md) for the full
 place-by-place table and what breaks if each is skipped.
 
 Objects must always be written under `dt=YYYY-MM-DD/`. Partition projection is the

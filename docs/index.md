@@ -8,10 +8,10 @@ It takes ABCD's minimally preprocessed sMRI/fMRI ([Hagler et al. 2019](https://d
 
 Most neuroimaging pipelines assume a persistent filesystem and a fixed pool of compute. CloudPipe assumes neither, and most of its design follows from that:
 
-- **No shared POSIX filesystem.** Steps exchange data as compressed S3 artifacts, and pods read the source data through a Globus S3 gateway rather than a staged copy ([ADR 001](decisions/001-s3-gateway-over-posix-staging.md), [ADR 004](decisions/004-s3-artifacts-for-inter-step-data.md)). Nothing survives a pod, so every step is restartable and the storage bill is not a function of how long a batch takes.
-- **Nodes exist only while work does.** Karpenter provisions each pipeline pod's node on demand and reclaims it after ([ADR 007](decisions/007-karpenter-for-pipeline-pods.md)), including spot GPU nodes for registration. GPUs are time-sliced three pods to a card.
+- **No shared POSIX filesystem.** Steps exchange data as compressed S3 artifacts, and pods read the source data through a Globus S3 gateway rather than a staged copy (ADR 001, ADR 004). Nothing survives a pod, so every step is restartable and the storage bill is not a function of how long a batch takes.
+- **Nodes exist only while work does.** Karpenter provisions each pipeline pod's node on demand and reclaims it after (ADR 007), including spot GPU nodes for registration. GPUs are time-sliced three pods to a card.
 - **Every run is measured, not just logged.** Each step emits structured QC and cost records to a queryable metrics corpus (S3 → Glue → Athena → Grafana), so per-run alignment quality and per-run dollar cost are both first-class queryable facts rather than something reconstructed later from logs. See [observability.md](observability.md).
-- **Design choices are written down as they are made.** Sixteen [ADRs](decisions/README.md) record what was chosen, what was rejected, and — where it matters — the measurement that decided it. Several document *rejected* approaches, which are usually the more useful half.
+- **Design choices are written down as they are made.** Architecture Decision Records (ADRs) record what was chosen, what was rejected, and — where it matters — the measurement that decided it. They are not published yet; references to "ADR NNN" in these pages point to them.
 
 ## Scale and cost
 
@@ -34,10 +34,9 @@ Two things here took real measurement to establish, and both are worth stating p
 
 CloudPipe is MIT-licensed and deliberately institution-neutral: deployment-specific values (account IDs, bucket names, domains, Globus UUIDs) appear as `<YOUR_*>` placeholders throughout. It is **not** a turnkey product — it is a working, documented reference deployment. The parts most likely to be useful outside this project, in rough order:
 
-1. The **ADRs** — reusable reasoning, no infrastructure required.
-2. The **metrics/QC layer** ([observability.md](observability.md), [ADR 011](decisions/011-s3-athena-for-metrics.md)) — the pattern generalises to any batch pipeline.
-3. The **Argo + Karpenter execution model** ([argo-workflows.md](argo-workflows.md), [ADR 009](decisions/009-argo-over-batch.md)).
-4. The **Terraform modules**, which are written to be lifted independently.
+1. The **metrics/QC layer** ([observability.md](observability.md)) — the pattern generalises to any batch pipeline.
+2. The **Argo + Karpenter execution model** ([argo-workflows.md](argo-workflows.md)).
+3. The **Terraform modules**, which are written to be lifted independently.
 
 Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS toolchain; that was never a design goal.
 
@@ -67,7 +66,6 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 | Rebuild or deploy a pre-baked GPU AMI | [pre-baked-amis.md](pre-baked-amis.md) |
 | Change Terraform infrastructure | [infrastructure.md](infrastructure.md) |
 | Sync changes to the public repo | [operations.md → Syncing to the public repo](operations.md#syncing-to-the-public-repo) |
-| Understand a non-obvious design choice | [decisions/README.md](decisions/README.md) |
 
 ---
 
@@ -117,10 +115,6 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 
 - [**globus-setup.md**](globus-setup.md) — One-time build-from-scratch walkthrough: prerequisites, network requirements, endpoint creation, S3 storage gateway, collection, IAM credentials, SSM parameters, HA subscription, native app registration, and refresh token. Includes a historical appendix on the disabled POSIX+EBS staging alternative.
 
-### Design decisions
-
-- [**decisions/README.md**](decisions/README.md) — Index of all Architecture Decision Records (ADRs): why the S3 gateway was chosen over POSIX staging, why SynthMorph replaced bbregister, why `orig.mgz` is used for T1w→MNI registration, why S3+Athena was chosen for metrics storage, and twelve other non-obvious design choices (sixteen ADRs in all).
-
 ---
 
 ## Repo layout
@@ -155,8 +149,8 @@ scripts/              — runnable helpers (shell, one-off python, notebook)
 tools/                — data & reference files (subject-id CSVs, cost CSVs, NIST assessment)
                         internal-only; not published to the public repo
 docs/                 — this documentation
-  decisions/          — Architecture Decision Records
-docs-internal/        — dated investigations and handoffs, agent notes, plans
+docs-internal/        — Architecture Decision Records, dated investigations and
+                        handoffs, agent notes, plans
                         internal-only; not published to the public repo or this site
 ```
 

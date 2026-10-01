@@ -21,7 +21,7 @@ The production pipeline starts from ABCD's *minimally preprocessed* release, so 
 Two consequences that matter when reading the QC numbers:
 
 - **The BOLD is never resampled out of native scanner space.** ABCD ships a fMRI→T1w matrix rather than applying it, so the BOLD↔T1w offset you see is field-of-view *prescription* — set by how the operator positioned the two acquisitions, routinely 16–97 mm, and a near-constant within a session (between-session SD 19.75 mm vs within-session 0.29 mm). Transform magnitude is therefore **not** a quality signal: it in fact *anti*-correlates with quality (corr(nmi, `rigid_disp_max_mm`) = +0.425), so a displacement gate ranks runs backwards. Nothing gates on it; the only BOLD→T1w gate is `nmi_gain > 0`.
-- **That shipped matrix is not used.** BOLD→T1w is re-derived with SynthMorph instead ([ADR 002](decisions/002-synthmorph-over-bbregister.md), [ADR 012](decisions/012-abcd-matrix-rejected.md)). The sidecar is still read, but only to detect non-steady-state frames.
+- **That shipped matrix is not used.** BOLD→T1w is re-derived with SynthMorph instead (ADR 002, ADR 012). The sidecar is still read, but only to detect non-steady-state frames.
 
 A `cloudpipe_fullproc` design exists for ingesting raw DICOMs and applying all of the above from scratch; it is **design only** — no WorkflowTemplates exist. It is documented at the end of this page.
 
@@ -39,7 +39,7 @@ prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
   -p subjects_file=s3://<YOUR_S3_BUCKET>/config/subjects.csv
 ```
 
-The flow gates concurrency: `ConcurrencyGate.count()` counts active Argo workflows and waits until below `max_concurrent` before submitting the next subject. `max_concurrent` is **not** a flow parameter — it's read live from the Prefect Variable `cloudpipe-max-concurrent` (fallback `50` when unset) on every poll cycle, so it can be changed mid-run with `prefect variable set cloudpipe-max-concurrent <N>` without restarting the flow. Use `start_index`/`end_index` to resume after a pause. The controller's `namespaceParallelism` (`400`) is the server-side backstop — see [ADR 008](decisions/008-prefect-as-queue-manager.md) for why a client-side gate alone cannot enforce the cap (#206). Arrivals are also paced to at most `cloudpipe-max-submissions-per-minute` (fallback `5`, `0` disables, read live), so a cold start ramps up instead of creating the cap's whole width at once (#393).
+The flow gates concurrency: `ConcurrencyGate.count()` counts active Argo workflows and waits until below `max_concurrent` before submitting the next subject. `max_concurrent` is **not** a flow parameter — it's read live from the Prefect Variable `cloudpipe-max-concurrent` (fallback `50` when unset) on every poll cycle, so it can be changed mid-run with `prefect variable set cloudpipe-max-concurrent <N>` without restarting the flow. Use `start_index`/`end_index` to resume after a pause. The controller's `namespaceParallelism` (`400`) is the server-side backstop — see ADR 008 for why a client-side gate alone cannot enforce the cap (#206). Arrivals are also paced to at most `cloudpipe-max-submissions-per-minute` (fallback `5`, `0` disables, read live), so a cold start ramps up instead of creating the cap's whole width at once (#393).
 
 **Direct single-subject submission:**
 ```bash
@@ -112,7 +112,7 @@ Phase-level `record-outcome-*` tasks (`anatomical`, `session`, `subregion-seg`, 
 
 The four FastSurfer producers are the one place a **single shared gate isn't enough**: they were originally one `withItems` loop with one combined `depends`, but Argo resolves a DAG task's `depends` statically before `withItems` expansion, so a shared gate cannot isolate which items are safe to pull `.exitCode` from. Each producer instead gets a `-failed-dagtask` (gated on `.Failed || .Errored`, carries `exit-code` for real classification) and an `-other-dagtask` (gated on `.Succeeded || .Skipped || .Omitted`, status only) — the same two-arm shape as the registration fallback recorders below, just per producer instead of per session/run.
 
-The per-run recorders whose producer writes its own outcomes in-pod are instead **fallbacks**, gated on `<producer>.Failed || .Errored || .Skipped` — never on bare success, so a healthy session pays for zero recorder pods. `.Errored` covers spot preemption (`pod deleted` / node shutdown), which is phase `Error`, not `Failed`, and is the case where the in-pod records never reach S3. See [ADR 016](decisions/016-skipped-producer-deadlock-in-dag-recording.md).
+The per-run recorders whose producer writes its own outcomes in-pod are instead **fallbacks**, gated on `<producer>.Failed || .Errored || .Skipped` — never on bare success, so a healthy session pays for zero recorder pods. `.Errored` covers spot preemption (`pod deleted` / node shutdown), which is phase `Error`, not `Failed`, and is the case where the in-pod records never reach S3. See ADR 016.
 
 > A record fan-out must never reference a **skipped** producer's output parameters: Argo cannot resolve them and the DAG deadlocks. This is why outcome recording passes the producer's `.status` rather than its outputs.
 
@@ -185,7 +185,7 @@ The eight checks (executed in one pass):
 8. **Check subregion derivatives** — `head_object` on `derivatives/subregions/{subj}/{region}/_complete.json` for all three regions, writing `/tmp/subregions_exists.txt`
 
 Both gate on the **completion marker**, never on a prefix listing or an individual
-file ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)). Under the old
+file (ADR 017). Under the old
 tarball layout a single `head_object` was a truthful "the whole derivative is here",
 because a tarball is one atomic PUT. An exploded prefix has no such natural atom: a
 listing returns objects for a tree whose upload died halfway, and on spot that state
@@ -233,7 +233,7 @@ Four steps run as a DAG. All FastSurfer steps use image `cloudpipe/fastsurfer`. 
 
 **GPU spot-drought fallback ([#373](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/373)).** When the workflow parameter `fastsurfer-device` is `cpu` (default `cuda`), A and C run on `cpu-heavy-nodepool` too: each pod is re-sized to 7 CPU / 8G by `podSpecPatch`, its `nvidia.com/gpu` limit is zeroed, and `--device cpu --threads 7` is appended to every FastSurfer call. Measured on one session (probe `fastsurfer-cpu-probe-lmkgg`, 2026-09-10, manifest in `scripts/manifests/`, internal repo only): 396 s on CPU against 357 s on a 3-way time-sliced T4 — inference itself is 172 s vs 35 s, but the bias-field, sub-segmentation and stats work that follows is CPU-bound on both paths — with Dice 0.9998 against the GPU segmentation and a 3.96G memory peak. About 1.4x the per-session cost, and it cannot be stalled by a GPU pool that grants no nodes — which happened for hours on 2026-09-03 and 2026-09-10. The queue manager chooses the value per submission from how many GPU pods have been Pending 15+ minutes (Prefect variable `cloudpipe-fastsurfer-device` overrides it), and the workflow records it as the label `cloudpipe.io/fastsurfer-device`. `t1w-to-mni` stays GPU-only.
 
-**There is no shared volume.** Each step works in a private `emptyDir` at `/work`, with `SUBJECTS_DIR=/work/subjects`, and hands state to the next step through S3 per [ADR 004](decisions/004-s3-artifacts-for-inter-step-data.md). Intermediates go to `scratch/{workflow.name}/anat/` and are reaped by the `scratch-expiration` lifecycle rule (7 days) in `terraform/modules/stack/s3_lifecycle.tf`. They are not derivatives — nothing outside the owning workflow may read them.
+**There is no shared volume.** Each step works in a private `emptyDir` at `/work`, with `SUBJECTS_DIR=/work/subjects`, and hands state to the next step through S3 per ADR 004. Intermediates go to `scratch/{workflow.name}/anat/` and are reaped by the `scratch-expiration` lifecycle rule (7 days) in `terraform/modules/stack/s3_lifecycle.tf`. They are not derivatives — nothing outside the owning workflow may read them.
 
 ```
 A  fastsurfer-template-build          (gpu)   long_prepare_template.sh + --seg_only --base
@@ -447,7 +447,7 @@ At 1.0% that is roughly **116 sessions** across the 11,628-subject cohort — se
 
 So the container validates each session before publishing it, rejecting any that has an `IsRunning` marker or is missing a non-empty white/pial surface per hemisphere.
 
-Since [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md) the guard works **positively**: the publish loop iterates the sessions that passed, so a rejected session is never written and never gets a `_complete.json`. It no longer depends on deleting a directory so that an `optional: true` artifact is skipped. The directory is still removed — for ephemeral-storage reclaim, and so that a future edit iterating the directory listing rather than the guard's verdict cannot publish a rejected session — but removal is no longer what enforces the guard.
+Since ADR 017 the guard works **positively**: the publish loop iterates the sessions that passed, so a rejected session is never written and never gets a `_complete.json`. It no longer depends on deleting a directory so that an `optional: true` artifact is skipped. The directory is still removed — for ephemeral-storage reclaim, and so that a future edit iterating the directory listing rather than the guard's verdict cannot publish a rejected session — but removal is no longer what enforces the guard.
 
 > **The deletion order is load-bearing.** Removing the directory at detection time cost two whole workflows in the 300-subject batch of 2026-08-12 (`sub-XXXXXXXX`, `sub-XXXXXXXX`). `long_compat_segmentHA.py` tolerates an *incomplete* session directory — it had been running against these very sessions before the guard existed — but not a *missing* one. It exited 1, `base-tps` was never written, and the exit-75 guard then retried a **deterministic** failure until the 8-attempt budget was gone (`retryStrategy.expression evaluated to false`), taking each subject's three-plus good sessions with it. Detection therefore runs before the bridge and removal after it. The derivative of a rejected session is genuinely absent — the existence check correctly reports the session missing and the next submission re-runs the phase. Self-healing is restored by making the failure legible, not by adding a second source of truth. Rejected sessions are also pruned from `base-tps` (written from the template's timepoint list, not from what is on disk), so one bad session does not fail `segment-subregions` for the whole subject. If *no* session survives, the step exits **1** — not 75 — because a deterministic allocation failure re-run is an identical failure, the same reasoning that keeps 137 out of the retry expression (#115).
 
@@ -547,7 +547,7 @@ A single `cpu-light` pod, `inventory` → `published-sessions-template`, sits be
 
 **Why this is not inventory's job.** Inventory runs *before* the anatomical phase, and `t1w_available` means "there is a T1w for this session in `mmps_mproc`" — a statement about the subject's inputs. This phase needs the opposite: "did the anatomical phase publish derivatives for this session". The two agree until the [#248](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/248) completion guard rejects one timepoint and passes the others, which is exactly what that guard exists to do. Fanning out on the input list then starts a branch whose first pod dies in *init* loading an artifact nothing wrote — `sub-XXXXXXXX` / `cloudpipe-knwr6` reported workflow phase `Error` with 25 of 27 pods green ([#270](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/270)).
 
-**Why it is a separate task and not part of the anatomical phase.** That phase is `when:`-skipped on every reprocess, and a fan-out may not reference a skipped producer's output parameters — the DAG deadlocks ([ADR 016](decisions/016-skipped-producer-deadlock-in-dag-recording.md)). As an always-runs sibling on the same gate it costs a few seconds, and it re-checks the markers on the reprocess path too.
+**Why it is a separate task and not part of the anatomical phase.** That phase is `when:`-skipped on every reprocess, and a fan-out may not reference a skipped producer's output parameters — the DAG deadlocks (ADR 016). As an always-runs sibling on the same gate it costs a few seconds, and it re-checks the markers on the reprocess path too.
 
 Sessions with no T1w source are excluded by the same filter and are **not** counted as rejections: they were never FastSurfer candidates, so reporting them as failures would mark most longitudinal subjects partial forever.
 
@@ -627,7 +627,7 @@ be declared when the run count varies by session.
 
 Runs `bold_to_t1w.py` — **SynthMorph rigid only** (`mri_synthmorph register -m rigid`): contrast-agnostic global alignment of the BOLD reference to the T1w.
 
-**BBR was removed in `61ccff7`.** An earlier revision ran `bbregister --bold` as a second, boundary-based refinement stage against the FastSurfer white surface. Boundary-based registration is the field standard for EPI→T1w (Greve & Fischl 2009), but it depends on detectable gray/white contrast at the boundary, and ABCD's 2.4 mm EPI does not reliably provide it. SynthMorph operates on intensity-normalized images and is contrast-agnostic, so it is the better tool at this resolution ([ADR 002](decisions/002-synthmorph-over-bbregister.md)). Consequently the `bbr_*` QC fields, and the "D7 guard" that parsed bbregister stdout to detect whether the SynthMorph init had been honored, no longer exist.
+**BBR was removed in `61ccff7`.** An earlier revision ran `bbregister --bold` as a second, boundary-based refinement stage against the FastSurfer white surface. Boundary-based registration is the field standard for EPI→T1w (Greve & Fischl 2009), but it depends on detectable gray/white contrast at the boundary, and ABCD's 2.4 mm EPI does not reliably provide it. SynthMorph operates on intensity-normalized images and is contrast-agnostic, so it is the better tool at this resolution (ADR 002). Consequently the `bbr_*` QC fields, and the "D7 guard" that parsed bbregister stdout to detect whether the SynthMorph init had been honored, no longer exist.
 
 The LTA output is converted to an ANTs/ITK `.txt` affine for `antsApplyTransforms` during functional preprocessing. The conversion is **hand-rolled in Python**, not `lta_convert --outitk`: that flag crashes with `munmap_chunk` on SynthMorph LTAs (FreeSurfer 7.4.1 heap corruption when `--src`/`--trg` are passed with a geometry-less LTA). The equivalent is a basis flip, `A_lps = D·R·D` and `t_lps = D·t` with `D = diag(-1,-1,1)`, and **no inversion** — ITK affines are pullbacks (fixed → moving) and the SynthMorph matrix already is one.
 
@@ -653,7 +653,7 @@ metrics/registration/dt={date}/{subj}_{ses}_{task}_{run}_bold_to_t1w_reg_qc.json
 
 Failure modes:
 - BOLD NIfTI not found → transfer missed this run; verify S3 key
-- Missing `mri/T1.mgz` or `mri/brainmask.mgz` → FastSurfer tree incomplete; `_complete.json` is the only valid existence test ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md))
+- Missing `mri/T1.mgz` or `mri/brainmask.mgz` → FastSurfer tree incomplete; `_complete.json` is the only valid existence test (ADR 017)
 - `mri_synthmorph` non-zero exit → check pod logs
 - Exit 137 → OOM; see the host-dependent peak above before raising the limit
 - `nmi: 0.0` in the QC record → early-exit failure path (NMI ≥ 1 for real tissue). Note `nmi ≈ 1.02` is a **good** score here, not a failure: identity scores ~1.011, so the theoretical 1.0–2.0 range is not the operating scale
@@ -941,7 +941,7 @@ Then resubmit with the standard `argo submit` command.
 
 The design: process raw ABCD DICOMs from scratch, applying preprocessing steps that are done upstream in cloudpipe_minproc: dcm2niix → despiking → STC → motion correction → SDC (FSL topup) → between-scan motion correction → then the same registration + func-preproc as cloudpipe_minproc. Gradient nonlinearity correction would be omitted (proprietary manufacturer files unavailable).
 
-It was originally sketched around the POSIX staging path, which no longer exists ([ADR 001](decisions/001-s3-gateway-over-posix-staging.md)); a real design would use the S3 gateway like `cloudpipe_minproc`, or `presynced` if the DICOMs are staged by other means. Planned WorkflowTemplate name: `cloudpipe-fullproc`.
+It was originally sketched around the POSIX staging path, which no longer exists (ADR 001); a real design would use the S3 gateway like `cloudpipe_minproc`, or `presynced` if the DICOMs are staged by other means. Planned WorkflowTemplate name: `cloudpipe-fullproc`.
 
 ---
 
@@ -983,7 +983,7 @@ argo submit --from workflowtemplate/subregion-seg \
   -p T1w_sessions='["ses-00A","ses-02A"]'
 ```
 
-There is no longer a `fastsurfer-exists` parameter, and no `hydrate` step. Both used to gate/perform staging of FastSurfer outputs onto the shared EFS volume; both are gone as of [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77) — each segmentation pod now declares the FastSurfer S3 derivatives trees (exploded per [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)) as its own input artifacts and stages them onto a private `emptyDir`, so standalone submission needs no extra flag either way.
+There is no longer a `fastsurfer-exists` parameter, and no `hydrate` step. Both used to gate/perform staging of FastSurfer outputs onto the shared EFS volume; both are gone as of [#77](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/77) — each segmentation pod now declares the FastSurfer S3 derivatives trees (exploded per ADR 017) as its own input artifacts and stages them onto a private `emptyDir`, so standalone submission needs no extra flag either way.
 
 `T1w_sessions` controls which S3 artifact inputs are declared. Sessions beyond `ses-00A` are declared `optional: true`; the template reads `base-tps` from the long-template tarball at runtime to determine which timepoints to actually process.
 
@@ -1025,7 +1025,7 @@ What the pod taught, kept because it applies to any TensorFlow step added to thi
 
 Results are collected into `/out`, which is its own **emptyDir volume** — the pod runs as UID 1000 and cannot `mkdir` at the image root filesystem.
 
-**Resume guards.** Each region checkpoints to and restores from its own final S3 prefix (`derivatives/subregions/{subjID}/{region}/`): before a region runs, `checkpoint_restore` stages that prefix if its `_complete.json` is present, instead of recomputing; after a region completes, `checkpoint_save` publishes it immediately. Because the checkpoint prefix *is* the derivative prefix, "checkpoint restored" and "already done in a prior run" stay the same question — and since [ADR 017](decisions/017-exploded-derivatives-over-tarballs.md) it is the same question `check_subregions_derivatives` asks, so the phase's resume guard and the pipeline's skip gate cannot drift apart. This survives a full workflow resubmit, not just an in-workflow pod retry, since S3 outlives pod/volume lifetime.
+**Resume guards.** Each region checkpoints to and restores from its own final S3 prefix (`derivatives/subregions/{subjID}/{region}/`): before a region runs, `checkpoint_restore` stages that prefix if its `_complete.json` is present, instead of recomputing; after a region completes, `checkpoint_save` publishes it immediately. Because the checkpoint prefix *is* the derivative prefix, "checkpoint restored" and "already done in a prior run" stay the same question — and since ADR 017 it is the same question `check_subregions_derivatives` asks, so the phase's resume guard and the pipeline's skip gate cannot drift apart. This survives a full workflow resubmit, not just an in-workflow pod retry, since S3 outlives pod/volume lifetime.
 
 > Two things went away in the move off tarballs. The **`> 1 KB` size floor** is gone: it existed because a tarball key that exists is not proof the tarball is whole, and `_complete.json` answers that directly — a guess replaced by a fact. And the template's **`outputs.artifacts` re-upload** is gone: it used to write identical bytes to the key `checkpoint_save` had already written ("redundant but harmless"), which under the exploded layout would be worse than redundant, since Argo does not order artifact uploads and could land a file object after the marker claiming completeness.
 

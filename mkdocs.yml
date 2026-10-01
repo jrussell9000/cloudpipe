@@ -1,4 +1,6 @@
-# MkDocs config for the PUBLIC documentation site.
+# Site config for the PUBLIC documentation site, built by Zensical (which reads
+# mkdocs.yml as-is). MkDocs can still build it for comparison until docs-site
+# task 7.4 removes it: `pixi run -e docs docs-build-mkdocs`.
 #
 # This builds the whole docs/ tree — everything under it is published, ordered
 # by `nav` below. Internal-only material (agent instructions, dated
@@ -10,9 +12,8 @@
 #   pixi run -e docs docs-build   — strict build; CI runs this to fail on broken
 #                                   internal links (see .github/workflows/ci.yaml)
 #
-# `mkdocs build --strict` turns warnings into errors. The validation block below
-# is what makes that useful: unrecognized links and absolute links are demoted
-# to warnings so --strict catches them, rather than passing silently.
+# `zensical build --strict` fails on a broken link or anchor. It does not fail
+# on a page missing from `nav`; tests/test_docs_boundary.py checks that.
 
 site_name: CloudPipe
 site_description: >-
@@ -30,8 +31,8 @@ theme:
     - navigation.tracking
     - navigation.sections
     - navigation.top
-    # Section landing pages: docs/decisions/README.md becomes the Decisions
-    # index rather than appearing twice in the sidebar.
+    # Section landing pages: a section's README.md becomes its index rather
+    # than appearing twice in the sidebar.
     - navigation.indexes
     - toc.follow
     - search.suggest
@@ -90,14 +91,15 @@ markdown_extensions:
 # not — whereas a directory is a boundary for all of them.
 # tests/test_docs_boundary.py fails if an internal path reappears under docs/.
 
-# What makes --strict worth running. `unrecognized_links: warn` is the setting
-# that turns a typo'd relative link into a build failure; without it MkDocs only
-# emits INFO and CI stays green over broken navigation.
+# MkDocs' validation keys, kept while `docs-build-mkdocs` exists. Zensical uses
+# its own (`invalid_links`, `invalid_link_anchors`) and does not document these.
+# Its --strict was verified against a broken link and a broken anchor with this
+# block in place; re-verify when the block is replaced or dropped in task 7.4.
 #
-# `nav.omitted_files: warn` makes a page that is not in `nav` below fail
-# --strict. With nothing excluded, every file under docs/ is published, so a new
-# page must be placed in the navigation deliberately rather than shipping
-# orphaned.
+# Under MkDocs, `unrecognized_links: warn` turns a typo'd relative link into a
+# --strict failure, and `nav.omitted_files: warn` does the same for a page not
+# in `nav`. Zensical has no equivalent for the second; the nav test in
+# tests/test_docs_boundary.py covers it for both generators.
 validation:
   omitted_files: warn
   absolute_links: warn
@@ -106,9 +108,10 @@ validation:
   nav:
     omitted_files: warn
 
-# Curated five-section structure. Order is deliberate: a newcomer reads top to
-# bottom (what it is -> how to run it -> what the science is -> how it is built ->
-# why it is built that way).
+# Curated structure. Order is deliberate: a newcomer reads top to bottom (what
+# it is -> how to run it -> what the science is -> how it is built -> how to
+# operate it). The Decisions section is gone for now: the ADRs moved to
+# docs-internal/decisions/ on 2026-10-01 and are not published.
 nav:
   - Home: index.md
 
@@ -137,26 +140,3 @@ nav:
 
   - Operations:
       - operations.md
-
-  - Decisions:
-      - decisions/README.md
-      - decisions/001-s3-gateway-over-posix-staging.md
-      - decisions/002-synthmorph-over-bbregister.md
-      - decisions/003-orig-mgz-for-t1w-registration.md
-      - decisions/004-s3-artifacts-for-inter-step-data.md
-      - decisions/005-preproc-py-in-configmap.md
-      - decisions/006-pod-identity-over-irsa.md
-      - decisions/007-karpenter-for-pipeline-pods.md
-      - decisions/008-prefect-as-queue-manager.md
-      - decisions/009-argo-over-batch.md
-      - decisions/010-globus-ha-subscription.md
-      - decisions/011-s3-athena-for-metrics.md
-      - decisions/012-abcd-matrix-rejected.md
-      - decisions/013-src-scripts-tools-reorg.md
-      - decisions/014-cloudflare-tunnel-over-vpn.md
-      - decisions/015-s3-backend-after-state-loss.md
-      - decisions/016-skipped-producer-deadlock-in-dag-recording.md
-      - decisions/017-exploded-derivatives-over-tarballs.md
-      - decisions/018-declarative-gcs-config-and-operator-cli.md
-      - decisions/019-signing-proxy-for-globus-ingress.md
-      - decisions/020-public-repo-as-upstream.md

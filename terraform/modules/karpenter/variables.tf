@@ -68,7 +68,8 @@ variable "zones" {
   description = <<-EOT
     Availability zones the GPU NodePools may provision into. Rendered into
     gpu-nodepool.yaml and gpu-dense-nodepool.yaml, which named this deployment's
-    zones verbatim until task 4.5 of openspec/changes/public-upstream-readiness.
+    zones verbatim until task 4.5 of
+    openspec/changes/archive/2026-10-01-public-upstream-readiness.
 
     Passed rather than derived so it stays the same list the VPC's subnets were
     built from: a NodePool offering a zone the cluster has no subnet in provisions

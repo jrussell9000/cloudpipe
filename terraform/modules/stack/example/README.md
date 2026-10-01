@@ -44,7 +44,7 @@ Then edit two things in `main.tf`:
 
 2. **The `backend "s3"` block**, which is commented out. Do not leave state on
    local disk; see
-   [ADR 015](../../../../docs/decisions/015-s3-backend-after-state-loss.md),
+   [ADR 015](../../../../docs-internal/decisions/015-s3-backend-after-state-loss.md),
    which exists because that went wrong once.
 
 ## Before the first apply
@@ -94,5 +94,5 @@ the validation rules.
 - [Architecture](../../../../docs/architecture.md) — how the pieces fit together.
 - [Operations](../../../../docs/operations.md) — running the pipeline once the
   cluster is up.
-- [Architecture decision records](../../../../docs/decisions/) — why things are
+- [Architecture decision records](../../../../docs-internal/decisions/) — why things are
   the way they are, including the ones that were tried and rejected.

@@ -16,7 +16,7 @@ The root is **only** what a module may not contain: the S3 backend, the provider
 | `moved_to_stack.tf` | `moved` blocks may only be written in the *calling* module. **Keep them.** They are a permanent record: deleting them makes any state that has not been migrated — another deployment's, a restored backup — plan a destroy and recreate. |
 | `abcd_v7_metrics_retire.tf` | A history file, kept in the root by design; it reads one variable and nothing else. |
 
-Why one module rather than several: Terraform can move addresses into a child module only through `moved` blocks in the caller, so a partial extraction leaves cross-referencing resources split across two modules for no safety gain. See design D4 of `openspec/changes/public-upstream-readiness`.
+Why one module rather than several: Terraform can move addresses into a child module only through `moved` blocks in the caller, so a partial extraction leaves cross-referencing resources split across two modules for no safety gain. See design D4 of `openspec/changes/archive/2026-10-01-public-upstream-readiness`.
 
 ### The example root
 
@@ -80,7 +80,7 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 | `../<name>/` | Reusable sub-modules, siblings of `stack/` (see module reference below) |
 | `terraform/versions.tf` + `terraform/providers.tf` | Provider pins, AWS provider aliases, S3 backend config — in the root, see above |
 | `terraform/abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the retired `<YOUR_S3_BUCKET>/metrics/*` prefix — in the root |
-| `bootstrap/` | Separate Terraform root that creates the `cloudpipe-terraform-state` S3 bucket itself — its own local backend, not part of the main stack's state. Rarely touched; see [ADR 015](decisions/015-s3-backend-after-state-loss.md). |
+| `bootstrap/` | Separate Terraform root that creates the `cloudpipe-terraform-state` S3 bucket itself — its own local backend, not part of the main stack's state. Rarely touched; see ADR 015. |
 
 ---
 
@@ -88,7 +88,7 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 
 Terraform state lives in the `cloudpipe-terraform-state` S3 bucket (versioned, SSE-encrypted, public access blocked), configured via the `backend "s3"` block in the root's `versions.tf` with native state locking (`use_lockfile = true`, requires Terraform >= 1.10). This bucket is itself managed by a separate, small Terraform config in `terraform/bootstrap/` — deliberately kept off the main stack's backend to avoid a chicken-and-egg dependency.
 
-This replaced a local-only backend (no remote state at all) after a 2026-07 incident where the machine holding the only state file was lost, requiring a full `terraform import` recovery of the entire stack. See [ADR 015](decisions/015-s3-backend-after-state-loss.md) for the incident writeup, what was recovered, two pieces of pre-existing infrastructure drift it surfaced (Globus AMI pinning, Karpenter `expireAfter`), and a list of diffs that are now permanent/expected rather than bugs.
+This replaced a local-only backend (no remote state at all) after a 2026-07 incident where the machine holding the only state file was lost, requiring a full `terraform import` recovery of the entire stack. See ADR 015 for the incident writeup, what was recovered, two pieces of pre-existing infrastructure drift it surfaced (Globus AMI pinning, Karpenter `expireAfter`), and a list of diffs that are now permanent/expected rather than bugs.
 
 ---
 
@@ -170,7 +170,7 @@ even three-way split will under-provision.
 
 ### Remote access (Cloudflare WARP)
 
-The EKS API (no public endpoint in steady state) and all five web UIs are **private**: nothing is reachable from the internet. Operators connect the Cloudflare WARP client, enrolled with a UW-Madison NetID login (MFA required), before using `kubectl`, `argo`, the web UIs, `pixi run prefect-deploy`, or the Kubecost scripts. See [ADR 014](decisions/014-cloudflare-tunnel-over-vpn.md) and plans 010/012.
+The EKS API (no public endpoint in steady state) and all five web UIs are **private**: nothing is reachable from the internet. Operators connect the Cloudflare WARP client, enrolled with a UW-Madison NetID login (MFA required), before using `kubectl`, `argo`, the web UIs, `pixi run prefect-deploy`, or the Kubecost scripts. See ADR 014 and plans 010/012.
 
 - **Path:** WARP → Cloudflare Gateway → tunnel `cloudpipe-eks` → `cloudflared` (two replicas, `gitops/apps/cloudflared/`) → the three private `/20`s, which the tunnel routes.
 - **Who:** one Access application, `private_services` (`terraform/modules/stack/cloudflare.tf`), covers TCP 443 and 80 on those subnets, gated by the `cluster_admins` policy. Adding a person there grants both `kubectl` reachability and the UIs; each UI still logs in separately through Dex.
@@ -249,7 +249,7 @@ All Karpenter nodes consolidate to zero when empty (`consolidateAfter: 10m`). Di
 
 ## Storage
 
-There is no shared cluster filesystem. All inter-step data passes through S3 artifacts (see [ADR 004](decisions/004-s3-artifacts-for-inter-step-data.md)); the EFS filesystem, its `efs-sc` StorageClass, and the EFS CSI driver were removed once `subregion-seg` (the last consumer) moved to per-pod `emptyDir`s + S3 checkpointing (GitHub #77).
+There is no shared cluster filesystem. All inter-step data passes through S3 artifacts (see ADR 004); the EFS filesystem, its `efs-sc` StorageClass, and the EFS CSI driver were removed once `subregion-seg` (the last consumer) moved to per-pod `emptyDir`s + S3 checkpointing (GitHub #77).
 
 ### EBS
 

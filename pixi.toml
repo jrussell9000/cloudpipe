@@ -1,5 +1,5 @@
 [workspace]
-authors = ["Justin Russell <<YOUR_MAINTAINER_EMAIL>>"]
+authors = ["Justin Russell"]
 channels = ["conda-forge"]
 license = "MIT"
 license-file = "LICENSE"
@@ -86,18 +86,26 @@ simpleitk = ">=2.5.5,<3"
 test-imaging = "pytest -o addopts= tests/images/fireants"
 
 # --- Public documentation site (docs-only; not needed by any image) ---
-# Builds docs/ into the public MkDocs Material site. Config, including the
-# curated nav and the exclude list, lives in mkdocs.yml at the repo root.
+# Builds docs/ into the public site with Zensical, the successor to Material for
+# MkDocs (in maintenance mode since 2025-11). Zensical reads mkdocs.yml as-is.
+# Pinned below 0.1: it is pre-1.0 and a minor bump may change behaviour.
+#
+# mkdocs + mkdocs-material stay for one sync cycle so the old build can be
+# compared or restored (docs-site task 7.4 removes them); `docs-build-mkdocs`
+# is that fallback.
 [feature.docs.dependencies]
 mkdocs = ">=1.6,<2"
 mkdocs-material = ">=9.5,<10"
+zensical = ">=0.0.67,<0.1"
 
 [feature.docs.tasks]
-# --strict promotes MkDocs warnings to errors. Combined with the `validation:`
-# block in mkdocs.yml (unrecognized_links: warn), this is what makes a typo'd
-# relative link fail the build instead of shipping a dead link. CI runs this.
-docs-build = "mkdocs build --strict"
-docs-serve = "mkdocs serve"
+# --strict fails the build on a broken link or anchor (verified 2026-10-01 with
+# positive controls). It does NOT fail on a page missing from nav, which MkDocs'
+# validation.nav.omitted_files did; tests/test_docs_boundary.py checks that
+# instead. CI runs this.
+docs-build = "zensical build --strict"
+docs-serve = "zensical serve"
+docs-build-mkdocs = "mkdocs build --strict"
 
 # --- Operator workstation (needs WARP) ---
 # `pixi run -e ops <tool>` exports this deployment's buckets and UI URLs from the

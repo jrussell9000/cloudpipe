@@ -284,7 +284,7 @@ S3 key: `metrics/anat-qc/dt={dt}/{subject}_{session}_anat_qc.json`
 >
 > This is the failure mode to remember when bumping any `schema_version`: an undeclared
 > *column* reads as `NULL`, but an out-of-enum *partition key* returns an empty result set with
-> a successful query status. See the checklist in [ADR 011](decisions/011-s3-athena-for-metrics.md).
+> a successful query status. See the checklist in ADR 011.
 
 **All nine image-quality fields are `0.0`, not absent, if `mri/orig.mgz`, `mri/brainmask.mgz`,
 or `mri/aseg.auto.mgz` was missing when `extract_qc.py` ran** (logged as a WARNING in the pod's
@@ -293,7 +293,7 @@ out true zeros with care; a same-session `efc == 0.0` alongside `etiv_mm3 > 0` i
 input case, not a real EFC of zero.
 
 Recorded but not gated — no thresholds are calibrated yet for any of these nine fields.
-`docs/decisions/` has no ADR on structural T1w IQM thresholds; treat these as candidates for
+No ADR covers structural T1w IQM thresholds; treat these as candidates for
 cross-subject outlier review, not pass/fail gates, per the same reasoning that kept
 `bold_to_t1w`'s `nmi`/`rigid_disp_mean_mm` gate-free below (§`RegistrationQC`).
 
@@ -505,7 +505,7 @@ S3 key: `metrics/workflow-runs/dt={dt}/{workflow_name}__{subject}_run_summary.js
 | `started_at`, `finished_at` | str | ISO 8601 UTC |
 | `total_duration_s` | int | Wall time, from `workflow.duration` |
 | `pending_duration_s` | float \| null | Seconds from workflow submission (`creationTimestamp`) to the wall-clock time a dedicated `record-workflow-start-dagtask` (no `depends`, starts immediately alongside the real first step) actually ran — queue + node-provision wait. That task writes its own start time to `metrics/workflow-starts/dt={dt}/{workflow_name}.json`, which the exit handler reads back; it isn't threaded through Argo's `workflow.outputs.parameters`, because `argo lint --offline` can't statically resolve that from an `onExit` template even though it works at runtime. **`null` means unmeasured, never a confident `0.0`** ([#147]): the two source timestamps are treated as equal/inverted whenever they can't be trusted, which is exactly what the pre-#147 wiring bug produced on every record |
-| `message` | str | Argo failure message; empty on success. In practice usually empty even on failure — Argo has no `{{tasks.<name>.message}}` DAG variable, see `docs/decisions/` — `failed_step`/`failure_category` are the reliable failure signal, not this field |
+| `message` | str | Argo failure message; empty on success. In practice usually empty even on failure — Argo has no `{{tasks.<name>.message}}` DAG variable, see `docs-internal/decisions/` — `failed_step`/`failure_category` are the reliable failure signal, not this field |
 | `failed_step` | str | Canonical name of the first failed step; `""` on success |
 | `failure_category` | str | `infrastructure` \| `algorithm` \| `data` \| `dependency` \| `qc_rejected` \| `unknown` \| `""`; see the `StepOutcome` taxonomy below — it's the same classifier |
 | `batch_label` | str \| null | Free-text era/batch label set at submission (`batch_label` on the queue-manager flow → the `batch-label` workflow parameter), e.g. `"leg-2"`. **Unlabelled is two different values, and this distinction is a query trap:** a schema-1.2 record submitted without a label carries the key as `""`, while every schema-1.1 record — everything written before 2026-09-02 — has **no such key at all** and therefore reads **`NULL`**. So `WHERE batch_label = ''` does *not* mean "unlabelled": at the time of writing it matched 15 rows and missed 3,336. Use `COALESCE(batch_label, '') = ''`, or test `IS NULL` explicitly. Added in schema 1.2 because era was otherwise recoverable only from a timestamp: the pre-leg-1 test batches finished on dates that overlap leg 1, so a `dt`-scoped query silently mixed 548 test rows into leg 1's Aug-18 partition, and separating them required knowing leg 1 began at `2026-08-18T16:54Z`. Filter on this instead going forward — but it is **not** a substitute for `started_at` on historical records, which carry no label to filter on |
@@ -609,7 +609,7 @@ auto-detects it, so only `compactor.read_raw_records` needed to learn about the 
 | `cpu_core_hours`, `ram_gb_hours`, `gpu_hours` | float | Resource consumption. RAM is converted from Kubecost's byte-hours to GB-hours so it is directly comparable to a pod's memory request |
 | `cpu_efficiency`, `ram_efficiency` | float | Kubecost's usage/request ratio in [0, 1], averaged over the pod's whole allocation window. Low efficiency on an expensive step *suggests* the cost is reducible by lowering requests rather than by making the code faster — but **do not size a request from this number alone on a step with input artifacts** (see below), and never size a hard memory *limit* from it, because a lifetime average cannot see the peak that OOMs |
 | `node`, `node_instance_type` | str | Where the pod landed. Instance type drives the rate, so a step whose cost moves without its resource-hours moving is a placement effect, not a workload change. Both come from node labels Kubecost propagates onto the allocation (`kubernetes.io/hostname`, `node.kubernetes.io/instance-type`) — under `aggregate=pod` the API returns no top-level `node` property. **`node` was empty on every row written before 2026-07-31**; rows older than that cannot answer co-tenancy questions |
-| `node_capacity_type` | str | **Schema 1.1+.** `"spot"` on every Karpenter-provisioned node — which is all pipeline compute, since all four nodepools are spot-only ([ADR 007](decisions/007-karpenter-for-pipeline-pods.md)) — and `"on-demand"` on the EKS managed-nodegroup nodes that carry system pods. Taken from the `karpenter.sh/capacity-type` node label, falling back to Kubecost's `preemptible` flag for nodes Karpenter did not create. `""` on rows written before schema 1.1 |
+| `node_capacity_type` | str | **Schema 1.1+.** `"spot"` on every Karpenter-provisioned node — which is all pipeline compute, since all four nodepools are spot-only (ADR 007) — and `"on-demand"` on the EKS managed-nodegroup nodes that carry system pods. Taken from the `karpenter.sh/capacity-type` node label, falling back to Kubecost's `preemptible` flag for nodes Karpenter did not create. `""` on rows written before schema 1.1 |
 | `node_effective_usd_per_hour` | float | **Schema 1.1+.** What the node actually cost per hour: its Kubecost **Assets** `totalCost` divided by its node-hours. This is the rate the pod's own cost columns were derived from, so it inherits the same day+1 drift and only settles at `scrape_age_days = 3`. **NULL, not 0**, when Kubecost had no asset for the node |
 | `node_ondemand_usd_per_hour` | float | **Schema 1.1+.** AWS **list** price for `node_instance_type` in-region, from the Pricing API at scrape time (`src/metrics/ec2_pricing.py`). Does not drift, and is *not* reduced by any savings plan or RI the account holds. **NULL, not 0**, when the Pricing API returned no rate for the type |
 | `scrape_age_days` | int | Same meaning as on `CostAllocation` |

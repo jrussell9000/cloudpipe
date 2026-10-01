@@ -63,7 +63,7 @@ prefect variable get cloudpipe-max-concurrent
 
 The 2026-08-10 batch ran at `100` while every doc said `50` (#206). The Variable persists across runs, so whatever the last batch set is what the next one inherits.
 
-The Variable is capped server-side by the controller's `namespaceParallelism` (`400`, namespace-wide across both pipelines — see [ADR 008](decisions/008-prefect-as-queue-manager.md)). Raising a Variable above that does **not** raise the effective cap: the surplus workflows are still submitted, then held `Pending` by the controller, which presents as a stalled batch rather than a submission error. To go above 400 concurrent, raise `namespaceParallelism` in `terraform/modules/argo-workflows/main.tf` and apply first.
+The Variable is capped server-side by the controller's `namespaceParallelism` (`400`, namespace-wide across both pipelines — see ADR 008). Raising a Variable above that does **not** raise the effective cap: the surplus workflows are still submitted, then held `Pending` by the controller, which presents as a stalled batch rather than a submission error. To go above 400 concurrent, raise `namespaceParallelism` in `terraform/modules/argo-workflows/main.tf` and apply first.
 
 **Arrivals are paced separately** by the Prefect Variable `cloudpipe-max-submissions-per-minute` (code default `5`; `0` disables pacing), also re-read live:
 
@@ -886,7 +886,7 @@ Two things about it are worth knowing before you trust the plan:
 - **It classifies on repetition, not on the exit code.** Nine `exit 75`s are deterministic and get skipped; one `exit 75` is the `EX_TEMPFAIL` guard working and gets retried. Keying off the code alone gets both wrong, in opposite directions. Spot kills (`143`, `pod deleted`, `imminent node shutdown`) are exempt from the repetition rule entirely, because on spot-only nodepools they repeat *without* being deterministic — that exemption exists because the classifier called a healthy subject deterministic on two SIGTERMs on its first live run.
 - **`The specified key does not exist` is retryable here even though the WorkflowTemplates' retry expression excludes it.** The two operate at different layers: an in-workflow retry of a consumer does not re-run its producer, so the key stays absent, but a *resubmission* re-runs the producer from the top. That was the real shape of [#274](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/274) — a spot kill orphaned a FastSurfer tree and the staging failures downstream were the symptom.
 
-Resubmitting is cheap because every expensive stage gates on a `_complete.json` marker ([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)), so a re-driven subject skips whatever already published. Use `--exclude-subjects` for determinism the classifier cannot see, such as a session the [#248](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/248) guard rejects on every run.
+Resubmitting is cheap because every expensive stage gates on a `_complete.json` marker (ADR 017), so a re-driven subject skips whatever already published. Use `--exclude-subjects` for determinism the classifier cannot see, such as a session the [#248](https://github.com/<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>/issues/248) guard rejects on every run.
 
 The sweep reads node status via `argo list -o json`, not `kubectl` — see the warning under [Workflow status](#workflow-status).
 
@@ -913,7 +913,7 @@ argo get -n argo-workflows <workflow-name> -o json | jq '.status.nodes[] | selec
 
 - **`python_lint`** — `ruff check .` and `ruff format --check .` over the **whole repo**.
 - **`pytest`** — installs the [pixi](https://pixi.sh) environment (`pixi.toml`/`pixi.lock`) and runs the full `tests/` suite via `pytest.ini`.
-- **`docs_build`** — `mkdocs build --strict` in the `docs` pixi environment. The only check that reads `docs/` as a *linked graph* rather than as prose, so it catches the drift a human reviewer misses: a renamed doc or reworded heading leaving live links pointing nowhere.
+- **`docs_build`** — `zensical build --strict` in the `docs` pixi environment. The only check that reads `docs/` as a *linked graph* rather than as prose, so it catches the drift a human reviewer misses: a renamed doc or reworded heading leaving live links pointing nowhere.
 - **`terraform_lint`** — `terraform fmt -check -recursive`, `terraform init -backend=false -lockfile=readonly` + `terraform validate`, then `tflint --recursive` using `terraform/.tflint.hcl`. Provider binaries come from a cached `TF_PLUGIN_CACHE_DIR` keyed on `terraform/.terraform.lock.hcl`; see [Terraform provider pinning](#terraform-provider-pinning) for why that lock file is committed.
 - **`argo-lint`** — `argo lint --offline argo/workflows/`, catching WorkflowTemplate schema errors before ArgoCD syncs them.
 
@@ -948,11 +948,13 @@ pixi run -e docs docs-build
 pixi run -e docs docs-serve
 ```
 
-`--strict` on its own is not enough to catch a broken link: MkDocs' *default* severity for an unresolvable relative link is `INFO`, so a plain strict build exits 0 over a tree full of dead links. The `validation:` block in `mkdocs.yml` promotes those to warnings, and `--strict` then turns warnings into a failure. Both settings are required; changing either one silently disables the check.
+The site is built with [Zensical](https://zensical.org), which reads `mkdocs.yml` unchanged. `zensical build --strict` fails on a broken relative link or a stale anchor — both verified with deliberately broken probes. It does **not** fail on a page that is missing from `nav`: such a page is published but unreachable from the sidebar. `tests/test_docs_boundary.py` checks that every page under `docs/` is in `nav` (and every `nav` entry exists), so the gap is covered by the pytest job rather than the build.
+
+Until `docs-site` task 7.4 removes it, the previous MkDocs build is still available as `pixi run -e docs docs-build-mkdocs`. On 2026-10-01 both produced the same 40 pages with the same 528 heading ids. MkDocs needs the `validation:` block in `mkdocs.yml`: its default severity for an unresolvable link is `INFO`, so without that block a strict MkDocs build exits 0 over dead links.
 
 Two consequences worth knowing before you edit a doc:
 
-- **In-page anchors follow GitHub's slug algorithm, not MkDocs'.** These docs are read on GitHub as well as on the site, and the two slugify headings differently (GitHub turns an em dash into a *double* hyphen; MkDocs' default collapses it to one). `mkdocs.yml` sets `toc.slugify` to `pymdownx.slugs.slugify(case="lower")`, which reproduces GitHub's algorithm so one setting keeps both renderings valid. Don't "fix" an anchor link by hand — that fixes the site and breaks GitHub.
+- **In-page anchors follow GitHub's slug algorithm, not the site generator's default.** These docs are read on GitHub as well as on the site, and the two slugify headings differently (GitHub turns an em dash into a *double* hyphen; the MkDocs-family default collapses it to one). `mkdocs.yml` sets `toc.slugify` to `pymdownx.slugs.slugify(case="lower")`, which reproduces GitHub's algorithm so one setting keeps both renderings valid; Zensical honours it, producing ids identical to the MkDocs build. Don't "fix" an anchor link by hand — that fixes the site and breaks GitHub.
 - **Links out of `docs/` must be absolute GitHub URLs.** A relative `../terraform/...` link resolves on GitHub but 404s on the published site, which is rooted at `docs/`. Point at `https://github.com/jrussell9000/cloudpipe/blob/main/...` (or `/tree/main/` for a directory) instead. Internal docs are the exception: they live in `docs-internal/`, which is never synced, so there is no URL to link to. Name the path in a code span (`docs-internal/investigations/…`) instead of linking.
 
 Neither job installs pip/conda dependencies outside `pixi.toml` — if a test needs a new package, add it to `pixi.toml` (and regenerate `pixi.lock` with `pixi install`) rather than installing ad hoc.
@@ -1080,7 +1082,7 @@ The `.github/workflows/sync-public.yaml` workflow runs automatically on every pu
 
 Synced paths: `argo/`, `gitops/`, `images/`, `prefect/`, `terraform/modules/`, `docs/`, `src/`, `scripts/`, `README.md`, `LICENSE`, `pixi.toml`, `pixi.lock`, `mkdocs.yml`.
 
-Not synced: root-level Terraform files (contain account-specific resource definitions), `.github/`, `packer/`, `tools/` (data & reference files only), `CLAUDE.md`. `scripts/sync-public.sh` is also excluded — it's the sync tool itself. Local build artifacts and caches (`.terraform/`, `.pixi/`, `.venv/`, `__pycache__/`, …) and secret material (`.env`, `*.tfvars`, `*.tfstate`, `keys/`) are excluded even if present in the working tree.
+Not synced: root-level Terraform files (contain account-specific resource definitions), `.github/`, `packer/`, `tools/` (data & reference files only), `docs-internal/` (the prose curation boundary — see below), `CLAUDE.md`. `scripts/sync-public.sh` is also excluded — it's the sync tool itself. Local build artifacts and caches (`.terraform/`, `.pixi/`, `.venv/`, `__pycache__/`, …) and secret material (`.env`, `*.tfvars`, `*.tfstate`, `keys/`) are excluded even if present in the working tree.
 
 **Deleting is not automatic outside a synced directory.** `rsync --delete` prunes only *within* each `SYNC_DIRS` entry, so removing a file from `docs/` does propagate, but removing a whole directory from `SYNC_DIRS` leaves the public copy in place forever. `tools/` was exactly that: ADR 013 moved its contents into `scripts/` and `scripts/manifests/`, and the public repo carried both copies until 2026-08-10, the stale one indistinguishable from current code to an outside reader.
 
@@ -1108,9 +1110,21 @@ Use `sub-XXXXXXXX` — and only that form — when writing an NBDC-form subject 
 
 **A verify pattern that cannot match is indistinguishable from one that works.** Until 2026-09-29 the subject-ID rule only knew the legacy `NDARINV…` form, and no synced path holds a real ID in that form — every ID this repo cites is an NBDC one. The rule matched nothing, passed on every run, and 575 real subject IDs reached the public repo underneath a green gate. When adding a pattern, confirm it matches the form the repo actually uses, and keep the positive-control tests in `tests/test_sync_public_scrub.py` and `tests/test_sync_public_check_source.py` honest.
 
+**The literal never reaches the scrub: `--check-source`**
+
+The gates above all run on the *staged public tree, after* the scrub, and answer one question: did the scrub reach everything? `bash scripts/sync-public.sh --check-source` asks a different one — is the literal in *this* repo at all? It scans the tracked files the sync would publish, as committed and before any rewriting, and prints a count per directory and per pattern. It publishes nothing. The `checks` job in `.github/workflows/ci.yaml` runs it on every PR, reading its path and pattern lists from the arrays in the script itself so the two cannot drift.
+
+Most of its output is a report. The teeth are `ZERO_LITERAL_DIRS`: for a directory on that list, any match fails the run, naming the file, line and pattern. Every directory the sync publishes as code is on it — `argo/`, `gitops/`, `images/`, `prefect/`, `scripts/`, `src/` and `terraform/modules/` — so those directories hold no deployment value as a literal; each reads it from a Terraform `variable`, the `cloudpipe-config` ConfigMap, or an environment variable. Each entry carries a comment naming its source, so a reader finds the mechanism from the gate.
+
+`docs/` is deliberately **not** gated, and is where every remaining literal lives (25 files as of 2026-09-30). Prose earns its keep by citing the deployment it was measured on, so a doc that names this deployment's data bucket is doing its job; the scrub map and the fail-closed gate are the control there, not a ban. Prefer configuration over a literal in code, and evidence over a placeholder in prose.
+
+Add a directory to the list **in the same change that clears it**. Gating first fails CI on `main` and blocks every unrelated PR; clearing first without the gate lets the directory regress before the follow-up lands.
+
+**Retire a scrub entry when its literal is gone.** `REPLACEMENTS` is a map of what the synced tree holds, not a catalogue of everything this deployment uses — a map padded with values nothing cites reads as if they were still published. Retiring is not a no-op, though, and that is the point: `REPLACEMENTS` rewrites silently while `VERIFY_PATTERNS` fails the sync, so a retired value that reappears aborts the sync under its pattern's label. Only retire an entry while a pattern still covers its class, and re-add one when a loud failure is the wrong answer — a new doc citing a Prefect flow-run UUID, say, which the UUID pattern cannot tell apart from a Globus collection ID. `tests/test_sync_public_check_source.py` keeps the map honest in the other direction: every entry must still appear in the census. One entry is exempt and says so — the `clusterName` one has no occurrence left and no pattern can back it up, because the pattern would have to be the bare word `cloudpipe`, which is the public repo's own name.
+
 **The published documentation site**
 
-The public repo builds `docs/` into a GitHub Pages site with MkDocs Material. `mkdocs.yml` is synced, so the site's structure is maintained here, alongside the docs themselves. The curation boundary is the directory: everything under `docs/` is published, and internal material lives in `docs-internal/`, which is neither synced nor built. `tests/test_docs_boundary.py` fails if an internal path reappears under `docs/`.
+The public repo builds `docs/` into a GitHub Pages site with Zensical (the Pages workflow runs the same `docs-build` task as internal CI, and `pixi.toml` is synced, so the generator follows this repo without re-installing the workflow). `mkdocs.yml` is synced, so the site's structure is maintained here, alongside the docs themselves. The curation boundary is the directory: everything under `docs/` is published, and internal material lives in `docs-internal/`, which is neither synced nor built. `tests/test_docs_boundary.py` fails if an internal path reappears under `docs/`.
 
 The Pages workflow itself is **not** synced, and can't be. Two reasons: `.github/` is outside `SYNC_DIRS` on purpose (the internal CI needs AWS credentials and the public repo needs none of it), and GitHub rejects a PAT-authenticated push that touches `.github/workflows/` unless the token carries the `workflow` scope — so auto-syncing it would break the entire sync job, not just itself. Its source of truth is `scripts/public-pages-workflow.yaml`, which *is* synced (byte-for-byte; a test pins that the scrub leaves it alone), and the live copy is installed by hand from it, inside a clone of the public repo:
 
@@ -1163,15 +1177,16 @@ git push
 
 If you add a new hardcoded value (account ID, domain, email, bucket, UUID, etc.) to any synced file:
 
-1. Prefer removing it at the source — lift it to a Terraform `variable`/`local` or a Terraform-published ConfigMap so the public copy carries a reference, not a literal. Nothing to scrub is the strongest guarantee.
-2. If it must stay a literal, add a `"literal|<YOUR_PLACEHOLDER>"` entry to the ordered `REPLACEMENTS` array in `scripts/sync-public.sh`. **Order matters** — put any pattern that is a substring of a more general one *before* that general one.
+1. **In code, remove it at the source** — read it from a Terraform `variable`/`local`, the `cloudpipe-config` ConfigMap, or an environment variable, so the public copy carries a reference and not a literal. In a gated directory this is not advice, it is the only option: `--check-source` fails the PR. Nothing to scrub is the strongest guarantee.
+2. In `docs/`, or in the root files, add a `"literal|<YOUR_PLACEHOLDER>"` entry to the ordered `REPLACEMENTS` array in `scripts/sync-public.sh`. **Order matters** — put any pattern that is a substring of a more general one *before* that general one.
 3. If the value is genuinely sensitive (not just deployment-specific), also add a matching pattern to `VERIFY_PATTERNS` in the same script so the fail-closed gate catches future omissions.
+4. When you *remove* the last occurrence of a value, remove its `REPLACEMENTS` entry in the same change and leave the pattern in place — see the retirement rule above.
 
-**A gate fired — what now?** The script names the offending `file:line`. Apply step 1 or 2 above for that value, then re-run. The public repo is not updated until both gates pass.
+**A gate fired — what now?** The script names the offending `file:line`. Apply step 1 or 2 above for that value, then re-run. The public repo is not updated until every gate passes.
 
 **Counting literals at the source**
 
-The public repo is to become the upstream once no synced code path holds a deployment literal ([ADR 020](decisions/020-public-repo-as-upstream.md)). Progress toward that is measured before anything is scrubbed:
+The public repo is to become the upstream once no synced code path holds a deployment literal (ADR 020). Progress toward that is measured before anything is scrubbed:
 
 ```bash
 bash scripts/sync-public.sh --check-source
@@ -1181,7 +1196,7 @@ This scans the tracked files the sync would publish (the same `SYNC_DIRS`, `SYNC
 
 It fails only for a directory listed in `ZERO_LITERAL_DIRS`, in the same script. That list is a ratchet: when a change removes a directory's last literal, add the directory to the list in the same change, and from then on any new literal there fails CI with its `file:line:match`. `docs/` is never added; its prose stays under the scrub until the docs are sorted into public and private.
 
-`gitops` is the first directory on the list. Every deployment value under it now comes from Terraform — the apps read `local.argocd_app_overrides` through the ApplicationSet's `templatePatch`, and the two bootstrap objects are rendered from `gitops/bootstrap/*.tftpl` — so a literal appearing there again means a value has acquired a second source, which is the thing [ADR 020](decisions/020-public-repo-as-upstream.md) removes. Adding a hostname, region or account ID to a chart's `values.yaml` now fails CI; put it in the override map instead (see "Per-app Helm overrides" in [gitops.md](gitops.md#per-app-helm-overrides)).
+`gitops` is the first directory on the list. Every deployment value under it now comes from Terraform — the apps read `local.argocd_app_overrides` through the ApplicationSet's `templatePatch`, and the two bootstrap objects are rendered from `gitops/bootstrap/*.tftpl` — so a literal appearing there again means a value has acquired a second source, which is the thing ADR 020 removes. Adding a hostname, region or account ID to a chart's `values.yaml` now fails CI; put it in the override map instead (see "Per-app Helm overrides" in [gitops.md](gitops.md#per-app-helm-overrides)).
 
 ---
 

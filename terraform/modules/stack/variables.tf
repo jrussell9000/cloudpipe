@@ -22,7 +22,8 @@ variable "institution_domain" {
 
     Only Prefect's oauth2-proxy reads this so far. The other uses of the same
     literal still live in the Terraform root and move here with the rest of the
-    stack's literals (task 4.5 of openspec/changes/public-upstream-readiness).
+    stack's literals (task 4.5 of
+    openspec/changes/archive/2026-10-01-public-upstream-readiness).
   EOT
   type        = string
 

@@ -2,7 +2,7 @@
 
 Structured metrics emitted by every pipeline step, stored in S3, queryable via Athena SQL or DuckDB, and visualized in Grafana.
 
-**Why this exists as a first-class layer rather than log scraping.** On ephemeral infrastructure the pod that knew how a step went is gone minutes later, and its node with it. So each step *emits* what it knows — alignment scores, motion summaries, resource peaks, exit status — as a structured record at the moment it still knows it. The result is that "how well did this run register?" and "what did this run cost?" are both SQL queries over a durable corpus, not archaeology across logs. Ten tables, all schemas hand-declared in Terraform ([ADR 011](decisions/011-s3-athena-for-metrics.md)).
+**Why this exists as a first-class layer rather than log scraping.** On ephemeral infrastructure the pod that knew how a step went is gone minutes later, and its node with it. So each step *emits* what it knows — alignment scores, motion summaries, resource peaks, exit status — as a structured record at the moment it still knows it. The result is that "how well did this run register?" and "what did this run cost?" are both SQL queries over a durable corpus, not archaeology across logs. Ten tables, all schemas hand-declared in Terraform (ADR 011).
 
 Three things about this corpus are load-bearing and non-obvious; skipping them leads to confidently wrong numbers:
 
