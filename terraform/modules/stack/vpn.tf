@@ -128,7 +128,7 @@ resource "aws_security_group" "vpn" {
 
   # Open to the internet — the operator works remotely full-time and is not
   # reliably reachable from the UW-Madison prefix list (its own VPN can't run
-  # concurrently with this one, see docs/decisions and this repo's handoffs).
+  # concurrently with this one, see docs-internal/decisions and this repo's handoffs).
   # Mutual-TLS client certificate authentication (authentication_options
   # below) is the actual access control here, not source IP.
   ingress {

@@ -561,7 +561,7 @@ decide *which account was intended*.
 
 Written 2026-09-22, when the ingress work that defined this contract finished its
 code. The decisions behind it are in
-[ADR 018](decisions/018-declarative-gcs-config-and-operator-cli.md); the questions
+ADR 018; the questions
 below are tracked in GitHub issue #446, so they do not live only in a finished
 change.
 

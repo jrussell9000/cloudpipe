@@ -51,7 +51,7 @@ Until 2026-09 an IAM user with a long-lived access key was required here, and in
 accounts that forbid creating IAM users it was the longest-lead item in the whole
 setup. It is gone: the storage gateway now writes to S3 through a signing proxy on
 the instance's own loopback interface, which signs with a role the instance assumes
-([ADR 019](decisions/019-signing-proxy-for-globus-ingress.md)). Terraform and the
+(ADR 019). Terraform and the
 machine image build both halves. You still type a key pair at one prompt in gate 4,
 but it is a placeholder that authenticates nothing — see
 [the key pair is not a secret](#the-key-pair-you-register-is-not-a-secret).
@@ -124,7 +124,7 @@ expedite from your side.
 Assurance** capability — required to create an HA endpoint — is a paid tier
 feature.
 
-**Why it gates everything.** From [ADR 010](decisions/010-globus-ha-subscription.md):
+**Why it gates everything.** From ADR 010:
 
 > Globus HA collections require that **both** endpoints in a transfer be HA. If
 > the cloudpipe destination collection is not HA, Globus rejects transfers from
@@ -144,7 +144,7 @@ willing to sponsor your endpoint under it.
 production deployment is also a subscription feature. If your institution's
 subscription includes HA but not the S3 connector, you are not blocked, but the
 route has changed: the POSIX+EBS staging path was removed in 2026-09
-([ADR 001](decisions/001-s3-gateway-over-posix-staging.md)). Stage the data into
+(ADR 001). Stage the data into
 the bucket by whatever means you have and submit with `ingress-mode=presynced`
 ([data-ingress.md](data-ingress.md)) — that needs no S3 add-on and no static IAM
 user key, and the `ingress-verify` step checks the layout before anything
@@ -246,7 +246,7 @@ its own IAM role, and forwards it to S3. The role is confined to the one bucket
 prefix that gateway writes to, and its credentials expire hourly. Nothing long-lived
 exists to leak, and nothing has to be requested. The reasoning, the alternatives, and
 the measured cost of putting a proxy in the path are in
-[ADR 019](decisions/019-signing-proxy-for-globus-ingress.md).
+ADR 019.
 
 Two consequences for you:
 
@@ -352,7 +352,7 @@ So a key pair has to exist. What changed is what it *is*: the gateway's S3 endpo
 points at the signing proxy on loopback rather than at AWS, the proxy replaces the
 signature with one made from the instance role's temporary credentials, and the
 registered pair therefore authenticates nothing
-([ADR 019](decisions/019-signing-proxy-for-globus-ingress.md), and
+(ADR 019, and
 [not a secret](#the-key-pair-you-register-is-not-a-secret) above).
 
 AWS Mountpoint for S3 would have let the connector use the instance role directly
@@ -384,8 +384,8 @@ hurts.
 
 | Task | Frequency | Automatable? | Symptom when missed |
 |---|---|---|---|
-| Re-authenticate the HA session with `pixi run globus login` | **Every 7 days today** — governed by our own gateway's `--authentication-timeout-mins` (`10080`). This is *not* a Globus limit: the ABCD source collection is High Assurance at `525600` (1 year), so there is no 30-day HA ceiling. See [ADR 010's Correction](decisions/010-globus-ha-subscription.md). | **No** — HA requires an interactive `prompt=login` | Presents as `not_from_allowed_domain` — *not* as an expiry message |
-| ~~Rotate the S3 gateway IAM access key~~ | **Never — there is no key to rotate.** The signing proxy's role credentials expire hourly and are re-obtained by the proxy ([ADR 019](decisions/019-signing-proxy-for-globus-ingress.md)) | n/a — the task is gone, not automated | n/a |
+| Re-authenticate the HA session with `pixi run globus login` | **Every 7 days today** — governed by our own gateway's `--authentication-timeout-mins` (`10080`). This is *not* a Globus limit: the ABCD source collection is High Assurance at `525600` (1 year), so there is no 30-day HA ceiling. See ADR 010's Correction. | **No** — HA requires an interactive `prompt=login` | Presents as `not_from_allowed_domain` — *not* as an expiry message |
+| ~~Rotate the S3 gateway IAM access key~~ | **Never — there is no key to rotate.** The signing proxy's role credentials expire hourly and are re-obtained by the proxy (ADR 019) | n/a — the task is gone, not automated | n/a |
 | Re-request subscription after endpoint deletion | Only after endpoint loss | No | Gateway operations fail with a subscription error |
 
 The weekly session lapse is worth calling out separately: it does **not**
@@ -426,6 +426,6 @@ the deployment values it expects are listed in
 - [data-ingress.md](data-ingress.md) — the S3 contract Globus exists to satisfy, and the alternatives
 - [globus-setup.md](globus-setup.md) — the ordered build procedure
 - [globus.md](globus.md) — operating the running system
-- [ADR 001](decisions/001-s3-gateway-over-posix-staging.md) — why the S3 gateway over POSIX staging
-- [ADR 010](decisions/010-globus-ha-subscription.md) — why High Assurance is mandatory
-- [ADR 019](decisions/019-signing-proxy-for-globus-ingress.md) — why no IAM user is needed, and why the key pair you register is not a secret
+- ADR 001 — why the S3 gateway over POSIX staging
+- ADR 010 — why High Assurance is mandatory
+- ADR 019 — why no IAM user is needed, and why the key pair you register is not a secret

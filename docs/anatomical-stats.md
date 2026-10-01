@@ -57,7 +57,7 @@ release is picked up with no code change. A missing file shows up as a smaller
 row count, not as a 404 that gets swallowed.
 
 `_complete.json` is the only existence test
-([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)). A stats file
+(ADR 017). A stats file
 under a tree with no marker is skipped, because the tree may be half-uploaded.
 
 ### Three different text formats
@@ -319,7 +319,7 @@ average, used as the reference for the longitudinal pipeline. Keep its tables
 separate from session-level analyses.
 
 **Aliases:** `stats/aseg+DKT.stats` is one of FastSurfer's 14 aliases
-([ADR 017](decisions/017-exploded-derivatives-over-tarballs.md)). The real
+(ADR 017). The real
 file, and the table name here, is `aseg+DKT.VINN.stats`.
 
 ---

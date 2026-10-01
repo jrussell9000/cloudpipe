@@ -552,7 +552,7 @@ spec:
         RUNS = json.loads(r"""{{inputs.parameters.runs}}""")
         WORKFLOW_NAME = "{{workflow.name}}"
 
-        # See ADR 016 (docs/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
+        # See ADR 016 (docs-internal/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
         # this pod records its own StepOutcome facts rather than exposing them
         # as a DAG output parameter for a sibling recorder task to read, which
         # is what deadlocked the session DAG (dagval-330e63gh-tarerr2) whenever
