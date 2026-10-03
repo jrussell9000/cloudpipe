@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""cloudpipe-setup — the first command a new deployer runs.
+
+Checks the prerequisites, says what is missing and how to get it, then hands off
+to `pixi run cloudpipe setup`. It is the only entry point that runs before pixi
+exists, which is the whole reason it is a separate file: everything after this
+point runs inside the pixi environment and may import whatever it likes.
+
+So this file imports **standard library only**, and a test enforces that (design
+D2). A third-party import here would be a prerequisite checker that cannot run
+until its own prerequisites are installed.
+
+It creates nothing, installs nothing without being asked, and takes no credential.
+Run it from a clone of the repository:
+
+    python3 scripts/cloudpipe-setup
+    python3 scripts/cloudpipe-setup --non-interactive --json
+
+Exit codes match the rest of the tooling: 0 everything present, 2 a human must
+act, 3 a check failed, 4 bad input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CONTRACT_VERSION = "1.0"
+
+#: Where pixi comes from. Shown before any offer to install, never fetched behind
+#: the deployer's back: this script asks them to run a shell script from the
+#: internet, and the one thing it owes them is the URL they are being asked to
+#: trust.
+PIXI_INSTALL_URL = "https://pixi.sh/install.sh"
+PIXI_DOCS_URL = "https://pixi.sh/latest/#installation"
+
+#: Read from the published module rather than hard-coded, so one file states the
+#: Terraform floor. The internal root has a `versions.tf` too and is NOT the one
+#: to read: it does not travel to a public deployer.
+STACK_VERSIONS = Path("terraform/modules/stack/versions.tf")
+
+OK, BLOCKED, CHECK_FAILED, INVALID = 0, 2, 3, 4
+
+
+class Check:
+    """One prerequisite, and what to do when it is not there.
+
+    `state` is `pass`, `fail` or `skipped`, which matches the states the rest of
+    the tooling reports. `skipped` means nobody could look — a check that could
+    not be performed never reports `pass`.
+    """
+
+    def __init__(
+        self,
+        identifier: str,
+        title: str,
+        state: str,
+        message: str,
+        remedy: str | None = None,
+        *,
+        required: bool = True,
+    ) -> None:
+        self.identifier = identifier
+        self.title = title
+        self.state = state
+        self.message = message
+        self.remedy = remedy
+        self.required = required
+
+    @property
+    def blocking(self) -> bool:
+        return self.required and self.state != "pass"
+
+    def as_dict(self) -> dict:
+        return {
+            "identifier": self.identifier,
+            "title": self.title,
+            "state": self.state,
+            "message": self.message,
+            "remedy": self.remedy,
+            "required": self.required,
+        }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="cloudpipe-setup",
+        description="Check the prerequisites for a CloudPipe deployment, then run the setup "
+        "wizard. Creates nothing and takes no credential.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a JSON envelope on stdout. Human text stays on stderr.",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Never prompt. An offer to install anything is declined, and a missing "
+        "prerequisite exits 2.",
+    )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Report the prerequisites and stop. Does not run the wizard.",
+    )
+    parser.add_argument(
+        "--repo",
+        metavar="DIR",
+        help="The repository clone to read the version constraints from (default: the directory "
+        "above this script).",
+    )
+    args, forwarded = parser.parse_known_args(argv)
+
+    try:
+        repo = _resolve_repo(args.repo)
+    except SystemExit:
+        raise
+    except OSError as err:
+        _note(f"error: {err}")
+        return INVALID
+
+    checks = run_checks(repo)
+    _report(checks)
+
+    if any(check.identifier == "pixi" and check.state != "pass" for check in checks):
+        installed = _offer_pixi(non_interactive=args.non_interactive)
+        if installed:
+            checks = run_checks(repo)
+            _report(checks)
+
+    blocking = [check for check in checks if check.blocking]
+    code = OK if not blocking else (BLOCKED if args.non_interactive else CHECK_FAILED)
+
+    if args.json:
+        json.dump(
+            {
+                "schema_version": CONTRACT_VERSION,
+                "command": "cloudpipe-setup",
+                "ok": not blocking,
+                "exit_code": code,
+                "data": {"repo": str(repo), "checks": [check.as_dict() for check in checks]},
+                "error": None,
+            },
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+
+    if blocking:
+        _note("")
+        _note(f"{len(blocking)} prerequisite(s) are missing. Nothing was changed.")
+        return code
+
+    if args.check_only:
+        return OK
+
+    return _hand_off(repo, args, forwarded)
+
+
+def run_checks(repo: Path) -> list[Check]:
+    """Every prerequisite, in the order a deployer needs them.
+
+    pixi first because it provides Python and everything the wizard imports;
+    Terraform and the AWS CLI next because the deployment cannot be applied
+    without them; `kubectl`, `helm` and `jq` last and non-blocking — they are for
+    operating the cluster afterwards, so a deployer who has not installed them yet
+    is not stopped from collecting their inputs.
+    """
+    return [
+        _check_pixi(),
+        _check_terraform(repo),
+        _check_aws_cli(),
+        _check_sso_profile(),
+        _check_optional("kubectl", "Kubernetes CLI", ["kubectl", "version", "--client=true"]),
+        _check_optional("helm", "Helm", ["helm", "version", "--short"]),
+        _check_optional("jq", "jq", ["jq", "--version"]),
+    ]
+
+
+def _check_pixi() -> Check:
+    found = shutil.which("pixi")
+    if not found:
+        return Check(
+            "pixi",
+            "pixi",
+            "fail",
+            "not on PATH. It provides the Python environment every other command in this "
+            "repository runs in.",
+            f"Install it from {PIXI_DOCS_URL}, or let this script do it.",
+        )
+    version = _version(["pixi", "--version"])
+    return Check("pixi", "pixi", "pass", f"{version or 'present'} ({found})")
+
+
+def _check_terraform(repo: Path) -> Check:
+    """Terraform, against the floor the stack module itself declares.
+
+    The constraint is read rather than restated. A floor written here would be a
+    second source of truth that drifts, and the symptom is the worst kind: a
+    deployer passes this check and then has `terraform init` reject the module.
+    """
+    required = terraform_floor(repo)
+    binary = shutil.which("terraform")
+    if not binary:
+        return Check(
+            "terraform",
+            "Terraform",
+            "fail",
+            f"not on PATH. The stack requires {required or 'a recent release'}.",
+            "Install it from https://developer.hashicorp.com/terraform/install",
+        )
+
+    version = _version(["terraform", "version"])
+    if required is None:
+        return Check(
+            "terraform",
+            "Terraform",
+            "skipped",
+            f"{version or 'present'}, but {STACK_VERSIONS} could not be read, so the required "
+            "version is unknown.",
+            f"Run this from a clone of the repository, or pass --repo. Then check {version} "
+            "against the module's required_version yourself.",
+        )
+
+    floor = _parse_version(required)
+    found = _parse_version(version or "")
+    if floor and found and found < floor:
+        return Check(
+            "terraform",
+            "Terraform",
+            "fail",
+            f"{version} is older than the required {required}. `use_lockfile` state locking "
+            "needs 1.10.",
+            "Upgrade from https://developer.hashicorp.com/terraform/install",
+        )
+    return Check("terraform", "Terraform", "pass", f"{version or 'present'} (requires {required})")
+
+
+def _check_aws_cli() -> Check:
+    """AWS CLI v2 specifically. v1 has no `aws sso login`.
+
+    Which is the whole point of requiring it: SSO is how a deployer gets
+    credentials here, and no part of this tooling accepts a key.
+    """
+    binary = shutil.which("aws")
+    if not binary:
+        return Check(
+            "aws-cli",
+            "AWS CLI v2",
+            "fail",
+            "not on PATH. Version 2 specifically — v1 has no `aws sso login`, and SSO is the "
+            "only credential path this tooling supports.",
+            "Install it from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-"
+            "install.html",
+        )
+    version = _version(["aws", "--version"])
+    if version and not version.startswith("aws-cli/2"):
+        return Check(
+            "aws-cli",
+            "AWS CLI v2",
+            "fail",
+            f"{version} is not version 2. v1 has no `aws sso login`.",
+            "Install v2 from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-"
+            "install.html",
+        )
+    return Check("aws-cli", "AWS CLI v2", "pass", f"{version or 'present'} ({binary})")
+
+
+def _check_sso_profile() -> Check:
+    """Whether an SSO profile exists and currently has credentials.
+
+    Read-only, and it reads no secret: `aws configure list-profiles` names
+    profiles, and `sts get-caller-identity` returns an account and a role. Neither
+    prints a key, and this script never writes an AWS config file.
+    """
+    if not shutil.which("aws"):
+        return Check(
+            "aws-sso",
+            "AWS SSO session",
+            "skipped",
+            "the AWS CLI is not installed, so there is nothing to ask.",
+            "Install the AWS CLI v2 first.",
+        )
+
+    profiles = _run(["aws", "configure", "list-profiles"])
+    if profiles is None:
+        return Check(
+            "aws-sso",
+            "AWS SSO session",
+            "skipped",
+            "`aws configure list-profiles` failed, so no profile could be found.",
+            "Run `aws configure sso` to create one.",
+        )
+
+    named = [line.strip() for line in profiles.splitlines() if line.strip()]
+    if not named:
+        return Check(
+            "aws-sso",
+            "AWS SSO session",
+            "fail",
+            "no AWS profile is configured. This tooling takes no access keys, so an SSO "
+            "profile is how it gets credentials.",
+            "Run `aws configure sso`, then `aws sso login`.",
+        )
+
+    identity = _run(["aws", "sts", "get-caller-identity", "--output", "json"])
+    if identity is None:
+        return Check(
+            "aws-sso",
+            "AWS SSO session",
+            "fail",
+            f"{len(named)} profile(s) configured, but no active credentials in this shell.",
+            "Run `aws sso login` (add --profile <name> if it is not your default), then run "
+            "this again.",
+        )
+
+    try:
+        account = json.loads(identity).get("Account", "unknown")
+    except json.JSONDecodeError:
+        account = "unknown"
+    return Check("aws-sso", "AWS SSO session", "pass", f"active, account {account}")
+
+
+def _check_optional(identifier: str, title: str, command: list[str]) -> Check:
+    """A tool needed to operate the cluster, not to collect inputs.
+
+    Non-blocking on purpose. Stopping a deployer from answering questions because
+    they have not installed `jq` yet would be a checklist serving itself.
+    """
+    if not shutil.which(command[0]):
+        return Check(
+            identifier,
+            title,
+            "fail",
+            "not on PATH. Needed to operate the cluster after it exists, not to collect "
+            "inputs — so this does not block `cloudpipe setup`.",
+            f"Install {command[0]} before the first `terraform apply`.",
+            required=False,
+        )
+    version = _version(command)
+    return Check(identifier, title, "pass", version or "present", required=False)
+
+
+def terraform_floor(repo: Path) -> str | None:
+    """The stack module's `required_version`, or None if it cannot be read.
+
+    None rather than a guess: a hard-coded floor here would pass a deployer whose
+    Terraform the module then rejects at `init`.
+    """
+    path = repo / STACK_VERSIONS
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    found = re.search(r'required_version\s*=\s*"([^"]+)"', text)
+    return found.group(1) if found else None
+
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    found = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    if not found:
+        return None
+    return tuple(int(part) for part in found.groups(default="0"))
+
+
+def _resolve_repo(given: str | None) -> Path:
+    if given is not None:
+        return Path(given).expanduser().resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+def _run(command: list[str]) -> str | None:
+    """Run a command, returning its output or None when it fails.
+
+    Every call site here is a read. `check=False` and a timeout because a missing
+    or hung tool is a check result, not a traceback.
+    """
+    try:
+        done = subprocess.run(  # noqa: S603 - fixed command lists, no shell
+            command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return done.stdout
+
+
+def _version(command: list[str]) -> str | None:
+    output = _run(command)
+    if not output:
+        return None
+    return output.splitlines()[0].strip() or None
+
+
+def _offer_pixi(*, non_interactive: bool) -> bool:
+    """Offer to install pixi, showing the URL first. Returns whether it installed.
+
+    Never under `--non-interactive`: piping a shell script from the internet into
+    `sh` is a decision a person makes, and a machine-driven run has no person to
+    make it. Declining is always fine — the instructions to do it by hand are
+    printed either way.
+    """
+    _note("")
+    if non_interactive:
+        _note(f"pixi is missing. Install it from {PIXI_DOCS_URL} and run this again.")
+        _note("Not offering to install it: --non-interactive was set.")
+        return False
+
+    _note("pixi is missing. This script can install it for you by running:")
+    _note("")
+    _note(f"    curl -fsSL {PIXI_INSTALL_URL} | sh")
+    _note("")
+    _note("That downloads and runs a shell script from the internet, into your home directory.")
+    _note(f"If you would rather not, install it yourself from {PIXI_DOCS_URL} and run this again.")
+    _note("")
+    _note("Install pixi now? [y/N] ", end="")
+
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        _note("")
+        _note("No answer, so nothing was installed.")
+        return False
+
+    if answer not in ("y", "yes"):
+        _note("Nothing was installed.")
+        return False
+
+    _note(f"running: curl -fsSL {PIXI_INSTALL_URL} | sh")
+    try:
+        curl = subprocess.run(  # noqa: S603 - the URL is a module constant, shown above
+            ["curl", "-fsSL", PIXI_INSTALL_URL],
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+        if curl.returncode != 0:
+            _note(f"could not download the installer: {curl.stderr.decode(errors='replace')}")
+            return False
+        shell = subprocess.run(["sh"], input=curl.stdout, check=False, timeout=600)  # noqa: S603,S607
+    except (OSError, subprocess.SubprocessError) as err:
+        _note(f"the install failed: {err}")
+        return False
+
+    if shell.returncode != 0:
+        _note("the installer exited non-zero. Nothing to retry automatically.")
+        return False
+
+    _note("")
+    _note("pixi installed. It puts itself on PATH through your shell profile, so if the check")
+    _note("below still says it is missing, open a new shell and run this again.")
+    return True
+
+
+def _hand_off(repo: Path, args: argparse.Namespace, forwarded: list[str]) -> int:
+    """Replace this process with the wizard.
+
+    `execvp` rather than a subprocess, so the wizard owns the terminal outright:
+    its prompts, its signals, its exit code. A wrapper in between is a layer that
+    can swallow Ctrl-C or renumber an exit code, and the exit codes are a
+    published contract.
+    """
+    command = ["pixi", "run", "cloudpipe", "setup"]
+    if args.json:
+        command.append("--json")
+    if args.non_interactive:
+        command.append("--non-interactive")
+    command.extend(forwarded)
+
+    _note("")
+    _note(f"Prerequisites are in place. Running: {' '.join(command)}")
+    _note("")
+
+    binary = shutil.which("pixi")
+    if binary is None:  # pragma: no cover - the pixi check above would have blocked
+        _note("error: pixi vanished between the check and the hand-off.")
+        return CHECK_FAILED
+
+    os.chdir(repo)
+    os.execvp(binary, command)  # noqa: S606 - a fixed command, resolved through which()
+
+
+def _report(checks: list[Check]) -> None:
+    _note("")
+    _note("Prerequisites")
+    for check in checks:
+        mark = {"pass": " ok ", "fail": "MISS", "skipped": "????"}[check.state]
+        optional = "" if check.required else " (optional)"
+        _note(f"  [{mark}] {check.title}{optional}: {check.message}")
+        if check.remedy and check.state != "pass":
+            _note(f"         {check.remedy}")
+
+
+def _note(text: str = "", *, end: str = "\n") -> None:
+    """Human output, always stderr, so `--json` stdout stays parseable."""
+    print(text, file=sys.stderr, end=end, flush=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -556,7 +556,7 @@ _T1W_MNI_THRESHOLDS = {
 #     Larger corrections are BETTER registrations, and the batch's largest
 #     offset (96.97 mm) had its second-highest mean nmi. The gate ranked runs
 #     backwards and discarded whole sessions on scanner positioning.
-# See docs/investigations/2026-07-29-bold-to-t1w-qc-handoff.md section 0.
+# See docs-internal/investigations/2026-07-29-bold-to-t1w-qc-handoff.md section 0.
 #
 # Why `nmi_gain` rather than an absolute `nmi` bound: absolute NMI is not
 # portable. Its scale depends on bin count, masking and interpolation, and the
@@ -603,7 +603,7 @@ _T1W_MNI_THRESHOLDS = {
 #     consumer can filter a poor run out at any later point.
 # When one error is irreversible and the other is a query away, the irreversible
 # one does not go behind a threshold fitted from healthy-only data. Quality
-# metrics are therefore recorded, not gated; see docs/investigations/ and
+# metrics are therefore recorded, not gated; see docs-internal/investigations/ and
 # handoffs/bold-t1w-qc-gate-calibration/PREREGISTRATION.md.
 _BOLD_T1W_THRESHOLDS = {
     'nmi_gain': {'fail': 0.0, 'direction': 'below', 'inclusive': True},
