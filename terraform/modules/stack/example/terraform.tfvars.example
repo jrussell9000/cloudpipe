@@ -12,6 +12,20 @@
 #   $EDITOR terraform.tfvars
 #   terraform init && terraform validate
 #
+# You do not have to fill this in by hand. From your copy of this directory:
+#
+#   pixi run cloudpipe setup --root .
+#
+# The wizard asks for each value, applies the same `validation` rules
+# ../variables.tf declares, records your answers in a document worth keeping in
+# version control, and renders terraform.tfvars and backend.tf from them. It
+# refuses to overwrite a terraform.tfvars it did not write. Then
+# `pixi run cloudpipe preflight` checks those answers against AWS, Cloudflare
+# and your OIDC issuer — read-only, creating nothing — so a wrong hosted zone or
+# an unscoped API token surfaces now rather than mid-install. Neither command
+# takes a credential: AWS comes from an SSO profile, Cloudflare from
+# CLOUDFLARE_API_TOKEN. See ../../../../docs/deployer-first-hour.md.
+#
 # Do NOT then run a bare `terraform apply` on an empty account: a fresh install
 # is phased, because the providers in main.tf look up a cluster that does not
 # exist yet. See "Bootstrap and install sequence" in

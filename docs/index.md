@@ -46,6 +46,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 
 | I want to… | Go to |
 |---|---|
+| **Stand up my own deployment, starting from a fresh clone** | [deployer-first-hour.md](deployer-first-hour.md) |
 | Understand how the system fits together | [architecture.md](architecture.md) |
 | Get ABCD data into the bucket, with or without Globus | [data-ingress.md](data-ingress.md) |
 | Find out whether I *can* reproduce the Globus ingress | [globus-prerequisites.md](globus-prerequisites.md) |
@@ -70,6 +71,10 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 ---
 
 ## Reference docs
+
+### Deploying this yourself
+
+- [**deployer-first-hour.md**](deployer-first-hour.md) — The path from a fresh clone to a Terraform root ready for its first apply: the prerequisite bootstrapper, `cloudpipe setup` (which collects the fifteen deployment inputs and renders `terraform.tfvars` and `backend.tf`), the state bucket, `globus init`, and the read-only `cloudpipe preflight` that checks your answers against AWS, Cloudflare and your OIDC issuer before anything is applied. None of those commands create a cloud resource.
 
 ### System
 

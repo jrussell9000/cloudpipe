@@ -464,18 +464,59 @@ The Globus instance is stopped when not actively transferring; `start-globus-ins
 
 ## Bootstrap and install sequence
 
-A fresh cluster install follows the phased sequence in `install.sh`. Do not run `terraform apply` directly on a new cluster — the phases are load-bearing:
+A fresh cluster install follows the phased sequence in `install.sh`. That script drives the reference deployment's own Terraform root and is not yet part of the published tree, so if you are deploying your own copy, work the table below by hand — every phase, in order. Do not run `terraform apply` directly on a new cluster either way; the phases are load-bearing.
 
-| Phase | What happens |
-|---|---|
-| 1 | VPC + EKS with public endpoint enabled (bootstrapping requires reachable API) |
-| 2 | EKS add-ons, Pod Identity, Karpenter, ArgoCD, service modules |
-| 3 | kube-system NetworkPolicies applied before strict VPC CNI mode |
-| 4 | Full apply (`crds_available=false`) — VPN created here |
-| 5 | Wait for ArgoCD to sync and install CRDs (external-secrets, Prometheus) |
-| 6 | Final apply: `crds_available=true`, `vpc_cni_strict_mode=true`, public endpoint disabled |
+Every `-target` address below is written as it reads **inside** the stack module. From a root that calls the stack as `module "stack"`, `module.vpc` is `-target=module.stack.module.vpc`; if you named your module call something else, use that name.
 
-After Phase 6 the EKS API is private-only — connect via VPN for all subsequent `kubectl`/`terraform` operations.
+**Before Phase 1**, confirm `CLOUDFLARE_API_TOKEN` is exported and the hand-created `cloudpipe/cloudflare-access-oidc` secret exists (`pixi run cloudpipe preflight` checks both). Both are first needed by the Phase 4 full apply, and failing there leaves a half-built cluster.
+
+| Phase | What happens | Public endpoint |
+|---|---|---|
+| 1 | `-target` the VPC, then EKS, with `endpoint_public_access=true` (bootstrapping needs a reachable API). Then `aws eks update-kubeconfig`, log Helm in to ECR Public, and pre-create the `argo-workflows` namespace — Phase 2's resources need it before ArgoCD has synced anything | open |
+| 2 | `-target` each add-on module in turn: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, Globus, FinOps | open |
+| 3 | `-target` the kube-system NetworkPolicies, **before** strict VPC CNI mode — strict mode blocks every pod with no policy, CoreDNS included, and the cluster deadlocks | open |
+| 4 | Full apply, `crds_available=false`. Creates the Cloudflare tunnel, its Access applications, and the VPN. **Then sync the tunnel token** — see below | open |
+| 5 | Wait for ArgoCD to sync and install the CRDs (`clustersecretstores.external-secrets.io`, `prometheusrules.monitoring.coreos.com`), and for each to report `Established` | open |
+| 6 | Apply with `crds_available=true` and `vpc_cni_strict_mode=true`, **endpoint still open**. This creates the External Secrets `ClusterSecretStore`, without which cloudflared cannot receive its token | open |
+| 7 | **Prove the tunnel before closing anything** — see below. If it is not healthy, stop here: the cluster stays reachable through the IAM-gated public endpoint | open |
+| 8 | Apply with `crds_available=true` and `vpc_cni_strict_mode=true` and no `endpoint_public_access`, which disables the public endpoint. Then refresh the kubeconfig | **closed** |
+
+After Phase 8 the EKS API is private-only. Reach it through the Cloudflare tunnel (WARP), or the VPN as a fallback, for every later `kubectl` and `terraform` operation.
+
+> **Phases 6, 7 and 8 used to be one apply,** which closed the public endpoint in the same step that created the store cloudflared needs — locking the cluster before the tunnel could possibly be up. They are separate on purpose. Do not merge them back.
+
+#### Phase 4: syncing the tunnel token
+
+Terraform deliberately never reads the tunnel's connector token, because it would land in state. So after Phase 4 it has to be copied into Secrets Manager, where External Secrets delivers it to cloudflared. Run this from the Terraform root:
+
+```bash
+CF_ACCOUNT_ID=$(terraform output -raw cloudflare_account_id)
+CF_TUNNEL_ID=$(terraform output -raw cloudflare_tunnel_id)
+curl -fsS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/token" \
+    --header @<(printf 'Authorization: Bearer %s' "$CLOUDFLARE_API_TOKEN") \
+  | jq -je '.result | strings' \
+  | aws secretsmanager create-secret --name cloudpipe/cloudflare-tunnel-token \
+      --secret-string file:///dev/stdin >/dev/null
+```
+
+Use `put-secret-value --secret-id` instead of `create-secret --name` if the secret already exists. Three details are load-bearing:
+
+- **`jq -j`, not `jq -r`.** `-r` appends a newline that is stored verbatim, and cloudflared then fails to register with what looks like an authentication error.
+- **The header comes from a process substitution**, so the API token never appears in a process argument list.
+- **The connector token goes pipe to pipe**, never to the terminal, a file, or an argument.
+
+#### Phase 7: proving the tunnel
+
+All four, in order — each is a way the tunnel can look ready while not being so:
+
+1. The `cloudflared/cloudflared-token` ExternalSecret exists (ArgoCD has synced it). Annotate it with a fresh `force-sync` value: External Secrets refreshes hourly, so a stale value can sit there looking synced.
+2. The in-cluster Secret holds the **current** token — compare a hash of it with a hash of the Secrets Manager value, not merely that it exists.
+3. If the token changed, `kubectl -n cloudflared rollout restart deployment/cloudflared`: the token reaches cloudflared as an environment variable, which a Secret update does not refresh in a running pod. Then wait for `rollout status`.
+4. Cloudflare reports the tunnel `healthy`: `GET /client/v4/accounts/<account>/cfd_tunnel/<tunnel-id>` returns `"status": "healthy"`.
+
+Only then run Phase 8.
+
+#### Target validation
 
 Both scripts share their `-target` lists via `terraform/targets.sh`, which also validates every
 address against the `.tf` sources before Terraform is invoked. `terraform apply -target=` on an
@@ -483,6 +524,9 @@ address declared nowhere is a hard error, not a no-op, so one stale entry used t
 bootstrap partway through — which is what a deleted-but-still-referenced
 `module.aws_efs_csi_pod_identity` did for three months (#211),
 unnoticed because the running cluster predates the removal and never re-runs the bootstrap. The
+same thing then happened to every address at once when the resources moved into the stack module,
+so the lists are now written relative to the stack and `tests/test_terraform_targets.py` runs the
+validation in CI rather than only at install. The
 preflight reports *every* bad address at once instead of failing at the first; cleanup.sh derives
 its teardown order by reversing the same list rather than keeping a second copy.
 
@@ -495,9 +539,9 @@ its teardown order by reversing the same list rather than keeping a second copy.
 
 | Variable | Default | Change when |
 |---|---|---|
-| `endpoint_public_access` | `false` | Set `true` only during `install.sh` bootstrap |
-| `crds_available` | `false` | Set `true` after ArgoCD has installed CRDs (Phase 5) |
-| `vpc_cni_strict_mode` | `false` | Set `true` after kube-system NetworkPolicies are in place (Phase 6) |
+| `endpoint_public_access` | `false` | Set `true` for Phases 1–7 of the bootstrap; dropped in Phase 8, once the tunnel is proven |
+| `crds_available` | `false` | Set `true` from Phase 6, after ArgoCD has installed the CRDs (Phase 5) |
+| `vpc_cni_strict_mode` | `false` | Set `true` from Phase 6, after the kube-system NetworkPolicies are in place (Phase 3) |
 | `admin_netid` | — | Institution username (without `@<institution_domain>`) granted ArgoCD + Argo admin access |
 | `globus_client_id` | — | Globus service account app client ID (no default — must be provided) |
 | `globus_s3_destination_bucket` | — | The data bucket (no default — must be provided) |

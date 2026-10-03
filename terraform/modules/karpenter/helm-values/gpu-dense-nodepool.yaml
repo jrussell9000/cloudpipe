@@ -4,7 +4,7 @@ metadata:
   name: gpu-dense-nodepool
 spec:
   # DROUGHT FALLBACK for gpu-nodepool (#374), carrying 4 time-sliced GPU pods per card
-  # instead of 3. Source: docs/investigations/2026-09-10-gpu-spot-acquisition-review.md
+  # instead of 3. Source: docs-internal/investigations/2026-09-10-gpu-spot-acquisition-review.md
   # §5.2 — a capacity lever, not a cost one: during a spot drought every grant should
   # carry as many pods as the card allows.
   #
