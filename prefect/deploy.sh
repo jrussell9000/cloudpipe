@@ -2,7 +2,10 @@
 # Register every deployment in prefect.yaml with the Prefect server, then read
 # each one back from the server to prove what it stored.
 #
-#   PREFECT_API_URL=https://prefect.<your-domain>/api pixi run prefect-deploy
+#   pixi run -e ops prefect-deploy
+#
+# The ops environment exports PREFECT_API_URL and PREFECT_API_AUTH_STRING from
+# the cluster (scripts/cloudpipe-env.sh). Outside it, export both by hand.
 #
 # Use this, never a bare `prefect deploy --all`. prefect.yaml names no bucket and
 # no registry: it reads them as `{{ $CLOUDPIPE_* }}` placeholders, and this script
@@ -20,11 +23,15 @@
 # that would be a second copy of what Terraform owns, with a quieter failure.
 # Both were measured against a local server, not read from the docs.
 #
-# Needs: kubectl able to read cloudpipe-config (WARP connected), and
-# PREFECT_API_URL. CLOUDPIPE_CONFIG_NAMESPACE overrides where the ConfigMap lives.
+# Needs: kubectl able to read cloudpipe-config (WARP connected), PREFECT_API_URL
+# and PREFECT_API_AUTH_STRING. CLOUDPIPE_CONFIG_NAMESPACE overrides where the
+# ConfigMap lives.
 set -euo pipefail
 
 : "${PREFECT_API_URL:?set PREFECT_API_URL to the Prefect server API, e.g. https://prefect.example.org/api}"
+# The API requires basic auth (#636). Checked here because a 401 from the middle
+# of `prefect deploy --all` would leave some deployments registered and some not.
+: "${PREFECT_API_AUTH_STRING:?set PREFECT_API_AUTH_STRING — run as 'pixi run -e ops prefect-deploy', or read it with: kubectl -n prefect get secret prefect-api-auth -o jsonpath='{.data.auth-string}' | base64 -d}"
 NAMESPACE="${CLOUDPIPE_CONFIG_NAMESPACE:-argo-workflows}"
 
 config() {

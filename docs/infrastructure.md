@@ -28,19 +28,21 @@ Its lock file is a byte-for-byte copy of the root's, asserted by that test. Afte
 
 ### Variables that must be set
 
-**Twenty-one** variables have **no default**, because a default is one deployment's value handed to everyone who does not set it — and nothing errors. A fork inheriting `domain` publishes services under a domain it does not own; one inheriting `github_oidc_allowed_subs` trusts this repository's workflows to assume its roles. Without a default, Terraform prompts, or fails under `-input=false` naming the variable.
+**Eighteen** variables have **no default**, because a default is one deployment's value handed to everyone who does not set it — and nothing errors. A fork inheriting `domain` publishes services under a domain it does not own; one inheriting `github_oidc_allowed_subs` trusts this repository's workflows to assume its roles. Without a default, Terraform prompts, or fails under `-input=false` naming the variable.
 
-Fifteen of the twenty-one are the ones task 4.5 stripped defaults from; the other six — `admin_netid`, `globus_client_id`, `globus_org_name`, `globus_contact_email`, `globus_owner_email`, `globus_identity_domain` — never had one. The list below is the fifteen, because they are the ones whose defaults were a claim about who is deploying. Both `terraform.tfvars.example` files are checked against the full twenty-one, derived from `variables.tf` rather than listed, so a twenty-second is covered without anyone editing a test.
+The five Globus identity variables — `globus_client_id`, `globus_org_name`, `globus_contact_email`, `globus_owner_email`, `globus_identity_domain` — are rendered by `globus init`. The other thirteen are below, because their defaults would be a claim about who is deploying. Both `terraform.tfvars.example` files are checked against the full eighteen, derived from `variables.tf` rather than listed, so a nineteenth is covered without anyone editing a test.
 
 | Group | Variables |
 |---|---|
-| Identity | `domain`, `institution_domain`, `institution_oidc_issuer` |
-| AWS | `region`, `cloudflare_account_id`, `globus_admin_prefix_list_id`, `uwmadison_prefix_list_id` |
+| Identity | `domain` (may be `null`, for port-forward mode — see [deployer-first-hour.md](deployer-first-hour.md#reaching-the-web-uis-without-a-domain)), `operator_emails` |
+| AWS | `region`, `cloudflare_account_id`, `globus_admin_prefix_list_id` |
 | Source control | `github_user_url`, `github_repo`, `gitops_repo_url`, `github_oidc_allowed_subs` |
 | Data | `globus_s3_destination_bucket`, `globus_source_collection_id` |
 | Cloudflare Zero Trust | `cloudflare_team_domain`, `cloudflare_team_name` |
 
-All fifteen are in `terraform/terraform.tfvars.example` with placeholder values, and all but `cloudflare_team_name` carry a `validation` block — Cloudflare generates that name, so there is no shape to check. `tests/test_terraform_required_variables.py` keeps the three facts aligned: no default, a validation block, and a line in the example file.
+`operator_emails` is who runs the deployment: the administrators of every web UI, and — with the Amazon Cognito user pool the stack creates by default — who may enroll a WARP device and reach the cluster.
+
+All thirteen carry a `validation` block except `cloudflare_team_name`, which Cloudflare generates, so there is no shape to check. `tests/test_terraform_required_variables.py` keeps the facts aligned: no default, a validation block, and a line in the example file for each one the root does not compute itself.
 
 Two placeholders in the example root's `terraform.tfvars.example` are deliberately **not** well-formed. `globus_source_collection_id` and `globus_client_id` are UUIDs, that file is published, and the publish gate fails on any 8-4-4-4-12 hex string — a valid-looking placeholder is indistinguishable from a real collection identifier both to the gate and to a reader. Terraform's `validation` rejects them until they are replaced, which is the intended failure.
 
@@ -61,7 +63,7 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 | `karpenter.tf` | Karpenter Helm release (via module) |
 | `storage.tf` | StorageClass (`ebs-sc`) |
 | `argowf.tf` | Argo Workflows SSO secrets, RBAC, Prefect→Argo cross-namespace bindings |
-| `argocd.tf` | ArgoCD Helm release, Dex OIDC config (UW-Madison NetID), bootstrap ApplicationSet |
+| `argocd.tf` | ArgoCD Helm release, Dex OIDC config, bootstrap ApplicationSet |
 | `prefect.tf` | Prefect module call, oauth2-proxy secret |
 | `globus.tf` | Globus module call |
 | `finops.tf` | Kubecost + Athena CUR module |
@@ -170,7 +172,7 @@ even three-way split will under-provision.
 
 ### Remote access (Cloudflare WARP)
 
-The EKS API (no public endpoint in steady state) and all five web UIs are **private**: nothing is reachable from the internet. Operators connect the Cloudflare WARP client, enrolled with a UW-Madison NetID login (MFA required), before using `kubectl`, `argo`, the web UIs, `pixi run prefect-deploy`, or the Kubecost scripts. See ADR 014 and plans 010/012.
+The EKS API (no public endpoint in steady state) and all five web UIs are **private**: nothing is reachable from the internet. Operators connect the Cloudflare WARP client, enrolled with an SSO login (MFA required), before using `kubectl`, `argo`, the web UIs, `pixi run prefect-deploy`, or the Kubecost scripts. See ADR 014 and plans 010/012.
 
 - **Path:** WARP → Cloudflare Gateway → tunnel `cloudpipe-eks` → `cloudflared` (two replicas, `gitops/apps/cloudflared/`) → the three private `/20`s, which the tunnel routes.
 - **Who:** one Access application, `private_services` (`terraform/modules/stack/cloudflare.tf`), covers TCP 443 and 80 on those subnets, gated by the `cluster_admins` policy. Adding a person there grants both `kubectl` reachability and the UIs; each UI still logs in separately through Dex.
@@ -295,7 +297,7 @@ RDS native secret (Secrets Manager)
       → Kubernetes Secret consumed by Argo/Prefect pods
 ```
 
-The `ClusterSecretStore` and `ExternalSecret` resources are gated behind `crds_available = true` — they cannot be applied until ArgoCD has installed the external-secrets CRDs (Phase 5 of `install.sh`).
+The `ClusterSecretStore` and `ExternalSecret` resources are gated behind `crds_available = true` — they cannot be applied until ArgoCD has installed the external-secrets CRDs (Phase 5 of `install.sh`). The flag is persisted in `terraform/install-state.auto.tfvars`; an apply that does not read it plans to **destroy** all of them (#635).
 
 ---
 
@@ -343,17 +345,16 @@ Cross-namespace RBAC (defined in `argowf.tf`):
 
 ## Authentication and SSO
 
-ArgoCD uses Dex as an OIDC broker. All three web UIs authenticate through it.
+By default every sign-in goes through the Amazon Cognito user pool the stack creates (`cognito.tf`), with an authenticator app required as a second factor. A deployment that integrates an identity provider directly supplies it through the module's `external_identity` input instead, and the UIs then sign in through ArgoCD's Dex.
 
-| UI | SSO path |
-|---|---|
-| ArgoCD | Institution OIDC (Terraform `institution_oidc_issuer`) → Dex |
-| Argo Workflows | Dex static client `argo-workflows` → oauth2-proxy |
-| Prefect | Dex static client `prefect` → oauth2-proxy |
+| UI | Cognito mode (default) | `external_identity` set |
+|---|---|---|
+| ArgoCD | Dex, with the pool as its upstream | Dex, with the external provider as its upstream |
+| Argo Workflows | the pool's `argo-workflows` client | Dex static client `argo-workflows` |
+| Prefect (oauth2-proxy) | the pool's `prefect` client | Dex static client `prefect` |
+| Grafana | the pool's `grafana` client | Dex static client `grafana` |
 
-The admin NetID (set via `var.admin_netid`) is mapped to the `argo-admin` service account in `argo-workflows` namespace, which binds to the `argo-workflows-admin` ClusterRole.
-
-Dex OIDC client credentials for UW-Madison are stored in Secrets Manager and read by Terraform during `argocd.tf` apply.
+In both modes the addresses in `var.operator_emails` hold the administrator role: ArgoCD's `role:admin`; the `argo-admin` service account in the `argo-workflows` namespace, which binds to the `argo-workflows-admin` ClusterRole; and Grafana's Admin role. The sign-in proxies admit only those addresses' email domains.
 
 ---
 
@@ -464,18 +465,63 @@ The Globus instance is stopped when not actively transferring; `start-globus-ins
 
 ## Bootstrap and install sequence
 
-A fresh cluster install follows the phased sequence in `install.sh`. Do not run `terraform apply` directly on a new cluster — the phases are load-bearing:
+A fresh cluster install follows the phased sequence in `install.sh`. That script drives the reference deployment's own Terraform root and is not yet part of the published tree, so if you are deploying your own copy, work the table below by hand — every phase, in order. Do not run `terraform apply` directly on a new cluster either way; the phases are load-bearing.
 
-| Phase | What happens |
-|---|---|
-| 1 | VPC + EKS with public endpoint enabled (bootstrapping requires reachable API) |
-| 2 | EKS add-ons, Pod Identity, Karpenter, ArgoCD, service modules |
-| 3 | kube-system NetworkPolicies applied before strict VPC CNI mode |
-| 4 | Full apply (`crds_available=false`) — VPN created here |
-| 5 | Wait for ArgoCD to sync and install CRDs (external-secrets, Prometheus) |
-| 6 | Final apply: `crds_available=true`, `vpc_cni_strict_mode=true`, public endpoint disabled |
+Every `-target` address below is written as it reads **inside** the stack module. From a root that calls the stack as `module "stack"`, `module.vpc` is `-target=module.stack.module.vpc`; if you named your module call something else, use that name.
 
-After Phase 6 the EKS API is private-only — connect via VPN for all subsequent `kubectl`/`terraform` operations.
+**Before Phase 1**, confirm `CLOUDFLARE_API_TOKEN` is exported (`pixi run cloudpipe preflight` checks it). It is first needed by the Phase 4 full apply, and failing there leaves a half-built cluster. With the default Cognito identity, no identity-provider secret is created by hand: Terraform creates the pool's clients and passes their secrets on.
+
+**Before Phase 8**, create at least one Cognito user — the commands, and what the operator then does at their first sign-in, are in [deployer-first-hour.md → create the operators' sign-in accounts](deployer-first-hour.md#step-8--create-the-operators-sign-in-accounts). Phase 8 closes the public EKS endpoint, after which the cluster is reached only over WARP, and nobody can sign in to WARP until the pool has a user. `install.sh` checks this and stops before Phase 8 if the pool is empty.
+
+| Phase | What happens | Public endpoint |
+|---|---|---|
+| 1 | `-target` the VPC, then EKS, with `endpoint_public_access=true` (bootstrapping needs a reachable API). Then `aws eks update-kubeconfig`, log Helm in to ECR Public, and pre-create the `argo-workflows` namespace — Phase 2's resources need it before ArgoCD has synced anything | open |
+| 2 | `-target` each add-on module in turn: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, Globus, FinOps | open |
+| 3 | `-target` the kube-system NetworkPolicies, **before** strict VPC CNI mode — strict mode blocks every pod with no policy, CoreDNS included, and the cluster deadlocks | open |
+| 4 | Full apply, `crds_available=false`. Creates the Cloudflare tunnel, its Access applications, and the VPN. **Then sync the tunnel token** — see below | open |
+| 5 | Wait for ArgoCD to sync and install the CRDs (`clustersecretstores.external-secrets.io`, `prometheusrules.monitoring.coreos.com`), and for each to report `Established` | open |
+| 6 | Write `install-state.auto.tfvars` (see below), then apply with `crds_available=true`, `vpc_cni_network_policy_enabled=true` and `vpc_cni_strict_mode=true`, **endpoint still open**. This creates the External Secrets `ClusterSecretStore`, without which cloudflared cannot receive its token | open |
+| 7 | **Prove the tunnel before closing anything** — see below. If it is not healthy, stop here: the cluster stays reachable through the IAM-gated public endpoint | open |
+| 8 | Apply with the same three flags and no `endpoint_public_access`, which disables the public endpoint. Then refresh the kubeconfig | **closed** |
+
+After Phase 8 the EKS API is private-only. Reach it through the Cloudflare tunnel (WARP), or the VPN as a fallback, for every later `kubectl` and `terraform` operation.
+
+> **Phase 6 persists its three flags to `terraform/install-state.auto.tfvars`,** and they must stay `true` for the life of the cluster. Terraform loads any `*.auto.tfvars` in the working directory, so a later plain `terraform apply` keeps them without `-var` flags. They cannot simply default to `true`, because Phases 1–4 run against a cluster that has neither the CRDs nor the kube-system policies. The file is gitignored (it is per-deployment state), so recreate it after a fresh clone — losing it destroys the ExternalSecrets and makes every NetworkPolicy inert, neither of which announces itself (#635).
+
+> **Phases 6, 7 and 8 used to be one apply,** which closed the public endpoint in the same step that created the store cloudflared needs — locking the cluster before the tunnel could possibly be up. They are separate on purpose. Do not merge them back.
+
+#### Phase 4: syncing the tunnel token
+
+Terraform deliberately never reads the tunnel's connector token, because it would land in state. So after Phase 4 it has to be copied into Secrets Manager, where External Secrets delivers it to cloudflared. Run this from the Terraform root:
+
+```bash
+CF_ACCOUNT_ID=$(terraform output -raw cloudflare_account_id)
+CF_TUNNEL_ID=$(terraform output -raw cloudflare_tunnel_id)
+curl -fsS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/token" \
+    --header @<(printf 'Authorization: Bearer %s' "$CLOUDFLARE_API_TOKEN") \
+  | jq -je '.result | strings' \
+  | aws secretsmanager create-secret --name cloudpipe/cloudflare-tunnel-token \
+      --secret-string file:///dev/stdin >/dev/null
+```
+
+Use `put-secret-value --secret-id` instead of `create-secret --name` if the secret already exists. Three details are load-bearing:
+
+- **`jq -j`, not `jq -r`.** `-r` appends a newline that is stored verbatim, and cloudflared then fails to register with what looks like an authentication error.
+- **The header comes from a process substitution**, so the API token never appears in a process argument list.
+- **The connector token goes pipe to pipe**, never to the terminal, a file, or an argument.
+
+#### Phase 7: proving the tunnel
+
+All four, in order — each is a way the tunnel can look ready while not being so:
+
+1. The `cloudflared/cloudflared-token` ExternalSecret exists (ArgoCD has synced it). Annotate it with a fresh `force-sync` value: External Secrets refreshes hourly, so a stale value can sit there looking synced.
+2. The in-cluster Secret holds the **current** token — compare a hash of it with a hash of the Secrets Manager value, not merely that it exists.
+3. If the token changed, `kubectl -n cloudflared rollout restart deployment/cloudflared`: the token reaches cloudflared as an environment variable, which a Secret update does not refresh in a running pod. Then wait for `rollout status`.
+4. Cloudflare reports the tunnel `healthy`: `GET /client/v4/accounts/<account>/cfd_tunnel/<tunnel-id>` returns `"status": "healthy"`.
+
+Only then run Phase 8.
+
+#### Target validation
 
 Both scripts share their `-target` lists via `terraform/targets.sh`, which also validates every
 address against the `.tf` sources before Terraform is invoked. `terraform apply -target=` on an
@@ -483,6 +529,9 @@ address declared nowhere is a hard error, not a no-op, so one stale entry used t
 bootstrap partway through — which is what a deleted-but-still-referenced
 `module.aws_efs_csi_pod_identity` did for three months (#211),
 unnoticed because the running cluster predates the removal and never re-runs the bootstrap. The
+same thing then happened to every address at once when the resources moved into the stack module,
+so the lists are now written relative to the stack and `tests/test_terraform_targets.py` runs the
+validation in CI rather than only at install. The
 preflight reports *every* bad address at once instead of failing at the first; cleanup.sh derives
 its teardown order by reversing the same list rather than keeping a second copy.
 
@@ -495,11 +544,12 @@ its teardown order by reversing the same list rather than keeping a second copy.
 
 | Variable | Default | Change when |
 |---|---|---|
-| `endpoint_public_access` | `false` | Set `true` only during `install.sh` bootstrap |
-| `crds_available` | `false` | Set `true` after ArgoCD has installed CRDs (Phase 5) |
-| `vpc_cni_strict_mode` | `false` | Set `true` after kube-system NetworkPolicies are in place (Phase 6) |
-| `admin_netid` | — | Institution username (without `@<institution_domain>`) granted ArgoCD + Argo admin access |
+| `endpoint_public_access` | `false` | Set `true` for Phases 1–7 of the bootstrap; dropped in Phase 8, once the tunnel is proven |
+| `crds_available` | `false` | Set `true` from Phase 6, after ArgoCD has installed the CRDs (Phase 5). Persisted in `install-state.auto.tfvars`; `false` destroys every `ExternalSecret` |
+| `vpc_cni_network_policy_enabled` | `false` | Set `true` from Phase 6. Turns the VPC CNI network-policy **agent** on; `false` makes every NetworkPolicy in the cluster inert. Persisted in `install-state.auto.tfvars` |
+| `vpc_cni_strict_mode` | `false` | Set `true` from Phase 6, after the kube-system NetworkPolicies are in place (Phase 3). Chooses strict over standard enforcement; only has effect while the agent above is on |
+| `operator_emails` | — | The operators: administrators of every web UI and, with Cognito, who may reach the cluster |
 | `globus_client_id` | — | Globus service account app client ID (no default — must be provided) |
 | `globus_s3_destination_bucket` | — | The data bucket (no default — must be provided) |
 | `kubernetes_version` | `1.35` | Bump for EKS version upgrades |
-| `domain` | — | Base domain for every service hostname (no default — must be provided) |
+| `domain` | — | Base domain for every service hostname, or `null` for port-forward mode (no default — must be provided) |

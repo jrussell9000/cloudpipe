@@ -77,9 +77,9 @@ These settings appear at the top level of the `cloudpipe` master WorkflowTemplat
 | Setting | Value |
 |---|---|
 | `serviceAccountName` | `argo-workflows-runner` |
-| `activeDeadlineSeconds` | `43200` (12 hours max runtime) |
-| `ttlStrategy.secondsAfterCompletion` | `86400` (24 hours before deletion) |
-| `podGC.strategy` | `OnWorkflowCompletion` (pods deleted when workflow finishes) |
+| `activeDeadlineSeconds` | `86400` (24 hours max runtime). Raised from 12h on 2026-08-17: the deadline is wall clock, so a controller outage spends every in-flight workflow's budget at once — that day it failed 107 of 300 workflows for no pipeline reason. A healthy 300-subject batch finishes in ~6h |
+| `ttlStrategy.secondsAfterCompletion` | `14400` (4 hours before deletion). A controller-memory control: the informer caches every retained Workflow, and 24h OOMKilled the controller on 2026-08-19. The cost is a 4h window for per-attempt pod data in `status.nodes`, which the hourly `argo-nodes-snapshot` CronWorkflow exists to cover |
+| `podGC.strategy` | `OnPodSuccess` (a pod is deleted as soon as it succeeds; failed pods stay for debugging) |
 | `podDisruptionBudget.minAvailable` | `100%` (prevents voluntary disruption of workflow pods) |
 | `securityContext` | `runAsUser/Group/fsGroup: 1000` (required for artifact file permissions across containers) |
 | `retryStrategy` | Limit 8, retry on spot interruption (`pod deleted`, `imminent node shutdown`) and exit codes 64/75/143, exponential backoff from 1 min capped at 5 min. The codes are matched in the node **message** as well as in `exitCode`, because an init- or wait-container death never populates `exitCode` (#277). Exit 137 is **not** retried — the budget is for infrastructure churn, not workload failures (see [operations.md](operations.md#retries)) |
@@ -276,7 +276,7 @@ argo submit --from workflowtemplate/functional-preprocessing \
 
 **`functional-preprocessing-session-template`** — **One pod per session**, looping over the session's `(task, run)` pairs (previously one pod per `(session, task, run)`). Downloads from S3 as whole-prefix directory artifacts: the session's `func/` (BOLD + BIDS sidecars + motion params) and `registration/` (bold-to-t1w brain masks and ITK affines, plus the shared t1w-to-mni transforms), along with FastSurfer's `mri/aseg.auto.mgz` (for aCompCor), `surf/` and `_links.json` (for grayordinate extraction) and the MNI template — the last two once per session rather than once per run. Runs `preproc.py` (AFNI) per run and tars each run's output itself. The task is skipped when `func_exists == "true"` for every run; individual complete runs are skipped inside the pod.
 
-Resources: 4 GB RAM (6 GB limit), 3 CPU, 20 GB ephemeral storage (30 GB limit) requested. Node pool: `cpu-heavy-nodepool`. Image: `afni`.
+Resources: 4 GB RAM (6 GB limit), 2 CPU, 20 GB ephemeral storage (30 GB limit) requested. The CPU request was measured down 6 → 3 → 2 (median live pod uses ~1.15 cores; the step is mostly S3 I/O), and the driver derives its thread count from it, so it must stay an integer. Node pool: `cpu-heavy-nodepool`. Image: `afni`.
 
 Output: `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz` → `derivatives/func/{subj}/{ses}/`.
 
@@ -344,7 +344,7 @@ These are injected as environment variables into the `globus-transfer-template` 
 
 The Argo server runs with `--auth-mode=sso --auth-mode=client`:
 
-- **SSO**: UW-Madison NetID via Dex (ArgoCD's Dex instance acts as broker). The `admin_netid` Terraform variable is mapped to the `argo-admin` service account, which has `argo-workflows-admin` ClusterRole.
+- **SSO**: the Amazon Cognito user pool directly by default, or ArgoCD's Dex when the deployment supplies an `external_identity`. The addresses in the `operator_emails` Terraform variable are mapped to the `argo-admin` service account, which has `argo-workflows-admin` ClusterRole.
 - **Client token**: CLI access using a service account token (`kubectl get secret argo-admin.service-account-token -n argo-workflows`). Used by scripts and the `argo` CLI with `--token`.
 
 TLS is terminated at the ALB; the Argo server runs `--secure=false` internally.

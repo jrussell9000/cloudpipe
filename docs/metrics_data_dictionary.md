@@ -52,7 +52,7 @@ above. Two more S3 prefixes exist under `metrics/` that are **not** part of this
 **`export_batch_metrics.py` output file: `func_qc.csv`**
 
 Emitted by `compute_func_qc_summary()` in `images/afni/preproc.py`, at the end of functional
-preprocessing for one BOLD run. Dataclass: `src/metrics/schemas.py:51`.
+preprocessing for one BOLD run. Dataclass: `src/metrics/schemas.py::FuncQC`.
 
 S3 key: `metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json`
 
@@ -240,7 +240,7 @@ Emitted by `images/fastsurfer/extract_qc.py` after FastSurfer parcellation compl
 plain-text `stats/aseg.stats` and `stats/{lh,rh}.aparc.stats` for the volume/morphometry
 fields; the T1w image-quality fields (schema 1.1+) load `mri/orig.mgz`, `mri/brainmask.mgz`,
 and `mri/aseg.auto.mgz` via nibabel/numpy instead. Matches its dataclass exactly
-(`src/metrics/schemas.py:124`) — no drift.
+(`src/metrics/schemas.py::AnatQC`) — no drift.
 
 WM/GM SNR is **not** here. It lives in [`FsqcQC`](#fsqcqc--per-subjectsession) as
 `wm_snr_orig/norm` and `gm_snr_orig/norm`, computed by `fsqc`; join `anat_qc` to `fsqc_qc` on
@@ -362,7 +362,7 @@ below, in one file — filter on that column)
 
 Two independent scripts write to this one prefix under a shared `registration_type`
 discriminator, and **each emits a genuinely different, non-overlapping field set** — the
-dataclass at `src/metrics/schemas.py:348` is a superset of both, padded with each other's
+dataclass at `src/metrics/schemas.py::RegistrationQC` is a superset of both, padded with each other's
 defaults, and its own field defaults (including `schema_version: "1.2"`) do not reflect what
 either live emitter actually writes today. Always filter `registration_qc(registration_type=...)`
 and read the section below for the type you asked for, not the dataclass.
@@ -396,7 +396,7 @@ noisy draws. `lncc - none_lncc` is that jump for any rescued row.
 | `lncc` | float | Mean local normalized cross-correlation in the template brain mask |
 | `mask_dice` | float | Dice between the MNI brain mask and the warped T1w mask; healthy ≈ 0.98. **Only present if `--brainmask` was passed** — absent, not zero, otherwise |
 | `jac_det_min`, `jac_det_max`, `jac_det_mean`, `jac_det_std` | float | Jacobian determinant of the SyN warp, restricted to the template brain mask (schema 2.1+ — not comparable to pre-2.1 whole-field values); `_mean` ≈ 1 for a healthy warp |
-| `jac_det_frac_negative` | float | Fraction of brain voxels with Jacobian det < 0 (folded warp). **Gated: fails above 0.005.** The earlier 0.001 sat *inside* the healthy distribution (10-subject batch: mean 0.0004, sd 0.0002, max 0.0013), so a normal registration tripped it ~17% of the time |
+| `jac_det_frac_negative` | float | Fraction of brain voxels with Jacobian det < 0 (folded warp). **Gated: fails above 0.005.** The earlier 0.001 sat *inside* the healthy distribution (10-subject batch: mean 0.0004, sd 0.0002, max 0.0013), so a normal registration tripped it ~17% of the time. `NULL` (with every other `jac_det_*` / `log_jac_*` field) when no finite determinant fell inside the mask — nothing was measured, and the verdict is `fail`. Before #642 that case wrote `0.0` for all of them and **passed**; `jac_det_min = jac_det_max = jac_det_frac_negative = 0` together is that sentinel's fingerprint in older rows |
 | `log_jac_mean`, `log_jac_std` | float | log(det J) distribution — symmetric about 0 (+0.69 = doubling of local volume, −0.69 = halving), so expansion/compression are directly comparable, unlike raw det J |
 | `log_jac_p01`, `log_jac_p99` | float | 1st/99th percentile of log-Jacobian — robust lower/upper edge |
 | `log_jac_min`, `log_jac_max` | float | Worst single compressing / expanding voxel |
@@ -486,24 +486,26 @@ every current row.
 **`export_batch_metrics.py` output file: `workflow_runs.csv`**
 
 Written by `src/metrics/exit_handler.py` on every `onExit` trigger, including failed and
-errored workflows. Constructed via the dataclass directly (`src/metrics/schemas.py:175`) — no
+errored workflows. Constructed via the dataclass directly (`src/metrics/schemas.py::WorkflowRun`) — no
 drift risk.
 
-S3 key: `metrics/workflow-runs/dt={dt}/{workflow_name}__{subject}_run_summary.json`
+S3 key: `metrics/workflow-runs/dt={dt}/{workflow_name}__{workflow_uid}__{subject}_run_summary.json`
+(`{workflow_name}__{subject}_…` on records without a UID).
 
 | Field | Type | Description |
 |---|---|---|
-| `workflow_name` | str | Argo workflow name, e.g. `cloudpipe-abc12` — join key to `CostAllocation` |
+| `workflow_name` | str | Argo workflow name, e.g. `cloudpipe-abc12` — join key to `CostAllocation`. **Not unique:** Argo reuses names (`generateName` plus five characters, freed when the 4h TTL reaps the workflow) |
+| `workflow_uid` | str \| null | **Schema 1.3+.** The Argo workflow UID — the run's identity (#638). `""` when the writer was not passed one, `NULL` on records written before 2026-10. Join `step_outcomes` / `subject_manifests` on `workflow_uid` when both are non-empty, else on `(workflow_name, subject)` |
 | `subject` | str | Subject ID from workflow parameters |
 | `status` | str | `Succeeded` \| `Failed` \| `Error` |
 | `started_at`, `finished_at` | str | ISO 8601 UTC |
 | `total_duration_s` | int | Wall time, from `workflow.duration` |
-| `pending_duration_s` | float \| null | Seconds from workflow submission (`creationTimestamp`) to the wall-clock time a dedicated `record-workflow-start-dagtask` (no `depends`, starts immediately alongside the real first step) actually ran — queue + node-provision wait. That task writes its own start time to `metrics/workflow-starts/dt={dt}/{workflow_name}.json`, which the exit handler reads back; it isn't threaded through Argo's `workflow.outputs.parameters`, because `argo lint --offline` can't statically resolve that from an `onExit` template even though it works at runtime. **`null` means unmeasured, never a confident `0.0`** (#147): the two source timestamps are treated as equal/inverted whenever they can't be trusted, which is exactly what the pre-#147 wiring bug produced on every record |
+| `pending_duration_s` | float \| null | Seconds from workflow submission (`creationTimestamp`) to the wall-clock time a dedicated `record-workflow-start-dagtask` (no `depends`, starts immediately alongside the real first step) actually ran — queue + node-provision wait. That task writes its own start time to `metrics/workflow-starts/dt={dt}/{workflow_name}__{workflow_uid}.json` (`{workflow_name}.json` before UIDs), which the exit handler reads back; it isn't threaded through Argo's `workflow.outputs.parameters`, because `argo lint --offline` can't statically resolve that from an `onExit` template even though it works at runtime. **`null` means unmeasured, never a confident `0.0`** (#147): the two source timestamps are treated as equal/inverted whenever they can't be trusted, which is exactly what the pre-#147 wiring bug produced on every record |
 | `message` | str | Argo failure message; empty on success. In practice usually empty even on failure — Argo has no `{{tasks.<name>.message}}` DAG variable, see `docs-internal/decisions/` — `failed_step`/`failure_category` are the reliable failure signal, not this field |
 | `failed_step` | str | Canonical name of the first failed step; `""` on success |
 | `failure_category` | str | `infrastructure` \| `algorithm` \| `data` \| `dependency` \| `qc_rejected` \| `unknown` \| `""`; see the `StepOutcome` taxonomy below — it's the same classifier |
 | `batch_label` | str \| null | Free-text era/batch label set at submission (`batch_label` on the queue-manager flow → the `batch-label` workflow parameter), e.g. `"leg-2"`. **Unlabelled is two different values, and this distinction is a query trap:** a schema-1.2 record submitted without a label carries the key as `""`, while every schema-1.1 record — everything written before 2026-09-02 — has **no such key at all** and therefore reads **`NULL`**. So `WHERE batch_label = ''` does *not* mean "unlabelled": at the time of writing it matched 15 rows and missed 3,336. Use `COALESCE(batch_label, '') = ''`, or test `IS NULL` explicitly. Added in schema 1.2 because era was otherwise recoverable only from a timestamp: the pre-leg-1 test batches finished on dates that overlap leg 1, so a `dt`-scoped query silently mixed 548 test rows into leg 1's Aug-18 partition, and separating them required knowing leg 1 began at `2026-08-18T16:54Z`. Filter on this instead going forward — but it is **not** a substitute for `started_at` on historical records, which carry no label to filter on |
-| `schema_version` | str | `"1.2"` (was `"1.1"` before `batch_label`). Both values stay listed in the compacted table's `projection.schema_version.values`: a version absent from that enum returns **zero rows with a SUCCEEDED query**, so narrowing it would silently hide every pre-1.2 record |
+| `schema_version` | str | `"1.3"` (`"1.2"` before `workflow_uid`, `"1.1"` before `batch_label`). Every value stays listed in the compacted table's `projection.schema_version.values`: a version absent from that enum returns **zero rows with a SUCCEEDED query**, so narrowing it would silently hide every older record |
 
 ---
 
@@ -514,21 +516,26 @@ S3 key: `metrics/workflow-runs/dt={dt}/{workflow_name}__{subject}_run_summary.js
 warning below)
 
 Written nightly (02:00 UTC, or on demand) by `src/metrics/kubecost_scraper.py`, one record per
-Argo workflow visible to Kubecost that day. Requires the `subjectid` pod label. Constructed via
-the dataclass (`src/metrics/schemas.py:521`) — no drift risk.
+Argo workflow visible to Kubecost that day. Requires the `subjectid` pod label. Also written by
+`scripts/reconstruct_costs.py` for days Kubecost lost or under-captured — those rows are a
+**model, not an invoice**; see `source` below. Both writers construct the dataclass
+(`src/metrics/schemas.py::CostAllocation`), so every field is present; the table below is
+what drifts, so check it against the class when a schema version moves.
 
 S3 key: `metrics/costs/dt={date}/{date}_{workflow_name}_cost_allocation.json`
 
 | Field | Type | Description |
 |---|---|---|
 | `date` | str | YYYY-MM-DD **scrape date** — the day *after* the workflow ran, since the scraper's default window is "yesterday". Equal to the `dt=` partition value |
-| `workflow_name` | str | Argo workflow name — join key to `WorkflowRun`. Absent on schema-1.0 records (pre-dates this field; query with `union_by_name=true` in DuckDB, Athena tolerates it natively) |
+| `workflow_name` | str | Argo workflow name — join key to `WorkflowRun`. Name-keyed, not UID-keyed, on purpose: Kubecost allocations carry the workflow **name** label, not the UID, and `date` already separates two runs that shared a name on different days. Absent on schema-1.0 records (pre-dates this field; query with `union_by_name=true` in DuckDB, Athena tolerates it natively) |
 | `subject` | str | From the `subjectid` Kubernetes pod label |
 | `total_cost_usd` | float | Total Kubernetes compute cost (USD) |
 | `cpu_cost_usd`, `memory_cost_usd`, `gpu_cost_usd` | float | Cost components |
 | `total_adjustment_usd` | float | **Schema 1.2+.** The portion of `total_cost_usd` that Kubecost's reconciliation against cloud billing (AWS CUR + spot data feed) has already applied for this specific allocation — sum of Kubecost's `cpuCostAdjustment`/`gpuCostAdjustment`/`ramCostAdjustment`/`networkCostAdjustment`/`loadBalancerCostAdjustment`/`pvCostAdjustment`. Absent (NULL, not 0) on schema ≤1.1 records. **Nonzero proves reconciliation has touched this row; zero is ambiguous** — could mean not-yet-reconciled, or reconciled with no correction needed. There is no Kubecost field that disambiguates those two cases directly — see `scrape_age_days` |
 | `scrape_age_days` | int | **Schema 1.2+.** Days between `date` (the report date) and when this record was actually written, i.e. `completed_at`'s date minus `date`. The nightly scraper writes `1` (day+1, Kubecost's least-reconciled point — see `kubecost_drift_probe.py`), and the settled re-scrape overwrites the same key with `3` once that date's reconciliation has converged. `3` is therefore the normal steady-state value and `1` means either a date less than 3 days old or one whose re-scrape never landed; a still-higher value is a manual backfill. This is the field to filter/sort on when comparing two records for the same `(date, workflow_name)` — the one with the larger `scrape_age_days` is the more-reconciled read. Defaults to `1` on schema ≤1.1 records read back today (they predate the field, and were in practice all day+1 scrapes) |
-| `schema_version` | str | `"1.2"` |
+| `source` | str | **Schema 1.3+.** Where this row's dollars come from: `"kubecost"` (scraped from the Allocation API, the normal path) or `"reconstructed"` (rebuilt by `scripts/reconstruct_costs.py` from archived argo-nodes pod durations, priced at per-instance-type rates measured on days Kubecost captured cleanly). NULL on pre-1.3 records, which are all scraped — read it as `COALESCE(source, 'kubecost')`. **A reconstructed row is a model, not an invoice**: any query that sums dollars as billed truth must say which sources it includes |
+| `scraped_total_cost_usd` | float? | **Schema 1.3+.** On a `reconstructed` row, the Kubecost `total_cost_usd` it replaced, kept so the original stays readable without a second row at the same key. NULL when nothing was replaced, and on every `kubecost` row |
+| `schema_version` | str | `"1.3"` (`"1.0"`–`"1.2"` on older records) |
 
 **Grain is one row per workflow per scrape date, not one row per workflow.** A workflow that
 spans the UTC-midnight boundary is scraped on two consecutive days and gets two rows (this is
@@ -591,7 +598,7 @@ auto-detects it, so only `compactor.read_raw_records` needed to learn about the 
 | Field | Type | Description |
 |---|---|---|
 | `date` | str | YYYY-MM-DD report date, same value and meaning as `CostAllocation.date`. Equal to the `dt=` partition value |
-| `workflow_name` | str | Argo workflow name — join key to `WorkflowRun` and to `costs` |
+| `workflow_name` | str | Argo workflow name — join key to `WorkflowRun` and to `costs`. Name-keyed on purpose, like `costs`: Kubecost labels carry the name, not the UID; `date` disambiguates |
 | `pod` | str | Argo pod name |
 | `step` | str | Pipeline component, from the per-template `cloudpipe.io/step` pod label (e.g. `bold-to-t1w`, `bold-preprocessing`, `long-segmentation`, `t1w-to-mni`). **Empty string, not NULL, when a template sets no such label** — such pods are kept so step-level sums always reconcile to the workflow total. A large `''` group means a template is missing its label, not that cost is unattributable |
 | `phase` | str | Coarser grouping from the `cloudpipe.io/phase` pod label (e.g. `functional`) |
@@ -776,14 +783,16 @@ until `scrape_age_days` reaches 3.
 
 Written unconditionally by `src/metrics/outcome_recorder.py` after every substantive pipeline
 step — the finest-grained record in the system. Constructed via the dataclass
-(`src/metrics/schemas.py:220`) — no drift risk.
+(`src/metrics/schemas.py::StepOutcome`) — no drift risk.
 
-S3 key: `metrics/step-outcomes/dt={dt}/{workflow_name}__{step}__{subject}__{session}__{task}__{run}_outcome.json`
-— absent scan dimensions (e.g. `task`/`run` for a subject-level step) use the literal string `"na"`.
+S3 key: `metrics/step-outcomes/dt={dt}/{workflow_name}__{workflow_uid}__{step}__{subject}__{session}__{task}__{run}_outcome.json`
+(no `__{workflow_uid}` on records without a UID) — absent scan dimensions (e.g. `task`/`run`
+for a subject-level step) use the literal string `"na"`.
 
 | Field | Type | Description |
 |---|---|---|
-| `workflow_name` | str | Argo workflow name |
+| `workflow_name` | str | Argo workflow name — **not unique**, Argo reuses names |
+| `workflow_uid` | str \| null | **Schema 1.1+.** The Argo workflow UID — the run's identity (#638). The exit handler gathers a run's outcomes by it, so a reused name cannot pull another run's rows into its manifest. `""`/`NULL` on older records; join on `(workflow_name, subject)` for those |
 | `step` | str | Canonical step name — one of `anatomical-phase`, `session-phase`, `fastsurfer-template`, `fastsurfer-template-parc`, `fastsurfer-long-seg`, `fastsurfer-long-parc`, `t1w-to-mni`, `bold-to-t1w`, `func-preproc`, `surface-sample` |
 | `subject` | str | Subject ID |
 | `session`, `task`, `run` | str | Scan-unit identity, or `"na"` if the step is scoped above that level |
@@ -792,7 +801,7 @@ S3 key: `metrics/step-outcomes/dt={dt}/{workflow_name}__{step}__{subject}__{sess
 | `failure_reason` | str | Raw Argo failure message, when available |
 | `upstream_failed_step` | str | The step whose failure caused this one to be skipped, if `status="skipped"` — `bold-to-t1w` for a QC-gated run, or `registration` when `preproc.py`'s own pre-flight check found the missing input (exit 66) |
 | `outputs_verified` | list[str] | S3 keys the recorder confirmed actually exist, not just that the step reported success |
-| `schema_version` | str | `"1.0"` |
+| `schema_version` | str | `"1.1"` (`"1.0"` before `workflow_uid`) |
 | `recorded_at` | str | ISO 8601 UTC — note this field is named `recorded_at`, not `completed_at`, on this one table |
 
 **Failure taxonomy** (`outcome_recorder.classify_failure`, pattern-matched against the Argo
@@ -825,19 +834,21 @@ relabelled.
 **Not exported by `export_batch_metrics.py`** — query via `CloudpipeMetrics` directly.
 
 Written by `src/metrics/exit_handler.py` at workflow exit, assembled from every `StepOutcome`
-emitted during that run. Constructed via the dataclass (`src/metrics/schemas.py:298`) — no
+emitted during that run. Constructed via the dataclass (`src/metrics/schemas.py::SubjectManifest`) — no
 drift risk.
 
-S3 key: `metrics/subject-manifests/dt={dt}/{workflow_name}__{subject}_manifest.json`
+S3 key: `metrics/subject-manifests/dt={dt}/{workflow_name}__{workflow_uid}__{subject}_manifest.json`
+(`{workflow_name}__{subject}_…` on records without a UID).
 
 | Field | Type | Description |
 |---|---|---|
-| `workflow_name`, `subject` | str | Identity |
-| `overall_status` | str | `succeeded` \| `partial` \| `failed` — `partial` is the correct, non-error outcome for e.g. a subject with no functional scans in one session; it is not itself a failure signal |
+| `workflow_name`, `subject` | str | Identity — but the name alone is not unique; Argo reuses names |
+| `workflow_uid` | str \| null | **Schema 1.1+.** The Argo workflow UID (#638). `""`/`NULL` on older records |
+| `overall_status` | str | `succeeded` \| `partial` \| `failed` — `partial` is the correct, non-error outcome for e.g. a subject with no functional scans in one session; it is not itself a failure signal. `succeeded` requires Argo to report the workflow `Succeeded`: a workflow that ended `Failed`/`Error` is `failed` when no step recorded an outcome, `partial` otherwise — even if every recorded step succeeded, since the failing step may have left no record. Join `workflow_runs.status` to tell a failed workflow's `partial` from a clean one |
 | `steps` | list[`StepSummary`] | One entry per step this workflow ran — see below |
 | `outputs_available` | list[str] | Union of `outputs_verified` from every succeeded step |
 | `failed_steps`, `skipped_steps` | list[str] | Canonical step names |
-| `schema_version` | str | `"1.0"` |
+| `schema_version` | str | `"1.1"` (`"1.0"` before `workflow_uid`) |
 
 **`StepSummary`** (nested, one per list entry in `steps`): `step`, `session`, `task`, `run`,
 `status`, `failure_category`, `failure_reason` — same meaning as the identically-named

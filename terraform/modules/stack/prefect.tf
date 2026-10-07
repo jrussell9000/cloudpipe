@@ -6,17 +6,16 @@ module "prefect" {
   source = "../prefect"
 
   # Cluster / network
-  cluster_name           = var.name
-  vpc_id                 = module.vpc.vpc_id
-  vpc_cidr               = var.vpc_cidr
-  public_subnets         = module.vpc.public_subnets
-  region                 = var.region
-  inbound_prefix_list_id = var.uwmadison_prefix_list_id
-  nat_gateway_ip         = module.vpc.nat_public_ips[0]
+  cluster_name   = var.name
+  vpc_id         = module.vpc.vpc_id
+  vpc_cidr       = var.vpc_cidr
+  public_subnets = module.vpc.public_subnets
+  region         = var.region
 
-  # DNS / TLS
-  route53_zone_name = data.aws_route53_zone.brc.name
-  certificate_arn   = aws_acm_certificate.primary_regional.arn
+  # UI access
+  publish_ui      = local.publish_uis
+  ui_host         = local.prefect_url
+  certificate_arn = one(aws_acm_certificate.primary_regional[*].arn)
 
   # Prefect config
   namespace = var.prefect_namespace
@@ -25,6 +24,9 @@ module "prefect" {
   # kubecost-cost-scraper flow runs on the Prefect worker and writes here.
   metrics_bucket = aws_s3_bucket.metrics.id
   work_pool      = var.prefect_work_pool
+
+  # The batch gate starts the Globus host before listing through it (#652).
+  globus_instance_arn = "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/${module.globus.instance_id}"
 
   # Shared internal UI ALB (ui_alb.tf)
   alb_group_annotations = local.ui_alb_group_annotations
@@ -37,7 +39,8 @@ module "prefect" {
 }
 
 # ------------------------------------------------------------------------------
-# Prefect oauth2-proxy — credentials for the proxy to authenticate against Dex
+# Prefect oauth2-proxy — credentials for the proxy to authenticate against its
+# issuer: the Cognito pool, or Dex in external mode (local.ui_oidc_*, cognito.tf)
 # ------------------------------------------------------------------------------
 resource "random_password" "prefect_oauth2_proxy_cookie" {
   length  = 32
@@ -50,8 +53,8 @@ resource "kubernetes_secret_v1" "prefect_oauth2_proxy" {
     namespace = var.prefect_namespace
   }
   data = {
-    client-id     = "prefect"
-    client-secret = random_password.prefect_dex_client.result
+    client-id     = local.ui_oidc_client_ids["prefect"]
+    client-secret = local.ui_oidc_client_secrets["prefect"]
     cookie-secret = random_password.prefect_oauth2_proxy_cookie.result
   }
   depends_on = [module.prefect]

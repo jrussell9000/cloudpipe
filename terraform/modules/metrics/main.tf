@@ -784,11 +784,11 @@ resource "aws_glue_catalog_table" "workflow_runs_compacted" {
 
   parameters = merge(local.compacted_partition_projection.workflow_runs, {
     "classification" = "parquet"
-    # 1.2 adds batch_label. Both versions stay listed: a value absent from this
-    # enum is not an error, it silently returns zero rows, so dropping 1.1 would
-    # make every record written before 2026-09-02 vanish from the compacted table
-    # with a SUCCEEDED query.
-    "projection.schema_version.values" = "1.1,1.2"
+    # 1.2 adds batch_label, 1.3 workflow_uid (#638). Every version stays listed:
+    # a value absent from this enum is not an error, it silently returns zero
+    # rows, so dropping 1.1 would make every record written before 2026-09-02
+    # vanish from the compacted table with a SUCCEEDED query.
+    "projection.schema_version.values" = "1.1,1.2,1.3"
   })
 
   partition_keys {
@@ -811,6 +811,10 @@ resource "aws_glue_catalog_table" "workflow_runs_compacted" {
 
     columns {
       name = "workflow_name"
+      type = "string"
+    }
+    columns {
+      name = "workflow_uid"
       type = "string"
     }
     columns {
@@ -871,8 +875,10 @@ resource "aws_glue_catalog_table" "step_outcomes_compacted" {
   table_type = "EXTERNAL_TABLE"
 
   parameters = merge(local.compacted_partition_projection.step_outcomes, {
-    "classification"                   = "parquet"
-    "projection.schema_version.values" = "1.0"
+    "classification" = "parquet"
+    # 1.1 adds workflow_uid (#638). Keep every version: one missing from this
+    # enum returns zero rows with a SUCCEEDED query.
+    "projection.schema_version.values" = "1.0,1.1"
   })
 
   partition_keys {
@@ -895,6 +901,10 @@ resource "aws_glue_catalog_table" "step_outcomes_compacted" {
 
     columns {
       name = "workflow_name"
+      type = "string"
+    }
+    columns {
+      name = "workflow_uid"
       type = "string"
     }
     columns {
@@ -955,8 +965,10 @@ resource "aws_glue_catalog_table" "subject_manifests_compacted" {
   table_type = "EXTERNAL_TABLE"
 
   parameters = merge(local.compacted_partition_projection.subject_manifests, {
-    "classification"                   = "parquet"
-    "projection.schema_version.values" = "1.0"
+    "classification" = "parquet"
+    # 1.1 adds workflow_uid (#638). Keep every version: one missing from this
+    # enum returns zero rows with a SUCCEEDED query.
+    "projection.schema_version.values" = "1.0,1.1"
   })
 
   partition_keys {
@@ -979,6 +991,10 @@ resource "aws_glue_catalog_table" "subject_manifests_compacted" {
 
     columns {
       name = "workflow_name"
+      type = "string"
+    }
+    columns {
+      name = "workflow_uid"
       type = "string"
     }
     columns {
@@ -2137,13 +2153,17 @@ resource "aws_glue_catalog_table" "step_outcomes" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "failure_category,failure_reason,outputs_verified,pipeline,recorded_at,run,schema_version,session,status,step,subject,task,upstream_failed_step,workflow_name"
+        paths                   = "failure_category,failure_reason,outputs_verified,pipeline,recorded_at,run,schema_version,session,status,step,subject,task,upstream_failed_step,workflow_name,workflow_uid"
         "ignore.malformed.json" = "true"
       }
     }
 
     columns {
       name = "workflow_name"
+      type = "string"
+    }
+    columns {
+      name = "workflow_uid"
       type = "string"
     }
     columns {
@@ -2227,13 +2247,17 @@ resource "aws_glue_catalog_table" "subject_manifests" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "completed_at,failed_steps,overall_status,outputs_available,pipeline,schema_version,skipped_steps,steps,subject,workflow_name"
+        paths                   = "completed_at,failed_steps,overall_status,outputs_available,pipeline,schema_version,skipped_steps,steps,subject,workflow_name,workflow_uid"
         "ignore.malformed.json" = "true"
       }
     }
 
     columns {
       name = "workflow_name"
+      type = "string"
+    }
+    columns {
+      name = "workflow_uid"
       type = "string"
     }
     columns {
@@ -2968,13 +2992,17 @@ resource "aws_glue_catalog_table" "workflow_runs" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "batch_label,completed_at,failed_step,failure_category,finished_at,message,pending_duration_s,pipeline,schema_version,started_at,status,subject,total_duration_s,workflow_name"
+        paths                   = "batch_label,completed_at,failed_step,failure_category,finished_at,message,pending_duration_s,pipeline,schema_version,started_at,status,subject,total_duration_s,workflow_name,workflow_uid"
         "ignore.malformed.json" = "true"
       }
     }
 
     columns {
       name = "workflow_name"
+      type = "string"
+    }
+    columns {
+      name = "workflow_uid"
       type = "string"
     }
     columns {

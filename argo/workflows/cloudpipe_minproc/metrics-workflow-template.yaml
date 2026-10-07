@@ -12,7 +12,7 @@ spec:
   ###########################################################################
   # Workflow exit handler — runs after every cloudpipe workflow (success or
   # failure) via onExit.  Writes a WorkflowRun JSON to
-  # s3://{metrics-bucket}/metrics/workflow-runs/dt={date}/{workflow-name}__{subject}_run_summary.json.
+  # s3://{metrics-bucket}/metrics/workflow-runs/dt={date}/{workflow-name}__{workflow-uid}__{subject}_run_summary.json.
   ###########################################################################
 
   - name: workflow-exit-handler
@@ -23,6 +23,11 @@ spec:
     inputs:
       parameters:
         - name: workflow-name
+        # {{workflow.uid}}. Argo reuses names; the UID is what keeps this run's
+        # step outcomes and start marker apart from another run's under the same
+        # name (#638). Defaulted like batch-label, for the same reason.
+        - name: workflow-uid
+          value: ''
         - name: subject
         - name: status
         - name: started-at
@@ -40,7 +45,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:e319537e801a2f0dd2c64731322eb0e9d6f9e6f8e4b5f1641c24f6cdcc6e0c70"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:b90721d0274cdad5632a0f5cbc52a7c442b37d32d3e6865ebab43c32f11a166a"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -52,6 +57,8 @@ spec:
       args:
         - --workflow-name
         - '{{inputs.parameters.workflow-name}}'
+        - --workflow-uid
+        - '{{inputs.parameters.workflow-uid}}'
         - --subject
         - '{{inputs.parameters.subject}}'
         - --status
@@ -69,7 +76,7 @@ spec:
 
   ###########################################################################
   # Records the wall-clock time the DAG began running, into
-  # s3://{metrics-bucket}/metrics/workflow-starts/dt={date}/{workflow-name}.json.
+  # s3://{metrics-bucket}/metrics/workflow-starts/dt={date}/{workflow-name}__{workflow-uid}.json.
   # A separate, no-`depends` DAG task (not threaded through Argo's
   # workflow.outputs.parameters) so the exit handler can read it back from S3
   # without depending on a global-output pattern that argo lint --offline
@@ -84,13 +91,16 @@ spec:
     inputs:
       parameters:
         - name: workflow-name
+        # {{workflow.uid}} — see workflow-exit-handler above (#638).
+        - name: workflow-uid
+          value: ''
         - name: metrics-bucket
 
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:e319537e801a2f0dd2c64731322eb0e9d6f9e6f8e4b5f1641c24f6cdcc6e0c70"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:b90721d0274cdad5632a0f5cbc52a7c442b37d32d3e6865ebab43c32f11a166a"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -102,5 +112,7 @@ spec:
       args:
         - --workflow-name
         - '{{inputs.parameters.workflow-name}}'
+        - --workflow-uid
+        - '{{inputs.parameters.workflow-uid}}'
         - --metrics-bucket
         - '{{inputs.parameters.metrics-bucket}}'

@@ -14,6 +14,17 @@ resource "helm_release" "argocd" {
   wait          = true
   wait_for_jobs = true # wait for argocd-redis-secret-init Job to complete
 
+  lifecycle {
+    # An external identity provider reaches Argo Workflows, Prefect and Grafana
+    # through Dex, whose issuer is ArgoCD's URL. Without a domain that URL is
+    # localhost, which inside those UIs' pods is the pod itself, so their SSO
+    # cannot work (design D4, open question 8). Cognito mode has no such limit.
+    precondition {
+      condition     = local.use_cognito || local.publish_uis
+      error_message = "external_identity needs a domain: without one, Dex's issuer is http://localhost:8080/api/dex, which the Argo Workflows, Prefect and Grafana pods cannot reach. Set domain, or leave external_identity null to use the Cognito user pool."
+    }
+  }
+
   values = [
     <<-EOT
     global:
@@ -31,47 +42,66 @@ resource "helm_release" "argocd" {
       params:
         reposerver.enable.git.submodule: "false"
       cm:
-        url: "https://${local.argocd_url}"
+        url: "${local.ui_base_urls["argocd"]}"
         dex.config: |
           connectors:
             - type: oidc
-              id: uwmadison
-              name: UW-Madison NetID
+              id: ${local.dex_connector.id}
+              name: ${local.dex_connector.name}
               config:
-                issuer: ${var.institution_oidc_issuer}
-                clientID: "${jsondecode(data.aws_secretsmanager_secret_version.argocd_dex_oidc.secret_string)["clientID"]}"
-                clientSecret: "${jsondecode(data.aws_secretsmanager_secret_version.argocd_dex_oidc.secret_string)["clientSecret"]}"
-                redirectURI: "https://${local.argocd_url}/api/dex/callback"
+                issuer: ${local.dex_connector.issuer}
+                clientID: "${local.dex_connector.client_id}"
+                clientSecret: "${local.dex_connector.client_secret}"
+                redirectURI: "${local.ui_base_urls["argocd"]}/api/dex/callback"
                 scopes:
                   - openid
                   - profile
                   - email
-                getUserInfo: true
+                getUserInfo: ${local.dex_connector.get_user_info}
                 userNameKey: email
-                insecureSkipEmailVerified: true
+                insecureSkipEmailVerified: ${local.dex_connector.insecure_skip_email_verified}
           staticClients:
             - id: argo-workflows
               name: Argo Workflows
               redirectURIs:
-                - "https://${local.argo_url}/oauth2/callback"
+                - "${local.ui_base_urls["argo"]}/oauth2/callback"
               secret: $argo-workflows-dex-client:clientSecret
             - id: prefect
               name: Prefect
               redirectURIs:
-                - "https://${local.prefect_url}/oauth2/callback"
+                - "${local.ui_base_urls["prefect"]}/oauth2/callback"
               secret: $prefect-dex-client:clientSecret
             - id: grafana
               name: Grafana
               redirectURIs:
-                - "https://${local.grafana_url}/login/generic_oauth"
+                - "${local.ui_base_urls["grafana"]}/login/generic_oauth"
               secret: $grafana-dex-client:clientSecret
       rbac:
-        policy.default: role:readonly
-        policy.csv: |
-          g, ${var.admin_netid}, role:admin
+        ${indent(4, local.argocd_rbac_values)}
     EOT
   ]
 }
+
+locals {
+  # ArgoCD's RBAC settings, built as text because the policy has one line per
+  # operator.
+  #
+  # Subjects are the operators' emails, in both identity modes. With a Dex
+  # connector, ArgoCD 3 otherwise matches on the upstream user ID — an opaque
+  # `sub` for Cognito, and a provider-specific username for any other — so
+  # `email` is added to the claims ArgoCD matches policy subjects against.
+  argocd_rbac_values = join("\n", concat(
+    ["scopes: \"[groups, email]\"", "policy.default: role:readonly", "policy.csv: |"],
+    [for email in local.admin_emails : "  g, ${email}, role:admin"],
+  ))
+}
+
+# Dex's three static clients below, and their secrets, serve external mode. In
+# Cognito mode those UIs are the pool's own clients (cognito.tf) and the static
+# clients go unused: registered, but no UI is configured to use them. Removing
+# them in that mode would put template directives in the heredoc above for no
+# gain — a static client is usable only with its secret, which only these
+# Secrets hold.
 
 # ------------------------------------------------------------------------------
 # Argo Workflows Dex static client secret
@@ -145,14 +175,9 @@ resource "kubernetes_secret_v1" "grafana_dex_client" {
   depends_on = [helm_release.argocd]
 }
 
-# ------------------------------------------------------------------------------
-# ArgoCD Dex OIDC credentials (UW-Madison NetID)
-# Stored in Secrets Manager at cloudpipe/argocd-dex-oidc as
-# {"clientID":"...","clientSecret":"..."}
-# ------------------------------------------------------------------------------
-data "aws_secretsmanager_secret_version" "argocd_dex_oidc" {
-  secret_id = "cloudpipe/argocd-dex-oidc"
-}
+# Dex's own OIDC client credentials are not read here. They come from
+# local.dex_connector (cognito.tf): the Cognito app client this module creates,
+# or whatever the caller supplies through var.external_identity (design D6).
 
 # ------------------------------------------------------------------------------
 # ArgoCD Repository Credentials
@@ -183,91 +208,6 @@ resource "kubernetes_secret_v1" "argocd_repo" {
   }
 
   depends_on = [helm_release.argocd]
-}
-
-# ------------------------------------------------------------------------------
-# ArgoCD ALB Security Group — UNUSED since ArgoCD joined the shared internal
-# `cloudpipe-ui` ALB (ui_alb.tf). Kept only so plan 012 §5's rollback can
-# recreate the per-app ALB; removed in plan 012 §3.4, once no old ALB remains.
-# The Argo Workflows, Prefect and Kubecost modules' `lb` SGs are in the same
-# state.
-#
-# inbound-cidrs does not accept prefix list IDs — use a security group with the
-# prefix list as an ingress rule and reference it via the security-groups annotation.
-# ------------------------------------------------------------------------------
-resource "aws_security_group" "argocd_lb" {
-  name_prefix = "argocd-alb-"
-  description = "Controls inbound access to the ArgoCD ALB."
-  vpc_id      = module.vpc.vpc_id
-}
-
-resource "aws_vpc_security_group_ingress_rule" "argocd_lb_https" {
-  security_group_id = aws_security_group.argocd_lb.id
-  description       = "HTTPS from UW Madison prefix list"
-  prefix_list_id    = var.uwmadison_prefix_list_id
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-resource "aws_vpc_security_group_ingress_rule" "argocd_lb_https_nat" {
-  security_group_id = aws_security_group.argocd_lb.id
-  description       = "HTTPS from VPC NAT gateway (allows in-cluster pods to reach Dex for SSO)"
-  cidr_ipv4         = "${module.vpc.nat_public_ips[0]}/32"
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-resource "aws_vpc_security_group_ingress_rule" "argocd_lb_http" {
-  security_group_id = aws_security_group.argocd_lb.id
-  description       = "HTTP from UW Madison prefix list (redirected to HTTPS)"
-  prefix_list_id    = var.uwmadison_prefix_list_id
-  from_port         = 80
-  ip_protocol       = "tcp"
-  to_port           = 80
-}
-
-# Allow access via the AWS Client VPN too (source-NATs to the VPC CIDR, same
-# as the EKS API server rule below) — lets a single VPN connection reach both
-# the cluster API and this ALB, without also requiring the UW-Madison VPN.
-resource "aws_vpc_security_group_ingress_rule" "argocd_lb_https_client_vpn" {
-  security_group_id = aws_security_group.argocd_lb.id
-  description       = "HTTPS from AWS Client VPN (source-NATs to VPC CIDR)"
-  cidr_ipv4         = var.vpc_cidr
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-resource "aws_vpc_security_group_ingress_rule" "argocd_lb_http_client_vpn" {
-  security_group_id = aws_security_group.argocd_lb.id
-  description       = "HTTP from AWS Client VPN (redirected to HTTPS)"
-  cidr_ipv4         = var.vpc_cidr
-  from_port         = 80
-  ip_protocol       = "tcp"
-  to_port           = 80
-}
-
-# The Client VPN CIDR rule above (and argocd_lb_https_nat, for Dex SSO) only
-# cover traffic to VPC-internal destinations. Traffic from a full-tunnel VPN
-# client to this ALB's *public* IP instead hairpins out through the VPC's NAT
-# gateway and back in over the internet, presenting the NAT gateway's EIP as
-# the source — argocd_lb_https_nat already trusts it for 443; HTTP needs the
-# same treatment.
-resource "aws_vpc_security_group_ingress_rule" "argocd_lb_http_nat" {
-  security_group_id = aws_security_group.argocd_lb.id
-  description       = "HTTP from VPC NAT gateway (redirected to HTTPS)"
-  cidr_ipv4         = "${module.vpc.nat_public_ips[0]}/32"
-  from_port         = 80
-  ip_protocol       = "tcp"
-  to_port           = 80
-}
-
-resource "aws_vpc_security_group_egress_rule" "argocd_lb" {
-  security_group_id = aws_security_group.argocd_lb.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
 }
 
 # ------------------------------------------------------------------------------
@@ -319,13 +259,17 @@ locals {
   grafana_sets_waf_annotation = can(local.grafana_ingress_annotations["alb.ingress.kubernetes.io/wafv2-acl-arn"])
 }
 
+# Published mode only — see local.publish_uis (locals.tf). In port-forward mode
+# there is no ALB to join and operators reach ArgoCD on localhost:8080.
 resource "kubernetes_ingress_v1" "argocd_ingress" {
+  count = local.publish_uis ? 1 : 0
+
   metadata {
     name      = "argocd-ingress"
     namespace = "argocd"
     annotations = merge(local.ui_alb_group_annotations, {
       # Create a Route53 alias record automatically via external-dns
-      "external-dns.alpha.kubernetes.io/hostname" = "argocd.${data.aws_route53_zone.brc.name}"
+      "external-dns.alpha.kubernetes.io/hostname" = "argocd.${data.aws_route53_zone.brc[0].name}"
 
       # WAFv2 association for the whole shared ALB (waf.tf) — Security Hub
       # ELB.16. This carries ON THIS INGRESS ALONE, unlike every other
@@ -347,10 +291,10 @@ resource "kubernetes_ingress_v1" "argocd_ingress" {
       # rather than being silently dropped. What would break the group is a
       # SECOND member specifying a different value, so the precondition below
       # fails the plan if Grafana's values.yaml ever grows this key.
-      "alb.ingress.kubernetes.io/wafv2-acl-arn" = aws_wafv2_web_acl.ui_alb.arn
+      "alb.ingress.kubernetes.io/wafv2-acl-arn" = aws_wafv2_web_acl.ui_alb[0].arn
 
       "alb.ingress.kubernetes.io/target-type"     = "ip"
-      "alb.ingress.kubernetes.io/certificate-arn" = aws_acm_certificate.primary_regional.arn
+      "alb.ingress.kubernetes.io/certificate-arn" = aws_acm_certificate.primary_regional[0].arn
 
       # Backend Protocol is HTTP because we terminate tls at the load balancer
       # (therefore we passed --insecure to the argocd-server)
@@ -381,7 +325,7 @@ resource "kubernetes_ingress_v1" "argocd_ingress" {
   spec {
     ingress_class_name = "alb"
     rule {
-      host = "argocd.${data.aws_route53_zone.brc.name}"
+      host = "argocd.${data.aws_route53_zone.brc[0].name}"
       http {
         path {
           backend {
@@ -425,6 +369,9 @@ locals {
   # An app reads its entry only if gitops/bootstrap/root-app.yaml.tftpl has a
   # branch for it. Adding a key here on its own does nothing.
   argocd_app_overrides = {
+    # Read in published mode only. In port-forward mode the ApplicationSet
+    # excludes gitops/apps/external-dns (root-app.yaml.tftpl), so this entry,
+    # whose domainFilters would be [null], reaches no Application.
     "external-dns" = {
       "external-dns" = {
         domainFilters = [var.domain]
@@ -455,10 +402,14 @@ locals {
 
     # Prefect's hostname reaches the browser twice, for two different consumers.
     # prefectUiApiUrl is the URL the loaded UI calls for its API, so it has to be
-    # the public ALB hostname rather than the in-cluster Service. redirect-url has
-    # to match the callback this same file registers with Dex under the `prefect`
-    # static client — the two disagreeing is an SSO failure with no manifest diff
-    # to see it in. The issuer is ArgoCD's hostname because Dex runs inside ArgoCD.
+    # where the browser reaches Prefect — the ALB hostname, or localhost:4200 in
+    # port-forward mode — rather than the in-cluster Service. redirect-url has
+    # to match the callback registered for the `prefect` client — the Dex static
+    # client above, or the Cognito client of that name (cognito.tf), which
+    # registers the same URL — and the two disagreeing is an SSO failure with no
+    # manifest diff to see it in. The issuer is the pool in Cognito mode and Dex
+    # in external mode (local.ui_oidc_issuer); oauth2-proxy discovers the rest
+    # from it, from inside its pod.
     #
     # emailDomains is the one value in this whole map whose upstream default is
     # permissive rather than empty: the oauth2-proxy chart ships ["*"], so a render
@@ -468,17 +419,17 @@ locals {
       "prefect-server" = {
         server = {
           uiConfig = {
-            prefectUiApiUrl = "https://${local.prefect_url}/api"
+            prefectUiApiUrl = "${local.ui_base_urls["prefect"]}/api"
           }
         }
       }
       "oauth2-proxy" = {
         config = {
-          emailDomains = [var.institution_domain]
+          emailDomains = local.admin_email_domains
         }
         extraArgs = {
-          "oidc-issuer-url" = "https://${local.argocd_url}/api/dex"
-          "redirect-url"    = "https://${local.prefect_url}/oauth2/callback"
+          "oidc-issuer-url" = local.ui_oidc_issuer
+          "redirect-url"    = "${local.ui_base_urls["prefect"]}/oauth2/callback"
         }
       }
     }
@@ -489,11 +440,18 @@ locals {
     # kubernetes_ingress_v1.argocd_ingress above read this entry merged over that
     # file, because from here on either source can carry an ALB annotation.
     #
-    # root_url and the Dex endpoints in grafana.ini are NOT here: they come from
-    # the grafana-oidc-config ConfigMap (terraform/modules/stack/grafana.tf) through the chart's
-    # envValueFrom, and Grafana expands them with $__env{DOMAIN}. Only
-    # allowed_domains needs the override, because it is read once at config parse
-    # and names who may sign in rather than where the service lives.
+    # In port-forward mode there is no ALB to join, so the ingress is off, and
+    # its hostname-bearing values are empty rather than a `null` that yamlencode
+    # would render into a host rule. The annotation map stays a literal with an
+    # empty value, not a conditional map: Helm merges it key by key either way,
+    # and tests/test_argocd_app_overrides.py reads its keys from the text (task 3.2 of
+    # openspec/changes/optional-domain-and-cognito-auth).
+    #
+    # root_url is the URL a browser reaches Grafana at, in either mode — https
+    # under the domain, or http://localhost:3000 — which is why it is here and not
+    # built from a bare domain in values.yaml, which could not switch scheme.
+    # Grafana builds its OAuth redirect from it, so it has to agree with the
+    # callback the `grafana` client registers.
     #
     # The whole `datasources` map is here for one value in it — defaultRegion.
     # Helm replaces lists instead of merging them, and the datasources are a list,
@@ -504,10 +462,11 @@ locals {
     "grafana" = {
       "grafana" = {
         ingress = {
+          enabled = local.publish_uis
           annotations = {
-            "external-dns.alpha.kubernetes.io/hostname" = local.grafana_url
+            "external-dns.alpha.kubernetes.io/hostname" = local.publish_uis ? local.grafana_url : ""
           }
-          hosts = [local.grafana_url]
+          hosts = local.publish_uis ? [local.grafana_url] : []
         }
 
         datasources = {
@@ -542,9 +501,27 @@ locals {
           }
         }
 
+        # Grafana's SSO, which differs by identity mode (local.ui_oidc_*,
+        # cognito.tf): the Cognito pool's endpoints and its `grafana` client in
+        # Cognito mode, Dex's routes and its `grafana` static client in external
+        # mode. generic_oauth takes the three endpoints separately rather than
+        # discovering them, and calls the token and userinfo ones from inside the
+        # pod, which is why Cognito mode does not route Grafana through Dex.
+        #
+        # role_attribute_path grants Grafana's Admin role to the administrators
+        # and Viewer to everyone else the SSO lets in — a JMESPath list literal,
+        # because Cognito mode has several.
         "grafana.ini" = {
+          server = {
+            root_url = local.ui_base_urls["grafana"]
+          }
           "auth.generic_oauth" = {
-            allowed_domains = var.institution_domain
+            client_id           = local.ui_oidc_client_ids["grafana"]
+            auth_url            = local.ui_oidc_authorize_url
+            token_url           = local.ui_oidc_token_url
+            api_url             = local.ui_oidc_userinfo_url
+            allowed_domains     = join(" ", local.admin_email_domains)
+            role_attribute_path = "contains(`${jsonencode(local.admin_emails)}`, email) && 'Admin' || 'Viewer'"
           }
         }
       }
@@ -562,6 +539,7 @@ resource "kubectl_manifest" "argocd_root_app" {
     repo_url      = var.gitops_repo_url
     revision      = var.gitops_revision
     app_overrides = local.argocd_app_overrides
+    publish_uis   = local.publish_uis
   })
 
   # Ensure ArgoCD is fully installed before trying to create the Application CRD

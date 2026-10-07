@@ -3,8 +3,9 @@
 `gpu-nodepool` is spot-only in a region where G-family capacity is thin. Over
 2026-09-03 → 09-10, 97% of GPU NodeClaims died on `insufficient_capacity`, and
 twice that week the fleet sat at 0–5 nodes with 80–350 GPU pods Pending for hours
-(docs/investigations/2026-09-10-gpu-spot-acquisition-review.md). `cpu-heavy-nodepool`
-launched 1,072 nodes in the same window without a single acquisition failure.
+(docs-internal/investigations/2026-09-10-gpu-spot-acquisition-review.md).
+`cpu-heavy-nodepool` launched 1,072 nodes in the same window without a single
+acquisition failure.
 
 FastSurfer segmentation is the bulk of that GPU demand and runs on CPU with
 `--device cpu`. This module decides, per submission, whether a new workflow carries

@@ -2,8 +2,14 @@
 # Kubernetes NetworkPolicy — argo-workflows namespace
 # NIST 800-171 H4: SC-7 Boundary Protection
 #
-# Default-deny with explicit allow rules. Requires the VPC CNI Network Policy
-# Controller addon (enableNetworkPolicy = "true"), which is already set in eks.tf.
+# Default-deny with explicit allow rules. These objects do NOTHING on their own:
+# they are enforced only while the VPC CNI network-policy agent is on, which
+# modules/stack/eks.tf gates on `vpc_cni_network_policy_enabled` (strict vs
+# standard is the separate `vpc_cni_strict_mode`). Both are persisted in
+# terraform/install-state.auto.tfvars by install.sh Phase 6; with the agent off
+# every policy here is inert and nothing reports it. That was issue #635 —
+# `kubectl get networkpolicy` looks identical either way, so check the add-on:
+#   kubectl -n kube-system get ds aws-node -o jsonpath='{..args}' | rg network-policy
 ################################################################################
 
 # Default deny all ingress and egress traffic.

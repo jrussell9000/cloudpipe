@@ -61,6 +61,7 @@ from registration_qc import (
     centroid_displacement_mm,
     dice,
     jacobian_stats,
+    json_safe,
     lncc,
     verdict,
 )
@@ -398,7 +399,7 @@ def finalize_outputs(staging, out_dir, qc, required_paths, metrics_path=None):
     # Observability outputs (from the in-memory qc dict, not from out_dir) — emitted
     # before promotion so they upload even when the verdict is 'fail'.
     if metrics_path is not None:
-        Path(metrics_path).write_text(json.dumps(qc))
+        Path(metrics_path).write_text(json.dumps(json_safe(qc)))
         log.info(f'Registration QC metrics: {metrics_path}')
 
     if qc['verdict'] == 'fail':
@@ -806,7 +807,7 @@ def main():
         )
 
     with open(qc_path, 'w') as fh:
-        json.dump(qc, fh)
+        json.dump(json_safe(qc), fh)
 
     # Emit observability outputs, then promote staging -> out_dir ONLY if QC did not
     # fail. On a 'fail' verdict this exits 65 BEFORE promoting, so no completion marker

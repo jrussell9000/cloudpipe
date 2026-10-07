@@ -64,7 +64,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:e319537e801a2f0dd2c64731322eb0e9d6f9e6f8e4b5f1641c24f6cdcc6e0c70"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:b90721d0274cdad5632a0f5cbc52a7c442b37d32d3e6865ebab43c32f11a166a"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -83,6 +83,9 @@ spec:
       args:
         - --workflow-name
         - '{{workflow.name}}'
+        # Argo reuses names; the UID keys the record (#638).
+        - --workflow-uid
+        - '{{workflow.uid}}'
         - --step
         - '{{inputs.parameters.step}}'
         # Always passed — Argo cannot conditionally omit an arg, so the empty

@@ -160,6 +160,10 @@ COPY images/afni/preproc.py images/afni/surf_geometry.py ./
 # python (3.14) with nothing installed. Its own test asserts that property.
 COPY images/shared/restore_links.py /app/restore_links.py
 
+# The StepOutcome taxonomy and writer the func-preproc driver records with
+# (#646). Standard-library only, same as restore_links.py.
+COPY images/shared/step_outcome.py /app/step_outcome.py
+
 RUN echo "python preproc.py" >> /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

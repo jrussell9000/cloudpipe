@@ -252,7 +252,7 @@ spec:
       # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
       # rewrites this to sha-<commit> once the first build lands, and only after
       # confirming that tag actually reached the registry.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:8c9cb9ed6dbd6dc9179507509f846f66fe61b3ec1c2af1ed8017005c93fd86bc"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:bdf24c02c1f28449bdc8d65ca1d7d927b2623434ee7a59c32c892eef3bb080d7"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -303,6 +303,8 @@ spec:
         AREA_MODE = "{{inputs.parameters.area-mode}}"
         TARGET_ROI = "{{inputs.parameters.target-roi}}"
         WORKFLOW_NAME = "{{workflow.name}}"
+        # Argo reuses names; the UID is what keeps this run's records apart (#638).
+        WORKFLOW_UID = "{{workflow.uid}}"
 
         # See ADR 016 (docs-internal/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
         # this pod records its own StepOutcome facts instead of exposing them
@@ -310,88 +312,32 @@ spec:
         STEP_OUTCOMES_DIR = Path("/tmp/step_outcomes")
         STEP_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Mirrors src/metrics/outcome_recorder.py's _TAXONOMY exactly — kept in
-        # sync by tests/images/afni/test_driver_gating.py::
-        # test_driver_taxonomy_matches_canonical. Duplicated inline rather than
-        # imported because this container has no access to src/metrics (see
-        # ADR 016 and issue #67).
-        _TAXONOMY: list[tuple[str, list[str]]] = [
-            (
-                "infrastructure",
-                [
-                    r"OOMKilled",
-                    r"exit\s+code\s+137",
-                    r"evicted",
-                    r"node\s+cordoned",
-                    r"deadline\s+exceeded",
-                    r"pod\s+unschedul",
-                    r"Unschedulable",
-                    r"insufficient\s+memory",
-                ],
-            ),
-            (
-                "data",
-                [
-                    r"NoSuchKey",
-                    r"NoSuchBucket",
-                    r"nss_volumes",
-                    r"missing\s+input",
-                    r"corrupt",
-                    r"Unable\s+to\s+open",
-                    r"Input\s+file\s+not\s+found",
-                ],
-            ),
-            (
-                "algorithm",
-                [
-                    r"AssertionError",
-                    r"ValueError",
-                    r"segmentation\s+fault",
-                    r"Segmentation\s+fault",
-                    r"SIGSEGV",
-                    r"RuntimeError",
-                    r"CalledProcessError",
-                    r"non-zero\s+exit\s+code",
-                    r"ERROR:",
-                ],
-            ),
-            (
-                "dependency",
-                [
-                    r"depended\s+on\s+task",
-                    r"upstream\s+task\s+failed",
-                    r"Skipped",
-                ],
-            ),
-        ]
+        # The StepOutcome taxonomy and record writer, shared with the fallback
+        # recorder (src/metrics/outcome_recorder.py) and the other two drivers:
+        # images/shared/step_outcome.py, COPYed into /app of this image (#646).
+        # It classifies `skipped` as dependency (#222), exit 65 as qc_rejected
+        # (#368) and signal deaths by exit code, for every writer alike — the
+        # inline copies this replaces had each kept a different subset.
+        sys.path.insert(0, "/app")
+        import step_outcome
 
-        def classify_failure(message):
-            msg = message or ""
-            for category, patterns in _TAXONOMY:
-                for pat in patterns:
-                    if re.search(pat, msg, re.IGNORECASE):
-                        return category
-            return "unknown"
+        QC_REJECTED_EXIT_CODE = step_outcome.QC_REJECTED_EXIT_CODE
 
-        def write_outcome(step, task, run, status, failure_reason=""):
-            record = {
-                "workflow_name": WORKFLOW_NAME,
-                "step": step,
-                "subject": SUBJ,
-                "session": SES,
-                "task": task,
-                "run": run,
-                "status": status,
-                "failure_category": "" if status == "succeeded" else classify_failure(failure_reason),
-                "failure_reason": failure_reason,
-                "upstream_failed_step": "",
-                "outputs_verified": [],
-                "pipeline": "cloudpipe_minproc",
-                "schema_version": "1.0",
-                "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            }
-            key = f"{WORKFLOW_NAME}__{step}__{SUBJ}__{SES}__{task}__{run}_outcome.json"
-            (STEP_OUTCOMES_DIR / key).write_text(json.dumps(record))
+        def write_outcome(step, task, run, status, failure_reason="", upstream_failed_step="", exit_code=None):
+            step_outcome.write_outcome(
+                STEP_OUTCOMES_DIR,
+                workflow_name=WORKFLOW_NAME,
+                workflow_uid=WORKFLOW_UID,
+                subject=SUBJ,
+                session=SES,
+                step=step,
+                task=task,
+                run=run,
+                status=status,
+                failure_reason=failure_reason,
+                upstream_failed_step=upstream_failed_step,
+                exit_code=exit_code,
+            )
 
         COMPONENTS = Path("/data/components")
         ANAT = Path("/data/anat")

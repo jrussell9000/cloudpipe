@@ -5,8 +5,12 @@ module "cert_manager_pod_identity" {
 
   name = "cert-manager"
 
-  attach_cert_manager_policy    = true
-  cert_manager_hosted_zone_arns = [var.route53_zone_arn]
+  attach_cert_manager_policy = true
+
+  # Empty without a domain: the policy's only purpose is the ACME DNS-01 solver,
+  # and a list holding one null would render an unusable policy statement rather
+  # than no permission.
+  cert_manager_hosted_zone_arns = var.route53_zone_arn == null ? [] : [var.route53_zone_arn]
 
   # Pod Identity Associations
   associations = {

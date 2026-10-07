@@ -27,27 +27,22 @@ variable "region" {
   type        = string
 }
 
-variable "inbound_prefix_list_id" {
-  description = "Managed prefix list ID controlling inbound access to the Prefect ALB."
-  type        = string
-}
-
-variable "nat_gateway_ip" {
-  description = "Public Elastic IP of the VPC's NAT gateway. Full-tunnel Client VPN traffic to this ALB's public IP hairpins out through the NAT gateway and back in over the internet, so the ALB security group must trust it as a source."
-  type        = string
-}
-
 ################################################################################
-# DNS / TLS
+# UI access — published behind the caller's shared ALB, or port-forwarded
 ################################################################################
 
-variable "route53_zone_name" {
-  description = "Name of the Route53 hosted zone (e.g. 'example.com'). Used to build the Prefect subdomain."
+variable "publish_ui" {
+  description = "Whether to create the Ingress that publishes the Prefect UI on the caller's shared ALB. False in port-forward mode, where `ui_host` and `certificate_arn` are null."
+  type        = bool
+}
+
+variable "ui_host" {
+  description = "Hostname the UI is published under (e.g. 'prefect.example.com'). Null when publish_ui is false."
   type        = string
 }
 
 variable "certificate_arn" {
-  description = "ARN of the ACM certificate for the Prefect ALB listener."
+  description = "ARN of the ACM certificate for the shared ALB listener. Null when publish_ui is false."
   type        = string
 }
 
@@ -81,6 +76,12 @@ variable "argo_namespace" {
   description = "Namespace the Argo workflow pods run in. The cloudpipe queue manager lists Pending pods there to detect a GPU spot drought and switch new submissions to CPU segmentation (#373)."
   type        = string
   default     = "argo-workflows"
+}
+
+variable "globus_instance_arn" {
+  description = "ARN of the Globus Connect Server EC2 instance. The queue manager's batch gate starts it before its live listing, since the host is stopped nightly (#652). Empty grants no EC2 permissions; the gate then warns and lists without starting the host."
+  type        = string
+  default     = ""
 }
 
 ################################################################################

@@ -3,7 +3,8 @@
 ################################################################################
 
 # ------------------------------------------------------------------------------
-# Argo Workflows SSO — credentials for the server to authenticate against Dex
+# Argo Workflows SSO — credentials for the server to authenticate against its
+# issuer: the Cognito pool, or Dex in external mode (local.ui_oidc_*, cognito.tf)
 # ------------------------------------------------------------------------------
 resource "kubernetes_secret_v1" "argo_workflows_sso" {
   metadata {
@@ -11,21 +12,23 @@ resource "kubernetes_secret_v1" "argo_workflows_sso" {
     namespace = var.argo_workflows_namespace
   }
   data = {
-    clientID     = "argo-workflows"
-    clientSecret = random_password.argo_workflows_dex_client.result
+    clientID     = local.ui_oidc_client_ids["argo-workflows"]
+    clientSecret = local.ui_oidc_client_secrets["argo-workflows"]
   }
   depends_on = [module.argo_workflows]
 }
 
 # ------------------------------------------------------------------------------
-# Argo Workflows SSO RBAC — maps the admin NetID to an admin-level service account
+# Argo Workflows SSO RBAC — maps the administrator's account to an admin-level
+# service account
 # ------------------------------------------------------------------------------
 resource "kubernetes_service_account_v1" "argo_admin" {
   metadata {
     name      = "argo-admin"
     namespace = var.argo_workflows_namespace
+    # An expr expression over the ID token's claims, matching the operator list.
     annotations = {
-      "workflows.argoproj.io/rbac-rule"            = "\"${var.admin_netid}@${var.institution_domain}\" == email"
+      "workflows.argoproj.io/rbac-rule"            = "email in ${jsonencode(local.admin_emails)}"
       "workflows.argoproj.io/rbac-rule-precedence" = "1"
     }
   }
@@ -142,17 +145,18 @@ module "argo_workflows" {
   source = "../argo-workflows"
 
   # Cluster / network
-  cluster_name           = var.name
-  vpc_id                 = module.vpc.vpc_id
-  vpc_cidr               = var.vpc_cidr
-  private_subnets        = module.vpc.private_subnets
-  nat_gateway_ip         = module.vpc.nat_public_ips[0]
-  region                 = var.region
-  inbound_prefix_list_id = var.uwmadison_prefix_list_id
+  cluster_name    = var.name
+  vpc_id          = module.vpc.vpc_id
+  vpc_cidr        = var.vpc_cidr
+  private_subnets = module.vpc.private_subnets
+  region          = var.region
 
-  # DNS / TLS
-  route53_zone_name = data.aws_route53_zone.brc.name
-  certificate_arn   = aws_acm_certificate.primary_regional.arn
+  # UI access
+  publish_ui      = local.publish_uis
+  ui_host         = local.argo_url
+  ui_base_url     = local.ui_base_urls["argo"]
+  oidc_issuer_url = local.ui_oidc_issuer
+  certificate_arn = one(aws_acm_certificate.primary_regional[*].arn)
 
   # Argo Workflows config
   namespace      = var.argo_workflows_namespace

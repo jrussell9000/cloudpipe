@@ -33,10 +33,11 @@ PutObject, not a DeleteObject — the orphan key survives as a harmless empty
 file, so the "nothing may delete from the run-of-record bucket" stance in
 terraform/modules/stack/metrics_bucket.tf is preserved and no new IAM grant is needed.
 
-Repair is deliberately skipped whenever the evidence for it is incomplete
-(any unreadable raw key, or a `dt` with no raw keys at all) — leaving a
-stale partition in place is visible and fixable, whereas emptying a live one
-on a transient S3 error silently destroys a day.
+Compaction of a (table, dt) — the write as well as the repair — is
+deliberately skipped whenever the evidence for it is incomplete (any
+unreadable raw key, or a `dt` with no raw keys at all) — leaving a stale
+partition in place is visible and fixable, whereas shrinking or emptying a
+live one on a transient S3 error silently destroys a day.
 """
 
 from __future__ import annotations
@@ -99,13 +100,13 @@ def read_raw_records_counting_skips(
 ) -> tuple[list[dict], int]:
     """read_raw_records, plus how many keys were skipped as unreadable.
 
-    The skip count exists for `repair_orphan_partitions`' benefit: skipping a
-    key makes the parsed record set an *under*-estimate of what raw actually
-    holds, and repair infers "this schema_version has no rows for this dt"
-    from exactly that set. If a transient GetObject failure dropped every key
-    of one version, a repair pass would empty a partition that is in fact
-    live. Callers that mutate compacted state on the basis of absence must
-    check this and stand down when it is non-zero.
+    The skip count exists because skipping a key makes the parsed record set
+    an *under*-estimate of what raw actually holds. Every compacted write is
+    a whole-file replacement built from that set, and repair infers "this
+    schema_version has no rows for this dt" from it, so a transient GetObject
+    failure would either shrink a live partition or empty one outright.
+    Callers that mutate compacted state from this set must check the count
+    and stand down when it is non-zero.
     """
     records = []
     skipped = 0
@@ -161,13 +162,17 @@ def build_table(records: list[dict]):
     """Build a pyarrow.Table from one schema_version's records.
 
     No explicit pyarrow.schema(...) is constructed by hand — pyarrow's own
-    type inference from the dict list is trusted, since callers only ever
-    pass one schema_version's records (from group_by_schema_version), so the
-    inferred column set IS that version's column set.
+    type inference from the dict list is trusted for the column TYPES. The
+    column SET is not left to it: from_pylist takes its columns from the first
+    record's keys only, and one schema_version's records do not all carry the
+    same keys (FuncQC's surf_*/subcort_* exist only on `--emit both` runs, at
+    the same "1.1" as volumetric-only ones). So every record is padded to the
+    union of keys, in first-seen order, before pyarrow sees it.
     """
     import pyarrow as pa
 
-    return pa.Table.from_pylist(records)
+    columns = list(dict.fromkeys(k for rec in records for k in rec))
+    return pa.Table.from_pylist([{k: rec.get(k) for k in columns} for rec in records])
 
 
 def write_parquet_to_s3(
@@ -394,6 +399,22 @@ def compact_prefix_dt(
         return {}
 
     records, skipped = read_raw_records_counting_skips(s3_client, bucket, keys)
+    if skipped:
+        # A partial read must not overwrite anything: part-0000.parquet is
+        # replaced whole, so writing it from a short record set shrinks a
+        # complete day, and the compactor only revisits the last few `dt`s.
+        # Same stance as the empty-listing case above — the existing compacted
+        # partitions stay as they are until a clean read.
+        log.warning(
+            "Not compacting %s dt=%s: %d of %d raw keys were unreadable, so the "
+            "record set is incomplete. Existing compacted partitions left as they are.",
+            table_name,
+            dt,
+            skipped,
+            len(keys),
+        )
+        return {}
+
     groups = group_by_schema_version(records)
 
     counts = {}
@@ -403,17 +424,7 @@ def compact_prefix_dt(
         write_parquet_to_s3(s3_client, table, bucket, key)
         counts[version] = len(group_records)
 
-    if skipped:
-        log.warning(
-            "Skipping orphan-partition repair for %s dt=%s: %d of %d raw keys were "
-            "unreadable, so absence of a schema_version can't be trusted.",
-            table_name,
-            dt,
-            skipped,
-            len(keys),
-        )
-    else:
-        repair_orphan_partitions(s3_client, bucket, table_name, dt, set(groups))
+    repair_orphan_partitions(s3_client, bucket, table_name, dt, set(groups))
     return counts
 
 

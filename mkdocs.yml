@@ -99,6 +99,9 @@ markdown_extensions:
 nav:
   - Home: index.md
 
+  - Deploying:
+      - deployer-first-hour.md
+
   - Pipelines:
       - pipelines.md
       - argo-workflows.md

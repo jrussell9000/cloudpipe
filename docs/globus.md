@@ -51,7 +51,7 @@ placeholder in the last column.
 | Source collection (NBDC Data Hub) | Terraform `globus_source_collection_id`, mirrored to SSM `/cloudpipe/globus/source-collection-id` | `<source-collection-id>` |
 | Source base path | Terraform `globus_source_base_path` (`/abcd/derivatives/mmps_mproc`) | |
 | Native app client ID | Secrets Manager `globus/refresh-token`, property `native-app-client-id` | |
-| IAM credential identity | The admin's own Globus identity | `<netid>@<institution_domain>` |
+| IAM credential identity | The admin's own Globus identity | `<username>@<institution_domain>` |
 | HA subscription ID | Issued by the institution's Globus subscription administrators | `<subscription-id>` |
 
 ---
@@ -273,7 +273,7 @@ it is done by hand:
    ```bash
    globus-connect-server user-credentials s3-create \
      <gateway-id> \
-     --globus-identity <netid>@<institution_domain> \
+     --globus-identity <username>@<institution_domain> \
      --replace-existing
    ```
 5. Confirm with `pixi run globus doctor` — the destination listing check exercises
@@ -440,7 +440,7 @@ With these set, `globus-connect-server` commands authenticate as the service acc
 > including [Endpoint recovery](#endpoint-recovery-after-accidental-deletion), where it is
 > only evidence of a deleted endpoint when the variables *are* loaded.
 
-> **`user-credentials list` with service credentials**: The list only shows credentials owned by the service account identity — not the `<netid>@<institution_domain>` credential registered in [setup step 3.6a](globus-setup.md#36a-register-the-gateways-placeholder-key-pair). An empty list is expected; it does not mean the registration is missing. Use `globus ls <collection-id>:/` to confirm S3 access is working.
+> **`user-credentials list` with service credentials**: The list only shows credentials owned by the service account identity — not the `<username>@<institution_domain>` credential registered in [setup step 3.6a](globus-setup.md#36a-register-the-gateways-placeholder-key-pair). An empty list is expected; it does not mean the registration is missing. Use `globus ls <collection-id>:/` to confirm S3 access is working.
 
 ### Checks by hand
 
@@ -539,7 +539,7 @@ If `s3_allow_multi_keys: True`, recreate the gateway (see below). An in-place up
 globus-connect-server user-credentials list
 globus-connect-server user-credentials delete <credential-id>
 globus-connect-server user-credentials s3-create <gateway-id> \
-  --globus-identity <netid>@<institution_domain>
+  --globus-identity <username>@<institution_domain>
 # Enter a valid IAM access key with permissions to s3://<bucket>
 ```
 
@@ -590,7 +590,7 @@ echo "New collection: $COLLECTION_ID"
 
 # 7. Register IAM credentials
 globus-connect-server user-credentials s3-create "$GATEWAY_ID" \
-  --globus-identity <netid>@<institution_domain>
+  --globus-identity <username>@<institution_domain>
 # Enter IAM access key with s3://<bucket> permissions at the prompts
 
 # 8. Update SSM — by hand: `globus configure` records a collection id only over the

@@ -197,16 +197,34 @@ variable "domain" {
   type = string
 }
 
-variable "institution_domain" {
-  type = string
+# The module's `external_identity` input, for a deployment that already
+# integrates an identity provider directly. There is no sensible example value:
+# the three IDs come from resources the deployment creates itself, outside this
+# module, and a direct integration is that provider's shape rather than a
+# generic one. See design D6 of
+# openspec/changes/optional-domain-and-cognito-auth.
+#
+# A new deployment does not set this. Leaving it null gets the Cognito user
+# pool the module creates, and an institutional provider reaches that pool
+# through Cognito federation.
+variable "external_identity" {
+  type = object({
+    access_identity_provider_id = string
+    access_policy_id            = string
+    dex_connector = object({
+      id            = string
+      name          = string
+      issuer        = string
+      client_id     = string
+      client_secret = string
+    })
+  })
+  sensitive = true
+  default   = null
 }
 
-variable "institution_oidc_issuer" {
-  type = string
-}
-
-variable "admin_netid" {
-  type = string
+variable "operator_emails" {
+  type = list(string)
 }
 
 variable "github_user_url" {
@@ -223,10 +241,6 @@ variable "gitops_repo_url" {
 
 variable "github_oidc_allowed_subs" {
   type = list(string)
-}
-
-variable "uwmadison_prefix_list_id" {
-  type = string
 }
 
 variable "cloudflare_account_id" {
@@ -289,14 +303,12 @@ module "stack" {
   name                         = var.name
   region                       = var.region
   domain                       = var.domain
-  institution_domain           = var.institution_domain
-  institution_oidc_issuer      = var.institution_oidc_issuer
-  admin_netid                  = var.admin_netid
+  external_identity            = var.external_identity
+  operator_emails              = var.operator_emails
   github_user_url              = var.github_user_url
   github_repo                  = var.github_repo
   gitops_repo_url              = var.gitops_repo_url
   github_oidc_allowed_subs     = var.github_oidc_allowed_subs
-  uwmadison_prefix_list_id     = var.uwmadison_prefix_list_id
   cloudflare_account_id        = var.cloudflare_account_id
   cloudflare_team_domain       = var.cloudflare_team_domain
   cloudflare_team_name         = var.cloudflare_team_name
@@ -325,6 +337,10 @@ output "cloudflare_account_id" {
 
 output "cloudflare_tunnel_id" {
   value = module.stack.cloudflare_tunnel_id
+}
+
+output "cognito_user_pool_id" {
+  value = module.stack.cognito_user_pool_id
 }
 
 output "ecr_cache_registry" {
