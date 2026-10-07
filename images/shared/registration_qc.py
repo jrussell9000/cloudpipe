@@ -6,6 +6,8 @@ Each Dockerfile COPYs this file to /app/registration_qc.py.
 
 from __future__ import annotations
 
+import math
+
 import nibabel as nib
 import numpy as np
 
@@ -556,7 +558,7 @@ _T1W_MNI_THRESHOLDS = {
 #     Larger corrections are BETTER registrations, and the batch's largest
 #     offset (96.97 mm) had its second-highest mean nmi. The gate ranked runs
 #     backwards and discarded whole sessions on scanner positioning.
-# See docs/investigations/2026-07-29-bold-to-t1w-qc-handoff.md section 0.
+# See docs-internal/investigations/2026-07-29-bold-to-t1w-qc-handoff.md section 0.
 #
 # Why `nmi_gain` rather than an absolute `nmi` bound: absolute NMI is not
 # portable. Its scale depends on bin count, masking and interpolation, and the
@@ -603,7 +605,7 @@ _T1W_MNI_THRESHOLDS = {
 #     consumer can filter a poor run out at any later point.
 # When one error is irreversible and the other is a query away, the irreversible
 # one does not go behind a threshold fitted from healthy-only data. Quality
-# metrics are therefore recorded, not gated; see docs/investigations/ and
+# metrics are therefore recorded, not gated; see docs-internal/investigations/ and
 # handoffs/bold-t1w-qc-gate-calibration/PREREGISTRATION.md.
 _BOLD_T1W_THRESHOLDS = {
     'nmi_gain': {'fail': 0.0, 'direction': 'below', 'inclusive': True},
@@ -635,12 +637,19 @@ def verdict(metrics: dict, thresholds: dict | None = None) -> str:
 
     A spec may set `'inclusive': True` to close its bound, so a value landing
     exactly ON the bound fails. Bounds are exclusive by default.
+
+    A gated key that is present but not a finite number (NaN, ±inf, None) FAILS.
+    Every comparison against NaN is False, so without this check a metric that
+    could not be measured would pass every bound — the gate would open on
+    exactly the degenerate inputs it exists to catch (#642).
     """
     thresholds = thresholds if thresholds is not None else _T1W_MNI_THRESHOLDS
     for key, spec in thresholds.items():
         if key not in metrics:
             continue
         val, bound = metrics[key], spec['fail']
+        if val is None or not math.isfinite(val):
+            return 'fail'
         inclusive = spec.get('inclusive', False)
         if spec['direction'] == 'below':
             if (val <= bound) if inclusive else (val < bound):
@@ -649,6 +658,19 @@ def verdict(metrics: dict, thresholds: dict | None = None) -> str:
             if (val >= bound) if inclusive else (val > bound):
                 return 'fail'
     return 'pass'
+
+
+def json_safe(record: dict) -> dict:
+    """`record` with every non-finite float replaced by None, for json.dump.
+
+    json.dumps writes NaN as a bare `NaN` token, which is not JSON: strict
+    parsers reject it, and the raw metrics tables are read by Athena's OpenX
+    JsonSerDe. An unmeasurable metric is a SQL NULL, the same mapping fsqc's
+    driver makes. Top-level values only — QC records are flat.
+    """
+    return {
+        k: None if isinstance(v, float) and not math.isfinite(v) else v for k, v in record.items()
+    }
 
 
 def jacobian_stats(warp_path: str, mask_path: str | None = None) -> dict:
@@ -671,10 +693,16 @@ def jacobian_stats(warp_path: str, mask_path: str | None = None) -> dict:
 
     log() is undefined at det <= 0, so folded voxels are excluded from every
     log_jac_* statistic and reported separately as jac_det_frac_negative; the
-    log_jac_frac_* denominators are the non-folded voxels only. If nothing is
-    left after masking, or no determinant is positive, the log_jac_* fields are
-    returned as 0.0 — that case is catastrophic and is caught by
-    jac_det_frac_negative rather than being encoded here.
+    log_jac_frac_* denominators are the non-folded voxels only. If no
+    determinant is positive, the log_jac_* fields are returned as 0.0 — that
+    case is catastrophic and is caught by jac_det_frac_negative (1.0) rather
+    than being encoded here.
+
+    If NO finite determinant is left after masking, nothing was measured, and
+    every field is NaN. verdict() fails a NaN gated metric, so a degenerate
+    warp fails the folding gate; the 0.0 this used to return passed it, since
+    0.0 is below the bound (#642). Serialise the record through json_safe(),
+    which writes NaN as JSON null.
 
     `mask_path` restricts every statistic to voxels where that image is > 0 —
     pass the MNI template so the numbers describe brain tissue. Outside the
@@ -729,13 +757,14 @@ def jacobian_stats(warp_path: str, mask_path: str | None = None) -> dict:
         'log_jac_frac_beyond_3': 0.0,
     }
     if det.size == 0:
+        nan = float('nan')
         return {
-            'jac_det_min': 0.0,
-            'jac_det_max': 0.0,
-            'jac_det_mean': 0.0,
-            'jac_det_std': 0.0,
-            'jac_det_frac_negative': 0.0,
-            **log_fields,
+            'jac_det_min': nan,
+            'jac_det_max': nan,
+            'jac_det_mean': nan,
+            'jac_det_std': nan,
+            'jac_det_frac_negative': nan,
+            **dict.fromkeys(log_fields, nan),
         }
 
     positive = det[det > 0]

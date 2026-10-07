@@ -1,15 +1,11 @@
 ################################################################################
-# Grafana SSO (Dex OIDC)
+# Grafana SSO (OIDC)
 #
-# Grafana authenticates against the ArgoCD-bundled Dex using its native
-# generic_oauth. Two things are delivered into the grafana namespace:
-#
-#   1. grafana-sso        — the Dex static-client secret (sensitive)
-#   2. grafana-oidc-config — non-sensitive values (domain, admin email) that the
-#                            Grafana chart reads via envValueFrom and expands in
-#                            grafana.ini with $__env{...}. This keeps var.domain
-#                            and var.admin_netid as the single source of truth
-#                            instead of hardcoding hostnames in the gitops values.
+# Grafana authenticates with its native generic_oauth: against the Cognito pool
+# directly in Cognito mode, against the ArgoCD-bundled Dex in external mode
+# (local.ui_oidc_*, cognito.tf; endpoints, root_url and the admin binding in
+# argocd.tf's override). The client ID and secret reach the grafana namespace
+# as the grafana-sso Secret below.
 #
 # The grafana namespace itself is created by the cluster-addons ApplicationSet
 # (gitops/apps/grafana), so it is referenced here as a data source — these
@@ -28,8 +24,8 @@ resource "kubernetes_secret_v1" "grafana_sso" {
     namespace = var.grafana_namespace
   }
   data = {
-    clientID     = "grafana"
-    clientSecret = random_password.grafana_dex_client.result
+    clientID     = local.ui_oidc_client_ids["grafana"]
+    clientSecret = local.ui_oidc_client_secrets["grafana"]
   }
   depends_on = [data.kubernetes_namespace_v1.grafana]
 }
@@ -48,8 +44,8 @@ resource "kubernetes_secret_v1" "grafana_sso" {
 # out of git. The value lives in Terraform state, like every other password in
 # this file.
 #
-# The local login form is an escape hatch only; normal access is SSO through
-# Dex. Read the password with:
+# The local login form is an escape hatch only; normal access is SSO. Read the
+# password with:
 #   kubectl -n grafana get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d
 resource "random_password" "grafana_admin" {
   length  = 32
@@ -96,105 +92,9 @@ resource "kubernetes_secret_v1" "grafana_renderer_token" {
   depends_on = [data.kubernetes_namespace_v1.grafana]
 }
 
-resource "kubernetes_config_map_v1" "grafana_oidc_config" {
-  metadata {
-    name      = "grafana-oidc-config"
-    namespace = var.grafana_namespace
-  }
-  data = {
-    domain      = var.domain
-    admin_email = "${var.admin_netid}@${var.institution_domain}"
-  }
-  depends_on = [data.kubernetes_namespace_v1.grafana]
-}
-
-################################################################################
-# Grafana ALB Security Group — UNUSED since Grafana joined the shared internal
-# `cloudpipe-ui` ALB (ui_alb.tf). Kept only so plan 012 §5's rollback can
-# recreate the per-app ALB; removed in plan 012 §3.4, once no old ALB remains.
-#
-# Restricts inbound access to the UW-Madison prefix list, matching the pattern
-# already used for the ArgoCD and Argo Workflows ALBs (see aws_security_group
-# "argocd_lb" in argocd.tf). Grafana's ingress is defined in the GitOps-synced
-# gitops/apps/grafana/values.yaml rather than as a Terraform-managed Kubernetes
-# resource, so it can't reference this security group's ID directly the way
-# ArgoCD's and Argo Workflows' Terraform-managed ingresses do. Instead this SG
-# is given an explicit Name tag, and referenced by that name (not ID) from the
-# security-groups annotation in values.yaml — the AWS Load Balancer Controller
-# accepts either.
-################################################################################
-
-resource "aws_security_group" "grafana_lb" {
-  name_prefix = "grafana-alb-"
-  description = "Controls inbound access to the Grafana ALB."
-  vpc_id      = module.vpc.vpc_id
-  tags        = { Name = "grafana-alb-sg" }
-}
-
-resource "aws_vpc_security_group_ingress_rule" "grafana_lb_https" {
-  security_group_id = aws_security_group.grafana_lb.id
-  description       = "HTTPS from UW Madison prefix list"
-  prefix_list_id    = var.uwmadison_prefix_list_id
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-resource "aws_vpc_security_group_ingress_rule" "grafana_lb_http" {
-  security_group_id = aws_security_group.grafana_lb.id
-  description       = "HTTP from UW Madison prefix list (redirected to HTTPS)"
-  prefix_list_id    = var.uwmadison_prefix_list_id
-  from_port         = 80
-  ip_protocol       = "tcp"
-  to_port           = 80
-}
-
-# Allow access via the AWS Client VPN too (source-NATs to the VPC CIDR, same
-# as the EKS API server rule in vpn.tf) — lets a single VPN connection reach
-# both the cluster API and this ALB, without also requiring the UW-Madison VPN.
-resource "aws_vpc_security_group_ingress_rule" "grafana_lb_https_client_vpn" {
-  security_group_id = aws_security_group.grafana_lb.id
-  description       = "HTTPS from AWS Client VPN (source-NATs to VPC CIDR)"
-  cidr_ipv4         = var.vpc_cidr
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-resource "aws_vpc_security_group_ingress_rule" "grafana_lb_http_client_vpn" {
-  security_group_id = aws_security_group.grafana_lb.id
-  description       = "HTTP from AWS Client VPN (redirected to HTTPS)"
-  cidr_ipv4         = var.vpc_cidr
-  from_port         = 80
-  ip_protocol       = "tcp"
-  to_port           = 80
-}
-
-# The Client VPN CIDR rule above only covers traffic to VPC-internal
-# destinations (where the VPN endpoint's own SNAT applies). Traffic from a
-# full-tunnel VPN client to this ALB's *public* IP instead hairpins out
-# through the VPC's NAT gateway and back in over the internet, presenting the
-# NAT gateway's EIP as the source — so that EIP needs its own trust rule too.
-resource "aws_vpc_security_group_ingress_rule" "grafana_lb_https_nat" {
-  security_group_id = aws_security_group.grafana_lb.id
-  description       = "HTTPS from VPC NAT gateway (full-tunnel VPN clients hairpin through here)"
-  cidr_ipv4         = "${module.vpc.nat_public_ips[0]}/32"
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-resource "aws_vpc_security_group_ingress_rule" "grafana_lb_http_nat" {
-  security_group_id = aws_security_group.grafana_lb.id
-  description       = "HTTP from VPC NAT gateway (redirected to HTTPS)"
-  cidr_ipv4         = "${module.vpc.nat_public_ips[0]}/32"
-  from_port         = 80
-  ip_protocol       = "tcp"
-  to_port           = 80
-}
-
-resource "aws_vpc_security_group_egress_rule" "grafana_lb" {
-  security_group_id = aws_security_group.grafana_lb.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
-}
+# The grafana-oidc-config ConfigMap that carried the domain and the admin
+# address into values.yaml's $__env{...} expressions is gone (tasks 2.7 and 3.4
+# of openspec/changes/optional-domain-and-cognito-auth). Every value it fed —
+# root_url, the SSO endpoints, the admin binding — now comes from the
+# ApplicationSet override in argocd.tf, which can express both access modes and
+# both identity modes; a bare domain expanded at startup could not.

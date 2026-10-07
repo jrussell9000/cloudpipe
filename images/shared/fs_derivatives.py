@@ -200,11 +200,11 @@ def _prune_stale(s3, bucket: str, prefix: str, keep: set[str]) -> list[str]:
     FastSurfer version that drops or renames a file.
 
     Ordered deliberately — after every new file object is uploaded, before the
-    marker. The tree is therefore never less complete than it was: a failure
-    here leaves the previous marker describing objects that are all still
-    present, and leaves this publish markerless, which reads as "absent" and
-    re-runs. Doing it first would delete a good tree in exchange for an upload
-    that might not finish.
+    marker. A failure here leaves the tree markerless (publish cleared any
+    previous marker before uploading), which reads as "absent" and re-runs,
+    and every object the new marker will count is already present. Doing it
+    first would delete a good tree's files in exchange for an upload that
+    might not finish.
     """
     stale = []
     paginator = s3.get_paginator("list_objects_v2")
@@ -230,9 +230,17 @@ def publish(
 ) -> dict:
     """Upload `tree` under `prefix`, then write `_links.json` and `_complete.json`.
 
-    Ordering is the contract: every file object, then any stale objects from a
-    previous publish removed, then the manifest, then the marker. Nothing else
-    may write `_complete.json`.
+    Ordering is the contract: any marker a previous publish left is removed,
+    then every file object, then any stale objects from a previous publish
+    removed, then the manifest, then the marker. Nothing else may write
+    `_complete.json`.
+
+    The first step is what makes a RE-publish safe. The long phase re-publishes
+    trees that are already complete whenever it reruns, and objects overwrite
+    in place — so a crash partway through would otherwise leave the old run's
+    marker certifying a mix of old-run and new-run files. With the old marker
+    gone first, a crash anywhere leaves the tree markerless, which reads as
+    "absent" and reruns.
     """
     tree = Path(tree)
     if not tree.is_dir():
@@ -245,6 +253,10 @@ def publish(
     files, link_rows, dir_count, total_bytes = _scan(tree)
     if not files:
         raise PublishError(f"refusing to publish an empty tree: {tree}")
+
+    # Before the first upload. S3 answers a delete of an absent key with 204, so
+    # a first publish needs no existence check.
+    client.delete_object(Bucket=bucket, Key=f"{prefix}/{COMPLETE_SIDECAR}")
 
     def _put(worker_s3, path: Path) -> str:
         key = f"{prefix}/{path.relative_to(tree)}"

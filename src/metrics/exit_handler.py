@@ -23,13 +23,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import deployment_env
-from schemas import StepSummary, SubjectManifest, WorkflowRun
+from schemas import StepSummary, SubjectManifest, WorkflowRun, workflow_tag
 from writer import emit_to_s3
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Emit WorkflowRun and SubjectManifest metrics to S3")
     p.add_argument("--workflow-name", required=True)
+    # {{workflow.uid}}. Argo reuses names; the UID is what tells this run's step
+    # outcomes and start marker from another run's under the same name (#638).
+    p.add_argument("--workflow-uid", default="")
     p.add_argument("--subject", required=True)
     p.add_argument("--status", required=True, choices=["Succeeded", "Failed", "Error"])
     p.add_argument("--started-at", default="")
@@ -92,63 +95,104 @@ def _date_range(start_iso: str, end_iso: str) -> list[str]:
     return [(start + timedelta(days=i)).isoformat() for i in range(days + 1)]
 
 
+def _belongs_to_this_run(rec: dict, workflow_uid: str, subject: str) -> bool:
+    """Whether a step outcome listed under this workflow's NAME is this run's.
+
+    Argo reuses names, so the name prefix can also hold another run's records
+    (#638). With a UID on both sides, the UID decides. A record written before
+    UIDs were recorded has none; for those the subject is the best evidence left
+    — two runs that share a name AND a subject within the date window are not
+    told apart, which is no worse than before.
+    """
+    rec_uid = rec.get("workflow_uid") or ""
+    if workflow_uid and rec_uid:
+        return rec_uid == workflow_uid
+    return rec.get("subject") == subject
+
+
 def _load_step_outcomes(
-    bucket: str, workflow_name: str, region: str, dates: list[str]
+    bucket: str,
+    workflow_name: str,
+    region: str,
+    dates: list[str],
+    workflow_uid: str = "",
+    subject: str = "",
 ) -> list[dict]:
     """Scan metrics/step-outcomes/dt=<date>/{workflow_name}__*.json for each date
-    and return all records.
+    and return this run's records (see _belongs_to_this_run).
 
     Step outcomes are written with dt = the write date of each individual
     record (see StepOutcome.s3_key), so a workflow that spans UTC midnight can
     have outcomes under more than one dt= partition. `dates` should cover the
     workflow's started_at through its completion date, inclusive.
+
+    The workflow name goes into the listing Prefix, not a client-side filter:
+    every exit handler would otherwise list every outcome every workflow wrote
+    that day. The trailing `__` keeps `cloudpipe-abc` from matching
+    `cloudpipe-abc123`'s keys. It is the NAME prefix on purpose, not
+    `{name}__{uid}__`: that also finds records written before keys carried the
+    UID, which the filter below then sorts out.
     """
     import boto3
 
     s3 = boto3.client("s3", region_name=region)
     paginator = s3.get_paginator("list_objects_v2")
-    needle = f"{workflow_name}__"
 
     records = []
+    dropped = 0
     for dt in dates:
-        prefix = f"metrics/step-outcomes/dt={dt}/"
+        prefix = f"metrics/step-outcomes/dt={dt}/{workflow_name}__"
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if not key[len(prefix) :].startswith(needle):
-                    continue
                 try:
                     body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-                    records.append(json.loads(body))
+                    rec = json.loads(body)
                 except Exception as exc:
                     print(f"  Warning: could not read {key}: {exc}", flush=True)
+                    continue
+                if _belongs_to_this_run(rec, workflow_uid, subject):
+                    records.append(rec)
+                else:
+                    dropped += 1
+    if dropped:
+        print(
+            f"  Ignored {dropped} step outcome(s) from another run named {workflow_name}",
+            flush=True,
+        )
     return records
 
 
 def _read_first_step_started_at(
-    bucket: str, workflow_name: str, region: str, dates: list[str]
+    bucket: str, workflow_name: str, region: str, dates: list[str], workflow_uid: str = ""
 ) -> str:
     """Read the record_workflow_start.py marker for this workflow, or "" if
     it was never written (e.g. the DAG failed before that task could run).
 
-    Written to metrics/workflow-starts/dt=<date>/{workflow_name}.json, keyed
+    Written to metrics/workflow-starts/dt=<date>/{workflow_tag}.json, keyed
     by that record's own write date -- same reasoning as
     _load_step_outcomes, so scan every date the workflow could have touched.
+    The UID-tagged key is tried first on each date; the bare-name key is the
+    layout a marker written before UIDs has.
     """
     import boto3
     from botocore.exceptions import ClientError
 
     s3 = boto3.client("s3", region_name=region)
+    tags = [workflow_tag(workflow_name, workflow_uid)]
+    if workflow_uid:
+        tags.append(workflow_name)
     for dt in dates:
-        key = f"metrics/workflow-starts/dt={dt}/{workflow_name}.json"
-        try:
-            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-            return json.loads(body).get("first_step_started_at", "")
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+        for tag in tags:
+            key = f"metrics/workflow-starts/dt={dt}/{tag}.json"
+            try:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                return json.loads(body).get("first_step_started_at", "")
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+                    print(f"  Warning: could not read {key}: {exc}", flush=True)
+            except Exception as exc:
                 print(f"  Warning: could not read {key}: {exc}", flush=True)
-        except Exception as exc:
-            print(f"  Warning: could not read {key}: {exc}", flush=True)
     return ""
 
 
@@ -158,6 +202,7 @@ def _build_manifest(
     pipeline: str,
     step_outcomes: list[dict],
     workflow_status: str,
+    workflow_uid: str = "",
 ) -> SubjectManifest:
     """Assemble a SubjectManifest from StepOutcome records."""
     steps = []
@@ -184,9 +229,12 @@ def _build_manifest(
         elif rec.get("status") == "skipped":
             skipped_steps.append(rec.get("step", ""))
 
-    # Derive overall_status
-    if not steps and workflow_status != "Succeeded":
-        overall_status = "failed"
+    # Derive overall_status. A workflow Argo reports as not Succeeded is never
+    # "succeeded", even when every *recorded* step was: the step that failed it
+    # may have no recorder, or died before writing one, and the WorkflowRun
+    # record for the same run says Failed.
+    if workflow_status != "Succeeded":
+        overall_status = "partial" if steps else "failed"
     elif failed_steps or skipped_steps:
         overall_status = "partial"
     else:
@@ -194,6 +242,7 @@ def _build_manifest(
 
     return SubjectManifest(
         workflow_name=workflow_name,
+        workflow_uid=workflow_uid,
         subject=subject,
         overall_status=overall_status,
         steps=steps,
@@ -230,11 +279,18 @@ def main() -> None:
         f"  Scanning step outcomes for workflow {args.workflow_name} across dt={dates}...",
         flush=True,
     )
-    step_outcomes = _load_step_outcomes(args.metrics_bucket, args.workflow_name, args.region, dates)
+    step_outcomes = _load_step_outcomes(
+        args.metrics_bucket,
+        args.workflow_name,
+        args.region,
+        dates,
+        workflow_uid=args.workflow_uid,
+        subject=args.subject,
+    )
     print(f"  Found {len(step_outcomes)} step outcome(s).", flush=True)
 
     first_step_started_at = _read_first_step_started_at(
-        args.metrics_bucket, args.workflow_name, args.region, dates
+        args.metrics_bucket, args.workflow_name, args.region, dates, args.workflow_uid
     )
 
     # Determine failed_step / failure_category for WorkflowRun
@@ -248,6 +304,7 @@ def main() -> None:
     # Emit WorkflowRun record
     run_record = WorkflowRun(
         workflow_name=args.workflow_name,
+        workflow_uid=args.workflow_uid,
         subject=args.subject,
         status=args.status,
         started_at=args.started_at,
@@ -261,7 +318,9 @@ def main() -> None:
         batch_label=args.batch_label,
         completed_at=now,
     )
-    run_key = WorkflowRun.s3_key(args.workflow_name, args.subject, dt=now[:10])
+    run_key = WorkflowRun.s3_key(
+        args.workflow_name, args.subject, dt=now[:10], workflow_uid=args.workflow_uid
+    )
     print(f"  Emitting workflow run metrics: {run_key}", flush=True)
     print(
         f"  status={args.status}  duration={args.duration_s}s"
@@ -279,8 +338,11 @@ def main() -> None:
         pipeline=args.pipeline,
         step_outcomes=step_outcomes,
         workflow_status=args.status,
+        workflow_uid=args.workflow_uid,
     )
-    manifest_key = SubjectManifest.s3_key(args.workflow_name, args.subject, dt=now[:10])
+    manifest_key = SubjectManifest.s3_key(
+        args.workflow_name, args.subject, dt=now[:10], workflow_uid=args.workflow_uid
+    )
     print(f"  Emitting subject manifest: {manifest_key}", flush=True)
     print(
         f"  overall_status={manifest.overall_status}"

@@ -8,7 +8,47 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
-test = "pytest"
+# `--dist loadfile` keeps every test in a file on ONE worker. The default `load`
+# scatters tests individually, so a module-scoped fixture is paid once PER WORKER
+# that receives one of its tests — and tests/test_terraform_globus_config.py has
+# a 32.41 s one (`terraform init` in a copy of the module, then
+# `terraform console`). Measured over the whole suite, at -n 4:
+#
+#     serial                    206.77 s
+#     -n 4                      143.88 s
+#     -n 4 --dist loadfile       99.21 s
+#
+# CAPPED AT FOUR, which is also what a GitHub-hosted runner has. Past four this
+# suite only gets SLOWER, because `loadfile` makes the terraform file (~95 s) the
+# wall-clock floor and extra workers contend with it:
+#
+#     -n 4     99.21 s
+#     -n 8    108.69 s
+#     -n 20   115.13 s
+#
+# KNOWN LOCAL HAZARD, pre-existing and not caused by the cap or by `-n`: when the
+# `terraform init` inside tests/test_terraform_globus_config.py::render fails,
+# render() answers with `pytest.skip`, so the module fixture skips and the file's
+# 12 assertions quietly stop running instead of going red (`2731 passed, 22
+# skipped` rather than `2743 passed, 10 skipped`). Under load it fired in roughly
+# 1 run in 3 at this setting. Not reproducible from concurrent `terraform init`
+# alone, so the cause is still open; see the tracking issue. CI is unaffected —
+# the pytest job installs no Terraform, so that file skips on every CI run
+# regardless. Locally, `pixi run test --allowed-skips-only` turns that skip into
+# a failure (tests/conftest.py, #650); the standing local count is now 1 skipped
+# (the opt-in live Globus test), so any other number is worth a look.
+#
+# To debug one test without the workers, bypass the task: `pixi run -- pytest -x
+# tests/foo.py`. Parallel output interleaves and does not stop cleanly at -x.
+test = "pytest -n auto --maxprocesses 4 --dist loadfile"
+
+# A coverage MAP, not a gate: nothing fails on a percentage. It exists so a
+# refactor of a module with thin tests (images/afni/preproc.py, #641) can see
+# what is unexercised before it starts. `--cov=<dir>` attributes by file path,
+# so the pytest.ini `pythonpath` imports count; xdist workers combine
+# automatically. Blind spot: Python a test `exec`s out of Argo YAML (e.g.
+# tests/images/afni/test_driver_gating.py) belongs to no file and is not counted.
+coverage = "pytest -n auto --maxprocesses 4 --dist loadfile --cov=images --cov=src --cov=prefect --cov-report=term-missing"
 
 # Operator surface for the Globus ingress: `pixi run globus doctor`, `... login`,
 # `... status`. PYTHONPATH rather than an installed package, matching how
@@ -16,6 +56,16 @@ test = "pytest"
 # AWS credentials come from the caller's environment (an AWS CLI v2 SSO profile);
 # the CLI never takes keys. See docs/globus-setup.md.
 globus = { cmd = "python -m globus_admin", env = { PYTHONPATH = "src" } }
+
+# Deployment setup wizard: `pixi run cloudpipe setup`, `... preflight`. Collects
+# the cluster-wide Terraform inputs and renders terraform.tfvars into a target
+# root; creates no AWS resource. Set up exactly like the `globus` task above, for
+# the same reason — PYTHONPATH, no build step. The `globus` task still owns the
+# eight Globus inputs; this one never asks for them.
+#
+# On a machine where pixi itself is not installed yet, run `scripts/cloudpipe-setup`
+# first: it is standard-library-only, checks the prerequisites, and hands off here.
+cloudpipe = { cmd = "python -m cloudpipe_setup", env = { PYTHONPATH = "src" } }
 
 # Register the Prefect deployments: `PREFECT_API_URL=… pixi run prefect-deploy`.
 # Fills prefect.yaml's bucket and registry placeholders from the cloudpipe-config
@@ -83,7 +133,22 @@ simpleitk = ">=2.5.5,<3"
 [feature.imaging.tasks]
 # pytest.ini's addopts globally ignores tests/images/fireants so the default env
 # does not fail collection; clear addopts to run exactly what that ignore hides.
-test-imaging = "pytest -o addopts= tests/images/fireants"
+#
+# `load` rather than the `test` task's `loadfile`: every test here lives in ONE
+# file, so loadfile would put the whole suite back on a single worker. Two tests
+# are 88% of its runtime — test_random_ticket_is_reproducible_and_matches_env_threads
+# (46.71 s) and test_affine_is_thread_invariant (27.24 s) — and the point is to
+# overlap exactly those two. Measured: 84.53 s serial, 58.60 s at -n 2, 51.47 s
+# at -n 4, 48.39 s at -n auto. Sublinear because ITK already threads inside each
+# test, so the workers oversubscribe the cores; correctness does not depend on
+# it, as every assertion is on geometry rather than timing.
+#
+# Uncapped, unlike `test`: that cap exists for a terraform subprocess, and
+# nothing here shells out.
+#
+# Parallel-safe despite SetGlobalDefaultNumberOfThreads: that global is
+# per-PROCESS and each xdist worker is its own process.
+test-imaging = "pytest -o addopts= -n auto tests/images/fireants"
 
 # --- Public documentation site (docs-only; not needed by any image) ---
 # Builds docs/ into the public site with Zensical, the successor to Material for
@@ -118,18 +183,37 @@ ops = { features = ["ops"], solve-group = "default" }
 numpy = ">=2.5.1,<3"
 pandas = ">=3.0.3,<4"
 boto3 = ">=1.43.49,<2"
-tqdm = ">=4.68.4,<5"
+# `hera` alone. The legacy `hera-workflows` package installs into the same
+# `hera/` directory with a different `hera/__init__.py`, so declaring both left
+# which API you got to link order (#647). Everything here imports the 5.x API.
 hera = ">=5.18.0,<6"
-hera-workflows = ">=4.4.1,<5"
-pipreqs = ">=0.5.0,<0.6"
 botocore = ">=1.43.49,<2"
 prefect = ">=3.7.8,<4"
 globus-sdk = ">=4.8.1,<5"
+# Declared, not inherited. `src/globus_admin/config.py` and
+# `src/cloudpipe_setup/config.py` both import yaml directly, but it resolved only
+# as a transitive dependency of `prefect` — so an unrelated prefect bump that
+# dropped it would have broken both CLIs with an ImportError and no other signal.
+# The constraint matches what the lock already installs (6.0.3), so nothing in the
+# solve changes.
+pyyaml = ">=6.0.3,<7"
+# Declared for the same reason. tests/globus/test_answers_schema.py and
+# test_configdoc_schema.py round-trip their documents through it, and reached it
+# only transitively — through `pytest.importorskip`, so losing it would have
+# turned three schema checks into silent skips (#650). Matches the locked 4.26.0.
+jsonschema = ">=4.26.0,<5"
 pip = ">=26.1.2,<27"
 pytest = ">=9.1.1,<10"
+# The coverage map (`pixi run coverage`, below) — report-only, not a gate.
+pytest-cov = ">=6,<8"
+# Same band as images/afni/pixi.toml. preproc.py imports PCA at module load for
+# aCompCor; without the real package the tests had to stub it out, which meant
+# compute_confounds could never run under test (#641).
+scikit-learn = ">=1.5.0,<2"
 requests = ">=2.34.2,<3"
 nibabel = ">=5.4.2,<6"
 scipy = ">=1.18.0,<2"
 matplotlib = ">=3.11.0,<4"
 duckdb = ">=1.5.4,<2"
 pyarrow = ">=21,<22"
+pytest-xdist = ">=3.8,<4"

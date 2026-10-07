@@ -436,13 +436,14 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:b3309b3955b076d02e8fc45191c6286fb0164ae8e408056029d388c0841ca53a"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:0af3d2a3271dab54cd44aa775c8ed71050e0a6d1005e1f80ff804ece6c4dc8c8"
       imagePullPolicy: IfNotPresent
 
       resources:
         # TODO(perf): validate memory limits against observed peak usage in CloudWatch.
-        # The float16 BOLD output reduces Stage 3 peak substantially, but intermediate
-        # ANTs warp operations may exceed the 6G limit on longer runs. Check
+        # Stage 3 stages warped frames in a disk memmap rather than a 4D RAM array,
+        # but intermediate ANTs warp operations may exceed the 6G limit on longer
+        # runs. Check
         # metrics/func-preproc QC JSONs for peak_memory_gb before adjusting.
         # Memory is still sized for ONE run: runs execute sequentially at jobs=1.
         requests:
@@ -494,7 +495,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:b3309b3955b076d02e8fc45191c6286fb0164ae8e408056029d388c0841ca53a"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:0af3d2a3271dab54cd44aa775c8ed71050e0a6d1005e1f80ff804ece6c4dc8c8"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather
@@ -551,6 +552,8 @@ spec:
         JOBS = max(1, int("{{inputs.parameters.jobs}}"))
         RUNS = json.loads(r"""{{inputs.parameters.runs}}""")
         WORKFLOW_NAME = "{{workflow.name}}"
+        # Argo reuses names; the UID is what keeps this run's records apart (#638).
+        WORKFLOW_UID = "{{workflow.uid}}"
 
         # See ADR 016 (docs-internal/decisions/016-skipped-producer-deadlock-in-dag-recording.md):
         # this pod records its own StepOutcome facts rather than exposing them
@@ -560,100 +563,32 @@ spec:
         STEP_OUTCOMES_DIR = Path("/tmp/step_outcomes")
         STEP_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Mirrors src/metrics/outcome_recorder.py's _TAXONOMY exactly — kept in
-        # sync by tests/images/afni/test_driver_gating.py::
-        # test_driver_taxonomy_matches_canonical. Duplicated inline rather than
-        # imported because this container has no access to src/metrics (see
-        # ADR 016 and issue #67).
-        _TAXONOMY: list[tuple[str, list[str]]] = [
-            (
-                "infrastructure",
-                [
-                    r"OOMKilled",
-                    r"exit\s+code\s+137",
-                    r"evicted",
-                    r"node\s+cordoned",
-                    r"deadline\s+exceeded",
-                    r"pod\s+unschedul",
-                    r"Unschedulable",
-                    r"insufficient\s+memory",
-                ],
-            ),
-            (
-                "data",
-                [
-                    r"NoSuchKey",
-                    r"NoSuchBucket",
-                    r"nss_volumes",
-                    r"missing\s+input",
-                    r"corrupt",
-                    r"Unable\s+to\s+open",
-                    r"Input\s+file\s+not\s+found",
-                ],
-            ),
-            (
-                "algorithm",
-                [
-                    r"AssertionError",
-                    r"ValueError",
-                    r"segmentation\s+fault",
-                    r"Segmentation\s+fault",
-                    r"SIGSEGV",
-                    r"RuntimeError",
-                    r"CalledProcessError",
-                    r"non-zero\s+exit\s+code",
-                    r"ERROR:",
-                ],
-            ),
-            (
-                "dependency",
-                [
-                    r"depended\s+on\s+task",
-                    r"upstream\s+task\s+failed",
-                    r"Skipped",
-                ],
-            ),
-        ]
+        # The StepOutcome taxonomy and record writer, shared with the fallback
+        # recorder (src/metrics/outcome_recorder.py) and the other two drivers:
+        # images/shared/step_outcome.py, COPYed into /app of this image (#646).
+        # It classifies `skipped` as dependency (#222), exit 65 as qc_rejected
+        # (#368) and signal deaths by exit code, for every writer alike — the
+        # inline copies this replaces had each kept a different subset.
+        sys.path.insert(0, "/app")
+        import step_outcome
 
-        def classify_failure(message):
-            msg = message or ""
-            for category, patterns in _TAXONOMY:
-                for pat in patterns:
-                    if re.search(pat, msg, re.IGNORECASE):
-                        return category
-            return "unknown"
+        QC_REJECTED_EXIT_CODE = step_outcome.QC_REJECTED_EXIT_CODE
 
-        def write_outcome(step, task, run, status, failure_reason="", upstream_failed_step=""):
-            # A "skipped" run is dependency by definition, matching
-            # outcome_recorder.classify_failure: its reason describes an absent
-            # upstream artifact, not anything this step did. Left to the pattern
-            # match it would classify as "data" (the reason names a missing
-            # input), which reads as bad subject data rather than an upstream
-            # QC rejection. Issue #222.
-            if status == "succeeded":
-                category = ""
-            elif status == "skipped":
-                category = "dependency"
-            else:
-                category = classify_failure(failure_reason)
-            record = {
-                "workflow_name": WORKFLOW_NAME,
-                "step": step,
-                "subject": SUBJ,
-                "session": SES,
-                "task": task,
-                "run": run,
-                "status": status,
-                "failure_category": category,
-                "failure_reason": failure_reason,
-                "upstream_failed_step": upstream_failed_step,
-                "outputs_verified": [],
-                "pipeline": "cloudpipe_minproc",
-                "schema_version": "1.0",
-                "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            }
-            key = f"{WORKFLOW_NAME}__{step}__{SUBJ}__{SES}__{task}__{run}_outcome.json"
-            (STEP_OUTCOMES_DIR / key).write_text(json.dumps(record))
+        def write_outcome(step, task, run, status, failure_reason="", upstream_failed_step="", exit_code=None):
+            step_outcome.write_outcome(
+                STEP_OUTCOMES_DIR,
+                workflow_name=WORKFLOW_NAME,
+                workflow_uid=WORKFLOW_UID,
+                subject=SUBJ,
+                session=SES,
+                step=step,
+                task=task,
+                run=run,
+                status=status,
+                failure_reason=failure_reason,
+                upstream_failed_step=upstream_failed_step,
+                exit_code=exit_code,
+            )
 
         # Read back from this container's own resources block via the
         # downward API (see the CPU_REQUEST env var in the template). Was a

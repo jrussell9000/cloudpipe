@@ -127,7 +127,7 @@ resource "aws_security_group" "vpn" {
   vpc_id      = module.vpc.vpc_id
 
   # Open to the internet — the operator works remotely full-time and is not
-  # reliably reachable from the UW-Madison prefix list (its own VPN can't run
+  # reliably reachable from an institutional prefix list (such a VPN can't run
   # concurrently with this one, see docs-internal/decisions and this repo's handoffs).
   # Mutual-TLS client certificate authentication (authentication_options
   # below) is the actual access control here, not source IP.

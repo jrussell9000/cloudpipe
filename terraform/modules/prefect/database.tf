@@ -15,15 +15,11 @@ resource "aws_security_group" "db" {
   tags        = merge(var.tags, { Name = "${var.cluster_name}-prefect-postgres-sg" })
 }
 
-resource "aws_vpc_security_group_ingress_rule" "db_operator" {
-  security_group_id = aws_security_group.db.id
-  description       = "PostgreSQL from operator workstation"
-  prefix_list_id    = var.inbound_prefix_list_id
-  from_port         = 5432
-  ip_protocol       = "tcp"
-  to_port           = 5432
-}
-
+# Only the VPC may connect. The instance is not publicly accessible, so it has
+# no public address, and a rule for public sources could never match; operators
+# arriving over WARP or the Client VPN reach it from inside the VPC CIDR. A rule
+# for the operator prefix list (all public ranges) was removed on 2026-10-05 for
+# that reason.
 resource "aws_vpc_security_group_ingress_rule" "db_vpc" {
   security_group_id = aws_security_group.db.id
   description       = "PostgreSQL from within the VPC (EKS pods)"

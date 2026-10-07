@@ -29,6 +29,17 @@ prefect-server:
       - name: PREFECT_SERVER_ANALYTICS_ENABLED
         value: "false"
 
+    # Prefect's own basic auth on /api/ (#636). oauth2-proxy lets /api/ through
+    # without SSO (skip-auth-regex below), so this is what gates the API. The
+    # chart renders PREFECT_SERVER_API_AUTH_STRING from the Secret's
+    # `auth-string` key; the Secret is created by terraform/modules/prefect
+    # (auth.tf), so no credential lives in this file. GET /api/health and
+    # /api/ready stay unauthenticated, which is what the probes below call.
+    # The browser UI asks for this credential once after SSO and remembers it.
+    basicAuth:
+      enabled: true
+      existingSecret: prefect-api-auth
+
     resources:
       requests:
         cpu: 100m
@@ -106,6 +117,12 @@ prefect-worker:
     selfHostedServerApiConfig:
       # In-cluster URL — worker talks to server directly without going through the ALB.
       apiUrl: "http://prefect-server.prefect.svc.cluster.local:4200/api"
+      # PREFECT_API_AUTH_STRING from the same Secret as the server's (#636). The
+      # worker passes its settings on to every flow-run pod it creates, so the
+      # queue-manager and scraper flows authenticate without a job-template edit.
+      basicAuth:
+        enabled: true
+        existingSecret: prefect-api-auth
 
     config:
       workPool: cloudpipe-k8s-pool
@@ -158,8 +175,11 @@ oauth2-proxy:
     skip-provider-button: "true"
     pass-access-token: "true"
     pass-user-headers: "true"
-    # API calls from the Prefect CLI and programmatic clients bypass SSO.
-    # The endpoint is VPN-gated at the ALB security group level.
+    # API calls from the Prefect CLI and programmatic clients bypass SSO — they
+    # cannot do a browser sign-in. The bypass is NOT network-gated: the UI ALB
+    # and this proxy's NetworkPolicy both admit the whole VPC CIDR. What gates
+    # /api/ is Prefect's own basic auth (server.basicAuth above, Secret
+    # prefect-api-auth from terraform/modules/prefect/auth.tf, #636).
     skip-auth-regex: "^/api/"
 
   service:

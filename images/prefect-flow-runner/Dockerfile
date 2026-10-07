@@ -17,7 +17,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 # destination collection before submitting, which is the only way to catch a
 # revoked session (lib/globus_session.py). Without it the gate still checks the
 # session's age, but says out loud that the live half was skipped.
-RUN uv pip install --system --no-cache hera boto3 pyarrow 'globus-sdk>=4.8.1,<5'
+#
+# Every package carries the band pixi.toml declares, so the flows run the major
+# version tests/prefect/ ran against. Unpinned, `hera` in particular could jump a
+# major release here with nothing in the repo changing (#647).
+RUN uv pip install --system --no-cache \
+    'hera>=5.18.0,<6' 'boto3>=1.43.49,<2' 'pyarrow>=21,<22' 'globus-sdk>=4.8.1,<5'
 
 WORKDIR /opt/prefect
 COPY prefect/flows/ flows/

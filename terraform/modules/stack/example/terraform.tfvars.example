@@ -12,6 +12,20 @@
 #   $EDITOR terraform.tfvars
 #   terraform init && terraform validate
 #
+# You do not have to fill this in by hand. From your copy of this directory:
+#
+#   pixi run cloudpipe setup --root .
+#
+# The wizard asks for each value, applies the same `validation` rules
+# ../variables.tf declares, records your answers in a document worth keeping in
+# version control, and renders terraform.tfvars and backend.tf from them. It
+# refuses to overwrite a terraform.tfvars it did not write. Then
+# `pixi run cloudpipe preflight` checks those answers against AWS, Cloudflare
+# and your OIDC issuer — read-only, creating nothing — so a wrong hosted zone or
+# an unscoped API token surfaces now rather than mid-install. Neither command
+# takes a credential: AWS comes from an SSO profile, Cloudflare from
+# CLOUDFLARE_API_TOKEN. See ../../../../docs/deployer-first-hour.md.
+#
 # Do NOT then run a bare `terraform apply` on an empty account: a fresh install
 # is phased, because the providers in main.tf look up a cluster that does not
 # exist yet. See "Bootstrap and install sequence" in
@@ -39,35 +53,61 @@ region = "us-west-2"
 # defaulted input. Changing it after the first apply recreates a great deal.
 name = "cloudpipe"
 
-# AWS managed prefix list of the IP ranges allowed to reach the web UIs over
-# HTTPS (ArgoCD, Argo Workflows, Prefect, Kubecost, Grafana). An ID, not an ARN.
-# Create the prefix list in the VPC console with your institution's ranges.
-#
-# The name still says uwmadison; it is the reference deployment's and means
-# "the institution's ingress prefix list" here.
-uwmadison_prefix_list_id = "pl-0123456789abcdef0"
-
 
 # --- Identity ----------------------------------------------------------------
 
 # Where the services are published. Must match a Route53 hosted zone that
 # already exists in this account — every service URL is derived from it.
+#
+# Or `domain = null`, for port-forward mode: no load balancer, certificate or
+# DNS records, and each web UI reached on a fixed localhost port through
+# `kubectl port-forward` over WARP (ArgoCD 8080, Argo Workflows 2746, Prefect
+# 4200, Grafana 3000, Kubecost 9090).
 domain = "example.org"
 
-# Who may sign in, which is a different question from where the services live.
-# Used by the SSO proxies and, with admin_netid below, to build the admin
-# address as <admin_netid>@<institution_domain>.
-institution_domain = "example.edu"
+# The operators. They hold the administrator role in each web UI, and their
+# email domains are the only ones the SSO proxies admit. The module creates an
+# Amazon Cognito user pool, with an authenticator app required as a second
+# factor, and these are also the addresses it admits to WARP enrollment and the
+# cluster. Each one needs a user in the pool — the module does not create users.
+# After apply, for each address:
+#
+#   aws cognito-idp admin-create-user \
+#     --user-pool-id "$(terraform output -raw cognito_user_pool_id)" \
+#     --username operator@example.org \
+#     --user-attributes Name=email,Value=operator@example.org Name=email_verified,Value=true
+#
+# Cognito emails a temporary password; the first sign-in sets a new one and
+# enrolls the authenticator app.
+operator_emails = ["operator@example.org"]
 
-# The institution's OIDC issuer — the upstream Cloudflare Access and Dex
-# authenticate against. The authorize/token/keyset endpoints are appended to it,
-# so it must be the issuer published at
-# <issuer>/.well-known/openid-configuration. No trailing slash.
-institution_oidc_issuer = "https://login.example.edu"
-
-# The one account allowed to enroll a WARP device and reach the cluster. A
-# username, not an address: the address is built from institution_domain.
-admin_netid = "example-admin"
+# An identity provider this module does not create, for a deployment that
+# already integrates one directly. Leave it unset to use Cognito, as above.
+#
+# There are no example values to copy, which is the honest answer rather than an
+# omission: the first two IDs name a Cloudflare Access identity provider and
+# policy that your own configuration creates, outside this module, and the last
+# five are what Dex needs to use that same provider. A direct integration is one
+# provider's shape — endpoint layouts, attribute names, assurance profiles — so
+# the module takes it as a value instead of trying to model every provider.
+#
+# Setting it replaces the Cognito pool entirely, and needs a domain. The
+# provider's own Access policy then decides who may reach the cluster;
+# operator_emails still grants the web UIs' administrator role.
+#
+# client_secret is a credential. Keep this file out of version control once it
+# holds a real one — `*.tfvars` is gitignored, and only `.example` travels.
+# external_identity = {
+#   access_identity_provider_id = "<access-identity-provider-id>"
+#   access_policy_id            = "<access-policy-id>"
+#   dex_connector = {
+#     id            = "<short-name-used-in-dex-callback-url>"
+#     name          = "<label-on-the-login-button>"
+#     issuer        = "https://login.example.edu"
+#     client_id     = "<dex-oidc-client-id>"
+#     client_secret = "<dex-oidc-client-secret>"
+#   }
+# }
 
 
 # --- Source control ----------------------------------------------------------
@@ -123,8 +163,8 @@ globus_s3_destination_bucket = "example-neuroimaging-data"
 globus_source_collection_id = "<source-collection-uuid>"
 globus_client_id            = "<service-client-uuid>"
 
-# Prefix list of IP ranges allowed SSH to the Globus EC2 instance. May be the
-# same list as uwmadison_prefix_list_id above, or a narrower sysadmin-only one.
+# Prefix list of IP ranges allowed SSH to the Globus EC2 instance, typically a
+# narrow sysadmin-only one.
 globus_admin_prefix_list_id = "pl-0123456789abcdef0"
 
 # Shown on the endpoint's public listing page.

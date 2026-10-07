@@ -487,7 +487,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:721e4e6d0487fb892b4ad8a21c719559dd7bc48bc613d64cebe1e6dd2983e804"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:074d91905eb65016b51c0e41feb3a2304e77a0d214a3cf74af8422435b8bef86"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -832,7 +832,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:005e176238eb88cf4afaf78f79e195e95a10a9b4dcedadfeb31cf1f419f0f7e0"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:fb478b4635bb23fa93bc117f9274a49d4d1008b4c974b3182c7fd63bf8c44c70"
       imagePullPolicy: IfNotPresent
 
       # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the
@@ -1028,9 +1028,10 @@ spec:
       # Pinned to the system interpreter, not bare `python3` — FreeSurfer's
       # Dockerfile puts $FREESURFER_HOME/python/bin (its own bundled Python
       # 3.8) ahead of the system PATH, so bare `python3` silently resolves to
-      # 3.8 here. The _TAXONOMY block below uses PEP 585 generics (3.9+) and
-      # crashes immediately on 3.8 with "'type' object is not subscriptable" —
-      # see issue #84.
+      # 3.8 here. The inline _TAXONOMY this driver used to carry crashed on 3.8
+      # with "'type' object is not subscriptable" (issue #84); it now imports
+      # /app/step_outcome.py (#646), which is written for the system 3.10 —
+      # keep the interpreter pinned.
       command: [/usr/bin/python3, -u]
       source: |
         """Run bold_to_t1w.py for every pending run in one session.
@@ -1056,6 +1057,8 @@ spec:
         JOBS_REQUESTED = max(1, int("{{inputs.parameters.jobs}}"))
         RUNS = json.loads(r"""{{inputs.parameters.runs}}""")
         WORKFLOW_NAME = "{{workflow.name}}"
+        # Argo reuses names; the UID is what keeps this run's records apart (#638).
+        WORKFLOW_UID = "{{workflow.uid}}"
 
         # ADR 017: the fastsurfer-output artifact above is now an exploded prefix,
         # not a tarball. Argo downloaded every object, but it cannot recreate a
@@ -1134,104 +1137,32 @@ spec:
         STEP_OUTCOMES_DIR = Path("/tmp/step_outcomes")
         STEP_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Mirrors src/metrics/outcome_recorder.py's _TAXONOMY exactly — kept in
-        # sync by tests/images/afni/test_driver_gating.py::
-        # test_driver_taxonomy_matches_canonical. Duplicated inline rather than
-        # imported because this container has no access to src/metrics (see
-        # ADR 016 and issue #67).
-        _TAXONOMY: list[tuple[str, list[str]]] = [
-            (
-                "infrastructure",
-                [
-                    r"OOMKilled",
-                    r"exit\s+code\s+137",
-                    r"evicted",
-                    r"node\s+cordoned",
-                    r"deadline\s+exceeded",
-                    r"pod\s+unschedul",
-                    r"Unschedulable",
-                    r"insufficient\s+memory",
-                ],
-            ),
-            (
-                "data",
-                [
-                    r"NoSuchKey",
-                    r"NoSuchBucket",
-                    r"nss_volumes",
-                    r"missing\s+input",
-                    r"corrupt",
-                    r"Unable\s+to\s+open",
-                    r"Input\s+file\s+not\s+found",
-                ],
-            ),
-            (
-                "algorithm",
-                [
-                    r"AssertionError",
-                    r"ValueError",
-                    r"segmentation\s+fault",
-                    r"Segmentation\s+fault",
-                    r"SIGSEGV",
-                    r"RuntimeError",
-                    r"CalledProcessError",
-                    r"non-zero\s+exit\s+code",
-                    r"ERROR:",
-                ],
-            ),
-            (
-                "dependency",
-                [
-                    r"depended\s+on\s+task",
-                    r"upstream\s+task\s+failed",
-                    r"Skipped",
-                ],
-            ),
-        ]
+        # The StepOutcome taxonomy and record writer, shared with the fallback
+        # recorder (src/metrics/outcome_recorder.py) and the other two drivers:
+        # images/shared/step_outcome.py, COPYed into /app of this image (#646).
+        # It classifies `skipped` as dependency (#222), exit 65 as qc_rejected
+        # (#368) and signal deaths by exit code, for every writer alike — the
+        # inline copies this replaces had each kept a different subset.
+        sys.path.insert(0, "/app")
+        import step_outcome
 
-        def classify_failure(message):
-            msg = message or ""
-            for category, patterns in _TAXONOMY:
-                for pat in patterns:
-                    if re.search(pat, msg, re.IGNORECASE):
-                        return category
-            return "unknown"
+        QC_REJECTED_EXIT_CODE = step_outcome.QC_REJECTED_EXIT_CODE
 
-        # bold_to_t1w.py exits 65, and only 65, when its QC gate rejects the run
-        # (see QC_REJECTED_EXIT_CODE in src/metrics/outcome_recorder.py, which
-        # maps it to the same category — test_driver_gating asserts the two
-        # agree). The driver holds rc directly, so it sets the category from the
-        # code instead of pattern-matching its own reason string: that string
-        # ("bold_to_t1w.py exited 65") matched no taxonomy pattern, which is how
-        # 180 rejections were recorded `unknown` (#368). The string itself is
-        # unchanged, because validate_test_batch.B2T_QC_REJECTION_RE keys on it.
-        QC_REJECTED_EXIT_CODE = 65
-
-        def write_outcome(step, task, run, status, failure_reason="", exit_code=None):
-            if status == "succeeded":
-                category = ""
-            elif exit_code == QC_REJECTED_EXIT_CODE:
-                category = "qc_rejected"
-            else:
-                category = classify_failure(failure_reason)
-            record = {
-                "workflow_name": WORKFLOW_NAME,
-                "step": step,
-                "subject": SUBJ,
-                "session": SES,
-                "task": task,
-                "run": run,
-                "status": status,
-                "failure_category": category,
-                "failure_reason": failure_reason,
-                "upstream_failed_step": "",
-                "outputs_verified": [],
-                "pipeline": "cloudpipe_minproc",
-                "schema_version": "1.0",
-                "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            }
-            key = f"{WORKFLOW_NAME}__{step}__{SUBJ}__{SES}__{task}__{run}_outcome.json"
-            (STEP_OUTCOMES_DIR / key).write_text(json.dumps(record))
+        def write_outcome(step, task, run, status, failure_reason="", upstream_failed_step="", exit_code=None):
+            step_outcome.write_outcome(
+                STEP_OUTCOMES_DIR,
+                workflow_name=WORKFLOW_NAME,
+                workflow_uid=WORKFLOW_UID,
+                subject=SUBJ,
+                session=SES,
+                step=step,
+                task=task,
+                run=run,
+                status=status,
+                failure_reason=failure_reason,
+                upstream_failed_step=upstream_failed_step,
+                exit_code=exit_code,
+            )
 
         FUNC_DIR = Path("/data/func")
         OUT_ROOT = Path("/tmp/registration_out")

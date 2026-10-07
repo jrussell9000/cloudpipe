@@ -17,8 +17,3 @@ output "db_secret_arn" {
   description = "ARN of the RDS-managed Secrets Manager secret holding the database credentials."
   value       = aws_db_instance.this.master_user_secret[0].secret_arn
 }
-
-output "lb_security_group_id" {
-  description = "ID of the ALB security group for the Argo Workflows server."
-  value       = aws_security_group.lb.id
-}

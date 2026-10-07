@@ -16,3 +16,6 @@ RUN pip install --disable-pip-version-check --root-user-action=ignore --no-cache
 # the writer and all three recorders import it, so it must ship beside them.
 COPY src/metrics/exit_handler.py src/metrics/writer.py src/metrics/schemas.py src/metrics/outcome_recorder.py src/metrics/record_workflow_start.py src/metrics/deployment_env.py /app/
 COPY src/inventory.py /app/
+# outcome_recorder.py imports its failure taxonomy from here (#646) — the same
+# module the in-pod drivers record with, so there is one taxonomy.
+COPY images/shared/step_outcome.py /app/
