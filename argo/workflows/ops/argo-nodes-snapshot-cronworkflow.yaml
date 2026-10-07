@@ -16,9 +16,18 @@
 # survived in the capture. Argo's server-side record had all 33. A client-side
 # watch is a cross-check, never the source of record.
 #
-# WHY `list` AND NOT A LOOP OF `get`. `status.nodes` is stored inline here (no
-# `offloadNodeStatusVersion`, no `compressedNodes`), so one paged LIST captures
-# a whole batch in seconds; `argo get` per workflow takes minutes over 300.
+# WHY `list` AND NOT A LOOP OF `get`. One paged LIST captures a whole batch in
+# seconds; `argo get` per workflow takes minutes over 300. The LIST returns the
+# CRD as stored, so node status arrives in one of three forms (#649). Small
+# workflows carry it inline in `status.nodes`. Past the etcd size limit the
+# controller moves it to `status.compressedNodes` (base64 of gzip — the
+# default; we do not set WORKFLOW_COMPRESSION_ALGORITHM), which is decoded here.
+# Past that, with `nodeStatusOffLoad: true`, it goes to the Argo DB and only
+# `status.offloadNodeStatusVersion` remains: those rows are reachable only via
+# the Argo server, so they are written with no pods and counted in the
+# heartbeat's `node_status`, never dropped silently. The large retry-heavy
+# workflows this snapshot exists for (#234, #239) are exactly the ones that
+# cross those limits.
 #
 # WHY A REDUCED PROJECTION. A raw dump of 300 workflows with inline node status
 # is hundreds of MB per snapshot, six times a day. Everything #234 (Error-phase
@@ -110,7 +119,7 @@ spec:
           karpenter.sh/nodepool: cpu-light-nodepool
 
         script:
-          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:e319537e801a2f0dd2c64731322eb0e9d6f9e6f8e4b5f1641c24f6cdcc6e0c70"
+          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:b90721d0274cdad5632a0f5cbc52a7c442b37d32d3e6865ebab43c32f11a166a"
           imagePullPolicy: IfNotPresent
           command: [python]
 
@@ -135,6 +144,7 @@ spec:
             (and therefore no image pin commit) to deploy or change.
             """
 
+            import base64
             import gzip
             import io
             import json
@@ -192,8 +202,37 @@ spec:
                         time.sleep(5 * (attempt + 1))
 
 
-            def pod_nodes(status):
-                """Per-attempt pod rows.
+            def node_map(status):
+                """(nodes, source) for one workflow's status.
+
+                `source` says where the node map came from, so a workflow written
+                with no pods can be told apart from one that has none:
+                  inline       status.nodes
+                  compressed   status.compressedNodes, base64 + gzip, decoded
+                  offloaded    in the Argo DB; only the Argo server can read it
+                  undecodable  compressedNodes in a format not handled here
+                               (Argo 4.1 can also write zstd/brotli)
+                  none         no node status at all (e.g. still Pending)
+                """
+                nodes = status.get("nodes")
+                if nodes:
+                    return nodes, "inline"
+                packed = status.get("compressedNodes")
+                if packed:
+                    try:
+                        raw = base64.b64decode(packed)
+                        if raw[:2] != b"\x1f\x8b":
+                            raise ValueError("not gzip")
+                        return json.loads(gzip.decompress(raw)), "compressed"
+                    except Exception:
+                        return {}, "undecodable"
+                if status.get("offloadNodeStatusVersion"):
+                    return {}, "offloaded"
+                return {}, "none"
+
+
+            def pod_nodes(nodes):
+                """Per-attempt pod rows from a node map.
 
                 Only `type == Pod` nodes are kept — DAG and StepGroup nodes carry
                 no attempt data. The template name is read as
@@ -202,7 +241,7 @@ spec:
                 filtering on `templateName` alone silently dropped 25 of 31 pods.
                 """
                 rows = []
-                for node in (status.get("nodes") or {}).values():
+                for node in nodes.values():
                     if node.get("type") != "Pod":
                         continue
                     ref = node.get("templateRef") or {}
@@ -228,6 +267,9 @@ spec:
             n_wf = 0
             n_pods = 0
             phases = {}
+            # Every source counted, so `offloaded: 0` on a quiet day is a positive
+            # statement rather than an absent key.
+            node_sources = {"inline": 0, "compressed": 0, "offloaded": 0, "undecodable": 0, "none": 0}
             cont = None
 
             with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
@@ -237,7 +279,15 @@ spec:
                         meta = wf.get("metadata") or {}
                         status = wf.get("status") or {}
                         labels = meta.get("labels") or {}
-                        rows = pod_nodes(status)
+                        nodes, source = node_map(status)
+                        node_sources[source] += 1
+                        if source in ("offloaded", "undecodable"):
+                            print(
+                                "WARNING: " + str(meta.get("name")) + " node status is "
+                                + source + "; written with no pod rows",
+                                flush=True,
+                            )
+                        rows = pod_nodes(nodes)
                         phase = status.get("phase")
                         phases[phase] = phases.get(phase, 0) + 1
                         n_wf += 1
@@ -249,6 +299,9 @@ spec:
                             "subject": labels.get("subjectid"),
                             "pipeline": labels.get("pipeline"),
                             "phase": phase,
+                            # Where `pods` came from: an empty list from an
+                            # "offloaded" workflow is missing data, not zero pods.
+                            "node_status": source,
                             "workflow_message": status.get("message"),
                             "started_at": status.get("startedAt"),
                             "finished_at": status.get("finishedAt"),
@@ -287,6 +340,7 @@ spec:
                         "pod_attempts": n_pods,
                         "bytes_gz": len(body),
                         "phases": phases,
+                        "node_status": node_sources,
                     },
                     indent=2,
                 ).encode(),
@@ -300,3 +354,4 @@ spec:
                 flush=True,
             )
             print("phases: " + json.dumps(phases), flush=True)
+            print("node_status: " + json.dumps(node_sources), flush=True)

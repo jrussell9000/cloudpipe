@@ -93,7 +93,35 @@ data "aws_iam_policy_document" "worker" {
       # every batch.
       "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/config",
       "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/gateway-name",
+      # The gate starts the Globus host before its live listing (#652); this is
+      # how it finds the instance. See StartGlobusHost below.
+      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/instance-id",
     ]
+  }
+
+  # The live listing cannot succeed against a stopped host, and the host is
+  # stopped every night at 00:00 UTC. Until #652 the gate refused every batch
+  # submitted after an idle midnight, because the only thing that started the
+  # host was a workflow, and no workflow exists until the gate lets one through.
+  # The same two grants the Argo runner holds for its start-globus-instance step
+  # (runner_globus_ec2 in terraform/modules/globus/main.tf): start this one
+  # instance, describe any (EC2 describe actions take no resource ARN).
+  dynamic "statement" {
+    for_each = var.globus_instance_arn == "" ? [] : [var.globus_instance_arn]
+    content {
+      sid       = "StartGlobusHost"
+      actions   = ["ec2:StartInstances"]
+      resources = [statement.value]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.globus_instance_arn == "" ? [] : [var.globus_instance_arn]
+    content {
+      sid       = "DescribeGlobusHost"
+      actions   = ["ec2:DescribeInstanceStatus", "ec2:DescribeInstances"]
+      resources = ["*"]
+    }
   }
 
   # The gate's second half is a live listing through the destination collection,

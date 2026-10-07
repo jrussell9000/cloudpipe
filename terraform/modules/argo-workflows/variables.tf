@@ -17,11 +17,6 @@ variable "vpc_cidr" {
   type        = string
 }
 
-variable "nat_gateway_ip" {
-  description = "Public Elastic IP of the VPC's NAT gateway. Full-tunnel Client VPN traffic to this ALB's public IP hairpins out through the NAT gateway and back in over the internet, so the ALB security group must trust it as a source."
-  type        = string
-}
-
 variable "private_subnets" {
   description = "List of private subnet IDs for the RDS subnet group."
   type        = list(string)
@@ -32,22 +27,32 @@ variable "region" {
   type        = string
 }
 
-variable "inbound_prefix_list_id" {
-  description = "Managed prefix list ID controlling inbound access to the Argo Workflows ALB"
+################################################################################
+# UI access — published behind the caller's shared ALB, or port-forwarded
+################################################################################
+
+variable "publish_ui" {
+  description = "Whether to create the Ingress that publishes the Argo Workflows UI on the caller's shared ALB. False in port-forward mode, where `ui_host` and `certificate_arn` are null."
+  type        = bool
+}
+
+variable "ui_host" {
+  description = "Hostname the UI is published under (e.g. 'argo.example.com'). Null when publish_ui is false."
   type        = string
 }
 
-################################################################################
-# DNS / TLS
-################################################################################
+variable "ui_base_url" {
+  description = "Where a browser reaches this UI, scheme and all — the ALB hostname when published, a fixed localhost port when port-forwarded. The SSO redirect URL is built from it, so it has to agree with what the identity provider has registered."
+  type        = string
+}
 
-variable "route53_zone_name" {
-  description = "Name of the Route53 hosted zone (e.g. 'example.com'). Used to build the Argo Workflows subdomain."
+variable "oidc_issuer_url" {
+  description = "OIDC issuer the Argo Workflows server trusts for SSO. The server discovers every other endpoint from it, from inside its pod, so it must be reachable from there as well as from the browser."
   type        = string
 }
 
 variable "certificate_arn" {
-  description = "ARN of the ACM certificate for the Argo Workflows ALB listener."
+  description = "ARN of the ACM certificate for the shared ALB listener. Null when publish_ui is false."
   type        = string
 }
 

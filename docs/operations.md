@@ -2,7 +2,7 @@
 
 Day-2 reference for submitting pipelines, monitoring progress, handling failures, and updating code.
 
-**Prerequisite**: connect **Cloudflare WARP** before using any CLI or web UI listed below — `kubectl`, `argo`, every Service URL, `pixi run prefect-deploy` / `PREFECT_API_URL=https://prefect.…`, and the Kubecost scripts (`scripts/kubecost_data_harvest.py`, `scripts/cloudpipe_minproc_costs.py`, `src/validate_test_batch.py`). The EKS API endpoint and the web-UI load balancer are both private; without WARP every hostname resolves but **times out**. See [infrastructure.md → Remote access](infrastructure.md#remote-access-cloudflare-warp).
+**Prerequisite**: connect **Cloudflare WARP** before using any CLI or web UI listed below — `kubectl`, `argo`, every Service URL, `pixi run -e ops prefect-deploy` and any other `prefect` CLI call, and the Kubecost scripts (`scripts/kubecost_data_harvest.py`, `scripts/cloudpipe_minproc_costs.py`, `src/validate_test_batch.py`). The EKS API endpoint and the web-UI load balancer are both private; without WARP every hostname resolves but **times out**. See [infrastructure.md → Remote access](infrastructure.md#remote-access-cloudflare-warp).
 
 - WARP's session lasts 24h. A *TLS handshake timeout* (kubectl) or a hanging page usually means it lapsed: `warp-cli debug access-reauth` (PowerShell: `& "C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe" debug access-reauth`).
 - The AWS Client VPN still works as a fallback until it is decommissioned. For VPN-specific trouble, see `docs-internal/investigations/2026-07-16-vpn-remote-access-troubleshooting.md` (internal).
@@ -23,9 +23,16 @@ Day-2 reference for submitting pipelines, monitoring progress, handling failures
 
 The commands on this page run in `pixi shell -e ops` (WARP connected), which reads this
 deployment's values from the cluster and exports them: `CLOUDPIPE_BUCKET`,
-`CLOUDPIPE_METRICS_BUCKET`, `CLOUDPIPE_ECR_REGISTRY`, `PREFECT_API_URL` and
-`KUBECOST_BASE_URL` (`scripts/cloudpipe-env.sh`). The `aws` CLI takes the region from your
-AWS profile.
+`CLOUDPIPE_METRICS_BUCKET`, `CLOUDPIPE_ECR_REGISTRY`, `PREFECT_API_URL`,
+`PREFECT_API_AUTH_STRING` and `KUBECOST_BASE_URL` (`scripts/cloudpipe-env.sh`). The `aws` CLI
+takes the region from your AWS profile.
+
+**The Prefect API requires basic auth** (#636): every `prefect` CLI call and Prefect client
+needs `PREFECT_API_AUTH_STRING`, read from Secret `prefect-api-auth` in `prefect`. `pixi
+shell -e ops` / `pixi run -e ops …` export it; outside that environment export it yourself
+(`kubectl -n prefect get secret prefect-api-auth -o jsonpath='{.data.auth-string}' | base64
+--decode`). A `401` means it is missing. The Prefect **UI** asks for the same credential once,
+after the SSO sign-in.
 
 ---
 
@@ -1054,11 +1061,13 @@ git push
 # If prefect.yaml also changed, the job summary will warn that a redeploy is needed.
 
 # Option B: manual local build + deploy (from repo root)
-PREFECT_API_URL=https://prefect.<your-domain>/api bash images/prefect-flow-runner/build.sh
-# This builds, pushes, and runs `pixi run prefect-deploy` in one step.
+pixi run -e ops bash images/prefect-flow-runner/build.sh
+# This builds, pushes, and runs `pixi run prefect-deploy` in one step. The ops
+# environment supplies PREFECT_API_URL and PREFECT_API_AUTH_STRING.
 ```
 
-Redeploy with `PREFECT_API_URL=… pixi run prefect-deploy` when `prefect/prefect.yaml` changes (adding deployments, changing parameters, etc.), or when a flow gains a parameter the deployment must store. Changing flow logic in `.py` files otherwise only requires a new image push.
+Redeploy with `pixi run -e ops prefect-deploy` (it refuses to start without `PREFECT_API_URL`
+and `PREFECT_API_AUTH_STRING`) when `prefect/prefect.yaml` changes (adding deployments, changing parameters, etc.), or when a flow gains a parameter the deployment must store. Changing flow logic in `.py` files otherwise only requires a new image push.
 
 **Never run a bare `prefect deploy --all`.** `prefect.yaml` names no bucket and no registry: they are `{{ $CLOUDPIPE_* }}` placeholders that `prefect/deploy.sh` fills from the `cloudpipe-config` ConfigMap. Prefect resolves a placeholder once, at deploy time, and an unset one stores `""` with only a warning — so a bare deploy *succeeds* and overwrites every deployment with an image of `/cloudpipe/cloudpipe-flow-runner:latest` and an empty bucket. `deploy.sh` refuses an empty value before deploying and reads every deployment back from the server afterwards, failing on any field that differs from what `prefect.yaml` renders to. The region is not configured at all: EKS Pod Identity injects `AWS_REGION` into every flow-run pod.
 
@@ -1071,6 +1080,38 @@ terraform apply
 ```
 
 Never use `-chdir=terraform` — run from within the `terraform/` directory.
+
+**`terraform/install-state.auto.tfvars` must exist first.** It holds three flags
+that are post-install state rather than configuration, and every later apply needs
+them (GitHub #635):
+
+```hcl
+crds_available                 = true
+vpc_cni_network_policy_enabled = true
+vpc_cni_strict_mode            = true
+```
+
+`install.sh` writes the file in Phase 6, and Terraform loads any `*.auto.tfvars`
+in the working directory automatically. It is gitignored, so **a fresh clone of an
+existing deployment does not have it** — create it before running any apply.
+Without it all three fall back to `false`, and the plan will quietly:
+
+- destroy the `ClusterSecretStore` and every `ExternalSecret` gated on
+  `crds_available` — the Argo and Prefect RDS credentials, the pgbouncer userlist
+  and the cloudflared token; and
+- set the vpc-cni add-on's `enableNetworkPolicy` to `false`, which makes **every**
+  NetworkPolicy in the cluster inert, each `default-deny-all` included.
+
+So read the plan before applying: a `kubectl_manifest` being destroyed, or a
+`vpc-cni` `configuration_values` change, means the file is missing or unread.
+`kubectl get networkpolicy -A` looks identical either way — the policies still
+exist, they are simply not enforced. Check the agent instead:
+
+```bash
+kubectl -n kube-system get ds aws-node \
+  -o jsonpath='{range .spec.template.spec.containers[?(@.name=="aws-eks-nodeagent")]}{.args}{end}' \
+  | tr ',' '\n' | rg enable-network-policy
+```
 
 PRs touching `terraform/` are checked by CI (`terraform fmt`, `terraform validate`, `tflint`) — see [Running tests and CI checks](#running-tests-and-ci-checks) above.
 

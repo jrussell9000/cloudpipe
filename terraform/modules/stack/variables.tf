@@ -3,33 +3,25 @@
 #################
 
 variable "domain" {
-  description = "Base domain name for all CloudPipe services. Must match an existing Route53 hosted zone in your account."
+  description = "Base domain name for all CloudPipe services. Must match an existing Route53 hosted zone in your account. null runs port-forward mode, with no published UIs."
   type        = string
 
   # No default: a fork that inherits ours publishes services under a domain it
   # does not own, and the ACM validation then fails against someone else's zone.
+  # null is a deliberate choice, written as `domain = null`.
+  #
+  # null selects port-forward mode (`local.publish_uis`, design D1 of
+  # openspec/changes/optional-domain-and-cognito-auth): no ALB, certificate,
+  # WAF, ingress, DNS record or external-dns, and each UI reached with
+  # `kubectl port-forward` on a fixed localhost port (design D2). Operators
+  # sign in through the Cognito pool, so no domain also needs no institutional
+  # SSO.
+  #
+  # The wizard's schema carries the same rule and the same wording;
+  # tests/test_setup_wizard_schema.py holds the two together.
   validation {
-    condition     = can(regex("^[a-z0-9.-]+\\.[a-z]{2,}$", var.domain))
-    error_message = "domain must be a bare DNS name with a TLD, e.g. example.org — no scheme and no trailing dot."
-  }
-}
-
-variable "institution_domain" {
-  description = <<-EOT
-    Email domain of the institution whose identities may sign in to the pipeline's
-    web UIs. Distinct from var.domain: that one is where the services are
-    published, this one is who is allowed through the SSO proxy in front of them.
-
-    Only Prefect's oauth2-proxy reads this so far. The other uses of the same
-    literal still live in the Terraform root and move here with the rest of the
-    stack's literals (task 4.5 of
-    openspec/changes/archive/2026-10-01-public-upstream-readiness).
-  EOT
-  type        = string
-
-  validation {
-    condition     = can(regex("^[a-z0-9.-]+\\.[a-z]{2,}$", var.institution_domain))
-    error_message = "institution_domain must be a bare email domain, e.g. example.edu."
+    condition     = var.domain == null || can(regex("^[a-z0-9.-]+\\.[a-z]{2,}$", var.domain))
+    error_message = "domain must be null (port-forward mode) or a bare DNS name with a TLD, e.g. example.org — no scheme and no trailing dot."
   }
 }
 
@@ -142,6 +134,12 @@ variable "argo_workflows_db_table_name" {
 
 variable "crds_available" {
   description = "Set to true once ArgoCD has synced and installed all CRDs (external-secrets, prometheus-operator). Gate kubectl_manifest resources that depend on those CRDs."
+  type        = bool
+  default     = false
+}
+
+variable "vpc_cni_network_policy_enabled" {
+  description = "Enable the VPC CNI network-policy agent (enableNetworkPolicy). FALSE MAKES EVERY NetworkPolicy IN THE CLUSTER INERT, including each default-deny-all — see issue #635. install.sh sets it true in Phase 6 and persists it in install-state.auto.tfvars. Separate from vpc_cni_strict_mode, which only chooses standard vs strict once the agent is on."
   type        = bool
   default     = false
 }
@@ -370,11 +368,6 @@ variable "certificate_validity_period_hours" {
   default     = 8760
 }
 
-variable "admin_netid" {
-  description = "Institution username, without the @<institution_domain> suffix, granted the ArgoCD admin role via Dex OIDC SSO"
-  type        = string
-}
-
 # Not a credential — an account identifier, and this file is not part of the
 # public mirror (only terraform/modules/** is). The Cloudflare API TOKEN is a
 # different thing entirely and never appears in Terraform: it is supplied via
@@ -393,16 +386,6 @@ variable "grafana_namespace" {
   description = "Kubernetes namespace where Grafana is deployed (must match the gitops/apps/grafana ArgoCD Application namespace)."
   type        = string
   default     = "grafana"
-}
-
-variable "uwmadison_prefix_list_id" {
-  description = "ID (not ARN) of the AWS managed prefix list allowed cloudPipe ingress (e.g. pl-xxxxxxxx)"
-  type        = string
-
-  validation {
-    condition     = startswith(var.uwmadison_prefix_list_id, "pl-")
-    error_message = "uwmadison_prefix_list_id must be a prefix list ID (pl-...), not an ARN."
-  }
 }
 
 variable "client_cidr_block" {
@@ -527,26 +510,73 @@ variable "security_findings_emails" {
 
 
 ##############################
-# Institution SSO / Cloudflare
+# Identity / Cloudflare
 ##############################
 
-variable "institution_oidc_issuer" {
+variable "external_identity" {
   description = <<-EOT
-    Base URL of the institution's OIDC identity provider, the upstream Cloudflare
-    Access authenticates against. The authorize/token/keyset endpoints are derived
-    from it, so this must be the issuer the provider actually publishes at
-    `<issuer>/.well-known/openid-configuration` — Access does not discover them.
+    An identity provider this module does not create, for a deployment that
+    already integrates one directly.
+
+    Supply an already-configured Cloudflare Access identity provider and policy,
+    and the values Dex needs to use the same provider. The module allows that
+    provider on its two Access applications and renders that Dex connector; it
+    builds the connector's `redirectURI` itself, from its own service URLs,
+    because it is the only place that knows them in both access modes.
+
+    Nothing here names an institution or a protocol profile on purpose. A direct
+    integration is one provider's shape — endpoint layouts, attribute names,
+    assurance profiles — so it belongs in the deployment's own configuration
+    rather than in this module (design D6 of
+    openspec/changes/optional-domain-and-cognito-auth).
+
+    Leave it null to use the Cognito user pool this module creates (cognito.tf),
+    with institutional SSO arriving through Cognito federation instead. That is
+    the default for new deployments, and the wizard never offers this input.
   EOT
-  type        = string
+
+  type = object({
+    access_identity_provider_id = string
+    access_policy_id            = string
+    dex_connector = object({
+      id            = string
+      name          = string
+      issuer        = string
+      client_id     = string
+      client_secret = string
+    })
+  })
+
+  # The Dex client secret is in here. It reaches state anyway, through the ArgoCD
+  # Helm release's values, which is a recorded tradeoff; marking it keeps it out
+  # of plan output.
+  sensitive = true
+
+  # Defaulted, because the wizard does not offer this input and a variable with
+  # no default that nothing asks for is a prompt mid-apply — or an error under
+  # `-input=false`, which is how any scripted apply runs.
+  default = null
+}
+
+variable "operator_emails" {
+  description = <<-EOT
+    Email addresses of the operators. In every mode they hold the administrator
+    role in each web UI, and their email domains are the ones the SSO proxies
+    admit. In Cognito mode (no `external_identity`) they are also who may enroll
+    a WARP device and reach the cluster, and each needs a user in the pool with
+    the same address — the module does not create users (output
+    `cognito_user_pool_id` names the pool to create them in).
+  EOT
+  type        = list(string)
 
   validation {
-    condition     = startswith(var.institution_oidc_issuer, "https://")
-    error_message = "institution_oidc_issuer must be an https URL with no trailing slash."
+    condition     = length(var.operator_emails) > 0
+    error_message = "operator_emails must hold at least one address: with none, no one can administer the deployment."
   }
 
   validation {
-    condition     = !endswith(var.institution_oidc_issuer, "/")
-    error_message = "institution_oidc_issuer must not end in a slash — the endpoint paths are appended to it."
+    condition     = alltrue([for email in var.operator_emails : can(regex("^[^@\\s]+@[a-z0-9.-]+\\.[a-z]{2,}$", email))])
+    error_message = "operator_emails must be email addresses with a lower-case domain, e.g. operator@example.org."
   }
 }
 

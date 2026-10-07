@@ -241,7 +241,11 @@ locals {
 # The web ACL
 # ------------------------------------------------------------------------------
 
+# Published mode only: the web ACL exists to protect the UI ALB, and without a
+# domain there is no ALB. See local.publish_uis (locals.tf).
 resource "aws_wafv2_web_acl" "ui_alb" {
+  count = local.publish_uis ? 1 : 0
+
   name  = "cloudpipe-ui-alb"
   scope = "REGIONAL" # ALB is a regional resource. CLOUDFRONT scope cannot attach.
 
@@ -427,6 +431,8 @@ data "aws_iam_policy_document" "ui_waf_logs_kms" {
 }
 
 resource "aws_kms_key" "ui_waf_logs" {
+  count = local.publish_uis ? 1 : 0
+
   description             = "CMK for the ${local.ui_waf_log_group_name} WAF log group"
   deletion_window_in_days = 7
   enable_key_rotation     = true
@@ -434,19 +440,25 @@ resource "aws_kms_key" "ui_waf_logs" {
 }
 
 resource "aws_kms_alias" "ui_waf_logs" {
+  count = local.publish_uis ? 1 : 0
+
   name          = "alias/${local.name}-ui-waf-logs"
-  target_key_id = aws_kms_key.ui_waf_logs.key_id
+  target_key_id = aws_kms_key.ui_waf_logs[0].key_id
 }
 
 resource "aws_cloudwatch_log_group" "ui_waf" {
+  count = local.publish_uis ? 1 : 0
+
   name              = local.ui_waf_log_group_name
   retention_in_days = 365
-  kms_key_id        = aws_kms_key.ui_waf_logs.arn
+  kms_key_id        = aws_kms_key.ui_waf_logs[0].arn
 }
 
 resource "aws_wafv2_web_acl_logging_configuration" "ui_alb" {
-  resource_arn            = aws_wafv2_web_acl.ui_alb.arn
-  log_destination_configs = [aws_cloudwatch_log_group.ui_waf.arn]
+  count = local.publish_uis ? 1 : 0
+
+  resource_arn            = aws_wafv2_web_acl.ui_alb[0].arn
+  log_destination_configs = [aws_cloudwatch_log_group.ui_waf[0].arn]
 
   # Log the interesting requests only. ALLOW with no rule match is the
   # overwhelming majority of traffic here — Grafana live panels re-poll every few
@@ -526,6 +538,8 @@ output "ui_alb_waf_web_acl_arn" {
     or has errored on it; `kubectl -n argocd describe ingress argocd-ingress` shows
     the error. Note that a web ACL cannot be deleted while still associated, so a
     `terraform destroy` of this file requires removing the annotation first.
+
+    null in port-forward mode, where there is no ALB to protect.
   EOT
-  value       = aws_wafv2_web_acl.ui_alb.arn
+  value       = one(aws_wafv2_web_acl.ui_alb[*].arn)
 }

@@ -81,8 +81,8 @@ Merging step 2 first leaves a window where neither source supplies the value, an
 | `external-dns` | Silent. A Deployment with no `--domain-filter` arg at all — an external-dns that manages every hosted zone it can reach. |
 | `aws-load-balancer-controller` | Loud. The chart refuses to render: `Chart cannot be installed without a valid clusterName!`. Region alone is silent, but the controller falls back to instance-metadata discovery, which is correct here. |
 | `cluster-config` | Loud, by our choice. Its template reads the value through `required`, so the render fails with a message naming the override. We own this template, so the failure mode was ours to pick — a bare `.Values.region` would have rendered `region:` and stopped every `ExternalSecret` in the cluster from resolving, with nothing in the manifest saying why. |
-| `prefect` | Silent, and the only one that fails **open**. The oauth2-proxy chart defaults `config.emailDomains` to `["*"]`, not to empty, so the generated `oauth2_proxy.cfg` admits every identity Dex will issue a token for instead of one domain. The same render also drops `--oidc-issuer-url` and `--redirect-url` and points the UI at `http://localhost:4200/api`. Every other app on this list either keeps working or refuses to render; this one renders something weaker than intended. |
-| `grafana` | Silent, and open in the same way: `allowed_domains` disappears from `grafana.ini`, and Grafana's default is no domain restriction at all, so `allow_sign_up: true` admits every identity Dex will issue a token for. (Dex's only upstream connector is UW-Madison NetID, so the set that widens to is narrower than Prefect's, but the render is still weaker than intended and goes Healthy.) The rest of that render is loud: the ingress host and `grafana.ini`'s `domain` fall back to the chart's `chart-example.local`, which moves the ALB host rule and drops the external-dns annotation, and the `datasources.yaml` provisioning key vanishes with its volume mount, so every dashboard loses its datasource. |
+| `prefect` | Silent, and the only one that fails **open**. The oauth2-proxy chart defaults `config.emailDomains` to `["*"]`, not to empty, so the generated `oauth2_proxy.cfg` admits every identity the deployment's provider will issue a token for instead of the operators' domains. The same render also drops `--oidc-issuer-url` and `--redirect-url` and points the UI at `http://localhost:4200/api`. Every other app on this list either keeps working or refuses to render; this one renders something weaker than intended. |
+| `grafana` | Silent, and open in the same way: `allowed_domains` disappears from `grafana.ini`, and Grafana's default is no domain restriction at all, so `allow_sign_up: true` admits every identity Dex will issue a token for. (Dex has a single upstream connector, so the set that widens to is narrower than Prefect's, but the render is still weaker than intended and goes Healthy.) The rest of that render is loud: the ingress host and `grafana.ini`'s `domain` fall back to the chart's `chart-example.local`, which moves the ALB host rule and drops the external-dns annotation, and the `datasources.yaml` provisioning key vanishes with its volume mount, so every dashboard loses its datasource. |
 
 Check either step locally before it lands. Where the chart is vendored under `gitops/apps/<app>/charts/`, `helm template` needs no network:
 
@@ -174,10 +174,10 @@ Umbrella chart combining three sub-charts pinned to the same release (`2026.4.10
 - Work pool: `cloudpipe-k8s-pool`
 
 **oauth2-proxy** (SSO gate in front of prefect-server)
-- Provider: OIDC via Dex (ArgoCD's Dex instance)
-- Only one email domain allowed, from `var.institution_domain`. The issuer URL and `redirect-url` come from the same override; the redirect has to agree with the `prefect` Dex static client in `terraform/modules/stack/argocd.tf`, which is why both live in Terraform
+- Provider: OIDC — the Cognito pool's `prefect` client by default, or ArgoCD's Dex with an `external_identity`
+- Allowed email domains are the domains of `var.operator_emails`. The issuer URL and `redirect-url` come from the same override; the redirect has to agree with the callback the `prefect` client registers (`terraform/modules/stack/cognito.tf`, or the Dex static client in `argocd.tf`), which is why all of it lives in Terraform
 - The chart's own default for the allowed domain is `["*"]`, so this value going missing widens access rather than breaking it
-- `/api/` path bypasses SSO — required for Prefect CLI and programmatic access; access is VPN-gated at the ALB security group instead
+- `/api/` path bypasses SSO — required for Prefect CLI and programmatic access. The bypass is **not** network-gated (the UI ALB and the proxy's NetworkPolicy admit the whole VPC CIDR); what gates `/api/` is **Prefect's own basic auth** (#636). The server requires `PREFECT_SERVER_API_AUTH_STRING` and every client sends `PREFECT_API_AUTH_STRING`, both from Secret `prefect-api-auth` in `prefect` (created by `terraform/modules/prefect/auth.tf`; the charts' `basicAuth.existingSecret` reads key `auth-string`). The worker passes it to the flow-run pods it creates. `GET /api/health` and `/api/ready` stay open for the probes, so a `200` from `/api/health` proves nothing about auth — test a protected endpoint such as `/api/admin/version`. The browser UI asks for the credential once after SSO and remembers it. To read it: `kubectl -n prefect get secret prefect-api-auth -o jsonpath='{.data.auth-string}' | base64 --decode` (`pixi run -e ops` exports it as `PREFECT_API_AUTH_STRING` for you)
 
 ### cluster-config
 
@@ -256,7 +256,14 @@ Helm chart: `prometheus-community/kube-prometheus-stack` v77.14.0. Runs the Prom
 
 Helm chart: `grafana/grafana` v8.10.1. The dashboard JSONs live alongside the chart in `gitops/apps/grafana/dashboards/` and are provisioned as ConfigMaps, so a dashboard change ships through git like any other manifest — it is not edited in the UI. Grafana's AWS access (Athena query, Glue read, S3) comes from a Pod Identity association defined in Terraform, not from static credentials. See [observability.md](observability.md) for the dashboard inventory.
 
-SSO URLs and the admin email are single-sourced from Terraform via the `grafana-oidc-config` ConfigMap and expanded by Grafana's own `$__env{...}` at startup. Four more values reach the chart by the other route, an ApplicationSet override — the ingress hostname (`hosts` and the external-dns annotation), the SSO `allowed_domains`, and the whole `datasources` map, which is Terraform's for the sake of the Athena datasource's region alone: that region sits in a list, and Helm replaces a list rather than merging into it. See [Per-app Helm overrides](#per-app-helm-overrides).
+Every deployment-specific value reaches the chart through an ApplicationSet override:
+
+- whether the ingress exists, and its hostname (`hosts` and the external-dns annotation);
+- `root_url`;
+- the SSO client ID, endpoints, admin binding and `allowed_domains`;
+- the whole `datasources` map. That map is Terraform's for the sake of the Athena datasource's region alone: the region sits in a list, and Helm replaces a list rather than merging into it.
+
+The override can express both access modes (a domain, or port-forward on `localhost:3000`) and both identity modes (Cognito, or Dex with an external provider). A domain expanded with `$__env{...}` at startup, which is how `root_url` and the SSO URLs used to arrive, could not. Only the client secret and the renderer token still arrive as environment variables, from Terraform-managed Secrets. See [Per-app Helm overrides](#per-app-helm-overrides).
 
 The ALB annotations on that ingress **do** stay in `values.yaml`, and Terraform asserts they agree with `local.ui_alb_group_annotations` — Grafana is the one `cloudpipe-ui` IngressGroup member Terraform does not render. That assertion reads the override merged over the file, because either source can now carry an annotation.
 
@@ -341,8 +348,8 @@ therefore single-sourceable exactly when some *runtime* consumer expands it:
 
 | Mechanism | Works because | Used by |
 |---|---|---|
-| `$__env{DOMAIN}` | Grafana's own binary interpolates it at startup | `grafana.ini` `root_url`, `auth.generic_oauth` URLs (GitHub #16) |
-| `configMapKeyRef` env var | kubelet resolves it at pod start | `DOMAIN` / `ADMIN_EMAIL` from the Terraform-managed `grafana-oidc-config` ConfigMap |
+| `$__env{...}` | Grafana's own binary interpolates it at startup | `grafana.ini` `client_secret` (formerly also `root_url`, GitHub #16, now an override) |
+| `secretKeyRef` env var | kubelet resolves it at pod start | the SSO client secret and renderer token, from Terraform-managed Secrets |
 | Terraform interpolation | rendered before the object is applied | everything in `terraform/`, incl. the live Argo `sso` key |
 
 Kubernetes reads an Ingress `host` **literally** — there is no interpolator in that path at all.
@@ -353,8 +360,8 @@ in the order the apps were done:
 | Location | Value | Now |
 |---|---|---|
 | `gitops/apps/external-dns/values.yaml` | `domainFilters[0]`, rendered into a `--domain-filter=` container arg | `var.domain` through the override (the first app migrated, and the worked example for the rest), alongside the region |
-| `gitops/apps/prefect/values.yaml` | `prefectUiApiUrl`, oauth2-proxy's `oidc-issuer-url` and `redirect-url`, and the allowed email domain | `local.prefect_url` / `local.argocd_url` / `var.institution_domain` through the override (#565, #566). These are also env-var-backed upstream (`PREFECT_UI_API_URL`, `OAUTH2_PROXY_OIDC_ISSUER_URL`, `OAUTH2_PROXY_REDIRECT_URL`), so the `configMapKeyRef` row above would have worked too; the override was chosen for consistency with the other apps |
-| `gitops/apps/grafana/values.yaml` | `ingress.hosts[0]` and the `external-dns.alpha.kubernetes.io/hostname` annotation — subchart values the Ingress object consumes literally — plus `allowed_domains` | `local.grafana_url` and `var.institution_domain` through the override. Moving the annotation is also what made the shared-ALB precondition in `terraform/modules/stack/argocd.tf` read the override merged over `values.yaml` rather than the file alone |
+| `gitops/apps/prefect/values.yaml` | `prefectUiApiUrl`, oauth2-proxy's `oidc-issuer-url` and `redirect-url`, and the allowed email domain | `local.ui_base_urls` / the identity mode's issuer / the domains of `var.operator_emails` through the override (#565, #566; the last two since the optional-domain-and-cognito-auth change). These are also env-var-backed upstream (`PREFECT_UI_API_URL`, `OAUTH2_PROXY_OIDC_ISSUER_URL`, `OAUTH2_PROXY_REDIRECT_URL`), so the `configMapKeyRef` row above would have worked too; the override was chosen for consistency with the other apps |
+| `gitops/apps/grafana/values.yaml` | `ingress.hosts[0]` and the `external-dns.alpha.kubernetes.io/hostname` annotation — subchart values the Ingress object consumes literally — plus `allowed_domains` | `local.grafana_url` and the domains of `var.operator_emails` through the override. Moving the annotation is also what made the shared-ALB precondition in `terraform/modules/stack/argocd.tf` read the override merged over `values.yaml` rather than the file alone |
 
 What remains under `gitops/` is not a domain and not a value: two region literals in
 `cloudflared`'s AZ comments (task 3.8 of the readiness change). The `pipelines` Application's
@@ -382,7 +389,7 @@ migration is one app at a time, in two pull requests each: the override first, a
 change nothing, then the literal's removal.
 
 **When changing the domain**, no file under `gitops/apps/` needs a manual edit any more. Change
-`var.domain` (and `var.institution_domain`, if the sign-in domain changes with it) and apply —
+`var.domain` (and `var.operator_emails`, if the sign-in domain changes with it) and apply —
 `terraform apply -target=kubectl_manifest.argocd_root_app` is enough to re-render the overrides,
 and ArgoCD syncs each app from there.
 
@@ -419,4 +426,4 @@ kubectl patch application <name> -n argocd \
   --type=merge -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
 ```
 
-Use the ArgoCD UI at `https://argocd.<domain>` for a visual diff between live state and git (requires VPN + UW-Madison NetID).
+Use the ArgoCD UI at `https://argocd.<domain>` for a visual diff between live state and git (requires VPN + an SSO login).

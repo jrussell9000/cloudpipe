@@ -432,7 +432,7 @@ Where each value lives, rather than the value itself:
 | S3 gateway ID | `globus-connect-server storage-gateway list` on the instance |
 | Collection ID | SSM `/cloudpipe/globus/collection-id` |
 | Collection name | `cloudpipe-s3` |
-| Registered credential identity (both gateways) | The admin's own identity, `<netid>@<institution_domain>` |
+| Registered credential identity (both gateways) | The admin's own identity, `<username>@<institution_domain>` |
 | Native app client ID | Secrets Manager `globus/refresh-token`, property `native-app-client-id` |
 
 This endpoint predates `bootstrap-endpoint`: it was created by hand with the
@@ -661,7 +661,7 @@ globus-connect-server collection create \
 ```bash
 globus-connect-server user-credentials s3-create \
   "${GATEWAY_ID}" \
-  --globus-identity <netid>@<institution_domain>
+  --globus-identity <username>@<institution_domain>
 # Prompts: AWS Access Key ID, then AWS Secret Access Key.
 # For a gateway pointed at its signing proxy, answer with the published example pair
 # (AKIAIOSFODNN7EXAMPLE / wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY). The proxy discards

@@ -25,4 +25,8 @@ RUN echo "#!/bin/bash" > /entrypoint.sh && \
 
 COPY images/workbench/cifti_assemble.py ./
 
+# The StepOutcome taxonomy and writer the surface-resample driver records with
+# (#646). Standard-library only.
+COPY images/shared/step_outcome.py ./
+
 ENTRYPOINT ["/entrypoint.sh"]

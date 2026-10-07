@@ -182,6 +182,9 @@ _UNION_COLUMNS = {
     ],
     "workflow_runs": [
         "workflow_name",
+        # Schema 1.3+: the run's identity — Argo reuses names (#638). "" or NULL
+        # on older rows; join on (workflow_name, subject) for those.
+        "workflow_uid",
         "subject",
         "status",
         "started_at",

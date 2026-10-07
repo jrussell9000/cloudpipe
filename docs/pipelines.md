@@ -108,12 +108,12 @@ processing         (skipped if all three                  │
 
 | Where | `record-outcome-*` tasks |
 |---|---|
-| `master-pipeline-dag` (this diagram) | `record-outcome-anatomical-dagtask`, `record-outcome-session-dagtask` (phase-level aggregates), `record-outcome-subregion-seg-dagtask`, `record-outcome-fsqc-metrics-dagtask` |
+| `master-pipeline-dag` (this diagram) | `record-outcome-anatomical-dagtask`, `record-outcome-session-dagtask` (phase-level aggregates), `record-outcome-subregion-seg-dagtask`, `record-outcome-fsqc-metrics-dagtask`, `record-outcome-rejected-sessions-dagtask` (one `fastsurfer-long-parc` row per session `published-sessions` rejected — see below) |
 | Anatomical child DAG | `record-outcome-fastsurfer-{template-build,template-parc,long-seg,long-parc}-{failed,other}-dagtask` (one failed/other pair per FastSurfer producer — see below) |
 | Session-level child DAG | `record-outcome-func-preproc-dagtask` (records both `func-preproc` and `surface-sample`), `record-outcome-surface-resample-dagtask` |
-| Registration child DAG | `record-outcome-t1w-to-mni-step`, `record-outcome-bold-to-t1w-step` |
+| Registration child DAG | `record-outcome-t1w-to-mni-step`, `record-outcome-t1w-to-mni-failed-step`, `record-outcome-bold-to-t1w-failed-step`, `record-outcome-bold-to-t1w-skipped-step` (no success arm for `bold-to-t1w`: the worker pod records its own per-run successes, ADR 016) |
 
-Phase-level `record-outcome-*` tasks (`anatomical`, `session`, `subregion-seg`, `fsqc-metrics`) depend on `<producer>.Succeeded || .Failed || .Errored || .Skipped || .Omitted`, so they run on every terminal status, including a spot-preempted `Errored` producer and an `Omitted` one whose own upstream dependency failed. For a task that carries no `when:` clause of its own — `fsqc-metrics` is the example — `Skipped` means *an upstream branch failed*, not that the work was already done.
+Phase-level `record-outcome-*` tasks (`anatomical`, `session`, `subregion-seg`, `fsqc-metrics`) depend on `<producer>.Succeeded || .Failed || .Errored || .Skipped || .Omitted`, so they run on every terminal status, including a spot-preempted `Errored` producer and an `Omitted` one whose own upstream dependency failed. A task that carries no `when:` clause of its own — `fsqc-metrics` is the example — is never `Skipped`: when an upstream branch fails, its `depends` is never satisfied and it comes out `Omitted`.
 
 The four FastSurfer producers are the one place a **single shared gate isn't enough**: they were originally one `withItems` loop with one combined `depends`, but Argo resolves a DAG task's `depends` statically before `withItems` expansion, so a shared gate cannot isolate which items are safe to pull `.exitCode` from. Each producer instead gets a `-failed-dagtask` (gated on `.Failed || .Errored`, carries `exit-code` for real classification) and an `-other-dagtask` (gated on `.Succeeded || .Skipped || .Omitted`, status only) — the same two-arm shape as the registration fallback recorders below, just per producer instead of per session/run.
 

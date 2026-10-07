@@ -123,6 +123,10 @@ def _read_secret(secret_id: str) -> dict:
     return json.loads(payload["SecretString"])
 
 
+def _ec2_client():
+    return boto3.client("ec2", region_name=deployment_region())
+
+
 def _transfer_client():
     """A TransferClient built from the stored refresh token, for the live gate check."""
     import globus_sdk
@@ -141,6 +145,8 @@ def check_globus_session(
     read_ssm=_read_ssm_optional,
     read_variable=None,
     transfer_client_factory=_transfer_client,
+    ec2_client_factory=_ec2_client,
+    wake=globus_session.wake_host,
 ) -> globus_session.GateDecision:
     """Refuse the batch before the first submission if the session cannot carry it.
 
@@ -148,6 +154,11 @@ def check_globus_session(
     with the reason in the failure, which is the only place an operator reliably
     looks — a warning in the logs of a run that submitted anyway is how 300
     workflows died unnoticed on 2026-08-17.
+
+    Starts the Globus host before the live listing, which cannot succeed against
+    a stopped host (#652). That is a side effect of a check, and it is deliberate:
+    the batch's first workflow would start the host minutes later anyway, and the
+    nightly schedule stops it again if the batch is refused.
     """
     get_variable = read_variable or (lambda name, default: Variable.get(name, default=default))
     margin_hours = _as_float(
@@ -179,6 +190,30 @@ def check_globus_session(
     logger.info(decision.reason)
     if not decision.allowed:
         raise RuntimeError(f"Refusing to submit: {decision.reason}")
+
+    # The listing needs the host up, and the host is stopped every night (#652).
+    # An unreadable instance ID degrades to the old behaviour, loudly, rather than
+    # refusing: the grant ships in Terraform, and a flow image deployed before the
+    # apply must not refuse batches that would list fine against a running host.
+    try:
+        instance_id = read_ssm(globus_session.SSM_INSTANCE_ID_PARAM)
+        unreadable = "is not set"
+    except ClientError as exc:
+        instance_id = None
+        unreadable = (
+            f"could not be read ({exc}); grant the worker role ssm:GetParameter on it in "
+            "terraform/modules/prefect/iam.tf"
+        )
+    if instance_id:
+        ready, detail = wake(ec2_client_factory(), instance_id, log=logger.info)
+        if not ready:
+            raise RuntimeError(f"Refusing to submit: {detail}")
+        logger.info(detail)
+    else:
+        logger.warning(
+            f"{globus_session.SSM_INSTANCE_ID_PARAM} {unreadable}, so the Globus host was not "
+            "started. If it is stopped, the listing below fails."
+        )
 
     # The age check cannot see a revoked session or a timeout somebody lowered,
     # so one real listing follows it. It costs a single API call per run.

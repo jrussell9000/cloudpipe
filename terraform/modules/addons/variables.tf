@@ -14,12 +14,7 @@ variable "region" {
 }
 
 variable "route53_zone_arn" {
-  description = "ARN of the Route53 zone for external-dns and cert-manager."
-  type        = string
-}
-
-variable "route53_zone_name" {
-  description = "Name of the Route53 zone for external-dns and cert-manager."
+  description = "ARN of the Route53 zone cert-manager may solve ACME DNS-01 challenges in, or null when the deployment has no domain."
   type        = string
 }
 

@@ -30,6 +30,16 @@ spec:
         revision: ${revision}
         directories:
           - path: gitops/apps/*
+%{ if !publish_uis ~}
+          # Port-forward mode publishes no hostnames, so there is nothing for
+          # external-dns to write and no hosted zone for it to write into
+          # (design D2 of openspec/changes/optional-domain-and-cognito-auth).
+          # The generator deploys every directory it matches, so leaving the
+          # app out takes an exclusion; Terraform not binding its IAM role is
+          # not enough.
+          - path: gitops/apps/external-dns
+            exclude: true
+%{ endif ~}
   template:
     metadata:
       name: '{{.path.basename}}'

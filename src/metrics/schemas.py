@@ -48,6 +48,25 @@ def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def workflow_tag(workflow_name: str, workflow_uid: str = "") -> str:
+    """The workflow component of a per-workflow S3 key.
+
+    Argo reuses workflow names — they are generateName plus five characters,
+    freed when the 4h TTL reaps the object — so the name alone is not an
+    identity (#638). With a UID the tag is `{name}__{uid}`; without one it is the
+    bare name, which is the layout every record written before 2026-10 has. The
+    name stays first, so a listing on the `{name}__` prefix finds both layouts.
+    """
+    return f"{workflow_name}__{workflow_uid}" if workflow_uid else workflow_name
+
+
+# Argo reuses names; the UID is the identity. kw_only so it can sit beside
+# workflow_name (its column position) ahead of required fields without
+# changing any positional constructor call. "" on records written before 2026-10.
+def _workflow_uid_field():
+    return field(default="", kw_only=True)
+
+
 # ---------------------------------------------------------------------------
 # Functional preprocessing QC
 # ---------------------------------------------------------------------------
@@ -452,10 +471,15 @@ class FsqcQC:
 class WorkflowRun:
     """Per-Argo-workflow run summary, written by the exit handler.
 
-    S3 key: metrics/workflow-runs/dt={dt}/{workflow_name}__{subject}_run_summary.json
+    S3 key: metrics/workflow-runs/dt={dt}/{workflow_name}__{workflow_uid}__{subject}_run_summary.json
+    (`{workflow_name}__{subject}_…` on records without a UID — see workflow_tag).
+
+    Argo reuses names; workflow_uid is the identity (schema 1.3+). Empty on
+    records written before 2026-10.
     """
 
     workflow_name: str
+    workflow_uid: str = _workflow_uid_field()
     subject: str
     status: str  # Succeeded | Failed | Error
 
@@ -486,7 +510,7 @@ class WorkflowRun:
     # fact that lived in nobody's schema. Label the batch at submission and the
     # question becomes a WHERE clause.
     batch_label: str = ""
-    schema_version: str = "1.2"
+    schema_version: str = "1.3"
     completed_at: str = field(default_factory=_now_utc)
 
     def to_dict(self) -> dict[str, Any]:
@@ -501,9 +525,12 @@ class WorkflowRun:
         return cls(**{k: v for k, v in d.items() if k in known})
 
     @staticmethod
-    def s3_key(workflow_name: str, subject: str, dt: str | None = None) -> str:
+    def s3_key(
+        workflow_name: str, subject: str, dt: str | None = None, workflow_uid: str = ""
+    ) -> str:
         dt = dt or _today_utc()
-        return f"metrics/workflow-runs/dt={dt}/{workflow_name}__{subject}_run_summary.json"
+        tag = workflow_tag(workflow_name, workflow_uid)
+        return f"metrics/workflow-runs/dt={dt}/{tag}__{subject}_run_summary.json"
 
 
 # ---------------------------------------------------------------------------
@@ -518,11 +545,17 @@ class StepOutcome:
     One record per (workflow_name, step, subject, session, task, run).
     Written unconditionally after each substantive pipeline step.
 
-    S3 key: metrics/step-outcomes/dt={dt}/{workflow_name}__{step}__{subject}__{session}__{task}__{run}_outcome.json
+    S3 key: metrics/step-outcomes/dt={dt}/{workflow_name}__{workflow_uid}__{step}__{subject}__{session}__{task}__{run}_outcome.json
+    (no `__{workflow_uid}` on records without a UID — see workflow_tag).
     Absent scan dimensions (e.g. task/run for subject-level steps) use the literal "na".
+
+    Argo reuses names; workflow_uid is the identity (schema 1.1+). Empty on
+    records written before 2026-10. The exit handler gathers a workflow's
+    outcomes by it, so a reused name cannot pull in another run's rows.
     """
 
     workflow_name: str
+    workflow_uid: str = _workflow_uid_field()
     step: str  # canonical step name from taxonomy
     subject: str
     session: str  # "na" for subject-scoped steps
@@ -540,7 +573,7 @@ class StepOutcome:
     outputs_verified: list = field(default_factory=list)  # S3 keys confirmed to exist
 
     pipeline: str = "cloudpipe_minproc"
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     recorded_at: str = field(default_factory=_now_utc)
 
     def to_dict(self) -> dict[str, Any]:
@@ -563,11 +596,13 @@ class StepOutcome:
         task: str = "na",
         run: str = "na",
         dt: str | None = None,
+        workflow_uid: str = "",
     ) -> str:
         dt = dt or _today_utc()
+        tag = workflow_tag(workflow_name, workflow_uid)
         return (
             f"metrics/step-outcomes/dt={dt}/"
-            f"{workflow_name}__{step}__{subject}__{session}__{task}__{run}_outcome.json"
+            f"{tag}__{step}__{subject}__{session}__{task}__{run}_outcome.json"
         )
 
 
@@ -598,10 +633,15 @@ class SubjectManifest:
 
     Assembled from all StepOutcome records emitted during the workflow run.
 
-    S3 key: metrics/subject-manifests/dt={dt}/{workflow_name}__{subject}_manifest.json
+    S3 key: metrics/subject-manifests/dt={dt}/{workflow_name}__{workflow_uid}__{subject}_manifest.json
+    (`{workflow_name}__{subject}_…` on records without a UID — see workflow_tag).
+
+    Argo reuses names; workflow_uid is the identity (schema 1.1+). Empty on
+    records written before 2026-10.
     """
 
     workflow_name: str
+    workflow_uid: str = _workflow_uid_field()
     subject: str
     overall_status: str  # "succeeded" | "partial" | "failed"
 
@@ -613,7 +653,7 @@ class SubjectManifest:
     skipped_steps: list = field(default_factory=list)  # canonical names of skipped steps
 
     pipeline: str = "cloudpipe_minproc"
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     completed_at: str = field(default_factory=_now_utc)
 
     def to_dict(self) -> dict[str, Any]:
@@ -628,9 +668,12 @@ class SubjectManifest:
         return cls(**{k: v for k, v in d.items() if k in known})
 
     @staticmethod
-    def s3_key(workflow_name: str, subject: str, dt: str | None = None) -> str:
+    def s3_key(
+        workflow_name: str, subject: str, dt: str | None = None, workflow_uid: str = ""
+    ) -> str:
         dt = dt or _today_utc()
-        return f"metrics/subject-manifests/dt={dt}/{workflow_name}__{subject}_manifest.json"
+        tag = workflow_tag(workflow_name, workflow_uid)
+        return f"metrics/subject-manifests/dt={dt}/{tag}__{subject}_manifest.json"
 
 
 # ---------------------------------------------------------------------------

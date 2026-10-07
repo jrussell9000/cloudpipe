@@ -307,6 +307,8 @@ spec:
             parameters:
               - name: workflow-name
                 value: '{{workflow.name}}'
+              - name: workflow-uid
+                value: '{{workflow.uid}}'
               - name: metrics-bucket
                 value: '{{workflow.parameters.metrics-bucket}}'
 
@@ -493,15 +495,20 @@ spec:
             (subregion-segmentation-dagtask.Succeeded ||
              subregion-segmentation-dagtask.Skipped)
 
-        # Record fsqc-metrics outcome (non-fatal). Runs on all terminal
-        # statuses, including Skipped — which here means an upstream branch
-        # failed rather than that the work was already done, since the task
-        # itself carries no `when:` clause.
+        # Record fsqc-metrics outcome (non-fatal). Runs on all five terminal
+        # statuses. The task carries no `when:` clause, so it is never
+        # Skipped: an upstream branch failing leaves its `depends` unsatisfied
+        # and it comes out Omitted, and a spot-preempted pod is Errored.
+        # Those are the cases triage needs, and a Succeeded||Failed||Skipped
+        # gate recorded neither (#634). `.Skipped` stays so the gate holds if
+        # a `when:` is ever added.
         - name: record-outcome-fsqc-metrics-dagtask
           depends: >-
             fsqc-metrics-dagtask.Succeeded ||
             fsqc-metrics-dagtask.Failed ||
-            fsqc-metrics-dagtask.Skipped
+            fsqc-metrics-dagtask.Errored ||
+            fsqc-metrics-dagtask.Skipped ||
+            fsqc-metrics-dagtask.Omitted
           templateRef:
             name: outcome-recorder
             template: record-step-outcome
@@ -519,12 +526,16 @@ spec:
                 value: '{{workflow.parameters.metrics-bucket}}'
 
         # Record subregion-segmentation phase outcome (non-fatal). Runs on all
-        # terminal statuses, including Skipped (outputs already existed).
+        # five terminal statuses: Skipped (outputs already existed), Errored
+        # (spot preemption) and Omitted (an upstream dependency failed) as
+        # well as Succeeded/Failed — see record-outcome-anatomical-dagtask.
         - name: record-outcome-subregion-seg-dagtask
           depends: >-
             subregion-segmentation-dagtask.Succeeded ||
             subregion-segmentation-dagtask.Failed ||
-            subregion-segmentation-dagtask.Skipped
+            subregion-segmentation-dagtask.Errored ||
+            subregion-segmentation-dagtask.Skipped ||
+            subregion-segmentation-dagtask.Omitted
           templateRef:
             name: outcome-recorder
             template: record-step-outcome
@@ -584,12 +595,15 @@ spec:
 
         # Record session-level pipeline outcome (aggregate over all sessions).
         # Fine-grained per-step outcomes for each session are recorded within the
-        # session-level and registration sub-DAGs.
+        # session-level and registration sub-DAGs. Five-way gate, for the same
+        # Errored/Omitted reasons as record-outcome-anatomical-dagtask.
         - name: record-outcome-session-dagtask
           depends: >-
             session-level-pipeline-dagtask.Succeeded ||
             session-level-pipeline-dagtask.Failed ||
-            session-level-pipeline-dagtask.Skipped
+            session-level-pipeline-dagtask.Errored ||
+            session-level-pipeline-dagtask.Skipped ||
+            session-level-pipeline-dagtask.Omitted
           templateRef:
             name: outcome-recorder
             template: record-step-outcome
@@ -1182,6 +1196,8 @@ spec:
           parameters:
             - name: workflow-name
               value: '{{workflow.name}}'
+            - name: workflow-uid
+              value: '{{workflow.uid}}'
             - name: subject
               value: '{{workflow.parameters.subjID}}'
             - name: status
@@ -1217,7 +1233,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:e319537e801a2f0dd2c64731322eb0e9d6f9e6f8e4b5f1641c24f6cdcc6e0c70"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:b90721d0274cdad5632a0f5cbc52a7c442b37d32d3e6865ebab43c32f11a166a"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

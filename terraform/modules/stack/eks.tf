@@ -185,15 +185,35 @@ module "eks" {
     }
     # vpc-cni must be before_compute so nodes have a CNI plugin when they join
     # and can reach Ready state (required for the node group to become ACTIVE).
-    # Strict mode is gated by vpc_cni_strict_mode (default false); install.sh
-    # enables it in the final apply after kube-system NetworkPolicies are in place.
+    #
+    # TWO SEPARATE SWITCHES, and conflating them was issue #635:
+    #
+    #   enableNetworkPolicy           turns the network-policy AGENT on or off.
+    #                                 Off means every NetworkPolicy in the
+    #                                 cluster — including each default-deny-all —
+    #                                 is inert. Gated by
+    #                                 vpc_cni_network_policy_enabled.
+    #   NETWORK_POLICY_ENFORCING_MODE standard (the default when the agent is on)
+    #                                 lets a pod no policy selects talk freely;
+    #                                 strict denies it. Gated by
+    #                                 vpc_cni_strict_mode.
+    #
+    # Until #635 the first read vpc_cni_strict_mode, so the one flag did both and
+    # any apply without `-var=vpc_cni_strict_mode=true` silently disabled policy
+    # enforcement cluster-wide. install.sh now persists these in
+    # install-state.auto.tfvars (Phase 6) so a later plain apply keeps them.
+    #
+    # Both still default to false because a FRESH cluster has no kube-system
+    # policies yet: install.sh applies those in Phase 3 and flips both in Phase 6.
+    # Turning the agent on where policies already exist but have never been
+    # enforced is a traffic change, not a no-op — see docs/operations.md.
     vpc-cni = {
       before_compute              = true
       most_recent                 = true
       resolve_conflicts_on_create = "OVERWRITE"
       resolve_conflicts_on_update = "OVERWRITE"
       configuration_values = jsonencode({
-        enableNetworkPolicy = tostring(var.vpc_cni_strict_mode)
+        enableNetworkPolicy = tostring(var.vpc_cni_network_policy_enabled)
         nodeAgent = {
           healthProbeBindAddr = "8163"
           metricsBindAddr     = "8162"

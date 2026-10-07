@@ -286,7 +286,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:005e176238eb88cf4afaf78f79e195e95a10a9b4dcedadfeb31cf1f419f0f7e0"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:fb478b4635bb23fa93bc117f9274a49d4d1008b4c974b3182c7fd63bf8c44c70"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -446,9 +446,10 @@ spec:
           # 2026-08-14 batch — see issue #268 and the matching guard in
           # fastsurfer-long-phase-workflow-template.yaml.
           #
-          # Retrying is safe: publish overwrites, `_prune_stale` clears a partial
-          # previous attempt, and `_complete.json` lands last, so a retried publish
-          # either completes the tree or leaves it markerless.
+          # Retrying is safe: publish clears any existing `_complete.json` before
+          # the first upload, overwrites, `_prune_stale` clears a partial previous
+          # attempt, and `_complete.json` lands last, so a retried publish either
+          # completes the tree or leaves it markerless (#639).
           checkpoint_save() {
             local region=$1 outdir=$2 rc=0
             "$PY" /app/fs_derivatives.py publish "$outdir" \

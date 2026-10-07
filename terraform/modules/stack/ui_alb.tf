@@ -20,12 +20,10 @@
 # The Client VPN also source-NATs into the VPC CIDR, which keeps it a working
 # fallback until it is decommissioned.
 #
-# No campus prefix list and no NAT EIP rules, unlike the per-app ALB SGs this
-# replaces: nothing reaches a private address over the internet or hairpins
-# through the NAT gateway.
-#
-# The five per-app SGs stay until the old ALBs are gone (plan 012 §3.4) — they
-# are what a rollback needs.
+# No campus prefix list and no NAT EIP rules, unlike the five per-app ALB SGs
+# this replaced: nothing reaches a private address over the internet or hairpins
+# through the NAT gateway. Those SGs were removed in plan 012 §3.4 (2026-10-05),
+# once this ALB was the only one left and none of them was attached to anything.
 ################################################################################
 
 # The ALB-level annotations every member of the group carries, defined ONCE.
@@ -78,11 +76,15 @@
 # secrecy". Every client on this internal ALB (cloudflared, in-cluster Go/Python
 # pods reaching Dex, browsers over the Client VPN) negotiates AEAD by preference;
 # CBC is the fallback for stacks a decade older than anything on this path.
+#
+# Published mode only. Without a domain there is no ALB and no member to carry
+# these, so the map is empty and every resource below has `count = 0`; see
+# local.publish_uis (locals.tf).
 locals {
   ui_alb_group_annotations = {
     "alb.ingress.kubernetes.io/group.name"                          = "cloudpipe-ui"
     "alb.ingress.kubernetes.io/scheme"                              = "internal"
-    "alb.ingress.kubernetes.io/security-groups"                     = aws_security_group.ui_alb.tags["Name"]
+    "alb.ingress.kubernetes.io/security-groups"                     = local.ui_alb_sg_name
     "alb.ingress.kubernetes.io/manage-backend-security-group-rules" = "true"
     "alb.ingress.kubernetes.io/listen-ports"                        = "[{\"HTTP\": 80}, {\"HTTPS\": 443}]"
     "alb.ingress.kubernetes.io/ssl-redirect"                        = "443"
@@ -92,14 +94,18 @@ locals {
 }
 
 resource "aws_security_group" "ui_alb" {
+  count = local.publish_uis ? 1 : 0
+
   name_prefix = "cloudpipe-ui-alb-"
   description = "Controls inbound access to the shared internal web-UI ALB."
   vpc_id      = module.vpc.vpc_id
-  tags        = { Name = "cloudpipe-ui-alb-sg" }
+  tags        = { Name = local.ui_alb_sg_name }
 }
 
 resource "aws_vpc_security_group_ingress_rule" "ui_alb_https" {
-  security_group_id = aws_security_group.ui_alb.id
+  count = local.publish_uis ? 1 : 0
+
+  security_group_id = aws_security_group.ui_alb[0].id
   description       = "HTTPS from the VPC (WARP via cloudflared, in-cluster Dex callers, Client VPN)"
   cidr_ipv4         = var.vpc_cidr
   from_port         = 443
@@ -108,7 +114,9 @@ resource "aws_vpc_security_group_ingress_rule" "ui_alb_https" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "ui_alb_http" {
-  security_group_id = aws_security_group.ui_alb.id
+  count = local.publish_uis ? 1 : 0
+
+  security_group_id = aws_security_group.ui_alb[0].id
   description       = "HTTP from the VPC (redirected to HTTPS)"
   cidr_ipv4         = var.vpc_cidr
   from_port         = 80
@@ -117,7 +125,9 @@ resource "aws_vpc_security_group_ingress_rule" "ui_alb_http" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "ui_alb" {
-  security_group_id = aws_security_group.ui_alb.id
+  count = local.publish_uis ? 1 : 0
+
+  security_group_id = aws_security_group.ui_alb[0].id
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
 }

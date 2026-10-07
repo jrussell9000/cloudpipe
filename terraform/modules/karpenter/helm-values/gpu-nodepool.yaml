@@ -96,13 +96,14 @@ spec:
       # daemonset is counted. See tests/argo/test_gpu_step_resources.py. The replica count
       # is also capped independently by T4 VRAM; see gitops/apps/nvidia-device-plugin/
       # values.yaml. For why raising it further is not worth doing, read
-      # docs/investigations/2026-09-03-per-node-timeslicing-costing.md — NOT PR #346 alone,
-      # whose capacity claims were withdrawn by #347 and then partly reinstated and re-scoped.
+      # docs-internal/investigations/2026-09-03-per-node-timeslicing-costing.md — NOT PR #346
+      # alone, whose capacity claims were withdrawn by #347 and then partly reinstated and
+      # re-scoped.
       # The recommendation has survived every revision; the reasoning under it has not.
       #
       # Keep BOTH sizes across all four families. The 2026-07-17 spot-scarcity investigation
-      # landed on exactly this xlarge/2xlarge set; do not narrow it further without
-      # re-reading docs/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md.
+      # landed on exactly this xlarge/2xlarge set; do not narrow it further without re-reading
+      # docs-internal/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md.
       # The g5/g6/g6e 2xlarge pools are still reachable — through gpu-dense-nodepool at 4
       # slices, not here at 3 (see the instance-type NotIn below).
       - key: "karpenter.k8s.aws/instance-size"
@@ -136,7 +137,7 @@ spec:
       # per-override InsufficientInstanceCapacity/UnfulfillableCapacity on each — the
       # overflow mechanism works, the pools are simply empty. Fill rate over that window
       # was 18 of 309 units (5.8%). See
-      # docs/investigations/2026-09-03-per-node-timeslicing-costing.md §6.
+      # docs-internal/investigations/2026-09-03-per-node-timeslicing-costing.md §6.
       #
       # g7 is EXPENSIVE: $0.5691/hr for g7.2xlarge against $0.1737 for g4dn.xlarge, so
       # $0.1897 vs $0.0579 per slice at 3 slices (3.3x). gpu-g7-price-nodeoverlay.yaml
@@ -183,7 +184,7 @@ spec:
         # collapse the whole ask onto a single pool.
         #
         # Targets the root cause in
-        # docs/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md §3:
+        # docs-internal/investigations/2026-07-17-gpu-nodepool-spot-scarcity-g6-enablement.md §3:
         # Karpenter batches pending GPU pods into ONE `Type: instant` CreateFleet call, which
         # is ALL-OR-NOTHING. A request AWS cannot fully fulfil returns UnfulfillableCapacity
         # and launches NOTHING — even when a sibling family had room. That report measured a

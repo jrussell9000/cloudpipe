@@ -521,7 +521,7 @@ def _write_qc(args: argparse.Namespace, measured: dict | None = None) -> None:
     2.3 gate failed 92 of 110 runs in the 2026-07-29 batch and passed none of
     them, discarding whole sessions on scanner positioning; see
     _BOLD_T1W_THRESHOLDS and the section-0 writeup in
-    docs/investigations/2026-07-29-bold-to-t1w-qc-handoff.md.
+    docs-internal/investigations/2026-07-29-bold-to-t1w-qc-handoff.md.
 
     `nmi_identity` is the NMI of the same BOLD reference resampled with identity
     — no registration at all — and `nmi_gain` is `nmi - nmi_identity`. Only

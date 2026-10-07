@@ -35,9 +35,14 @@ variable "account_id" {
   description = "The AWS Account ID passed from the parent module."
 }
 
-variable "hostname" {
+variable "publish_ui" {
+  type        = bool
+  description = "Whether to create the Ingress that publishes the Kubecost UI on the caller's shared ALB. False in port-forward mode, where `ui_host` and `certificate_arn` are null."
+}
+
+variable "ui_host" {
   type        = string
-  description = "AWS Route53 zone hostname"
+  description = "Hostname the UI is published under (e.g. 'kubecost.example.com'). Null when publish_ui is false."
 }
 
 variable "alb_group_annotations" {
@@ -47,25 +52,5 @@ variable "alb_group_annotations" {
 
 variable "certificate_arn" {
   type        = string
-  description = "AWS Certificate ARN"
-}
-
-variable "vpc_id" {
-  type        = string
-  description = "VPC ID — used to create the ALB security group."
-}
-
-variable "inbound_prefix_list_id" {
-  type        = string
-  description = "ID of the managed prefix list controlling inbound HTTPS access to the Kubecost ALB."
-}
-
-variable "vpc_cidr" {
-  type        = string
-  description = "VPC CIDR block. Trusted as an inbound source so AWS Client VPN clients (which source-NAT to this CIDR for VPC-internal destinations) can reach the Kubecost ALB."
-}
-
-variable "nat_gateway_ip" {
-  type        = string
-  description = "Public Elastic IP of the VPC's NAT gateway. Full-tunnel Client VPN traffic to this ALB's public IP hairpins out through the NAT gateway and back in over the internet, so the ALB security group must trust it as a source."
+  description = "ARN of the ACM certificate for the shared ALB listener. Null when publish_ui is false."
 }

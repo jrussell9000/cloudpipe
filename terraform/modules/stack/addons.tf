@@ -5,12 +5,15 @@
 module "addons" {
   source = "../addons"
 
-  cluster_name      = module.eks.cluster_name
-  vpc_id            = module.vpc.vpc_id
-  region            = var.region
-  route53_zone_arn  = data.aws_route53_zone.brc.arn
-  route53_zone_name = data.aws_route53_zone.brc.name
-  eks_cluster       = module.eks
+  cluster_name = module.eks.cluster_name
+  vpc_id       = module.vpc.vpc_id
+  region       = var.region
+  eks_cluster  = module.eks
+
+  # Null in port-forward mode: cert-manager's only use for a hosted zone is the
+  # ACME DNS-01 solver, and without a domain there is no public certificate to
+  # issue.
+  route53_zone_arn = one(data.aws_route53_zone.brc[*].arn)
 }
 
 # The amazon-cloudwatch-observability pod identity is gone with the addon it
@@ -40,12 +43,20 @@ module "aws_ebs_csi_pod_identity" {
 # EXTERNAL DNS
 # Helm release managed by ArgoCD (gitops/apps/external-dns/)
 # Pod Identity Association keeps the IAM binding in Terraform; SA is created by Helm
+#
+# Published mode only — external-dns exists to write the UI hostnames into the
+# hosted zone, and port-forward mode publishes no hostnames. Note that the
+# ArgoCD ApplicationSet deploys every directory under gitops/apps, so switching
+# this binding off does not stop the deployment itself; excluding the app is
+# task 3.2 of openspec/changes/optional-domain-and-cognito-auth.
 module "external_dns_pod_identity" {
+  count = local.publish_uis ? 1 : 0
+
   source = "terraform-aws-modules/eks-pod-identity/aws"
 
   name                          = "external-dns"
   attach_external_dns_policy    = true
-  external_dns_hosted_zone_arns = ["${data.aws_route53_zone.brc.arn}"]
+  external_dns_hosted_zone_arns = [data.aws_route53_zone.brc[0].arn]
 
   associations = {
     cloudpipe = {

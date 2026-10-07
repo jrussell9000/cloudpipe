@@ -38,6 +38,7 @@ Stages:
   3. Warp unmasked BOLD → MNI (cubic B-spline)         (scipy: map_coordinates)
   4. Warp brain mask → MNI (nearest-neighbour)         (scipy: map_coordinates)
   5. Apply MNI-space mask to MNI-space BOLD             (AFNI: 3dcalc)
+     then read the result back against the warp       (fails the run on mismatch)
   6. Confound estimation
 
 Masking is applied after warping rather than before to avoid Gibbs ringing
@@ -293,9 +294,12 @@ def precompute_composite_warp(
 
 def apply_transforms(
     bold: Path, mni_template: Path, composite_warp: Path, outdir: Path, prefix: str, threads: int
-) -> tuple[Path, np.ndarray, np.ndarray]:
+) -> tuple[Path, np.ndarray, np.ndarray, np.ndarray]:
     """Warp the unmasked 4D BOLD to MNI space using the precomputed composite
     displacement field.
+
+    Returns (unmasked MNI BOLD path, tSNR map, warp coords, temporal-mean map).
+    The two maps come from the float32 warp output in memory, never the file.
 
     The BOLD is intentionally left unmasked at this stage so that interpolation
     does not encounter the steep native-space brain boundary, which would produce
@@ -306,18 +310,28 @@ def apply_transforms(
     all threads.  Each thread calls scipy.ndimage.map_coordinates for one frame;
     scipy's C extension releases the GIL so threads achieve real CPU parallelism.
 
-    out_data is float16 (~1.6 GB for a 400-frame run at 2mm MNI resolution) rather
-    than float32 (~3.2 GB), halving the Stage 3 memory peak.  scipy works internally
-    in float64; the per-frame result is cast to float32 then narrowed to float16 on
-    assignment.  Downstream tools (FSL, AFNI, FreeSurfer) promote float16 NIfTI to
-    float32 on read; precision loss (~3.3 sig figs) is negligible for BOLD data.
+    The output is int16 with a per-run scl_slope (scl_inter 0), the NIfTI-1
+    mechanism for storing reals in 16 bits. NIfTI-1 has no float16 datatype:
+    this function used to write float16 bytes under datatype 512, which is
+    DT_UINT16, so every reader (Stage 5's 3dcalc included) took the bit patterns
+    for the intensities. Do not reintroduce a hand-set datatype code here.
+
+    The slope needs the whole run's range before the first voxel is quantised,
+    so the warp is two passes. Pass 1 writes each float32 frame into a disk
+    scratch file (np.memmap) and tracks max|value|; pass 2 quantises frame by
+    frame into the NIfTI. Nothing holds the full 4D array in anonymous memory —
+    the memmap's pages are file-backed and reclaimable — which keeps Stage 3
+    under the step's 6G limit without the float16 array the old writer needed.
+    Quantisation step is max|value| / 32767, about 4.5 significant digits at
+    the top of the range.
 
     coords is returned to the caller so Stage 4 (warp_mask_to_mni) can reuse it
     without a second _build_warp_coords call (BOLD and brainmask share the same
     native-space affine).
 
-    Peak RAM:  bold_data (1.28 GB) + coords (0.07 GB) + out_data (1.6 GB float16)
-               ≈ 3 GB  vs. ~14.1 GB for 1mm float32.
+    Peak RAM: bold_data (native float32) + coords (3 x N_mni float64) + the
+    Welford accumulators (2 x N_mni float64). The scratch file costs disk
+    (4 bytes x N_mni x n_frames), not RAM.
     """
     mni_img = nib.load(mni_template)
     bold_img = nib.load(bold)
@@ -333,17 +347,18 @@ def apply_transforms(
         flush=True,
     )
 
-    # Allocate time-first (n_frames, x, y, z) so each thread writes a single
-    # contiguous 16 MB block (out_data[t]).  The alternative time-last layout
-    # (x, y, z, n_frames) causes out_data[..., t] writes to touch one element
-    # per 4 KB page across the full 6 GB array — a scattered page-fault storm
-    # with 6 concurrent threads that exhausts the cgroup memory limit.
-    out_data = np.empty((n_frames, *mni_shape), dtype=np.float16)
+    # Time-first (n_frames, x, y, z) so each thread writes one contiguous frame
+    # (scratch[t]). The time-last layout (x, y, z, n_frames) makes every frame
+    # write touch one element per 4 KB page across the whole array — a scattered
+    # page-fault storm with several concurrent threads.
+    scratch_path = outdir / f"{prefix}_desc-warpscratch_bold.f32"
+    scratch = np.memmap(scratch_path, dtype=np.float32, mode='w+', shape=(n_frames, *mni_shape))
 
-    # tSNR via Welford's online algorithm (avoids reloading 6 GB for mean/std).
+    # tSNR via Welford's online algorithm (avoids a second pass for mean/std).
     mean_acc = np.zeros(mni_shape, dtype=np.float64)
     M2_acc = np.zeros(mni_shape, dtype=np.float64)
     wf_count = [0]
+    max_abs = [0.0]
     wf_lock = threading.Lock()
 
     def _warp_frame(t: int) -> None:
@@ -354,8 +369,10 @@ def apply_transforms(
             mode='constant',
             cval=0.0,
         ).astype(np.float32)
-        out_data[t] = frame_f32  # contiguous 16 MB write; no page-fault storm
+        scratch[t] = frame_f32  # one contiguous frame; no page-fault storm
+        frame_max = float(np.abs(frame_f32).max())
         with wf_lock:
+            max_abs[0] = max(max_abs[0], frame_max)
             wf_count[0] += 1
             delta = frame_f32 - mean_acc
             mean_acc[:] += delta / wf_count[0]
@@ -367,6 +384,9 @@ def apply_transforms(
     with np.errstate(divide="ignore", invalid="ignore"):
         _std = np.sqrt(M2_acc / n_frames).astype(np.float32)
         tsnr_map = np.where(_std > 0, mean_acc.astype(np.float32) / _std, 0.0).astype(np.float32)
+    # Kept for verify_mni_bold_readback: the one view of the warp's output that
+    # never passes through the writer, so the file can be checked against it.
+    mean_map = mean_acc.astype(np.float32)
     # Released by rebinding rather than `del`: these three are captured by the
     # _warp_frame closure above, and `del`ing a closed-over name makes pyflakes
     # (F821) treat every use inside the closure as unbound. Rebinding drops the
@@ -374,18 +394,23 @@ def apply_transforms(
     bold_data = mean_acc = M2_acc = None
     del _std
 
-    # Write NIfTI manually to avoid a second 6 GB transpose copy.
-    # out_data is (n_frames, x, y, z) C-order; NIfTI expects each 3D volume
-    # stored in Fortran order (x-fastest).  np.asfortranarray converts each
-    # 16 MB frame; frames are written in time order so the on-disk layout
-    # matches (x, y, z, t) Fortran-order — identical to what nibabel would write.
+    # A NaN anywhere would make the slope NaN and every voxel garbage; stop here
+    # rather than ship that.
+    if not np.isfinite(max_abs[0]):
+        raise ValueError(f"warped BOLD contains non-finite values ({prefix})")
+    slope = max_abs[0] / 32767.0 if max_abs[0] > 0 else 1.0
+
+    # Write NIfTI manually, one frame at a time, to avoid a full 4D transpose.
+    # scratch is (n_frames, x, y, z) C-order; NIfTI expects each 3D volume
+    # stored in Fortran order (x-fastest). Frames are written in time order so
+    # the on-disk layout matches (x, y, z, t) Fortran order — identical to what
+    # nibabel would write.
     out_hdr = mni_img.header.copy()
-    # nibabel's set_data_dtype rejects float16 in some versions; set the NIfTI1
-    # datatype/bitpix fields directly (512 = DT_FLOAT16, bitpix = 16).
-    out_hdr.structarr['datatype'] = 512
-    out_hdr.structarr['bitpix'] = 16
+    out_hdr.set_data_dtype(np.int16)
     out_hdr.set_data_shape((*mni_shape, n_frames))
-    out_hdr['vox_offset'] = 352.0
+    # Explicit, never inherited: the template's own scl_slope/scl_inter are NaN.
+    out_hdr.set_slope_inter(slope, 0.0)
+    out_hdr.set_data_offset(352)
     # pixdim[4] is the TR, and out_hdr is copied from the MNI *template* — a 3D
     # file whose pixdim[4] is a meaningless 1.0. Without this the output claims
     # a 1 s TR regardless of the sequence, which sails through any plausibility
@@ -393,15 +418,27 @@ def apply_transforms(
     # header (including the CIFTI -timestep, which is derived from this file).
     out_hdr.structarr['pixdim'][4] = float(bold_img.header.get_zooms()[3])
 
+    on_disk = np.dtype(np.int16).newbyteorder(out_hdr.endianness)
     out_nii = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-unmasked_bold.nii"
     with open(str(out_nii), 'wb') as _f:
         _f.write(bytes(np.array(out_hdr.structarr).tobytes()))  # 348-byte header
         _f.write(b'\x00' * 4)  # pad to vox_offset=352
         for t in range(n_frames):
-            _f.write(np.asfortranarray(out_data[t]).tobytes())  # 16 MB per frame
-    out_data = None  # rebind, not `del` — closed over by _warp_frame (see above)
+            q = np.rint(scratch[t] / np.float32(slope))
+            # The frame holding max|value| lands on ±32767 up to float32
+            # rounding, which can tip it to ±32768 and wrap. Clip only that.
+            np.clip(q, -32767, 32767, out=q)
+            # order='F' is what makes the bytes x-fastest. tobytes() defaults
+            # to 'C' whatever the array's memory layout, so the np.asfortranarray
+            # this line used to wrap was a no-op: on the 97x115x97 grid, where
+            # x and z have the same length, every reader saw the volume with x
+            # and z swapped, and Stage 5 then masked it with a correctly
+            # oriented mask.
+            _f.write(q.astype(on_disk).tobytes(order='F'))
+    scratch = None  # rebind, not `del` — closed over by _warp_frame (see above)
+    scratch_path.unlink()
 
-    # Compress .nii → .nii.gz and remove the uncompressed file (~6 GB on disk).
+    # Compress .nii → .nii.gz and remove the uncompressed file.
     # pigz (parallel gzip) compresses in ~5-10s vs ~60-90s for Python's single-
     # threaded gzip; fall back to gzip if pigz is not in PATH.
     out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-unmasked_bold.nii.gz"
@@ -413,7 +450,7 @@ def apply_transforms(
             shutil.copyfileobj(_src, _dst)
         out_nii.unlink()
 
-    return out, tsnr_map, coords
+    return out, tsnr_map, coords, mean_map
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +500,10 @@ def apply_mni_mask(bold_mni: Path, mask_mni: Path, outdir: Path, prefix: str) ->
 
     Masking here rather than before the warp prevents LanczosWindowedSinc
     from ringing across the sharp native-space brain boundary.
+
+    -datum float pins the published dtype. Stage 3 writes scaled int16, and
+    3dcalc's default would be a short output re-quantised under a new scale
+    factor per sub-brick; float stores the slope-applied values exactly.
     """
     out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz"
     run(
@@ -474,11 +515,80 @@ def apply_mni_mask(bold_mni: Path, mask_mni: Path, outdir: Path, prefix: str) ->
             str(mask_mni),
             "-expr",
             "a*step(b)",
+            "-datum",
+            "float",
             "-prefix",
             str(out),
         ]
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 read-back: check the published MNI BOLD against the warp
+# ---------------------------------------------------------------------------
+
+# Tolerance on the per-voxel temporal mean, as a fraction of the largest in-mask
+# mean. Quantisation alone moves a mean by at most half a step, max|value|/65534
+# (~1.5e-5 of the run's range); 1e-3 leaves a wide margin for that. The defects
+# this exists to catch moved values by their own magnitude or more.
+READBACK_RTOL = 1e-3
+
+
+class MNIBoldReadbackError(RuntimeError):
+    """The published MNI BOLD does not hold the values the warp produced."""
+
+
+def verify_mni_bold_readback(mni_bold: Path, mask_mni: Path, mean_map: np.ndarray) -> None:
+    """Fail the run if the published MNI BOLD does not read back as the warp.
+
+    From 2026-05-25 to 2026-10-06 every MNI BOLD shipped corrupt. The Stage 3
+    writer stored float16 bit patterns under DT_UINT16 and wrote its bytes in
+    the wrong axis order, and nothing caught it for four months. Every QC field
+    anyone read was either computed in memory (tsnr_median) or rank-based
+    enough to survive (aqi). See
+    docs-internal/investigations/2026-10-06-mni-bold-float16-corruption-handoff.md.
+
+    This compares the in-mask temporal mean of the file as nibabel reads it,
+    which is what every consumer sees, against `mean_map`, which apply_transforms
+    accumulated from the float32 warp output and which never touched the writer.
+    Any defect between the warp and the published file fails this: dtype,
+    scaling, byte order, axis order, the masking step. It does not check the
+    warp itself (registration has its own gates); it checks that the file is
+    the warp.
+
+    Raises rather than warns. A mismatch means the derivative is wrong by
+    construction, and a non-zero exit is what keeps the driver from shipping it.
+    It is also deterministic, so the step's retryStrategy (64/75/143) leaves it
+    alone.
+    """
+    mask = np.asanyarray(nib.load(mask_mni).dataobj) > 0
+    shape = nib.load(mni_bold).shape[:3]
+    if shape != mean_map.shape or shape != mask.shape:
+        raise MNIBoldReadbackError(
+            f"{mni_bold.name}: spatial shape {shape} does not match the warp's "
+            f"{mean_map.shape} / mask {mask.shape}"
+        )
+    if not mask.any():
+        raise MNIBoldReadbackError(f"{mask_mni.name}: empty mask, nothing to verify")
+
+    got = _load_masked_timeseries(mni_bold, mask_mni).mean(axis=1, dtype=np.float64)
+    want = mean_map[mask].astype(np.float64)
+    err = np.abs(got - want)
+    tol = READBACK_RTOL * float(np.abs(want).max())
+    r = float(np.corrcoef(got, want)[0, 1]) if got.std() > 0 and want.std() > 0 else float("nan")
+    summary = (
+        f"max |file - warp| = {err.max():.4g}, median {np.median(err):.4g}, "
+        f"tolerance {tol:.4g}, r = {r:.6f}, over {mask.sum()} in-mask voxels"
+    )
+    if not np.all(err <= tol):
+        raise MNIBoldReadbackError(
+            f"{mni_bold.name} does not read back as the warp produced it: {summary}. "
+            f"{np.count_nonzero(err > tol)} voxels out of tolerance. Suspect the "
+            "Stage 3 writer (datatype, scl_slope, byte or axis order) or the Stage 5 "
+            "3dcalc step before suspecting the data."
+        )
+    print(f"  read-back OK: {summary}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1533,7 +1643,7 @@ def main() -> None:
 
         print("\n--- Stage 3: Warp unmasked BOLD → MNI (cubic B-spline) ---", flush=True)
         with timed_stage("4d_warp", _timings):
-            bold_mni_unmasked, tsnr_map, warp_coords = apply_transforms(
+            bold_mni_unmasked, tsnr_map, warp_coords, mean_map = apply_transforms(
                 bold=args.bold,
                 mni_template=args.mni_template,
                 composite_warp=composite_warp,
@@ -1556,10 +1666,19 @@ def main() -> None:
 
         composite_warp.unlink()  # ~200 MB; not needed after Stage 4
 
-        print("\n--- Stage 5: Apply MNI mask ---", flush=True)
+        print("\n--- Stage 5: Apply MNI mask, then read it back ---", flush=True)
+        # The read-back runs inside the "masking" timing rather than under a
+        # key of its own: a new timed_stage key must also be declared in both
+        # Glue stage_timings_s structs (terraform/modules/metrics/main.tf), or
+        # Athena silently drops it — see tests/metrics/test_stage_timings_struct.py.
+        # It runs before Stage 5b, so a corrupt file costs no surface work. Not
+        # on the grayordinate short path: that reuses an MNI BOLD it did not
+        # warp, so there is no in-memory mean to check against.
         with timed_stage("masking", _timings):
             mni_bold = apply_mni_mask(bold_mni_unmasked, mask_mni, args.outdir, prefix)
             bold_mni_unmasked.unlink()
+            verify_mni_bold_readback(mni_bold, mask_mni, mean_map)
+        del mean_map
 
     surf_paths: dict[str, Path] = {}
     subcort: tuple[Path, Path, Path] | None = None

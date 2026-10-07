@@ -366,8 +366,9 @@ The nightly scraper queries the in-cluster Kubecost Allocation API aggregated by
 **Schedule**: Prefect deployment `kubecost-cost-scraper`, nightly at 02:00 UTC. To run manually:
 
 ```bash
-PREFECT_API_URL=https://prefect.<domain>/api \
-  prefect deployment run kubecost-cost-scraper/kubecost-cost-scraper
+# The ops environment exports PREFECT_API_URL and PREFECT_API_AUTH_STRING (the
+# API requires basic auth, #636).
+pixi run -e ops prefect deployment run kubecost-cost-scraper/kubecost-cost-scraper
 ```
 
 **Direct CLI**:

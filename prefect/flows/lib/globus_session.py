@@ -24,17 +24,31 @@ treated exactly like "already expired".
 This duplicates `src/globus_admin/sessions.py` on purpose — the flow-runner image
 does not carry that package. `tests/prefect/test_globus_session_gate.py` asserts
 the two agree on a table of inputs, so the copy cannot drift unnoticed.
+
+The live listing needs the Globus host up, and the host is stopped every night at
+00:00 UTC (`aws_scheduler_schedule.globus_stop`). Only a workflow's
+`start-globus-instance` step starts it again, and no workflow exists until this
+gate lets the batch through. So from the day the listing shipped (#437) until
+#652, every batch submitted after an idle midnight was refused with a connect
+timeout that read like an outage. `wake_host` starts the host first, the same
+way the workflow step does.
 """
 
 from __future__ import annotations
 
 import json
+import socket
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 SSM_SESSION_PARAM = "/cloudpipe/globus/session-established-at"
 SSM_CONFIG_PARAM = "/cloudpipe/globus/config"
+#: The Globus host's EC2 instance ID, which `wake_host` starts. The same parameter
+#: the workflow's `start-globus-instance` step reads.
+SSM_INSTANCE_ID_PARAM = "/cloudpipe/globus/instance-id"
 #: Which gateway's declared timeout the gate measures against. Published by
 #: Terraform rather than derived — see #506 and the comment on the resource.
 SSM_GATEWAY_NAME_PARAM = "/cloudpipe/globus/gateway-name"
@@ -197,6 +211,78 @@ def timeout_minutes_from_config(document: Any, gateway_name: str | None = None) 
             return declared, f"declared for {gateway.get('display_name')}"
 
     return DEFAULT_SESSION_TIMEOUT_MINUTES, "the default (no gateway declares a timeout)"
+
+
+#: gridftp listens here; it is what the Transfer service connects to.
+HOST_PORT = 443
+#: Matches `start-globus-instance-template`: up to 40 x 15 s for each wait.
+WAIT_DELAY_S = 15
+WAIT_ATTEMPTS = 40
+
+
+def wake_host(
+    ec2: Any,
+    instance_id: str,
+    *,
+    log: Callable[[str], None],
+    connect: Callable[..., Any] = socket.create_connection,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[bool, str]:
+    """Start the Globus host if it is not running, and wait until gridftp answers.
+
+    The same sequence as the workflow's `start-globus-instance-template`, for the
+    same reason. EC2 status checks pass before `cloudpipe-gcs-boot` has gridftp
+    listening, so the readiness signal is a TCP connect to port 443, not the
+    instance state. A host that is already running still gets the port check,
+    because a workflow may have started it seconds ago.
+
+    Returns (ready, detail) rather than raising, like `destination_reachable`,
+    so the caller decides how a refusal is reported.
+    """
+    config = {"Delay": WAIT_DELAY_S, "MaxAttempts": WAIT_ATTEMPTS}
+    try:
+        state = ec2.describe_instance_status(InstanceIds=[instance_id], IncludeAllInstances=True)[
+            "InstanceStatuses"
+        ][0]["InstanceState"]["Name"]
+
+        if state == "stopping":
+            # start_instances on a stopping instance raises IncorrectInstanceState.
+            log(f"Globus host {instance_id} is stopping; waiting for it to stop before starting it")
+            ec2.get_waiter("instance_stopped").wait(InstanceIds=[instance_id], WaiterConfig=config)
+            state = "stopped"
+        if state == "stopped":
+            log(
+                f"Globus host {instance_id} is stopped (the nightly schedule stops it at "
+                "00:00 UTC); starting it"
+            )
+            ec2.start_instances(InstanceIds=[instance_id])
+            state = "pending"
+        if state == "pending":
+            ec2.get_waiter("instance_status_ok").wait(
+                InstanceIds=[instance_id], WaiterConfig=config
+            )
+            log(f"Globus host {instance_id} passed EC2 status checks")
+        elif state != "running":
+            return False, f"Globus host {instance_id} is {state} and cannot be started"
+
+        ip = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][
+            0
+        ].get("PublicIpAddress")
+    except Exception as exc:  # botocore ClientError / WaiterError
+        return False, f"Globus host {instance_id} could not be started: {exc}"
+
+    if not ip:
+        return False, f"Globus host {instance_id} is running but has no public IP"
+    for _ in range(WAIT_ATTEMPTS):
+        try:
+            with connect((ip, HOST_PORT), timeout=5):
+                return True, f"Globus host {instance_id} is up; gridftp answers on {ip}:{HOST_PORT}"
+        except OSError:
+            sleep(WAIT_DELAY_S)
+    return False, (
+        f"Globus host {instance_id} is running but gridftp did not answer on {ip}:{HOST_PORT} "
+        f"within {WAIT_ATTEMPTS * WAIT_DELAY_S} s"
+    )
 
 
 def destination_reachable(transfer_client: Any, collection_id: str, path: str) -> tuple[bool, str]:

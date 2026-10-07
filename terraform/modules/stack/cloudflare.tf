@@ -58,7 +58,7 @@ output "cloudflare_account_id" {
 # Note this routes ALL private-subnet traffic for a connected WARP client, not
 # only API-server traffic. Narrowing to the API server's ENIs is not viable —
 # they are dynamic and unmanaged. The Access application's port restriction and
-# the NetID allowlist policy are what gate access; the route is reachability
+# the operator allowlist policy are what gate access; the route is reachability
 # only.
 resource "cloudflare_zero_trust_tunnel_cloudflared_route" "private_subnets" {
   for_each = toset(module.vpc.private_subnets_cidr_blocks)
@@ -69,131 +69,28 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_route" "private_subnets" {
   comment    = "cloudpipe EKS private subnet"
 }
 
-# --- Access identity provider (UW-Madison NetID) ------------------------------
+# --- The identity provider this deployment authenticates against --------------
 #
-# Unblocked 2026-08-17: DoIT registered the client and the credentials are in
-# Secrets Manager at cloudpipe/cloudflare-access-oidc, created by hand (§2.2 —
-# Terraform must never own an aws_secretsmanager_secret here).
+# Not declared here. The two applications below allow one identity provider and
+# attach one policy, read from `local.access_identity_provider_id` and
+# `local.access_policy_id` (cognito.tf). By default those are the Cognito
+# provider and operator policy cognito.tf creates; a caller that supplies
+# `var.external_identity` replaces both with its own (design D6 of
+# openspec/changes/optional-domain-and-cognito-auth).
 #
-# VERIFIED WORKING 2026-08-17. An IdP Test returns a resolved identity —
-# email "<netid>@<institution_domain>", with acr https://refeds.org/profile/mfa proving
-# NetID MFA was enforced. The long-open token_endpoint_auth_method question
-# (handoffs/cloudflare-access-oidc-doit-reply.md §1.3) is settled by the same
-# round-trip: whatever Cloudflare sends, the institution IdP accepts it. Do not
-# reopen it.
+# The external path exists because a direct integration is not generic. The
+# reference deployment's is a fixed set of endpoint paths, a specific identity
+# attribute and an assurance profile — one institution's, not a shape any other
+# deployer's provider has to match — so it lives in a module that is never
+# published, and hands back an identity provider ID, a policy ID and the values
+# a Dex connector needs.
 #
-# The IdP alone is inert — it grants nothing until a policy references it, which
-# is what makes the dashboard's "Test" button a zero-blast-radius diagnostic.
-# The policy and applications that DO create an access path are further down.
-#
-# One hard-won constraint, worth not rediscovering: Cloudflare's generic OIDC
-# connector reads claims **only from the ID token**. There is no userinfo_url
-# argument anywhere in this resource's schema and it never calls /userinfo, so a
-# claim released only at the userinfo endpoint is invisible to Access. Getting
-# here required DoIT to release an identity claim in the ID token itself.
-#
-# Corollary: Dex works against this same IdP only because Dex calls /userinfo.
-# Never infer Cloudflare's behaviour from Dex's.
-data "aws_secretsmanager_secret_version" "cloudflare_access_oidc" {
-  secret_id = "cloudpipe/cloudflare-access-oidc"
-}
-
-locals {
-  cloudflare_access_oidc = jsondecode(
-    data.aws_secretsmanager_secret_version.cloudflare_access_oidc.secret_string
-  )
-}
-
-# Cloudflare requires auth_url/token_url/certs_url EXPLICITLY — there is no
-# discovery-only mode, unlike Dex, which takes just the issuer (plan §2.1). The
-# values come from <institution_oidc_issuer>/.well-known/openid-configuration, read
-# live on 2026-08-15.
-#
-# The client secret DOES land in Terraform state. That is a recorded, deliberate
-# tradeoff (plan §2.7), not an oversight — unlike the tunnel token, which is
-# kept out of state by refusing the data source that would read it.
-resource "cloudflare_zero_trust_access_identity_provider" "netid" {
-  account_id = var.cloudflare_account_id
-  name       = "UW-Madison NetID"
-  type       = "oidc"
-
-  config = {
-    client_id     = local.cloudflare_access_oidc["clientID"]
-    client_secret = local.cloudflare_access_oidc["clientSecret"]
-    auth_url      = "${var.institution_oidc_issuer}/idp/profile/oidc/authorize"
-    token_url     = "${var.institution_oidc_issuer}/idp/profile/oidc/token"
-    certs_url     = "${var.institution_oidc_issuer}/idp/profile/oidc/keyset"
-
-    scopes = ["openid", "profile", "email"]
-
-    # `claims` are surfaced in the Access JWT passed to origins and usable as
-    # policy selectors. eppn is the identity; `acr` is listed only so the
-    # admin policy below can REQUIRE the MFA profile — an OIDC-claim selector
-    # can only match a claim named here.
-    #
-    # This list was briefly much longer, as a diagnostic. If you ever need to see
-    # what the institution IdP actually puts in the ID token, that technique is the
-    # only way to observe it from our side: list claim names here and read them
-    # back from `oidc_fields` in the IdP Test dialog. Include a control group of
-    # protocol claims (iss/aud/auth_time/acr) when you do — an empty result
-    # otherwise cannot distinguish "claim absent" from "probe never ran", which
-    # made the first round of testing worthless. See
-    # handoffs/cloudflare-access-oidc-doit-reply.md.
-    claims = ["eduperson_principal_name", "acr"]
-
-    # eduperson_principal_name, NOT email — a deliberate deviation from the plan
-    # (§3.4 says "email" to match Dex's userNameKey: email).
-    #
-    # DoIT released eduperson_principal_name in the ID token on 2026-08-17 rather
-    # than email, on the grounds that it is the more stable identifier. That is
-    # correct: a NetID user's email can change, their eppn does not. Since eppn is
-    # netid@<institution_domain> it is email-shaped, so Access policies keyed on email still
-    # work against it — email_claim_name is just "which claim holds the thing
-    # Access treats as the user's email".
-    #
-    # Consequence to keep in mind: Access identities are now eppn while Dex's are
-    # email. Those happen to coincide for UW accounts, but they are not the same
-    # field, so never assume a value from one path is comparable to the other.
-    email_claim_name = "eduperson_principal_name"
-    pkce_enabled     = true
-  }
-}
-
-# --- Authorization: who may enroll a device and reach the API server ----------
-#
-# ONE reusable policy, attached to both applications below, so "who is an admin"
-# cannot drift between "may enroll WARP" and "may reach the cluster".
-#
-# `include` is the allowlist — var.admin_netid's eppn, never a blanket
-# whole-domain rule (that would grant cluster reachability to every
-# university). An `email` selector matches because eppn is email-shaped and the
-# IdP maps it into Access's email slot (email_claim_name above).
-#
-# `require` fails closed on MFA. The institution IdP returns
-# acr = https://refeds.org/profile/mfa for an MFA login (IdP Test, 2026-08-17);
-# requiring it here means a login that ever arrives without MFA is denied,
-# rather than trusting NetID to keep enforcing it. Because the selector is bound
-# to this IdP's ID, it also implicitly rejects every other login method (e.g.
-# One-time PIN), which carries no such claim.
-resource "cloudflare_zero_trust_access_policy" "cluster_admins" {
-  account_id = var.cloudflare_account_id
-  name       = "cloudpipe cluster admins (NetID + MFA)"
-  decision   = "allow"
-
-  include = [
-    { email = { email = "${var.admin_netid}@${var.institution_domain}" } },
-  ]
-
-  require = [
-    {
-      oidc = {
-        identity_provider_id = cloudflare_zero_trust_access_identity_provider.netid.id
-        claim_name           = "acr"
-        claim_value          = "https://refeds.org/profile/mfa"
-      }
-    },
-  ]
-}
+# One constraint from building it, worth not rediscovering here: Cloudflare's
+# generic OIDC connector reads claims **only from the ID token**. It has no
+# userinfo_url argument and never calls /userinfo, so a claim released only at
+# the userinfo endpoint is invisible to Access. Dex works against the same
+# provider only because Dex does call /userinfo — never infer Cloudflare's
+# behaviour from Dex's.
 
 # --- Access organization (account singleton) ----------------------------------
 #
@@ -210,14 +107,14 @@ resource "cloudflare_zero_trust_access_policy" "cluster_admins" {
 #
 # auth_domain and name are pinned to the live values read over the API on
 # 2026-09-17, because both are optional-but-not-computed and must never be sent
-# as null. auth_domain is load-bearing: it is the team domain in the NetID
-# redirect URI DoIT registered. `name` is the stale auto-generated one; it is
+# as null. auth_domain is load-bearing: it is the team domain in the redirect
+# URI the identity provider has registered. `name` is the stale auto-generated one; it is
 # cosmetic (handoffs/cloudflare-access-oidc-registration.md §2.5), and renaming
 # it is a separate, deliberate change.
 #
 # 24h matches the EKS app's session_duration. When the WARP session identity
 # lapses, the client shows "Authentication required"; clicking it, or
-# `warp-cli debug access-reauth`, renews it with a NetID login.
+# `warp-cli debug access-reauth`, renews it with a fresh login.
 locals {
   cloudflare_team_domain = var.cloudflare_team_domain
 }
@@ -248,11 +145,11 @@ resource "cloudflare_zero_trust_access_application" "warp_enrollment" {
 
   # No app_launcher_visible: Cloudflare's own Terraform example sets it, but
   # provider v5.23.0 rejects it for type = "warp" at validate time.
-  allowed_idps              = [cloudflare_zero_trust_access_identity_provider.netid.id]
+  allowed_idps              = [local.access_identity_provider_id]
   auto_redirect_to_identity = true
 
   policies = [
-    { id = cloudflare_zero_trust_access_policy.cluster_admins.id, precedence = 1 },
+    { id = local.access_policy_id, precedence = 1 },
   ]
 }
 
@@ -312,12 +209,12 @@ resource "cloudflare_zero_trust_access_application" "private_services" {
     ],
   )
 
-  allowed_idps              = [cloudflare_zero_trust_access_identity_provider.netid.id]
+  allowed_idps              = [local.access_identity_provider_id]
   auto_redirect_to_identity = true
   app_launcher_visible      = false
   session_duration          = "24h"
 
-  # Accept the WARP client's session identity (the NetID login done at device
+  # Accept the WARP client's session identity (the login done at device
   # enrollment) instead of demanding a per-app browser login. Without this the
   # app inherits the org default, false, and a raw TCP client like kubectl
   # cannot perform that login: Gateway accepts the TCP connection at the edge
@@ -328,7 +225,7 @@ resource "cloudflare_zero_trust_access_application" "private_services" {
   allow_authenticate_via_warp = true
 
   policies = [
-    { id = cloudflare_zero_trust_access_policy.cluster_admins.id, precedence = 1 },
+    { id = local.access_policy_id, precedence = 1 },
   ]
 }
 
@@ -344,7 +241,7 @@ resource "cloudflare_zero_trust_access_application" "private_services" {
 # error" — which is the token's scope, not a wrong token.
 
 # Split Tunnels in INCLUDE mode: only the VPC goes through WARP. Everything else
-# — general internet, Zoom, the UW-Madison VPN, a home LAN — stays on the
+# — general internet, video calls, an institutional VPN, a home LAN — stays on the
 # device's own connection. Nothing in cloudpipe uses Gateway filtering, so
 # routing all traffic through Cloudflare would buy nothing.
 #

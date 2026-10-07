@@ -17,8 +17,3 @@ output "worker_iam_role_name" {
   description = "Name of the IAM role used by the Prefect worker service account."
   value       = module.worker_pod_identity.iam_role_name
 }
-
-output "lb_security_group_id" {
-  description = "ID of the ALB security group for the Prefect server."
-  value       = aws_security_group.lb.id
-}

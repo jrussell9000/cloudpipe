@@ -3,7 +3,10 @@
 # CI (build-prefect-flow-runner.yaml) does the build on every push to main; this
 # is the manual path.
 #
-#   PREFECT_API_URL=https://prefect.<your-domain>/api images/prefect-flow-runner/build.sh
+#   pixi run -e ops bash images/prefect-flow-runner/build.sh
+#
+# The ops environment exports PREFECT_API_URL and PREFECT_API_AUTH_STRING, which
+# the re-registration below needs (prefect/deploy.sh checks both).
 #
 # Run from anywhere — always builds from the repo root so COPY flows/ works.
 set -euo pipefail

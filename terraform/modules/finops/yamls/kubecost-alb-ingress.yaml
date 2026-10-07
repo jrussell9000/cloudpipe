@@ -5,7 +5,7 @@ metadata:
   namespace: kubecost
   annotations:
     # This tells external-dns to update the Route 53 records for the hostname with the reference to the loadbalancer
-    external-dns.alpha.kubernetes.io/hostname: kubecost.${hostname}
+    external-dns.alpha.kubernetes.io/hostname: ${ui_host}
     # Provide the certificate ARN - will automagically enable TLS
     alb.ingress.kubernetes.io/certificate-arn: ${certificate_arn}
     # Set the backend protocol - AWS LB talking to pods
@@ -22,7 +22,7 @@ metadata:
 spec:
   ingressClassName: alb
   rules:
-  - host: kubecost.${hostname}
+  - host: ${ui_host}
     http:
       paths:
       - path: /

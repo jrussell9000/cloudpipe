@@ -34,10 +34,12 @@ grafana:
   # ---------------------------------------------------------------------------
   # ALB Ingress — routes the Grafana hostname → Grafana svc
   #
-  # The hostname itself is not here: `hosts` and the external-dns hostname
-  # annotation come from local.grafana_url through this app's entry in
-  # local.argocd_app_overrides (terraform/modules/stack/argocd.tf). The annotations below stay,
-  # and Terraform's precondition reads that override merged over this file.
+  # Neither the hostname nor whether the ingress exists is here: `enabled`,
+  # `hosts` and the external-dns hostname annotation come from this app's entry
+  # in local.argocd_app_overrides (terraform/modules/stack/argocd.tf), which
+  # turns the ingress off for a deployment with no domain (port-forward mode).
+  # The annotations below stay, and Terraform's precondition reads that
+  # override merged over this file.
   #
   # A member of the shared internal `cloudpipe-ui` ALB, with ArgoCD, Argo
   # Workflows, Prefect and Kubecost (plan 012). Reachable only from inside the
@@ -47,7 +49,6 @@ grafana:
   # from the host rule (and the group's HTTPS listener carries it anyway).
   # ---------------------------------------------------------------------------
   ingress:
-    enabled: true
     ingressClassName: alb
     annotations:
       alb.ingress.kubernetes.io/backend-protocol: HTTP
@@ -143,10 +144,9 @@ grafana:
     passwordKey: admin-password
 
   # ---------------------------------------------------------------------------
-  # SSO env bridge — values injected from Terraform-managed objects so the
-  # domain/admin email are single-sourced from var.domain / var.admin_netid
-  # (see terraform/modules/stack/grafana.tf) rather than hardcoded here. Grafana expands
-  # these with $__env{...} inside grafana.ini below.
+  # Secrets from Terraform-managed objects (terraform/modules/stack/grafana.tf),
+  # so neither is hardcoded here. Grafana expands the client secret with
+  # $__env{...} inside grafana.ini below.
   # ---------------------------------------------------------------------------
   envValueFrom:
     GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET:
@@ -158,14 +158,6 @@ grafana:
       secretKeyRef:
         name: grafana-renderer-token
         key: token
-    DOMAIN:
-      configMapKeyRef:
-        name: grafana-oidc-config
-        key: domain
-    ADMIN_EMAIL:
-      configMapKeyRef:
-        name: grafana-oidc-config
-        key: admin_email
 
   # ---------------------------------------------------------------------------
   # Image renderer — a separate Deployment + Service that renders panels and
@@ -213,10 +205,12 @@ grafana:
 
   # ---------------------------------------------------------------------------
   # Grafana configuration
+  #
+  # server.root_url comes from local.argocd_app_overrides
+  # (terraform/modules/stack/argocd.tf): https under the domain, or
+  # http://localhost:3000 in port-forward mode.
   # ---------------------------------------------------------------------------
   grafana.ini:
-    server:
-      root_url: https://grafana.$__env{DOMAIN}
     analytics:
       reporting_enabled: false
       check_for_updates: false
@@ -226,24 +220,25 @@ grafana:
     # until SSO is verified end-to-end; flip disable_login_form to true after.
     auth:
       disable_login_form: false
-    # SSO via the ArgoCD-bundled Dex (UW-Madison NetID upstream). Endpoints are
-    # Dex's OIDC routes under the argocd host; the admin NetID gets the Admin
-    # role, everyone else in the institution's email domain gets Viewer.
+    # SSO. Everything that differs by deployment or by identity mode comes from
+    # local.argocd_app_overrides (terraform/modules/stack/argocd.tf), not from
+    # here: client_id, auth_url, token_url and api_url (the Cognito pool, or
+    # the ArgoCD-bundled Dex with an external identity provider),
+    # role_attribute_path (Admin for the administrators, Viewer for everyone
+    # else), and allowed_domains.
     #
-    # allowed_domains is that domain, and it comes from var.institution_domain
-    # through local.argocd_app_overrides (terraform/modules/stack/argocd.tf) rather than from
-    # here. Grafana's own default is no domain restriction at all, so with
-    # allow_sign_up below this value going missing widens access instead of
-    # breaking anything.
+    # Grafana's own default for allowed_domains is no restriction at all, so
+    # with allow_sign_up below that value going missing widens access instead
+    # of breaking anything.
     auth.generic_oauth:
       enabled: true
-      name: UW-Madison NetID
-      client_id: grafana
+      # The label on Grafana's login button, as every operator sees it. Neutral
+      # for EVERY deployment including the reference one, by the operator's
+      # decision (design D9 of
+      # openspec/changes/optional-domain-and-cognito-auth) — a per-deployment
+      # override would be a second source for a cosmetic string.
+      name: Single sign-on
       client_secret: $__env{GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET}
       scopes: openid profile email
-      auth_url: https://argocd.$__env{DOMAIN}/api/dex/auth
-      token_url: https://argocd.$__env{DOMAIN}/api/dex/token
-      api_url: https://argocd.$__env{DOMAIN}/api/dex/userinfo
       allow_sign_up: true
       email_attribute_path: email
-      role_attribute_path: "email == '$__env{ADMIN_EMAIL}' && 'Admin' || 'Viewer'"

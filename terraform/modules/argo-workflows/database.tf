@@ -19,15 +19,6 @@ resource "aws_security_group" "db" {
   tags        = merge(var.tags, { Name = "${var.cluster_name}-argo-postgres-sg" })
 }
 
-# resource "aws_vpc_security_group_ingress_rule" "db_uwmadison" {
-#   security_group_id = aws_security_group.db.id
-#   description       = "PostgreSQL from operator workstation"
-#   prefix_list_id    = var.inbound_prefix_list_id
-#   from_port         = 5432
-#   ip_protocol       = "tcp"
-#   to_port           = 5432
-# }
-
 resource "aws_vpc_security_group_ingress_rule" "db_vpc" {
   security_group_id = aws_security_group.db.id
   description       = "PostgreSQL from within the VPC (EKS pods)"

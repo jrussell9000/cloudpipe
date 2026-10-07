@@ -133,4 +133,7 @@ COPY --chown=1000:1000 images/shared/registration_qc.py /app/registration_qc.py
 COPY --chown=1000:1000 images/shared/fs_derivatives.py /app/fs_derivatives.py
 COPY --chown=1000:1000 images/shared/restore_links.py /app/restore_links.py
 
+# The StepOutcome taxonomy and writer the bold-to-t1w driver records with (#646).
+COPY --chown=1000:1000 images/shared/step_outcome.py /app/step_outcome.py
+
 USER nonroot

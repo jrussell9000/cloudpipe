@@ -50,133 +50,32 @@ This module is invoked ONLY by the standalone outcome-recorder WorkflowTemplate
 now — the fallback path fired when a step is Skipped or its worker pod died
 before it could record its own outcome. func-preproc, bold-to-t1w and
 surface-resample now write their own per-run StepOutcome records directly
-(see ADR 016), with real failure messages, via an inline copy of
-_TAXONOMY/classify_failure embedded in each driver script (Argo scripts run in
-containers that don't have this module installed, so it can't be imported
-across images — see tests/images/afni/test_driver_gating.py::
-test_driver_taxonomy_matches_canonical, which guards the copies staying in
-sync with the one below).
+(see ADR 016), with real failure messages. They and this recorder classify
+through ONE taxonomy, images/shared/step_outcome.py (#646) — COPYed into /app
+of every image that records an outcome, this one included.
 """
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import deployment_env
 from schemas import StepOutcome
+
+# The failure taxonomy and its exit-code tables live in step_outcome; they are
+# re-exported here under their old names, which callers and tests still use.
+# message is usually empty in practice — Argo has no DAG task variable for it
+# (see module docstring) — so the exit code is the fallback that keeps the
+# taxonomy from collapsing to "unknown" on every real failure.
+from step_outcome import (  # noqa: F401 — re-exports
+    _EXIT_CODE_CATEGORY,
+    _EXIT_CODE_REASON,
+    _TAXONOMY,
+    QC_REJECTED_EXIT_CODE,
+    classify_failure,
+)
 from writer import emit_to_s3
-
-# ---------------------------------------------------------------------------
-# Failure taxonomy classifier
-# ---------------------------------------------------------------------------
-
-# Ordered patterns — first match wins.
-_TAXONOMY: list[tuple[str, list[str]]] = [
-    (
-        "infrastructure",
-        [
-            r"OOMKilled",
-            r"exit\s+code\s+137",
-            r"evicted",
-            r"node\s+cordoned",
-            r"deadline\s+exceeded",
-            r"pod\s+unschedul",
-            r"Unschedulable",
-            r"insufficient\s+memory",
-        ],
-    ),
-    (
-        "data",
-        [
-            r"NoSuchKey",
-            r"NoSuchBucket",
-            r"nss_volumes",
-            r"missing\s+input",
-            r"corrupt",
-            r"Unable\s+to\s+open",
-            r"Input\s+file\s+not\s+found",
-        ],
-    ),
-    (
-        "algorithm",
-        [
-            r"AssertionError",
-            r"ValueError",
-            r"segmentation\s+fault",
-            r"Segmentation\s+fault",
-            r"SIGSEGV",
-            r"RuntimeError",
-            r"CalledProcessError",
-            r"non-zero\s+exit\s+code",
-            r"ERROR:",
-        ],
-    ),
-    (
-        "dependency",
-        [
-            r"depended\s+on\s+task",
-            r"upstream\s+task\s+failed",
-            r"Skipped",
-        ],
-    ),
-]
-
-
-# The exit code a registration step uses when its own quality gate rejects the
-# transform it just produced: fst1w_to_mni.py and bold_to_t1w.py exit 65, and
-# only for that, before promoting any output. The run did not break — it
-# worked and said no — so it gets its own category rather than falling through
-# to "unknown" alongside real crashes (issue #368). 65 is also excluded from
-# every retry expression, since a deterministic registration re-rejects.
-QC_REJECTED_EXIT_CODE = 65
-
-# Container exit codes carry the only failure signal a DAG task actually
-# exposes, since {{tasks.<name>.message}} does not exist. 128+N is the shell
-# convention for "killed by signal N".
-_EXIT_CODE_CATEGORY: dict[int, str] = {
-    137: "infrastructure",  # 128+9  SIGKILL — OOMKilled or node eviction
-    143: "infrastructure",  # 128+15 SIGTERM — pod deleted / node drained
-    139: "algorithm",  # 128+11 SIGSEGV
-    134: "algorithm",  # 128+6  SIGABRT
-    QC_REJECTED_EXIT_CODE: "qc_rejected",
-}
-
-# What a known exit code means, spelled out in failure_reason. The panel a
-# human reads is failure_reason, not failure_category, and a bare "exit code 65"
-# there reads as a crash.
-_EXIT_CODE_REASON: dict[int, str] = {
-    QC_REJECTED_EXIT_CODE: "QC gate rejected the registration; no outputs promoted",
-}
-
-
-def classify_failure(status: str, message: str, exit_code: str = "") -> str:
-    """Return a taxonomy category for a failed or skipped step.
-
-    message is usually empty in practice — Argo has no DAG task variable for it
-    (see module docstring), so exit_code is the fallback that keeps the taxonomy
-    from collapsing to "unknown" on every real failure.
-    """
-    if status.lower() == "succeeded":
-        return ""
-    # Skipped with no message → dependency by definition
-    if status.lower() == "skipped":
-        return "dependency"
-    msg = message or ""
-    for category, patterns in _TAXONOMY:
-        for pat in patterns:
-            if re.search(pat, msg, re.IGNORECASE):
-                return category
-    # No message to match (the usual case from a DAG) — fall back to the exit
-    # code, then to "the controller never ran the pod" for an empty Error.
-    code = (exit_code or "").strip()
-    if code.isdigit() and int(code) in _EXIT_CODE_CATEGORY:
-        return _EXIT_CODE_CATEGORY[int(code)]
-    if status.lower() == "error" and not msg.strip():
-        return "infrastructure"
-    return "unknown"
-
 
 # ---------------------------------------------------------------------------
 # Per-run status resolution
@@ -346,6 +245,9 @@ def verify_outputs(expected: list[str], bucket: str, region: str, step: str = ""
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Record a StepOutcome to S3")
     p.add_argument("--workflow-name", required=True)
+    # {{workflow.uid}}. Argo reuses names, so this is what keys the record (#638).
+    # Optional only so a template that has not passed it yet still records.
+    p.add_argument("--workflow-uid", default="")
     # Repeatable: one pod can record several steps that share a producer task
     # and a gate, differing only by step name. func-preproc and surface-sample
     # both hang off functional-preprocessing-dagtask, so recording them together
@@ -420,6 +322,7 @@ def record_one_step(args: argparse.Namespace, step: str) -> None:
 
     outcome = StepOutcome(
         workflow_name=args.workflow_name,
+        workflow_uid=args.workflow_uid,
         step=step,
         subject=args.subject,
         session=args.session,
@@ -441,6 +344,7 @@ def record_one_step(args: argparse.Namespace, step: str) -> None:
         task=args.task,
         run=args.run,
         dt=outcome.recorded_at[:10],
+        workflow_uid=args.workflow_uid,
     )
 
     print(f"  Recording step outcome: {s3_key}", flush=True)

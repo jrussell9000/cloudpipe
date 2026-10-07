@@ -64,12 +64,18 @@ metrics/anat-qc/dt={date}/{subj}_{ses}_anat_qc.json
 metrics/fsqc-qc/dt={date}/{subj}_{ses}_fsqc_qc.json
 metrics/registration/dt={date}/{subj}_{ses}_t1w_to_mni_reg_qc.json
 metrics/registration/dt={date}/{subj}_{ses}_{task}_{run}_bold_to_t1w_reg_qc.json
-metrics/workflow-runs/dt={date}/{workflow-name}__{subj}_run_summary.json
-metrics/subject-manifests/dt={date}/{workflow-name}__{subj}_manifest.json
+metrics/workflow-runs/dt={date}/{workflow-name}__{workflow-uid}__{subj}_run_summary.json
+metrics/subject-manifests/dt={date}/{workflow-name}__{workflow-uid}__{subj}_manifest.json
+metrics/workflow-starts/dt={date}/{workflow-name}__{workflow-uid}.json
 metrics/costs/dt={date}/{date}_{workflow-name}_cost_allocation.json
 metrics/pod-costs/dt={date}/{date}_{workflow-name}_pod_costs.json
-metrics/step-outcomes/dt={date}/{workflow-name}__{step}__{subj}__{ses}__{task}__{run}_outcome.json
+metrics/step-outcomes/dt={date}/{workflow-name}__{workflow-uid}__{step}__{subj}__{ses}__{task}__{run}_outcome.json
 ```
+
+Argo reuses workflow names, so the per-workflow keys carry `{workflow-uid}` too (#638;
+`schemas.workflow_tag`). Records written without one — everything before 2026-10 — keep
+the `{workflow-name}__…` form; the name stays first, so a `{workflow-name}__` prefix
+lists both. Costs stay name-keyed: Kubecost labels carry the name, not the UID.
 
 `pod-costs/` is the one prefix where a key holds **many** records: all of a workflow's pods, as
 newline-delimited JSON (one compact object per line). Athena and DuckDB both read that natively;

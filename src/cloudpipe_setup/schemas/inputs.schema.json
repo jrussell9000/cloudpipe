@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cloudpipe.invalid/schemas/inputs.schema.json",
+  "title": "CloudPipe deployment inputs",
+  "x-schema-version": "2.0",
+  "description": "Every cluster-wide value a human supplies to stand up a CloudPipe deployment, and nothing else. `pixi run cloudpipe setup` reads this file rather than hard-coding its questions, and renders `terraform.tfvars` and `backend.tf` into a target Terraform root from the answers.\n\nThis is the integration contract for any front end. A caller reads it and renders a complete input form without opening another file: `title` is the prompt, `description` is the help text, `pattern` is the rule, `x-section` is the grouping, and `x-source` says where a human obtains the value. Fields marked `x-derived` are computed and overridable — a form generator must display the computed value and accept a change, but must NOT present them as questions.\n\nThe eight Globus variables are deliberately absent. `pixi run globus init` owns them and renders them into a separate `globus.auto.tfvars`; see `src/globus_admin/schemas/answers.schema.json`. The two sets are disjoint and a test holds them so, because two tools writing one variable is two tools disagreeing about it.\n\nThere is deliberately NO AWS credential, key, or profile field, and no Cloudflare API token field. AWS credentials come from the deployer's environment through an AWS CLI v2 SSO profile; the Cloudflare token comes from CLOUDFLARE_API_TOKEN. Neither is ever prompted for, stored, or printed.\n\nEvery `pattern` here is the mechanical equivalent of a `validation` block in `terraform/modules/stack/variables.tf`, and `tests/test_setup_wizard_schema.py` derives both sides from that file and asserts they agree. A field whose variable Terraform does not constrain carries no pattern: one invented here would reject values Terraform accepts, which is the single failure a deployer cannot work around. `x-error-message` is Terraform's own `error_message`, verbatim, so the two can never word the same rule differently.\n\nNo value in this file identifies any deployment. Where a shape needs illustrating, the description uses a placeholder or a reserved example name.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "region",
+    "domain",
+    "operator_emails",
+    "github_repo",
+    "gitops_repo_url",
+    "github_user_url",
+    "github_oidc_allowed_subs",
+    "cloudflare_account_id",
+    "cloudflare_team_domain",
+    "cloudflare_team_name"
+  ],
+  "x-required-when": {
+    "state_bucket": "The backend block is being rendered, which is the default. `cloudpipe setup --no-backend` skips both the file and this requirement."
+  },
+  "properties": {
+    "region": {
+      "type": "string",
+      "pattern": "^[a-z]{2}(-gov)?-[a-z]+-[0-9]$",
+      "x-error-message": "region must be an AWS region id: two letters, a dash, a word, a dash, a digit.",
+      "title": "AWS region",
+      "description": "The region holding the cluster and almost everything else. Two things are always us-east-1 regardless of this value — ACM certificates attached to CloudFront, and the ECR Public token — which is why the example root configures that as a separate provider alias rather than deriving it.",
+      "x-section": "aws",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": "region"
+    },
+    "domain": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z0-9.-]+\\.[a-z]{2,}$",
+      "x-error-message": "domain must be null (port-forward mode) or a bare DNS name with a TLD, e.g. example.org — no scheme and no trailing dot.",
+      "x-null-meaning": "port-forward mode: no published web UIs, and no domain or hosted zone needed",
+      "title": "Service domain",
+      "description": "Where the web UIs are published, as <ui>.<domain> over WARP, or none. With a domain, a Route53 hosted zone for it must already exist in the account you are deploying into — ACM validates its certificates against that zone, so a domain you do not own fails at apply rather than here. `cloudpipe preflight` checks for the zone before you get that far.\n\nWith none, nothing is published: no load balancer, certificate or DNS record. Each UI is reached on a fixed localhost port with `pixi run cloudpipe ui <name>`, which port-forwards over WARP.\n\nA bare DNS name: no scheme, no trailing dot.",
+      "x-section": "identity",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": "domain"
+    },
+    "operator_emails": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[^@\\s]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+        "x-error-message": "operator_emails must be email addresses with a lower-case domain, e.g. operator@example.org."
+      },
+      "minItems": 1,
+      "x-error-message": "operator_emails must hold at least one address: with none, no one can administer the deployment.",
+      "title": "Operator email addresses",
+      "description": "The people who run this deployment, as email addresses, comma-separated. They may enroll a WARP device and reach the cluster, they hold the administrator role in every web UI, and their email domains are the only ones the web UIs' sign-in admits.\n\nThe stack creates an Amazon Cognito user pool for them, with an authenticator app required as a second factor. It does not create the users: after the apply, each address needs `aws cognito-idp admin-create-user` against the pool the `cognito_user_pool_id` output names.",
+      "x-section": "identity",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": "operator_emails"
+    },
+    "github_repo": {
+      "type": "string",
+      "pattern": "^[^/]+/[^/]+$",
+      "x-error-message": "github_repo must be in owner/repo format, with no scheme and no .git suffix.",
+      "title": "CI repository (owner/repo)",
+      "description": "The repository whose GitHub Actions runs may assume the ECR push and Packer AMI build roles. In owner/repo form: no scheme, no .git suffix.\n\nNot necessarily the repository ArgoCD syncs — see gitops_repo_url. CI can run in one repository while the cluster follows another, and in the reference deployment it does.",
+      "x-section": "source-control",
+      "x-source": "source-control-host",
+      "x-terraform-variable": "github_repo"
+    },
+    "gitops_repo_url": {
+      "type": "string",
+      "pattern": "^https://",
+      "x-error-message": "gitops_repo_url must be an https clone URL — ArgoCD reads it without a credential here.",
+      "title": "GitOps repository clone URL",
+      "description": "The repository ArgoCD reads gitops/apps/ from, and that every generated Application tracks. An https clone URL: ArgoCD reads it without a credential, so an ssh URL does not work.\n\nDeliberately separate from github_repo, which scopes the GitHub Actions trust policy. These may name the same repository or different ones.",
+      "x-section": "source-control",
+      "x-source": "source-control-host",
+      "x-terraform-variable": "gitops_repo_url"
+    },
+    "github_user_url": {
+      "type": "string",
+      "pattern": "^https://",
+      "x-error-message": "github_user_url must be an https URL.",
+      "title": "Repository owner URL",
+      "description": "The owner's https URL — the organization or user page above your repositories. Used to scope the ArgoCD repository credential so that one credential covers every repository beneath it rather than one per repository.",
+      "x-section": "source-control",
+      "x-source": "source-control-host",
+      "x-terraform-variable": "github_user_url"
+    },
+    "github_oidc_allowed_subs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "x-error-message": "github_oidc_allowed_subs must not be empty: an empty list trusts nothing and every build loses its credentials.",
+      "title": "GitHub Actions OIDC subject claims",
+      "description": "The exact `token.actions.githubusercontent.com:sub` claim values allowed to assume the GitHub Actions roles. Derived from github_repo as main-branch runs only, which covers every workflow that assumes those roles today.\n\nOverride it when you need one of three things, all of which the stack's own variable documents: a non-main branch, temporarily, to test a build workflow before merging it; a job that sets a GitHub `environment:`, which mints repo:<repo>:environment:<name> and would NOT match a ref-shaped entry; or a wildcard, since the trust policy uses StringLike and `*` is a wildcard in these values.\n\nAn entry that matches nothing is not an error anywhere: the job simply loses its credentials. That is why this is derived rather than typed.",
+      "x-section": "source-control",
+      "x-source": "derived",
+      "x-terraform-variable": "github_oidc_allowed_subs",
+      "x-derived": true,
+      "x-derived-from": [
+        "github_repo"
+      ],
+      "x-derived-template": "repo:{github_repo}:ref:refs/heads/main"
+    },
+    "cloudflare_account_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "x-error-message": "cloudflare_account_id must be the 32-character hex account id from the Cloudflare dashboard.",
+      "title": "Cloudflare account ID",
+      "description": "The account that owns the Zero Trust organization: 32 lowercase hex characters. It is in the Cloudflare dashboard URL once you have selected the account.",
+      "x-section": "cloudflare",
+      "x-source": "cloudflare-dashboard",
+      "x-terraform-variable": "cloudflare_account_id"
+    },
+    "cloudflare_team_domain": {
+      "type": "string",
+      "pattern": "\\.cloudflareaccess\\.com$",
+      "x-error-message": "cloudflare_team_domain must end in .cloudflareaccess.com.",
+      "title": "Zero Trust team domain",
+      "description": "The Zero Trust team domain, <team>.cloudflareaccess.com. It is the organization's auth_domain and the host that WARP and the browser are sent to, so it has to match what Cloudflare assigned this account — it is not a name you choose here.",
+      "x-section": "cloudflare",
+      "x-source": "cloudflare-dashboard",
+      "x-terraform-variable": "cloudflare_team_domain"
+    },
+    "cloudflare_team_name": {
+      "type": "string",
+      "minLength": 1,
+      "title": "Zero Trust organization name",
+      "description": "The organization's name as Cloudflare generated it. A separate value from the team domain and NOT derivable from it: reading it back from the dashboard is the only way to get it right.\n\nNo pattern is checked here, deliberately — Cloudflare generates the value and there is no shape to check, which is also why Terraform does not constrain it. Get it wrong and nothing rejects it: the organization is silently renamed.",
+      "x-section": "cloudflare",
+      "x-source": "cloudflare-dashboard",
+      "x-terraform-variable": "cloudflare_team_name"
+    },
+    "state_bucket": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
+      "x-error-message": "state_bucket must be a valid S3 bucket name.",
+      "title": "Terraform state bucket",
+      "description": "The S3 bucket holding this deployment's Terraform state. It must exist before the first `terraform init`, and creating it is the one step the wizard will not take for you — nothing here creates an AWS resource. The closing output prints the commands that create it, enable versioning on it, and block public access to it.\n\nUse a bucket dedicated to state, not the data bucket. Remote state is not optional in practice: local state is one laptop away from a deployment nobody can change, and versioning is what makes a truncated state recoverable. `cloudpipe setup --no-backend` skips the backend file entirely if you manage state another way.",
+      "x-section": "terraform-state",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": null
+    },
+    "state_key": {
+      "type": "string",
+      "minLength": 1,
+      "default": "cloudpipe/terraform.tfstate",
+      "title": "Terraform state key",
+      "description": "The object key the state is written to inside the bucket. The default is fine unless the bucket holds state for more than one deployment, in which case give each its own key — two roots sharing one key overwrite each other's state.",
+      "x-section": "terraform-state",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": null
+    }
+  },
+  "$defs": {
+    "section": {
+      "description": "Field groupings, in the order a front end should present them. The identifiers are stable; the titles are display text.",
+      "x-order": [
+        {
+          "identifier": "aws",
+          "title": "AWS"
+        },
+        {
+          "identifier": "identity",
+          "title": "Identity"
+        },
+        {
+          "identifier": "source-control",
+          "title": "Source control"
+        },
+        {
+          "identifier": "cloudflare",
+          "title": "Cloudflare Zero Trust"
+        },
+        {
+          "identifier": "terraform-state",
+          "title": "Terraform state"
+        }
+      ]
+    },
+    "source": {
+      "description": "Where a human obtains the value. A front end may group or annotate by this; the wizard shows it alongside the help text, because \"go and look this up\" is a different kind of answer from \"decide this\".",
+      "enum": [
+        "aws-console",
+        "cloudflare-dashboard",
+        "identity-provider",
+        "source-control-host",
+        "institution",
+        "deployer-choice",
+        "derived"
+      ]
+    }
+  }
+}

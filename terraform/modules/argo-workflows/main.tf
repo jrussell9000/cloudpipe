@@ -10,58 +10,6 @@ data "kubernetes_namespace_v1" "this" {
 }
 
 ################################################################################
-# ALB security group — restricts inbound to operator IP only
-################################################################################
-
-resource "aws_security_group" "lb" {
-  name_prefix = "${var.cluster_name}-argo-lb-"
-  vpc_id      = var.vpc_id
-  description = "Controls inbound access to the Argo Workflows ALB."
-  tags        = merge(var.tags, { Name = "${var.cluster_name}-argo-lb-sg" })
-}
-
-resource "aws_vpc_security_group_ingress_rule" "lb_https" {
-  security_group_id = aws_security_group.lb.id
-  description       = "HTTPS from operator workstation"
-  prefix_list_id    = var.inbound_prefix_list_id
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-# Allow access via the AWS Client VPN too (source-NATs to the VPC CIDR) — lets
-# a single VPN connection reach both the cluster API and this ALB, without
-# also requiring the UW-Madison VPN.
-resource "aws_vpc_security_group_ingress_rule" "lb_https_client_vpn" {
-  security_group_id = aws_security_group.lb.id
-  description       = "HTTPS from AWS Client VPN (source-NATs to VPC CIDR)"
-  cidr_ipv4         = var.vpc_cidr
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-# The rule above only covers traffic to VPC-internal destinations (where the
-# VPN endpoint's own SNAT applies). Traffic from a full-tunnel VPN client to
-# this ALB's *public* IP instead hairpins out through the VPC's NAT gateway
-# and back in over the internet, presenting the NAT gateway's EIP as the
-# source — so that EIP needs its own trust rule too.
-resource "aws_vpc_security_group_ingress_rule" "lb_https_nat" {
-  security_group_id = aws_security_group.lb.id
-  description       = "HTTPS from VPC NAT gateway (full-tunnel VPN clients hairpin through here)"
-  cidr_ipv4         = "${var.nat_gateway_ip}/32"
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
-}
-
-resource "aws_vpc_security_group_egress_rule" "lb" {
-  security_group_id = aws_security_group.lb.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
-}
-
-################################################################################
 # workflow-controller-configmap — owns dynamic DB persistence config
 # ArgoCD's Helm chart uses controller.configMap.create: false
 ################################################################################
@@ -162,14 +110,14 @@ resource "kubernetes_config_map_v1" "workflow_controller" {
     # SSO config — must live here because the Helm chart's configMap.create is
     # false (Terraform owns this ConfigMap), so Helm never writes this key.
     "sso" = <<-YAML
-      issuer: https://argocd.${var.route53_zone_name}/api/dex
+      issuer: ${var.oidc_issuer_url}
       clientId:
         name: argo-workflows-sso
         key: clientID
       clientSecret:
         name: argo-workflows-sso
         key: clientSecret
-      redirectUrl: https://argo.${var.route53_zone_name}/oauth2/callback
+      redirectUrl: ${var.ui_base_url}/oauth2/callback
       scopes:
       - openid
       - profile
@@ -249,6 +197,8 @@ resource "kubernetes_config_map_v1" "cloudpipe_config" {
 ################################################################################
 
 resource "kubernetes_ingress_v1" "this" {
+  count = var.publish_ui ? 1 : 0
+
   metadata {
     name      = "argoworkflows-ingress"
     namespace = var.namespace
@@ -262,7 +212,7 @@ resource "kubernetes_ingress_v1" "this" {
     # idles the stream out and the UI silently freezes on stale state.
     annotations = merge(var.alb_group_annotations, {
       # Create a Route53 alias record automatically via external-dns
-      "external-dns.alpha.kubernetes.io/hostname" = "argo.${var.route53_zone_name}"
+      "external-dns.alpha.kubernetes.io/hostname" = var.ui_host
 
       "alb.ingress.kubernetes.io/target-type"     = "ip"
       "alb.ingress.kubernetes.io/certificate-arn" = var.certificate_arn
@@ -278,7 +228,7 @@ resource "kubernetes_ingress_v1" "this" {
     ingress_class_name = "alb"
 
     rule {
-      host = "argo.${var.route53_zone_name}"
+      host = var.ui_host
       http {
         path {
           path      = "/*"

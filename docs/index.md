@@ -46,6 +46,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 
 | I want to… | Go to |
 |---|---|
+| **Stand up my own deployment, starting from a fresh clone** | [deployer-first-hour.md](deployer-first-hour.md) |
 | Understand how the system fits together | [architecture.md](architecture.md) |
 | Get ABCD data into the bucket, with or without Globus | [data-ingress.md](data-ingress.md) |
 | Find out whether I *can* reproduce the Globus ingress | [globus-prerequisites.md](globus-prerequisites.md) |
@@ -70,6 +71,10 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 ---
 
 ## Reference docs
+
+### Deploying this yourself
+
+- [**deployer-first-hour.md**](deployer-first-hour.md) — The path from a fresh clone to a Terraform root ready for its first apply: the prerequisite bootstrapper, `cloudpipe setup` (which collects the fifteen deployment inputs and renders `terraform.tfvars` and `backend.tf`), the state bucket, `globus init`, and the read-only `cloudpipe preflight` that checks your answers against AWS, Cloudflare and your OIDC issuer before anything is applied. None of those commands create a cloud resource.
 
 ### System
 
@@ -123,10 +128,15 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 argo/workflows/
   cloudpipe_minproc/       — production pipeline WorkflowTemplates
   fmri_first_level_proc/ — first-level GLM WorkflowTemplate
+  ops/                — operational CronWorkflows (e.g. the hourly argo-nodes snapshot)
   # cloudpipe_fullproc/ (raw DICOM input) is planned but not yet created — see architecture.md
 images/               — Docker image source (one directory per image)
-terraform/            — AWS infrastructure
+terraform/            — AWS infrastructure; the root holds only backend, providers,
+                        variables, the `module "stack"` call and `moved` blocks
   modules/
+    stack/            — everything managed: EKS, S3, RDS, IAM, and the calls to the
+                        modules below
+      example/        — a minimal root for outside deployments to copy
     addons/           — EKS add-ons + their Pod Identity associations
     argo-workflows/   — Argo IAM, RDS, RBAC
     globus/           — GCS EC2, SSM, EventBridge
@@ -143,9 +153,15 @@ prefect/flows/        — Prefect queue manager flows
 src/                  — importable library code (on pytest pythonpath)
   metrics/            — schemas, Athena/DuckDB query helpers, exit handler, cost scraper,
                         nightly compactor, per-step outcome recorder
-  inventory.py, validate_test_batch.py, workflow_steps.py, pullsamplestats.py
+  globus_admin/       — Globus operator tooling (`pixi run globus <command>`)
+  cloudpipe_setup/    — the setup wizard (`scripts/cloudpipe-setup`)
+  anat_stats/         — cohort aggregation of FastSurfer and subregion stats into Parquet
+  inventory.py, validate_test_batch.py, workflow_steps.py, pullsamplestats.py,
+  resubmit_failed.py
 scripts/              — runnable helpers (shell, one-off python, notebook)
-  manifests/          — ad-hoc k8s debug manifests
+  jobs/               — standing k8s manifests these docs tell you to run
+                        (investigations/ and manifests/ hold one-off probes;
+                        internal-only, not published)
 tools/                — data & reference files (subject-id CSVs, cost CSVs, NIST assessment)
                         internal-only; not published to the public repo
 docs/                 — this documentation
@@ -180,3 +196,5 @@ docs-internal/        — Architecture Decision Records, dated investigations an
 | Argo server | `https://argo.<domain>` |
 | ArgoCD | `https://argocd.<domain>` |
 | Grafana | `https://grafana.<domain>` |
+
+A deployment with no domain (`domain = null`) publishes none of those hostnames. Each UI is reached on a fixed `localhost` port with `pixi run cloudpipe ui <name>` — see [the deployer's first hour](deployer-first-hour.md#reaching-the-web-uis-without-a-domain).
