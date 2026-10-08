@@ -491,6 +491,16 @@ resource "aws_s3_bucket_logging" "finops" {
   depends_on = [module.finops, aws_s3_bucket_policy.access_logs]
 }
 
+# The metrics bucket. Subject-keyed rows, so it carries the same obligation as
+# the data bucket and had neither data events nor access logging.
+resource "aws_s3_bucket_logging" "metrics" {
+  bucket        = aws_s3_bucket.metrics.id
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "s3-access-logs/${aws_s3_bucket.metrics.id}/"
+
+  depends_on = [aws_s3_bucket_policy.access_logs]
+}
+
 # AU-9: who read or deleted the audit trail is itself audit information. The
 # access-log bucket is deliberately not logged to itself — that recurses, and
 # each delivery would generate a further record.
@@ -522,6 +532,39 @@ resource "aws_s3_bucket_logging" "logs" {
 # Do not re-add these to get searchable logs. Query the S3 archive instead; it
 # holds the same bytes and is already paid for.
 
+# Object-level data events are the DUA accountability control (see the
+# cloudtrail-retention rule above). Three buckets hold data that obligation
+# covers, and until now only the first was selected:
+#
+#   * the subject-data bucket — the imaging input and derivatives;
+#   * the metrics bucket — every Glue table in modules/metrics has a `subject`
+#     column, so this is subject-keyed data, not anonymous telemetry;
+#   * the Terraform state bucket — state holds the Cloudflare IdP client secret
+#     and the VPN CA key in plain text.
+#
+# Advanced selectors rather than the basic `event_selector` this replaced. The
+# two are mutually exclusive, and the conversion has one trap worth stating
+# because it is silent: a basic selector carries `include_management_events`,
+# while advanced selectors log management events ONLY if a selector explicitly
+# matches `eventCategory = Management`. Adding data selectors alone would have
+# switched management-event logging off across the whole trail — that is the
+# control-plane record, not a detail — so the second selector below is load
+# bearing and is asserted by a test.
+#
+# Neither selector sets `readOnly`, which means both reads and writes, matching
+# the `read_write_type = "All"` it replaces.
+locals {
+  # A trailing slash means "every object in the bucket"; without it the selector
+  # matches the bucket itself and logs nothing.
+  cloudtrail_state_bucket = coalesce(var.terraform_state_bucket, "${var.name}-terraform-state")
+
+  cloudtrail_data_bucket_arns = [
+    "arn:aws:s3:::${var.globus_s3_destination_bucket}/",
+    "${aws_s3_bucket.metrics.arn}/",
+    "arn:aws:s3:::${local.cloudtrail_state_bucket}/",
+  ]
+}
+
 resource "aws_cloudtrail" "this" {
   name                          = "${var.name}-cloudtrail"
   s3_bucket_name                = aws_s3_bucket.logs.id
@@ -529,13 +572,33 @@ resource "aws_cloudtrail" "this" {
   include_global_service_events = true
   is_multi_region_trail         = true
   enable_log_file_validation    = true
-  # Add CloudTrail auditing for globus destination bucket
-  event_selector {
-    read_write_type           = "All"
-    include_management_events = true
-    data_resource {
-      type   = "AWS::S3::Object"
-      values = ["arn:aws:s3:::${var.globus_s3_destination_bucket}/"]
+
+  advanced_event_selector {
+    name = "S3 object data events on the subject-data, metrics and state buckets"
+
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Data"]
+    }
+
+    field_selector {
+      field  = "resources.type"
+      equals = ["AWS::S3::Object"]
+    }
+
+    field_selector {
+      field       = "resources.ARN"
+      starts_with = local.cloudtrail_data_bucket_arns
+    }
+  }
+
+  # Do not remove. See the note above: without this, management events stop.
+  advanced_event_selector {
+    name = "Management events"
+
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Management"]
     }
   }
 }

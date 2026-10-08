@@ -472,6 +472,26 @@ variable "access_log_retention_days" {
   default     = 30
 }
 
+variable "athena_result_retention_days" {
+  description = "Days before Athena query results in the finops bucket expire. Does not affect CUR data or the Kubecost store."
+  type        = number
+  default     = 7
+}
+
+# The state bucket is named in the backend block (versions.tf), which Terraform
+# evaluates before variables and will not interpolate, so it cannot be read from
+# there. It is declared here only so CloudTrail can select object-level events on
+# it — state holds provider secrets in plain text. Null means "derive it from
+# var.name", which is how this deployment is named; an outside deployment whose
+# state bucket is named differently, or lives in another account, sets it
+# explicitly. A selector on a bucket that does not exist matches nothing and is
+# harmless.
+variable "terraform_state_bucket" {
+  description = "Bucket holding this deployment's Terraform state, for CloudTrail data events. Defaults to <name>-terraform-state."
+  type        = string
+  default     = null
+}
+
 # Versioning on the audit bucket is an AU-9 tamper-evidence control, not a
 # backup (see the H8 risk acceptance, which deliberately does NOT cover this
 # bucket). A deleted log leaves a noncurrent version behind for long enough to
@@ -577,6 +597,120 @@ variable "operator_emails" {
   validation {
     condition     = alltrue([for email in var.operator_emails : can(regex("^[^@\\s]+@[a-z0-9.-]+\\.[a-z]{2,}$", email))])
     error_message = "operator_emails must be email addresses with a lower-case domain, e.g. operator@example.org."
+  }
+}
+
+variable "cognito_federation" {
+  description = <<-EOT
+    One institutional identity provider, federated into the Cognito user pool
+    (design D5 of openspec/changes/optional-domain-and-cognito-auth).
+
+    This is how an institution's single sign-on reaches a deployment. Cloudflare
+    Access and Dex do not change: they keep talking to the pool, and the pool
+    talks to the institution. The institution registers ONE redirect URI —
+    Cognito's, printed by the `cognito_federation_redirect_uri` output — instead
+    of one per relying party.
+
+    `type` is "saml" or "oidc".
+
+      - SAML needs `metadata_url`, the IdP metadata document's URL.
+      - OIDC needs `oidc_issuer` and `client_secret_id`, the name of a Secrets
+        Manager secret holding {"clientID": ..., "clientSecret": ...}. That
+        secret is the institution's credential: it is created by hand and read
+        by a data source, never owned by Terraform, which is the same
+        convention `external_identity` follows.
+
+    `mfa_evidence` is how this provider's multifactor authentication is proven,
+    and exactly one form is required. Cognito "delegates all authentication
+    processes to the IdP and doesn't offer them additional authentication
+    factors", so a federated user never meets the pool's own authenticator
+    requirement — something has to stand in its place for 3.5.3:
+
+      - `claim` + `claim_value`: a claim the IdP asserts per login, which the
+        Cloudflare Access policy then REQUIRES. `acr` is the usual claim name,
+        and several research federations define a standard value for an MFA
+        login — the provider's own team knows which they assert. This is the
+        strong form: a login that arrives without it is denied.
+      - `attestation`: a reference to the institution's written policy, for a
+        provider that cannot assert a per-login claim. SAML carries its
+        authentication context in the assertion rather than as an attribute, so
+        SAML federation usually lands here. Nothing is enforced at login; the
+        deployer's SSP cites this string.
+
+    `attribute_mapping` maps pool attributes to the IdP's claim names. The
+    default maps email and email_verified from claims of the same name. Both
+    matter: the UIs sign in on email, and Cognito marks a federated user's
+    address verified only if something maps `email_verified` — an unverified
+    address is refused by the Dex connector.
+  EOT
+
+  type = object({
+    type             = string
+    name             = optional(string, "institution")
+    metadata_url     = optional(string)
+    oidc_issuer      = optional(string)
+    client_secret_id = optional(string)
+    authorize_scopes = optional(string, "openid email profile")
+    attribute_mapping = optional(map(string), {
+      email          = "email"
+      email_verified = "email_verified"
+    })
+    mfa_evidence = object({
+      claim       = optional(string)
+      claim_value = optional(string)
+      attestation = optional(string)
+    })
+  })
+
+  default = null
+
+  validation {
+    condition     = var.cognito_federation == null || contains(["saml", "oidc"], var.cognito_federation.type)
+    error_message = "cognito_federation.type must be \"saml\" or \"oidc\"."
+  }
+
+  # 1 to 32 characters, and Cognito rejects a leading or trailing underscore or
+  # separator. It reaches the authorize URL as `identity_provider`, so it is
+  # also the one value the institution may see.
+  validation {
+    condition     = var.cognito_federation == null || can(regex("^[^_[:space:]][[:print:]]{0,30}[^_[:space:]]$", var.cognito_federation.name))
+    error_message = "cognito_federation.name must be 2 to 32 printable characters and may not begin or end with an underscore or a space."
+  }
+
+  validation {
+    condition     = var.cognito_federation == null || var.cognito_federation.type != "saml" || try(startswith(var.cognito_federation.metadata_url, "https://"), false)
+    error_message = "cognito_federation.metadata_url is required for a SAML provider and must be an https URL."
+  }
+
+  validation {
+    condition     = var.cognito_federation == null || var.cognito_federation.type != "oidc" || try(startswith(var.cognito_federation.oidc_issuer, "https://"), false)
+    error_message = "cognito_federation.oidc_issuer is required for an OIDC provider and must be an https URL."
+  }
+
+  validation {
+    condition     = var.cognito_federation == null || var.cognito_federation.type != "oidc" || !endswith(coalesce(var.cognito_federation.oidc_issuer, "x"), "/")
+    error_message = "cognito_federation.oidc_issuer must not end in a slash — Cognito appends the discovery path to it."
+  }
+
+  validation {
+    condition     = var.cognito_federation == null || var.cognito_federation.type != "oidc" || try(length(var.cognito_federation.client_secret_id) > 0, false)
+    error_message = "cognito_federation.client_secret_id is required for an OIDC provider: the name of a hand-created Secrets Manager secret holding {\"clientID\": ..., \"clientSecret\": ...}."
+  }
+
+  # The MFA-evidence rule, which is the one validation here that is about
+  # compliance rather than shape. A federation with no evidence is rejected
+  # before anything is applied, because Cognito adds no factor of its own.
+  validation {
+    condition = var.cognito_federation == null || (
+      (try(length(var.cognito_federation.mfa_evidence.claim) > 0, false) && try(length(var.cognito_federation.mfa_evidence.claim_value) > 0, false))
+      != try(length(var.cognito_federation.mfa_evidence.attestation) > 0, false)
+    )
+    error_message = "cognito_federation.mfa_evidence must declare exactly one form: either `claim` AND `claim_value` (a per-login claim the Access policy will require), or `attestation` (a reference to the institution's written MFA policy). Cognito delegates authentication to the provider and adds no second factor of its own, so one of the two is what satisfies NIST 800-171 3.5.3."
+  }
+
+  validation {
+    condition     = var.cognito_federation == null || try(length(var.cognito_federation.attribute_mapping["email"]) > 0, false)
+    error_message = "cognito_federation.attribute_mapping must map `email`: every web UI signs in on the email address, and an unmapped one leaves the federated user with no identity the deployment can match."
   }
 }
 

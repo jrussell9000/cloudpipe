@@ -1,5 +1,5 @@
 # 1. Base Operating System
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -15,7 +15,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 #
 # `apt-get upgrade` at the end is the same-release security upgrade (NIST SP 800-171
 # SI-2, finding N1) — not `dist-upgrade`, so it only moves already-installed packages to
-# a newer revision of Ubuntu 24.04 and never installs or removes one. It applies to the
+# a newer revision of Ubuntu 26.04 and never installs or removes one. It applies to the
 # apt set only; the AFNI tarball and the micromamba environment fetched below are
 # vendored and invisible to apt.
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -68,6 +68,23 @@ class Field:
     #: is satisfied by it. `null_meaning` is what choosing it does, for the prompt.
     nullable: bool = False
     null_meaning: str | None = None
+    #: Why this field is never prompted for, or None when it is. An object whose
+    #: shape belongs to someone else — `cognito_federation` — is written into the
+    #: answers document by hand, then validated and rendered like any other.
+    not_asked: str | None = None
+    #: The nested schema of an object field, for the validation that cannot be a
+    #: pattern on a scalar. A tuple of (name, subschema) rather than a dict, so
+    #: the dataclass stays hashable and needs no mutable default.
+    properties: tuple[tuple[str, Any], ...] = ()
+    required_properties: tuple[str, ...] = ()
+
+    @property
+    def property_schemas(self) -> dict[str, Any]:
+        return dict(self.properties)
+
+    @property
+    def is_object(self) -> bool:
+        return self.type == "object"
 
     @property
     def is_derived(self) -> bool:
@@ -172,6 +189,9 @@ def fields() -> tuple[Field, ...]:
             type=base_type,
             nullable="null" in types,
             null_meaning=body.get("x-null-meaning"),
+            not_asked=body.get("x-not-asked"),
+            properties=tuple(body.get("properties", {}).items()),
+            required_properties=tuple(body.get("required", ())),
             item_rules=_rules(body.get("items", {})),
             rules=_rules(body),
             section=body["x-section"],

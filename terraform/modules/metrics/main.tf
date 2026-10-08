@@ -128,8 +128,13 @@ resource "aws_glue_catalog_table" "func_preproc_compacted" {
   table_type = "EXTERNAL_TABLE"
 
   parameters = merge(local.compacted_partition_projection.func_preproc, {
-    "classification"                   = "parquet"
-    "projection.schema_version.values" = "1.0,1.1"
+    "classification" = "parquet"
+    # 1.2 added for #643 (CompCor now excludes non-steady-state frames). Must
+    # be here BEFORE the reprocess emits 1.2: a schema_version outside this
+    # enum is not a projected partition, so those rows return ZERO ROWS with a
+    # SUCCEEDED query status — see #241 and the note at the top of this file.
+    # 1.0 and 1.1 stay until no pre-reprocess partitions remain.
+    "projection.schema_version.values" = "1.0,1.1,1.2"
   })
 
   partition_keys {

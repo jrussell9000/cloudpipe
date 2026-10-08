@@ -61,6 +61,82 @@
       "x-source": "deployer-choice",
       "x-terraform-variable": "operator_emails"
     },
+    "cognito_federation": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "title": "Institutional identity provider (optional)",
+      "description": "Your institution's single sign-on, federated into the Cognito user pool. Leave it out unless you have one: the pool on its own is a complete, compliant way to sign in.\n\nThis is the one input the wizard does not ask for, because its shape is your institution's rather than this tool's — and because arranging it takes a conversation with their identity team, not a line at a terminal. Write it into the answers document by hand; `cloudpipe setup` renders it and `cloudpipe preflight` checks it. See docs/deployer-first-hour.md, \"Signing in with your institution's identity provider\".\n\n`type` is \"saml\" (with `metadata_url`) or \"oidc\" (with `oidc_issuer` and `client_secret_id`, the name of a Secrets Manager secret you create by hand holding {\"clientID\": ..., \"clientSecret\": ...}).\n\n`mfa_evidence` is required and takes exactly one form, because Cognito adds no second factor of its own for a federated user: either `claim` and `claim_value`, a per-login claim the Cloudflare Access policy will then require, or `attestation`, a reference to their written policy for a provider that cannot assert one.",
+      "x-section": "identity",
+      "x-source": "identity-provider",
+      "x-terraform-variable": "cognito_federation",
+      "x-not-asked": "Its shape is the institution's, and a nested object is not a question a line-oriented prompt can ask well. Write it in the answers document; it is validated and rendered like every other field.",
+      "x-null-meaning": "no institutional provider: operators sign in to the Cognito pool itself",
+      "properties": {
+        "type": {
+          "enum": [
+            "saml",
+            "oidc"
+          ],
+          "x-error-message": "cognito_federation.type must be \"saml\" or \"oidc\"."
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[^_\\s][\\S\\s]{0,30}[^_\\s]$",
+          "x-error-message": "cognito_federation.name must be 2 to 32 printable characters and may not begin or end with an underscore or a space."
+        },
+        "metadata_url": {
+          "type": "string",
+          "pattern": "^https://",
+          "x-error-message": "cognito_federation.metadata_url is required for a SAML provider and must be an https URL."
+        },
+        "oidc_issuer": {
+          "type": "string",
+          "allOf": [
+            {
+              "pattern": "^https://",
+              "x-error-message": "cognito_federation.oidc_issuer is required for an OIDC provider and must be an https URL."
+            },
+            {
+              "pattern": "[^/]$",
+              "x-error-message": "cognito_federation.oidc_issuer must not end in a slash — Cognito appends the discovery path to it."
+            }
+          ]
+        },
+        "client_secret_id": {
+          "type": "string",
+          "minLength": 1,
+          "x-error-message": "cognito_federation.client_secret_id is required for an OIDC provider: the name of a hand-created Secrets Manager secret holding {\"clientID\": ..., \"clientSecret\": ...}."
+        },
+        "authorize_scopes": {
+          "type": "string"
+        },
+        "attribute_mapping": {
+          "type": "object",
+          "x-error-message": "cognito_federation.attribute_mapping must map `email`: every web UI signs in on the email address, and an unmapped one leaves the federated user with no identity the deployment can match."
+        },
+        "mfa_evidence": {
+          "type": "object",
+          "x-error-message": "cognito_federation.mfa_evidence must declare exactly one form: either `claim` AND `claim_value` (a per-login claim the Access policy will require), or `attestation` (a reference to the institution's written MFA policy). Cognito delegates authentication to the provider and adds no second factor of its own, so one of the two is what satisfies NIST 800-171 3.5.3.",
+          "properties": {
+            "claim": {
+              "type": "string"
+            },
+            "claim_value": {
+              "type": "string"
+            },
+            "attestation": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "required": [
+        "type",
+        "mfa_evidence"
+      ]
+    },
     "github_repo": {
       "type": "string",
       "pattern": "^[^/]+/[^/]+$",

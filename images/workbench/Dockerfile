@@ -1,4 +1,4 @@
-FROM ghcr.io/prefix-dev/pixi:0.41.4 AS build
+FROM ghcr.io/prefix-dev/pixi:0.81.0 AS build
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1) — same treatment,
 # and for the same reason, as images/afni/Dockerfile: the Ubuntu 24.04 pixi base ships

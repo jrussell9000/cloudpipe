@@ -51,7 +51,11 @@ resource "helm_release" "argocd" {
               config:
                 issuer: ${local.dex_connector.issuer}
                 clientID: "${local.dex_connector.client_id}"
-                clientSecret: "${local.dex_connector.client_secret}"
+                # Unquoted, and always a `$secret:key` reference in both identity
+                # modes (cognito.tf) — never the secret itself (#644). Unquoted
+                # to match the proven staticClients below; ArgoCD resolves the
+                # reference from a part-of: argocd Secret.
+                clientSecret: ${local.dex_connector.client_secret}
                 redirectURI: "${local.ui_base_urls["argocd"]}/api/dex/callback"
                 scopes:
                   - openid
@@ -102,6 +106,39 @@ locals {
 # them in that mode would put template directives in the heredoc above for no
 # gain — a static client is usable only with its secret, which only these
 # Secrets hold.
+
+# ------------------------------------------------------------------------------
+# Supplied provider's Dex connector secret (#644)
+#
+# Only this Secret holds the value; the dex.config above renders
+# `$institution-dex-connector:clientSecret`. Interpolating it instead put the
+# secret in plain text into the argocd-cm CONFIGMAP — outside the EKS KMS
+# envelope, which covers Secrets only (eks.tf), readable by anything with
+# `get configmaps` in argocd, and retained in Helm release history and plan
+# output. The Cognito branch (cognito.tf) and the three static clients below
+# already did it this way.
+#
+# ArgoCD resolves `$<secret>:<key>` in argocd-cm — dex.config connectors
+# included — only for a Secret in this namespace carrying the
+# `app.kubernetes.io/part-of: argocd` label (ArgoCD docs, "Reference SSO
+# clientSecret from a custom Kubernetes Secret"). Without the label the literal
+# `$name:key` string reaches Dex and every sign-in fails on an invalid secret.
+# ------------------------------------------------------------------------------
+resource "kubernetes_secret_v1" "institution_dex_connector" {
+  count = local.external
+
+  metadata {
+    name      = "institution-dex-connector"
+    namespace = "argocd"
+    labels = {
+      "app.kubernetes.io/part-of" = "argocd"
+    }
+  }
+  data = {
+    clientSecret = local.external_dex_client_secret
+  }
+  depends_on = [helm_release.argocd]
+}
 
 # ------------------------------------------------------------------------------
 # Argo Workflows Dex static client secret
@@ -393,12 +430,17 @@ locals {
       }
     }
 
-    # cluster-config has no subchart: `region` is its own chart value, read by
-    # templates/cluster-secret-store.yaml. Leaving it unset renders a
-    # ClusterSecretStore with an empty region, which external-secrets rejects.
-    "cluster-config" = {
-      region = var.region
-    }
+    # cluster-config has NO override entry any more, deliberately. Its only
+    # overridden value was `region`, read by templates/cluster-secret-store.yaml,
+    # and that template is gone with the second ClusterSecretStore (#637) — the
+    # remaining templates in that chart read no deployment values at all. An
+    # entry here that no template reads is what
+    # test_dependency_free_override_keys_are_read_by_templates forbids: Helm
+    # accepts an unknown value in silence and renders nothing with it.
+    #
+    # The matching `else if` branch in root-app.yaml.tftpl is removed in the
+    # same change, because test_every_branch_has_an_override_entry and
+    # test_every_override_entry_has_a_branch require the two to move together.
 
     # Prefect's hostname reaches the browser twice, for two different consumers.
     # prefectUiApiUrl is the URL the loaded UI calls for its API, so it has to be

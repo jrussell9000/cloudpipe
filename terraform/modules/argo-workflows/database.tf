@@ -86,8 +86,21 @@ resource "aws_db_instance" "this" {
 ################################################################################
 
 # ClusterSecretStore — shared by all ExternalSecrets in the cluster.
-# Uses EKS Pod Identity via the external-secrets service account, which has
-# SecretsManager GetSecretValue permission via module.external_secrets_pod_identity.
+#
+# There is deliberately NO `auth` block, and that is what selects EKS Pod
+# Identity. With `auth` unset the AWS provider falls back to the default
+# credential chain, which resolves to the external-secrets controller pod's own
+# credentials — the `external-secrets` service account, granted
+# SecretsManager GetSecretValue by module.external_secrets_pod_identity.
+#
+# This used to carry `auth.pod.serviceAccountRef`, which looked like the thing
+# selecting Pod Identity and was not: `spec.provider.aws.auth` accepts only
+# `jwt` and `secretRef`, the CRD sets no x-kubernetes-preserve-unknown-fields,
+# so the API server pruned it and the live store has always had `auth: {}`
+# (#687). Do not add it back, and do not "fix" it into `auth.jwt` — that would
+# switch the store to service-account-token auth and change which credentials
+# every ExternalSecret in the cluster uses.
+#
 # count = 0 until ArgoCD installs the external-secrets CRDs; set crds_available=true after first ArgoCD sync.
 resource "kubectl_manifest" "cluster_secretstore" {
   count     = var.crds_available ? 1 : 0
@@ -101,11 +114,31 @@ resource "kubectl_manifest" "cluster_secretstore" {
         aws:
           service: SecretsManager
           region: ${var.region}
-          auth:
-            pod:
-              serviceAccountRef:
-                name: external-secrets
-                namespace: external-secrets
+      # Which namespaces may reference this store (#637). Without conditions a
+      # ClusterSecretStore is usable from ANY namespace, so anything able to
+      # create an ExternalSecret — an ArgoCD-synced app, a workflow manifest —
+      # could pull a secret this store can read into its own namespace.
+      #
+      # Exactly the namespaces that reference it today, from
+      # `kubectl get externalsecrets -A`:
+      #   argo-workflows  argo-db, pgbouncer-auth-userlist
+      #   prefect         prefect-db-credentials
+      #   cloudflared     cloudflared-token
+      #
+      # argo-workflows/globus-credentials is covered by the argo-workflows
+      # entry too: it used to read a second store, which has since been retired
+      # and its consumer repointed here (#637). This is now the only
+      # ClusterSecretStore in the cluster, so a namespace missing from this list
+      # has no fallback.
+      #
+      # Adding a namespace is required before an ExternalSecret in it will
+      # sync, and the failure is quiet — ESO keeps serving the last synced
+      # Secret and reports the error only on the ExternalSecret's status.
+      conditions:
+        - namespaces:
+            - argo-workflows
+            - prefect
+            - cloudflared
   YAML
 }
 

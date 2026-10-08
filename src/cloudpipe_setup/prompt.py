@@ -100,6 +100,11 @@ def _is_asked(field: schema.Field, *, with_backend: bool) -> bool:
     """
     if field.is_derived:
         return False
+    # A field whose shape belongs to someone else — an institution's federated
+    # provider — is written into the answers document rather than typed at a
+    # prompt. It is still validated and still rendered; `x-not-asked` says why.
+    if field.not_asked:
+        return False
     if field.required:
         return True
     return field.required_when is None or with_backend

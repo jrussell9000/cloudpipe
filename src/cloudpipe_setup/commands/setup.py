@@ -23,6 +23,13 @@ if TYPE_CHECKING:
 
     from ..cli import Context
 
+#: The published installer, as a deployer invokes it from their clone. A path
+#: rather than a documentation section, because this is the command the closing
+#: output has to name. `tests/test_setup_wizard_render.py` pairs it with the file
+#: it points at, so a rename of a published interface name cannot leave this
+#: message naming a script that is not there.
+INSTALLER = "scripts/stack/install.sh"
+
 
 @register("setup")
 def setup(ctx: Context) -> ExitCode:
@@ -231,6 +238,11 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
             }
         )
 
+    # The phased install is a published script, not a procedure to work by hand:
+    # scripts/stack/install.sh is in the tree the deployer cloned, and the reference
+    # deployment runs that same copy. Naming the command is what the capability
+    # requires, and it is also what keeps this message true as the phases change —
+    # the script's own --list-phases is the phase list, and nothing here restates it.
     steps.append(
         {
             "identifier": "install.phased",
@@ -239,9 +251,47 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
             "message": "a bare `terraform apply` against an empty account fails in the root's "
             "cluster lookup: the providers read a cluster that does not exist yet.",
             "remedy": {
+                "kind": "command",
+                "text": f"bash {INSTALLER} --root {root}   "
+                f"(or one phase at a time with --phase N, which a first install wants; "
+                f"`bash {INSTALLER} --list-phases` prints them)",
+            },
+        }
+    )
+
+    # Two things the install needs from a human. Named here because the installer
+    # cannot supply either and both stop it part-way: the token at the Phase 4
+    # apply, and an operator before the phase that closes the public endpoint. The
+    # installer refuses rather than locking anyone out, but by then the deployer has
+    # a half-built cluster and a reason to wonder what they did wrong.
+    steps.append(
+        {
+            "identifier": "install.cloudflare_token",
+            "title": "Cloudflare API token, in the environment",
+            "state": "blocked",
+            "message": "the installer reads CLOUDFLARE_API_TOKEN from the environment and never "
+            "as a Terraform variable, which would persist it in state.",
+            "remedy": {
                 "kind": "human",
-                "text": 'Follow "Bootstrap and install sequence" in docs/infrastructure.md: '
-                "-target the VPC and the cluster first, then the rest.",
+                "text": "Export an account-scoped token with Zero Trust: Edit, plus Tunnel and "
+                "Access permissions, in the shell you install from. "
+                "`pixi run cloudpipe preflight` checks it before you start.",
+            },
+        }
+    )
+    steps.append(
+        {
+            "identifier": "install.operator_accounts",
+            "title": "An operator who can sign in",
+            "state": "blocked",
+            "message": "the phase that closes the public Kubernetes endpoint refuses to run "
+            "against an empty user pool: after it the cluster is reached only over WARP, and "
+            "WARP admits only identities the pool knows.",
+            "remedy": {
+                "kind": "human",
+                "text": "Once the pool exists, create one account per operator_emails entry — "
+                "the installer prints the command, and docs/deployer-first-hour.md covers what "
+                "each operator does at their first sign-in.",
             },
         }
     )

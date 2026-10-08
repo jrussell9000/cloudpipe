@@ -1,4 +1,26 @@
-FROM deepmi/fastsurfer:latest
+# Digest-pinned, not `:latest` (#648). This base carries the segmentation code
+# that runs on DUA data: the built image is baked into the GPU AMI and runs with
+# the runner role, which can write and delete across the data bucket. On a
+# floating tag an upstream push silently changes that code with no diff in this
+# repo and no rebuild of our own — the pin is what makes a base change a
+# reviewable commit.
+#
+# This pin is a NO-OP for what is running today, which is why it is safe to
+# land without a re-validation run. Upstream `latest` was last pushed
+# 2026-06-02; the fastsurfer image baked into the live AMI
+# (cloudpipe-gpu-fastsurfer-50317282787d-...) was built 2026-09-30, so the tag
+# has not moved since and this digest is the one production was built from.
+#
+# Dependabot (.github/dependabot.yml) proposes bumps and rewrites the tag
+# comment with the digest. Do NOT merge one without deciding whether a new
+# FastSurfer release can change segmentation output — the equivalence tests and
+# a real-subject run are the check, not CI going green.
+#
+# The tag comment is on its own line, NOT trailing the FROM: a Dockerfile has
+# no inline comments, so `FROM image@digest # tag` parses the comment as
+# arguments and fails with "FROM requires either one or three arguments".
+# tag: latest (upstream pushed 2026-06-02)
+FROM deepmi/fastsurfer@sha256:11d594ae6fea7b1dde5b66ba5124b6295c4eedf1f401e21c7319c22eefd55c50
 
 USER root
 

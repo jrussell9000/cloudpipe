@@ -477,9 +477,30 @@ module "eks" {
   }
 }
 
+# Envelope-encrypts every Kubernetes Secret in the cluster, which makes this the
+# single most destructive key in the account to lose: scheduling its deletion
+# renders every Secret undecryptable once the window elapses, and there is no
+# recovery after that — not from a backup, because the ciphertext is what was
+# backed up.
+#
+# Hence all three settings, which the other CMKs in this module already had:
+#   * rotation, so a long-lived key does not accumulate material under one
+#     version (logging.tf, waf.tf and security_findings.tf all rotate);
+#   * a 30-day window rather than 7, which is the difference between noticing an
+#     accidental destroy over a holiday and not;
+#   * prevent_destroy, so a `terraform destroy` or a removed resource block
+#     fails the plan instead of scheduling the deletion.
+#
+# Rotation is transparent here: AWS keeps every prior key version and selects
+# the right one to decrypt, so already-encrypted Secrets are unaffected.
 resource "aws_kms_key" "eks_secrets" {
   description             = "KMS key for EKS secrets encryption"
-  deletion_window_in_days = 7
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 data "aws_iam_policy_document" "eks_logs_kms" {
@@ -517,9 +538,12 @@ data "aws_iam_policy_document" "eks_logs_kms" {
   }
 }
 
+# No prevent_destroy on this one: losing it costs the control-plane log history,
+# which is recoverable in the sense that it resumes, unlike the Secrets above.
 resource "aws_kms_key" "eks_logs" {
   description             = "KMS key for EKS logs"
-  deletion_window_in_days = 7
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
   policy                  = data.aws_iam_policy_document.eks_logs_kms.json
 }
 
