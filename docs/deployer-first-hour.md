@@ -43,7 +43,7 @@ Everything else — the cluster, the pipeline, Globus ingress, the metrics store
 | Secrets created by hand | none | your provider's client secrets |
 | Needs a domain | no | **yes** — a precondition refuses the combination, because the UIs' sign-in broker would then be reachable only from your own browser and not from inside the cluster |
 
-Take the default unless you already run an identity provider and want the UIs pointed straight at it. An institutional provider does not need that input: it attaches to the Cognito pool as a federated provider instead, which keeps every institution-specific value in one place. That is a documented extension point rather than something the wizard models.
+Take the default unless you already run an identity provider and want the UIs pointed straight at it. An institutional provider does not need that input: it attaches to the Cognito pool as a federated provider instead, which keeps every institution-specific value in one place. See [Signing in with your institution's identity provider](#signing-in-with-your-institutions-identity-provider).
 
 ## Step 1 — clone, and run the bootstrapper
 
@@ -160,7 +160,7 @@ pixi run cloudpipe preflight --account <your-aws-account-id>
 
 Preflight checks what your answers assert about the world, which is a different question from whether the answers are well-formed. It is read-only: every call it makes is a read, and it creates, modifies and deletes nothing. You can re-run it, paste its output into a ticket, and run it against a deployment somebody else built.
 
-Six checks, in order:
+Nine checks, in order:
 
 | Check | What it confirms |
 |---|---|
@@ -169,6 +169,9 @@ Six checks, in order:
 | `aws.hosted_zone` | A hosted zone with exactly your domain's name exists in that account. Skipped, not failed, with `domain: null` |
 | `aws.prefix_lists` | The Globus managed prefix list ID resolves in this account and region |
 | `cloudflare.token` | The token is valid, active, and can read Zero Trust configuration in your account |
+| `federation.metadata` | A federated provider's discovery document or SAML metadata is reachable. Skipped when nothing is federated |
+| `federation.mfa_evidence` | Exactly one form of multifactor evidence is declared |
+| `federation.client_secret` | A federated OIDC provider's hand-created client secret exists |
 | `globus.inputs` | Every Globus variable is set in a file Terraform loads — rendered by `globus init`, or by hand in `terraform.tfvars` |
 
 Exit `3` if any check failed, `0` if they all passed or were skipped.
@@ -181,19 +184,30 @@ Exit `3` if any check failed, `0` if they all passed or were skipped.
 
 Do **not** run a bare `terraform apply` on an empty account. The root's providers look up a cluster that does not exist yet, so the first install has to be applied in phases, each one `-target`ed at a subset.
 
-The eight phases, what each does, and the three variables that change between them are in [infrastructure.md → Bootstrap and install sequence](infrastructure.md#bootstrap-and-install-sequence). Read the whole section before you start. Three phases are where a hand-run install goes wrong:
+`scripts/stack/install.sh` drives the phases. Run it from your root, which is where your `terraform.tfvars` and `backend.tf` are:
 
-- **Phase 4's tunnel-token sync.** Terraform never reads the Cloudflare tunnel's connector token, so it has to be copied into Secrets Manager by hand. Without it cloudflared never connects. The section gives the exact commands, which keep the token out of your terminal, your shell history and every process argument list.
-- **Phase 7's tunnel check, before Phase 8 closes the public endpoint.** After Phase 8 the EKS API is private-only, reached through the Cloudflare tunnel (or the VPN as a fallback). Close it before the tunnel is proven healthy, and the tunnel is the one route you cannot fix from outside.
-- **Step 8 below, also before Phase 8.** The tunnel being healthy is not the same as somebody being able to log in to it.
+```bash
+export CLOUDFLARE_API_TOKEN=...          # never echoed, never a Terraform variable
 
-Phase 6 also writes `terraform/install-state.auto.tfvars`, holding `crds_available`, `vpc_cni_network_policy_enabled` and `vpc_cni_strict_mode`, all `true`. Those three start `false` because the first phases run against a cluster with no CRDs and no kube-system NetworkPolicies, and they have to stay `true` afterwards — so they are persisted to a file every later `terraform` run loads, rather than living only on the install commands. Keep the file; it is gitignored, so a fresh clone needs it recreated before any apply. Losing it destroys the ExternalSecrets and disables NetworkPolicy enforcement, both quietly (#635; [operations.md → Updating infrastructure](operations.md#updating-infrastructure-terraform)).
+bash <path-to-clone>/scripts/stack/install.sh --list-phases   # what it will do, and in what order
+bash <path-to-clone>/scripts/stack/install.sh                 # all eight phases, in order
+```
 
-The reference deployment drives these phases with a script that is not yet part of the published tree, so for now you run them by hand, in order. Publishing that script, parameterized for any deployment, is the setup wizard's next version.
+One phase at a time is equally valid, and is the better way to run a first install: `--phase 1`, then `--phase 2`, and so on. A phase that fails prints the `--from-phase N` command that continues from it. Nothing is carried between invocations — each phase re-reads the deployment and re-checks what it depends on, and says which phase to run first if something is missing.
+
+The eight phases, what each does, and the three variables that change between them are in [infrastructure.md → Bootstrap and install sequence](infrastructure.md#bootstrap-and-install-sequence). Read that section before you start. Three things are where a hand-run install goes wrong, and the script does all three for you:
+
+- **Phase 4's tunnel-token sync.** Terraform never reads the Cloudflare tunnel's connector token, so it has to be copied into Secrets Manager separately. Without it cloudflared never connects. The script pipes it from Cloudflare to Secrets Manager, comparing hashes, so the token never reaches your terminal, your shell history or any process argument list.
+- **Phase 7's tunnel check, before Phase 8 closes the public endpoint.** After Phase 8 the EKS API is private-only, reached through the Cloudflare tunnel (or the VPN as a fallback). Close it before the tunnel is proven healthy, and the tunnel is the one route you cannot fix from outside. Phase 8 re-proves the tunnel itself, every time it runs, and leaves the endpoint open if it cannot.
+- **Step 8 below, also before Phase 8.** The tunnel being healthy is not the same as somebody being able to log in to it. Phase 8 refuses to close the endpoint against an empty user pool and prints the command that fixes it.
+
+Phase 6 also writes `install-state.auto.tfvars` in your root, holding `crds_available`, `vpc_cni_network_policy_enabled` and `vpc_cni_strict_mode`, all `true`. Those three start `false` because the first phases run against a cluster with no CRDs and no kube-system NetworkPolicies, and they have to stay `true` afterwards — so they are persisted to a file every later `terraform` run loads, rather than living only on the install commands. Keep the file; it is gitignored, so a fresh clone needs it recreated before any apply. Losing it destroys the ExternalSecrets and disables NetworkPolicy enforcement, both quietly (#635; [operations.md → Updating infrastructure](operations.md#updating-infrastructure-terraform)).
+
+The reference deployment runs this same script, which is the only thing that keeps it honest.
 
 ## Step 8 — create the operators' sign-in accounts
 
-**Do this before the phase that closes the public EKS endpoint.** Terraform creates the Cognito user pool, but not the users in it — creating a user is a change to your account that belongs to you, and the wizard's next version is where it moves. Until then it is two commands per operator.
+**Do this before the phase that closes the public EKS endpoint.** Terraform creates the Cognito user pool, but not the users in it, and neither does the installer. That is deliberate rather than unfinished: creating a sign-in identity is a change to your account that belongs to you, the operator then has to complete an authenticator enrollment interactively anyway, and the installer's job is to refuse to lock you out — which it does, by checking the pool before Phase 8 and printing the command below. It is two commands per operator.
 
 Once the pool exists, for each address in `operator_emails`:
 
@@ -223,6 +237,81 @@ Three things worth knowing before you rely on this:
 - **The pool sends mail through Cognito's default sender**, which is rate-limited to a small number of messages per day. That is ample for a handful of operators and is not a path to build anything else on.
 
 Why this is a step rather than a footnote: after the endpoint closes, the cluster is reachable only over WARP, and WARP admits only identities the pool knows. An empty pool at that moment leaves the mTLS VPN as the only way in.
+
+## Signing in with your institution's identity provider
+
+Optional, and the one input the wizard does not ask for: write `cognito_federation` into your answers document and the institution's provider is federated **into** the Cognito pool. `cloudpipe setup` renders it into `terraform.tfvars` and `cloudpipe preflight` checks it, like every other field — it is not prompted for because its shape is the institution's, and because a nested object is not a question a line-oriented prompt asks well. Cloudflare Access and the web UIs do not change — they keep authenticating against the pool, and the pool authenticates against the institution. Operators then see their institution's login button beside the pool's own form.
+
+The institution registers **one** redirect URI, which Terraform prints:
+
+```bash
+terraform output -raw cognito_federation_redirect_uri
+# https://<your-pool-domain>/oauth2/idpresponse
+```
+
+That is the whole integration on their side. Everything else — endpoint layout, signing keys, which attributes they release — stays theirs, which is why this is one input rather than a mode the tooling models.
+
+### SAML or OIDC
+
+In `cloudpipe-answers.yaml`:
+
+```yaml
+# SAML: Cognito reads the metadata document, so key rotations need no apply here.
+cognito_federation:
+  type: saml
+  name: my-university
+  metadata_url: https://login.example.edu/metadata
+  mfa_evidence:
+    attestation: Example University IT policy 4.2 (2026-01), MFA required for all staff logins
+
+# OIDC: Cognito discovers the endpoints from the issuer.
+cognito_federation:
+  type: oidc
+  name: my-university
+  oidc_issuer: https://login.example.edu
+  client_secret_id: cloudpipe/federation-oidc   # created by hand, see below
+  mfa_evidence:
+    claim: acr
+    claim_value: https://example.edu/profile/mfa
+```
+
+An OIDC provider issues you a client ID and secret. Those are the institution's credential, so Terraform never owns them: create the secret by hand and name it in `client_secret_id`.
+
+```bash
+aws secretsmanager create-secret --name cloudpipe/federation-oidc \
+  --secret-string '{"clientID":"...","clientSecret":"..."}'
+```
+
+### You must declare how their MFA is proven
+
+Amazon Cognito "delegates all authentication processes to the IdP and doesn't offer them additional authentication factors". A federated user therefore never meets the pool's own authenticator requirement, and something has to take its place for NIST 800-171 3.5.3. Terraform refuses a federation that declares neither:
+
+| Form | What it does | When to use it |
+|---|---|---|
+| `claim` + `claim_value` | Terraform maps that claim into the pool and the Cloudflare Access policy **requires** it. A login arriving without it is denied. | The provider asserts MFA per login. `acr` is the usual claim; several research federations define a standard value for an MFA login, so ask your identity team which one they assert |
+| `attestation` | Records a reference to their written policy. Nothing is enforced at login; your SSP cites this string. | The provider cannot assert a per-login claim |
+
+**SAML usually means attestation.** SAML carries its authentication context inside the assertion rather than as a releasable attribute, so there is generally no claim for Cognito to map or for Access to require. That is a real reduction in assurance compared with the claim path — you are trusting a policy document instead of checking each login — and it is why the field is named after evidence rather than after a setting.
+
+### What preflight checks for you
+
+Three of its checks are about this block, and each reports `skipped` for a deployment that federates nothing:
+
+| Check | What it confirms |
+|---|---|
+| `federation.metadata` | An OIDC issuer publishes a discovery document with all three endpoints Cognito needs, or a SAML metadata URL answers at all |
+| `federation.mfa_evidence` | Exactly one form is declared — and it prints back what you are committing to, including the attestation text |
+| `federation.client_secret` | The OIDC client secret you created by hand exists, in the deployment's region |
+
+### What to check after the first federated login
+
+The claim path has several places it can go quiet rather than loud, so confirm it rather than assuming:
+
+- **The operator reaches the UIs at all.** Cognito marks a federated address verified only if the attribute mapping sets `email_verified`, and the UIs refuse an unverified address. The default mapping reads a claim of that name; if the institution does not release one, map whichever claim they do.
+- **On the claim path, a login *without* MFA is refused.** That is the thing the claim form buys, and it is only real if you have seen it happen.
+- **`operator_emails` still governs who is an administrator.** Federation decides who may sign in; it does not grant anyone a role.
+
+This path has not yet been exercised against a real institutional provider — see group 6 of `openspec/changes/optional-domain-and-cognito-auth`.
 
 ## Reaching the web UIs without a domain
 

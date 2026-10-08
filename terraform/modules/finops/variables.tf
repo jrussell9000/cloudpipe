@@ -14,6 +14,19 @@ variable "athena_workgroup" {
   default = "cur_athena_workgroup"
 }
 
+variable "athena_result_retention_days" {
+  description = "Days before Athena query results under query-results/ and grafana-query-results/ expire. Does not affect the CUR data under athena/ or the Kubecost store."
+  type        = number
+  default     = 7
+
+  validation {
+    # Athena result reuse caps at 7 days, so anything shorter can expire a
+    # result the engine still considers reusable.
+    condition     = var.athena_result_retention_days >= 7
+    error_message = "athena_result_retention_days must be at least 7, the maximum Athena result-reuse window."
+  }
+}
+
 # Passthrough variables
 variable "root_name" {
   description = "Root name (e.g., cloudpipe) used in infrastructure creation"

@@ -42,15 +42,21 @@ CHECK_ACCOUNT = "aws.account"
 CHECK_HOSTED_ZONE = "aws.hosted_zone"
 CHECK_PREFIX_LISTS = "aws.prefix_lists"
 CHECK_CLOUDFLARE = "cloudflare.token"
+CHECK_FEDERATION_METADATA = "federation.metadata"
+CHECK_FEDERATION_EVIDENCE = "federation.mfa_evidence"
+CHECK_FEDERATION_SECRET = "federation.client_secret"
 CHECK_GLOBUS_INPUTS = "globus.inputs"
 
-# Contract 2.0 removed two checks whose subjects the answers no longer hold
+# Contract 2.0 removed two checks whose subjects the answers no longer held
 # (design D7 of openspec/changes/optional-domain-and-cognito-auth):
 # `oidc.discovery`, of the institution's issuer, which a Cognito deployment does
-# not have; and `aws.access_oidc_secret`, of a hand-created Access client secret,
-# which Cognito replaces with one Terraform creates. Federation (group 4 of that
-# change) brings an OIDC issuer back as an optional input, and its discovery
-# check with it.
+# not have, and `aws.access_oidc_secret`, of a hand-created Access client
+# secret, which Cognito replaces with one Terraform creates. The three
+# `federation.*` checks above are their successors, under the optional
+# `cognito_federation` input: `federation.metadata` fetches an OIDC issuer's
+# discovery document or a SAML provider's metadata, and `federation.secret`
+# looks for the OIDC client secret the deployer creates by hand. Each reports
+# `skipped` for a deployment that federates nothing, which is most of them.
 
 ORDER = (
     CHECK_IDENTITY,
@@ -58,6 +64,9 @@ ORDER = (
     CHECK_HOSTED_ZONE,
     CHECK_PREFIX_LISTS,
     CHECK_CLOUDFLARE,
+    CHECK_FEDERATION_METADATA,
+    CHECK_FEDERATION_EVIDENCE,
+    CHECK_FEDERATION_SECRET,
     CHECK_GLOBUS_INPUTS,
 )
 """The order checks run and are reported in: identity first, because every AWS
@@ -109,8 +118,9 @@ class World:
     pay for an SDK import.
 
     `region` is the deployment's, from the answers. It is passed to every client
-    rather than left to the AWS CLI profile, because a check reads a regional
-    resource — a managed prefix list exists in one region only. Left to the
+    rather than left to the AWS CLI profile, because two checks read regional
+    resources — a managed prefix list and a Secrets Manager secret each exist in
+    one region only. Left to the
     profile, a deployer whose CLI default differs
     from the deployment is told an id that exists "does not resolve". It is set on
     the client, not the session, so it applies to an injected session too and a
@@ -183,6 +193,15 @@ class World:
         found = response.get("PrefixLists", ())
         return dict(found[0]) if found else None
 
+    def describe_secret(self, name: str) -> dict[str, Any]:
+        """`DescribeSecret`, never `GetSecretValue`.
+
+        The check is that the secret exists. Reading it would put an identity
+        provider's client secret in this process for no benefit, and the
+        permission to describe is the one a deployer is likelier to hold.
+        """
+        return dict(self._client("secretsmanager").describe_secret(SecretId=name))
+
     def fetch_json(self, url: str, *, headers: dict[str, str] | None = None) -> tuple[int, Any]:
         """A GET, returning (status, parsed body). Never a POST, PUT or DELETE.
 
@@ -227,6 +246,9 @@ def run(
         _check_hosted_zone(world, answers, identity),
         _check_prefix_lists(world, answers, root, identity),
         _check_cloudflare(world, answers),
+        _check_federation_metadata(world, answers),
+        _check_federation_evidence(answers),
+        _check_federation_secret(world, answers, identity),
         _check_globus_inputs(root, repo),
     ]
     assert [record.identifier for record in records] == list(ORDER)
@@ -685,6 +707,219 @@ def _check_globus_inputs(root: Path, repo: Path) -> Record:
 def _skipped(identifier: str, title: str, message: str, remedy: Remedy) -> Record:
     return Record(
         identifier=identifier, title=title, state="skipped", message=message, remedy=remedy
+    )
+
+
+def _federation(answers: dict[str, Any]) -> dict[str, Any] | None:
+    """The federation block, or None when this deployment federates nothing."""
+    block = answers.get("cognito_federation")
+    return block if isinstance(block, dict) and block else None
+
+
+_NO_FEDERATION = (
+    "no cognito_federation is set, so this deployment federates no institutional provider."
+)
+
+
+def _check_federation_metadata(world: World, answers: dict[str, Any]) -> Record:
+    """The provider's own document is reachable and is the right kind of document.
+
+    For OIDC, the discovery document, and not merely a 200: Cognito needs the
+    authorization, token and keyset endpoints, and a document missing one
+    passes a status check and fails at sign-in. For SAML, that the metadata URL
+    answers at all and looks like metadata — Cognito reads it at apply, so an
+    unreachable one is a failed apply rather than a failed login.
+    """
+    federation = _federation(answers)
+    if federation is None:
+        return _skipped(
+            CHECK_FEDERATION_METADATA,
+            "Federated provider metadata",
+            _NO_FEDERATION,
+            Remedy("human", "Nothing to fix: operators sign in to the Cognito pool itself."),
+        )
+
+    saml = federation.get("type") == "saml"
+    url = (
+        str(federation.get("metadata_url"))
+        if saml
+        else str(federation.get("oidc_issuer", "")).rstrip("/")
+        + "/.well-known/openid-configuration"
+    )
+    title = "Federated provider metadata"
+    try:
+        status, body = world.fetch_json(url)
+    except (urllib.error.URLError, OSError, ValueError) as err:
+        return _skipped(
+            CHECK_FEDERATION_METADATA,
+            title,
+            f"{url} could not be reached from here ({err}). This machine's network, not "
+            "necessarily the provider.",
+            Remedy("human", f"Open {url} in a browser, or try again from a network that can."),
+        )
+
+    if status != 200:
+        return Record(
+            identifier=CHECK_FEDERATION_METADATA,
+            title=title,
+            state="fail",
+            message=f"{url} returned HTTP {status}.",
+            remedy=Remedy(
+                "human",
+                "Confirm the URL with the institution's identity team. For OIDC it is the "
+                "`issuer`, not a login or authorization URL.",
+            ),
+        )
+
+    if saml:
+        # Not JSON: fetch_json returns None for a body it cannot parse, which is
+        # what metadata XML looks like from here. That is the pass.
+        return Record(
+            identifier=CHECK_FEDERATION_METADATA,
+            title=title,
+            state="pass",
+            message=f"{url} answers, and Cognito will read it at apply.",
+        )
+
+    if not isinstance(body, dict):
+        return Record(
+            identifier=CHECK_FEDERATION_METADATA,
+            title=title,
+            state="fail",
+            message=f"{url} did not return a discovery document.",
+            remedy=Remedy("human", "Confirm the issuer URL with the institution's identity team."),
+        )
+
+    needed = ("authorization_endpoint", "token_endpoint", "jwks_uri")
+    absent = [key for key in needed if not body.get(key)]
+    if absent:
+        return Record(
+            identifier=CHECK_FEDERATION_METADATA,
+            title=title,
+            state="fail",
+            message=f"{url} publishes no {', '.join(absent)}. Cognito discovers the endpoints "
+            "from this document, so a missing one is a sign-in that cannot complete.",
+            remedy=Remedy("human", "Ask the institution's identity team for the endpoints."),
+        )
+    return Record(
+        identifier=CHECK_FEDERATION_METADATA,
+        title=title,
+        state="pass",
+        message=f"{url} publishes all three endpoints Cognito needs.",
+    )
+
+
+def _check_federation_evidence(answers: dict[str, Any]) -> Record:
+    """Exactly one declared form of multifactor evidence, and what it commits to.
+
+    Terraform refuses the configuration without one, so this is not the only
+    gate. It is here because the deployer should meet the requirement while
+    reading a report, not while reading a plan error — and because the
+    attestation form is a claim about an institution's policy that a human has
+    to stand behind, which is worth printing back to them.
+    """
+    federation = _federation(answers)
+    if federation is None:
+        return _skipped(
+            CHECK_FEDERATION_EVIDENCE,
+            "Federated MFA evidence",
+            _NO_FEDERATION,
+            Remedy("human", "Nothing to fix: the pool requires an authenticator app of its own."),
+        )
+
+    evidence = federation.get("mfa_evidence") or {}
+    by_claim = bool(evidence.get("claim")) and bool(evidence.get("claim_value"))
+    by_attestation = bool(evidence.get("attestation"))
+
+    if by_claim == by_attestation:
+        return Record(
+            identifier=CHECK_FEDERATION_EVIDENCE,
+            title="Federated MFA evidence",
+            state="fail",
+            message="cognito_federation.mfa_evidence declares "
+            + ("both forms" if by_claim else "neither form")
+            + ". Cognito delegates authentication to the provider and adds no second factor of "
+            "its own, so exactly one of them is what satisfies NIST 800-171 3.5.3.",
+            remedy=Remedy(
+                "human",
+                "Set either `claim` and `claim_value` (a per-login claim the Access policy will "
+                "require) or `attestation` (a reference to their written MFA policy).",
+            ),
+        )
+
+    if by_claim:
+        return Record(
+            identifier=CHECK_FEDERATION_EVIDENCE,
+            title="Federated MFA evidence",
+            state="pass",
+            message=f"a login must carry {evidence['claim']} = {evidence['claim_value']}, and the "
+            "Access policy requires it.",
+        )
+    return Record(
+        identifier=CHECK_FEDERATION_EVIDENCE,
+        title="Federated MFA evidence",
+        state="pass",
+        message=f"attested: {evidence['attestation']}. Nothing is enforced at login, so your "
+        "SSP cites this and someone has to keep it true.",
+    )
+
+
+def _check_federation_secret(
+    world: World, answers: dict[str, Any], identity: dict[str, Any] | None
+) -> Record:
+    """The OIDC client secret the deployer creates by hand exists.
+
+    Read rather than created, like every other hand-made secret here, so an
+    absent one fails at apply — the failure this check exists to move earlier.
+    """
+    federation = _federation(answers)
+    title = "Federated client secret"
+    if federation is None or federation.get("type") != "oidc":
+        return _skipped(
+            CHECK_FEDERATION_SECRET,
+            title,
+            _NO_FEDERATION
+            if federation is None
+            else "a SAML provider needs no client secret: its trust is the metadata document.",
+            Remedy("human", "Nothing to fix."),
+        )
+
+    name = str(federation.get("client_secret_id") or "")
+    if not name:
+        return Record(
+            identifier=CHECK_FEDERATION_SECRET,
+            title=title,
+            state="fail",
+            message="cognito_federation.client_secret_id is not set, so there is no secret for "
+            "Terraform to read the institution's client credentials from.",
+            remedy=Remedy("human", "Set it to the name of the secret you created."),
+        )
+    if identity is None:
+        return _no_credentials(CHECK_FEDERATION_SECRET, title)
+
+    try:
+        world.describe_secret(name)
+    except Exception as err:  # noqa: BLE001
+        if _error_code(err) in _DENIED_CODES:
+            return _translate(err, CHECK_FEDERATION_SECRET, title, "secretsmanager:DescribeSecret")
+        return Record(
+            identifier=CHECK_FEDERATION_SECRET,
+            title=title,
+            state="fail",
+            message=f"no Secrets Manager secret named {name} in account "
+            f"{identity.get('Account', 'unknown')}, region {world.region}. Terraform reads it "
+            "and never creates it, so the apply fails on the data source.",
+            remedy=Remedy(
+                "command",
+                f"aws secretsmanager create-secret --name {name} "
+                '--secret-string \'{"clientID":"...","clientSecret":"..."}\'',
+            ),
+        )
+    return Record(
+        identifier=CHECK_FEDERATION_SECRET,
+        title=title,
+        state="pass",
+        message=f"{name} exists in region {world.region}.",
     )
 
 

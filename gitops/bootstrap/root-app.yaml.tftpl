@@ -24,6 +24,24 @@ spec:
   # the Application out of the set — which, with prune, deletes its resources.
   goTemplate: true
   goTemplateOptions: ["missingkey=error"]
+  # What happens when an Application leaves this set — renamed or removed app
+  # directory, a generator change, a mistyped reference that survives
+  # missingkey=error (#637).
+  #
+  # Without this, removing the Application also deletes everything it owns.
+  # Several of these apps own CRDs: argo-workflows sets crds.install: true, and
+  # external-secrets and prometheus-operator-crds are CRD owners too. Deleting
+  # a CRD cascades to every custom resource of that kind, so losing the
+  # argo-workflows Application would take every live Workflow and
+  # WorkflowTemplate with it, and losing external-secrets would take every
+  # ESO-owned Secret. gitops/apps/pipelines/ was already lost this way once.
+  #
+  # This governs ONLY the set-level removal. The per-Application
+  # `syncPolicy.automated.prune` below is untouched, so a resource deleted from
+  # a directory ArgoCD still tracks is still pruned — which is the behaviour
+  # that should keep working.
+  syncPolicy:
+    preserveResourcesOnDeletion: true
   generators:
     - git:
         repoURL: ${repo_url}
@@ -96,12 +114,6 @@ spec:
         helm:
           valuesObject:
             ${indent(12, trimspace(yamlencode(app_overrides["aws-load-balancer-controller"])))}
-    {{- else if eq .path.basename "cluster-config" }}
-    spec:
-      source:
-        helm:
-          valuesObject:
-            ${indent(12, trimspace(yamlencode(app_overrides["cluster-config"])))}
     {{- else if eq .path.basename "prefect" }}
     spec:
       source:

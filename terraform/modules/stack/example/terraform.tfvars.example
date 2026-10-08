@@ -81,6 +81,37 @@ domain = "example.org"
 # enrolls the authenticator app.
 operator_emails = ["operator@example.org"]
 
+# Optional: your institution's identity provider, federated INTO the Cognito
+# pool above. Cloudflare Access and the web UIs do not change — they keep
+# authenticating against the pool, and the pool authenticates against the
+# institution, which registers one redirect URI (the
+# cognito_federation_redirect_uri output).
+#
+# `mfa_evidence` is required and takes exactly one form, because Cognito adds
+# no second factor for a federated user:
+#
+#   - { claim = "acr", claim_value = "<the value they assert>" } — a
+#     per-login claim, which the Access policy then REQUIRES. The strong form.
+#   - { attestation = "<reference to their written MFA policy>" } — for a
+#     provider that cannot assert one. SAML usually lands here, because it
+#     carries its authentication context in the assertion rather than as a
+#     releasable attribute. Nothing is enforced at login; your SSP cites it.
+#
+# See docs/deployer-first-hour.md, "Signing in with your institution's
+# identity provider", before using this.
+#
+# cognito_federation = {
+#   type         = "saml"
+#   name         = "my-university"
+#   metadata_url = "https://login.example.edu/metadata"
+#   mfa_evidence = { attestation = "Example University IT policy 4.2 (2026-01)" }
+# }
+#
+# For OIDC, `oidc_issuer` replaces `metadata_url` and `client_secret_id` names a
+# hand-created Secrets Manager secret holding
+# {"clientID": ..., "clientSecret": ...} — the institution's credential, which
+# Terraform reads and never owns.
+
 # An identity provider this module does not create, for a deployment that
 # already integrates one directly. Leave it unset to use Cognito, as above.
 #

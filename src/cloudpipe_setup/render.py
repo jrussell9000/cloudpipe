@@ -19,6 +19,7 @@ that decides where their state lives.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +41,11 @@ TFVARS_HEADER = """\
 # globus.auto.tfvars, which Terraform loads after this file.
 #
 # Next step is not `terraform apply`. A fresh deployment's first apply is phased,
-# because the root's providers look up a cluster that does not exist yet. See
-# "Bootstrap and install sequence" in docs/infrastructure.md.
+# because the root's providers look up a cluster that does not exist yet. Run
+# `bash scripts/stack/install.sh --root <this directory>` from your clone — add
+# `--list-phases` to see what it will do, or `--phase N` to take one phase at a
+# time. "Bootstrap and install sequence" in docs/infrastructure.md describes each
+# phase and the two steps it needs from you.
 """
 
 BACKEND_HEADER = """\
@@ -146,8 +150,13 @@ def write(path: Path, content: str, *, force: bool) -> Path:
     return path
 
 
-def _hcl(value: Any) -> str:
-    """An HCL literal for a value the schema allows: a string, a list of them, or null.
+def _hcl(value: Any, *, indent: int = 0) -> str:
+    """An HCL literal for a value the schema allows.
+
+    A string, a list of them, null, or an object — the last being
+    `cognito_federation`, whose shape is the institution's and so is nested
+    rather than flat. Written over several lines, because a deployer reads this
+    file and a one-line object with a nested object inside it is unreadable.
 
     Null only reaches here for a nullable field the deployer chose it for —
     `domain = null` is port-forward mode — so it is written as HCL's own null,
@@ -161,4 +170,22 @@ def _hcl(value: Any) -> str:
         return str(value)
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_hcl(entry) for entry in value) + "]"
+    if isinstance(value, dict):
+        pad = " " * (indent + 2)
+        # Sorted, so two runs of the same answers render the same file and a
+        # diff shows what the deployer changed rather than what moved.
+        lines = [
+            f"{pad}{_hcl_key(key)} = {_hcl(item, indent=indent + 2)}"
+            for key, item in sorted(value.items())
+        ]
+        return "{\n" + "\n".join(lines) + "\n" + " " * indent + "}"
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _hcl_key(key: str) -> str:
+    """An object key, quoted only when it is not a bare identifier.
+
+    `attribute_mapping`'s keys are a provider's attribute names, which may hold
+    a colon (`custom:...`); an unquoted one is a syntax error.
+    """
+    return key if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key) else _hcl(key)

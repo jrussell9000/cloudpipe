@@ -335,12 +335,26 @@ output "cloudflare_account_id" {
   value = module.stack.cloudflare_account_id
 }
 
+# The install and teardown scripts read these two; see ../installer.tf for why
+# they are outputs rather than something a script works out for itself.
+output "cluster_name" {
+  value = module.stack.cluster_name
+}
+
+output "region" {
+  value = module.stack.region
+}
+
 output "cloudflare_tunnel_id" {
   value = module.stack.cloudflare_tunnel_id
 }
 
 output "cognito_user_pool_id" {
   value = module.stack.cognito_user_pool_id
+}
+
+output "cognito_federation_redirect_uri" {
+  value = module.stack.cognito_federation_redirect_uri
 }
 
 output "ecr_cache_registry" {

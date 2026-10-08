@@ -155,6 +155,18 @@ def extract_bold_ref(bold: Path, outdir: Path, prefix: str, nss_frames: int) -> 
     Used as the -i geometry input when precomputing the composite warp and
     reused in confound estimation for tissue-mask warping.
     """
+    # nss_frames < 1 would make the slice below empty, and mean() over an empty
+    # axis returns all-NaN with only a RuntimeWarning. That reference is the
+    # geometry input for the composite warp and the tissue-mask warping in
+    # confound estimation, so the NaNs would propagate into derivatives rather
+    # than stop anything. Nothing reaches this today (nss_volumes.csv holds only
+    # 5, 8 and 16, and an empty --nss-frames fails in argparse), which is
+    # exactly why it needs a guard rather than a comment.
+    if nss_frames < 1:
+        raise ValueError(
+            f'nss_frames={nss_frames} gives no frames to average for the BOLD '
+            'reference; expected at least 1'
+        )
     img = nib.load(bold)
     data = np.asarray(img.dataobj[..., :nss_frames], dtype=np.float32)
     ref_data = data.mean(axis=-1)
@@ -869,6 +881,25 @@ def extract_subcortical(
 # ---------------------------------------------------------------------------
 
 
+def _pad_nss(comps: np.ndarray, nss_frames: int) -> np.ndarray:
+    """Zero-fill component rows for the excluded non-steady-state frames.
+
+    CompCor is fitted on the steady-state frames only, so a component series is
+    `n_frames - nss_frames` long and has to be restored to full length before it
+    can sit in the confounds table next to the per-frame regressors.
+
+    Zero rather than NaN, matching fMRIPrep: its confounds table carries `0.0`
+    in every `t_comp_cor_*` and `a_comp_cor_*` column on a row where
+    `non_steady_state_outlier00` is 1, and reserves `n/a` for the differenced
+    columns (dvars, framewise_displacement) whose first frame is undefined. A
+    zero also keeps the column usable as a GLM regressor without the caller
+    having to impute, which NaN would not.
+    """
+    if nss_frames <= 0:
+        return comps
+    return np.vstack([np.zeros((nss_frames, comps.shape[1]), dtype=comps.dtype), comps])
+
+
 def compute_confounds(
     bold: Path,
     brainmask: Path,
@@ -899,6 +930,23 @@ def compute_confounds(
         or the number needed to explain ≥50% of variance (fMRIPrep default)
       - tCompCor: 5 PCA components from the top 2% of brain voxels ranked
         by temporal standard deviation (data-driven noise ROI)
+
+    Both CompCor decompositions EXCLUDE the non-steady-state frames (#643).
+    The T1-saturation transient in the first 8-16 frames is the largest
+    variance source in many voxels, so including it biased tCompCor's
+    98th-percentile voxel ranking toward whichever voxels saturate hardest and
+    pulled the leading components of both decompositions toward the transient
+    instead of physiological noise. Only the frames from nss_frames onward feed
+    the SD ranking, the voxelwise demean and the PCA fits; the component columns
+    are then zero-filled on the NSS rows (see _pad_nss). This matches
+    fMRIPrep's ignore_initial_volumes behaviour, which matters because the
+    aCompCor subspace is an endpoint of the equivalence benchmark.
+
+    ABCD ships 5, 8 or 16 NSS frames per run (tools/nss_volumes.csv: 25262 runs
+    at 8, 6446 at 16, 2202 at 5 — the 5s are GE DV25). Mostly above the
+    zero-to-five fMRIPrep documents as typical, so the excluded fraction here is
+    larger than in most fMRIPrep runs. Do not quote "8 or 16": the 5s are a
+    tenth of the GE data.
       - Cosine (DCT) regressors: discrete cosine basis for implicit high-pass
         filtering at 1/128 Hz; number of regressors = floor(2·T·TR/128)
       - Non-steady-state outlier indicators: one binary column per NSS frame
@@ -930,6 +978,20 @@ def compute_confounds(
     n_frames = bold_img.shape[3]
     tr = float(bold_img.header.get_zooms()[3])
     mask_data = nib.load(brainmask).get_fdata() > 0
+
+    # Frames that feed the CompCor decompositions (#643). Guarded rather than
+    # clamped: nss_frames comes from tools/nss_volumes.csv keyed by run, so a
+    # count at or past the end of the series means the CSV and this BOLD
+    # disagree about which run this is, or the series is truncated. Fitting on
+    # whatever was left would emit confounds that look valid and describe
+    # almost nothing, and the driver only marks a run failed on a non-zero
+    # exit — the same reasoning as the empty-tissue raise below.
+    n_keep = n_frames - nss_frames
+    if nss_frames < 0 or n_keep < 2:
+        raise ValueError(
+            f'nss_frames={nss_frames} leaves {n_keep} of {n_frames} frames for '
+            'CompCor; need at least 2. Check tools/nss_volumes.csv against this run.'
+        )
 
     # --- aCompCor tissue masks: precompute before loading bold_data so that
     #     bold_data can be freed immediately after ROI extraction. ---
@@ -979,15 +1041,23 @@ def compute_confounds(
     # --- Global signal ---
     global_signal = brain_ts.mean(axis=1)
 
-    # --- tCompCor: top-2% temporal-SD voxels ---
-    temporal_std = brain_ts.std(axis=0)  # (voxels,)
+    # --- tCompCor: top-2% temporal-SD voxels, steady-state frames only ---
+    #
+    # The SD ranking runs on the steady-state frames too, not just the PCA. The
+    # transient is what makes a voxel high-variance, so ranking over the full
+    # series selects the voxels that saturate most rather than the noisiest
+    # ones, and the noise ROI itself comes out wrong (#643).
+    steady_ts = brain_ts[nss_frames:]  # (n_keep, n_brain)
+    temporal_std = steady_ts.std(axis=0)  # (voxels,)
     sd_threshold = np.percentile(temporal_std, 98)
-    high_var_ts = brain_ts[:, temporal_std >= sd_threshold]  # (T, n_hv)
+    high_var_ts = steady_ts[:, temporal_std >= sd_threshold]  # (n_keep, n_hv)
     high_var_ts = high_var_ts - high_var_ts.mean(axis=0)  # voxelwise demean
-    n_tcc = min(5, high_var_ts.shape[1], n_frames)
+    n_tcc = min(5, high_var_ts.shape[1], n_keep)
     t_comp_cor_cols: dict = {}
     if n_tcc > 0:
-        t_comps = PCA(n_components=n_tcc).fit_transform(high_var_ts)  # (T, n_tcc)
+        t_comps = _pad_nss(
+            PCA(n_components=n_tcc).fit_transform(high_var_ts), nss_frames
+        )  # (T, n_tcc)
         for i in range(n_tcc):
             t_comp_cor_cols[f't_comp_cor_{i:02d}'] = t_comps[:, i]
 
@@ -1033,15 +1103,18 @@ def compute_confounds(
     for tissue, ts in [('wm', wm_ts), ('csf', csf_ts)]:
         n_vox = ts.shape[1]
 
-        roi_ts = ts - ts.mean(axis=0)  # voxelwise demean
+        # Steady-state frames only, and the demean is taken over those frames
+        # as well — demeaning across the transient leaves the NSS rows offset
+        # and shifts the whole series, which the PCA then fits (#643).
+        roi_ts = ts[nss_frames:] - ts[nss_frames:].mean(axis=0)  # voxelwise demean
 
         # Fit up to 5 components, then trim to whichever is fewer: 5 or the
         # minimum number of components needed to explain ≥50% of variance.
-        max_comp = min(5, n_vox, n_frames)
+        max_comp = min(5, n_vox, n_keep)
         pca = PCA(n_components=max_comp).fit(roi_ts)
         cumvar = np.cumsum(pca.explained_variance_ratio_)
         n_comp = min(int(np.searchsorted(cumvar, 0.50)) + 1, max_comp)
-        comps = pca.transform(roi_ts)[:, :n_comp]  # (T, n_comp)
+        comps = _pad_nss(pca.transform(roi_ts)[:, :n_comp], nss_frames)  # (T, n_comp)
         print(
             f"  aCompCor {tissue.upper()}: {n_comp} components "
             f"({cumvar[n_comp - 1]:.1%} variance explained)",
@@ -1802,23 +1875,41 @@ def main() -> None:
             tsnr_map=tsnr_map,
             container_peak_memory_gb=container_gb,
         )
+        # The volumetric record goes out FIRST, before any surface work. The
+        # note above reasons that a missing metrics record costs one row in
+        # Athena — but with the surface block ordered first, a failure in
+        # _surface_qc or its write lost the volumetric row too, on a run whose
+        # volumetric derivative and QC had both completed. Writing it here costs
+        # one extra write on the --emit both path and bounds the loss to the
+        # surface row.
+        qc_path = Path(f"/tmp/{prefix}_qc.json")
+        qc_path.write_text(json.dumps(qc))
+        print(f"  QC summary: {qc_path}", flush=True)
+
         if surf_paths:
             # Computed once and used twice: folded into the volumetric QC for a
             # single per-run view, and written to metrics/surface-sample/ so that
             # prefix never carries a stale record from an earlier short-path run.
-            surf_metrics = _surface_qc(surf_paths, subcort)
-            qc.update(surf_metrics)
-            Path(f"/tmp/{prefix}_surf_qc.json").write_text(
-                json.dumps(
-                    {
-                        **_surface_qc_envelope(args, _timings, total, peak_gb, container_gb),
-                        **surf_metrics,
-                    }
+            try:
+                surf_metrics = _surface_qc(surf_paths, subcort)
+                qc.update(surf_metrics)
+                qc_path.write_text(json.dumps(qc))  # re-write with surf folded in
+                Path(f"/tmp/{prefix}_surf_qc.json").write_text(
+                    json.dumps(
+                        {
+                            **_surface_qc_envelope(args, _timings, total, peak_gb, container_gb),
+                            **surf_metrics,
+                        }
+                    )
                 )
-            )
-        qc_path = Path(f"/tmp/{prefix}_qc.json")
-        qc_path.write_text(json.dumps(qc))
-        print(f"  QC summary: {qc_path}", flush=True)
+            except Exception:
+                traceback.print_exc()
+                print(
+                    f"[preproc] WARNING: surface QC failed for {prefix}; the "
+                    "volumetric metrics record above still stands. Derivatives "
+                    "are unaffected.",
+                    flush=True,
+                )
     except Exception:
         traceback.print_exc()
         print(

@@ -83,7 +83,7 @@ RUN set -eu; \
     echo "AFNI $ver: extracted $AFNI_PROGRAMS + $(ls /afni/lib* | wc -l) libraries"
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────────
-FROM ghcr.io/prefix-dev/pixi:0.41.4 AS build
+FROM ghcr.io/prefix-dev/pixi:0.81.0 AS build
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). The pixi base is
 # Ubuntu 24.04 and this is the stage that ships, so that base layer goes out as-is and
