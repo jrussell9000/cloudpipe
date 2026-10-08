@@ -13,6 +13,7 @@ the answers document.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -238,6 +239,8 @@ def validate_field(field: schema.Field, value: Any) -> list[Record]:
     """
     if value is None and field.nullable:
         return []
+    if field.is_object:
+        return _check_object(field, value)
     if field.is_list:
         return _check_list(field, value)
     return _check_scalar(field, value)
@@ -327,6 +330,97 @@ def _check_list(field: schema.Field, value: Any) -> list[Record]:
                 )
             )
     return problems
+
+
+def _check_object(field: schema.Field, value: Any) -> list[Record]:
+    """An object field, against the nested schema and the rules it cannot express.
+
+    One field, `cognito_federation`. Its rules are Terraform's own, with
+    Terraform's own wording, because a deployer who gets past this and then
+    fails at `plan` has been told their input was fine. What cannot live in a
+    JSON Schema `pattern` — "a SAML provider needs a metadata URL", "declare
+    exactly one form of MFA evidence" — is written out here, keyed to the same
+    `x-error-message` strings the schema carries, so there is still one place
+    the wording lives.
+    """
+    schemas = field.property_schemas
+
+    def fail(message: str) -> Record:
+        return Record(
+            identifier=field.identifier,
+            title=field.title,
+            state="fail",
+            message=message,
+            remedy=Remedy("human", field.description.split("\n", 1)[0]),
+        )
+
+    def message(*path: str) -> str:
+        body: Any = schemas
+        for step in path[:-1]:
+            body = body.get(step, {}).get("properties", {})
+        return str(body.get(path[-1], {}).get("x-error-message", f"{field.identifier} is invalid."))
+
+    if not isinstance(value, dict):
+        return [fail(f"{field.identifier} must be a mapping, not a {type(value).__name__}.")]
+
+    unknown = sorted(set(value) - set(schemas))
+    if unknown:
+        return [fail(f"{field.identifier} has no such setting(s): {', '.join(unknown)}.")]
+
+    missing = [name for name in field.required_properties if value.get(name) in (None, "", {})]
+    if missing:
+        return [fail(f"{field.identifier} is missing {', '.join(missing)}.")]
+
+    kind = value.get("type")
+    if kind not in schemas["type"]["enum"]:
+        return [fail(message("type"))]
+
+    problems = [
+        fail(message(name))
+        # Per-type requirements: what Terraform's conditional validations check.
+        for name in (("metadata_url",) if kind == "saml" else ("oidc_issuer", "client_secret_id"))
+        if not value.get(name)
+    ]
+    problems += [fail(text) for text in _broken_patterns(schemas, value)]
+    problems += [fail(message(name)) for name in _broken_rules(value)]
+    return problems
+
+
+def _broken_patterns(schemas: dict[str, Any], value: dict[str, Any]) -> list[str]:
+    """Every pattern an object's own values break, as the message for each.
+
+    `allOf` carries a property with two rules, which is `oidc_issuer`: it must
+    be https, and must not end in a slash.
+    """
+    broken = []
+    for name, body in schemas.items():
+        entry = value.get(name)
+        if not isinstance(entry, str):
+            continue
+        for rule in [body, *body.get("allOf", ())]:
+            if "pattern" in rule and not re.search(rule["pattern"], entry):
+                broken.append(str(rule["x-error-message"]))
+    return broken
+
+
+def _broken_rules(value: dict[str, Any]) -> list[str]:
+    """The property names whose rule is not a pattern: the two Terraform spells out."""
+    broken = []
+
+    # Exactly one form of MFA evidence. The compliance rule, not a shape.
+    evidence = value.get("mfa_evidence")
+    if not isinstance(evidence, dict):
+        broken.append("mfa_evidence")
+    else:
+        by_claim = bool(evidence.get("claim")) and bool(evidence.get("claim_value"))
+        if by_claim == bool(evidence.get("attestation")):
+            broken.append("mfa_evidence")
+
+    # The mapping has a default in Terraform, so only a supplied one is checked.
+    mapping = value.get("attribute_mapping")
+    if mapping is not None and not (isinstance(mapping, dict) and mapping.get("email")):
+        broken.append("attribute_mapping")
+    return broken
 
 
 def invalid(problems: list[Record]) -> CliError:

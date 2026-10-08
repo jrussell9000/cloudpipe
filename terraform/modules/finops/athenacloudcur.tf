@@ -38,6 +38,68 @@ resource "aws_s3_bucket_ownership_controls" "finops" {
   }
 }
 
+# Expire Athena query results.
+#
+# modules/metrics/athena.tf used to claim results "share the same lifecycle
+# policy" as this bucket. There was no lifecycle policy — this resource is it.
+# Measured 2026-10-07: 23,596 objects / 2.08 GB under grafana-query-results/ and
+# 4,206 / 1.99 GB under query-results/, oldest 2026-05-24, still growing at
+# roughly 175 objects and 15 MB a day. The storage cost is cents; the reason to
+# expire them is that a result set is a materialised copy of whatever the query
+# selected, and the metrics tables are subject-keyed, so these accumulate
+# subject-level extracts in a bucket whose own comments classify it as
+# reconstructible cost data (force_destroy = true).
+#
+# Scoped to the two result prefixes BY DESIGN. This bucket also holds the CUR
+# reports under athena/ and the Kubecost federated store, both of which are the
+# cost history itself and must not expire — an unfiltered rule would delete the
+# record this bucket exists to keep.
+#
+# 7 days, which is the floor the variable enforces rather than a margin above
+# it. Nothing reads these objects after the query that wrote them: Athena hands
+# results back through GetQueryResults while the query is still in flight, and
+# src/metrics/athena.py uses the prefix purely as an output_location — there is
+# no reader anywhere in this repo that fetches a result by key. Grafana re-runs
+# its queries, and Kubecost does the same with query-results/. So the only thing
+# retention buys is a window to inspect what a query actually returned, and the
+# floor exists because Athena's own result reuse caps at 7 days.
+resource "aws_s3_bucket_lifecycle_configuration" "finops" {
+  bucket = aws_s3_bucket.finops.id
+
+  rule {
+    id     = "expire-grafana-query-results"
+    status = "Enabled"
+    filter {
+      prefix = "grafana-query-results/"
+    }
+    expiration {
+      days = var.athena_result_retention_days
+    }
+  }
+
+  rule {
+    id     = "expire-cur-query-results"
+    status = "Enabled"
+    filter {
+      prefix = "query-results/"
+    }
+    expiration {
+      days = var.athena_result_retention_days
+    }
+  }
+
+  # Athena writes a .metadata sibling for every result and abandons multipart
+  # uploads on cancelled queries; neither is covered by an expiration alone.
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
 resource "aws_s3_bucket_acl" "finops" {
   depends_on = [aws_s3_bucket_ownership_controls.finops]
   bucket     = aws_s3_bucket.finops.id

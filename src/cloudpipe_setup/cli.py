@@ -136,8 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         description="Verify the facts the collected inputs assert about the world: the resolved "
         "AWS identity, the hosted zone (when there is a domain), the managed prefix list, the "
-        "Cloudflare token and its Zero Trust scope, and whether `globus init` has rendered its "
-        "inputs. Every call is a read.",
+        "Cloudflare token and its Zero Trust scope, a federated provider's metadata, MFA "
+        "evidence and client secret, and whether `globus init` has rendered its inputs. "
+        "Every call is a read.",
     )
     preflight.add_argument(
         "--account",

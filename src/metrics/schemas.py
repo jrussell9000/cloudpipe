@@ -135,7 +135,14 @@ class FuncQC:
     # Provenance
     pipeline: str = "cloudpipe_minproc"
     image_tag: str = ""
-    schema_version: str = "1.1"
+    # 1.1 -> 1.2 at #643: no field changed, but every confound value did. The
+    # CompCor decompositions now exclude the non-steady-state frames, so a run
+    # at 1.1 and a run at 1.2 carry a_comp_cor_*/t_comp_cor_* columns computed
+    # two different ways. The whole cohort is 1.1 today and the reprocess
+    # replaces it; the bump is what makes a run the reprocess MISSED visible
+    # afterwards, instead of indistinguishable from a corrected one. The
+    # longitudinal reprocess can partially skip, so that is a real case.
+    schema_version: str = "1.2"
     completed_at: str = field(default_factory=_now_utc)
 
     # Grayordinate QC, present only on runs that also emit surfaces (--emit

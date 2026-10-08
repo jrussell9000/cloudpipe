@@ -1,12 +1,17 @@
 # cluster-config wraps no upstream chart, so this file holds the chart's own
 # values rather than a subchart's.
 #
-# `region` is NOT set here. It differs between deployments, so Terraform supplies
-# it: the root ApplicationSet patches it in from local.argocd_app_overrides in
-# terraform/modules/stack/argocd.tf, and templates/cluster-secret-store.yaml reads it. Setting
-# it here would shadow nothing — the override wins — but it would put the value
-# in two places. See "Per-app Helm overrides" in docs/gitops.md.
+# Deliberately empty. Every template in this chart is now
+# deployment-independent — RBAC, the External Secrets patch, GPU priority
+# classes and the storage class — so the chart has no value for Terraform to
+# override and no entry in local.argocd_app_overrides.
 #
-# The template reads it through `required`, so if the override ever goes missing
-# this app goes Degraded rather than rendering an empty region that would stop
-# every ExternalSecret in the cluster from resolving.
+# It used to carry `region`, read by templates/cluster-secret-store.yaml through
+# `required` so a missing override left the app Degraded rather than rendering
+# an empty region. That template went with the second ClusterSecretStore (#637);
+# the remaining store is created in Terraform
+# (terraform/modules/argo-workflows/database.tf), which supplies its own region.
+#
+# If a deployment value is ever needed here again, add it to the override map
+# AND the matching branch in gitops/bootstrap/root-app.yaml.tftpl — the tests in
+# tests/test_argocd_app_overrides.py require the two to move together.

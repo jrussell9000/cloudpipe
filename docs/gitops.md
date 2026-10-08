@@ -188,8 +188,7 @@ It declares no dependencies, so it is the one app whose override keys are the ch
 | Template | What it creates |
 |---|---|
 | `argo-server-rbac.yaml` | ClusterRoles and bindings for the Argo server and `argo-admin` SA (node reader, SSO RBAC, events reader cross-namespace) |
-| `cluster-secret-store.yaml` | `ClusterSecretStore` named `aws-secrets-manager` pointing to Secrets Manager in `.Values.region` |
-| `external-secrets-patch.yaml` | Patch for External Secrets Operator — ClusterRole/ClusterRoleBinding also created by Terraform (`terraform/modules/addons/external-secrets.tf`); ArgoCD manages the live state |
+| `external-secrets-patch.yaml` | Patch for External Secrets Operator — a ClusterRole for the cluster-scoped webhook configurations plus a namespaced Role for the rest, with twins created by Terraform (`terraform/modules/addons/external-secrets.tf`); ArgoCD manages the live state |
 | `gpu-priority-classes.yaml` | Three `PriorityClass` objects ranking the GPU steps under spot scarcity (#370) — see below |
 | `storage-class.yaml` | `ebs-sc` StorageClass (gp3, encrypted, default) — also created by Terraform; ArgoCD manages the live state |
 

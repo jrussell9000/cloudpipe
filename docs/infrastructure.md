@@ -307,7 +307,7 @@ The `ClusterSecretStore` and `ExternalSecret` resources are gated behind `crds_a
 |---|---|---|
 | Data bucket (`var.globus_s3_destination_bucket`) | **No** | Primary data — input BOLD, derivatives, first-level subject CSVs, config files (see architecture.md for key layout), plus archived pod logs under `logs/` |
 | `cloudpipe-metrics` | **Yes** | All QC/cost metric records (`metrics/*`) and their compacted Parquet copies |
-| `cloudpipe-finops` | — | CUR cost-and-usage reports, Athena query results (`grafana-query-results/`) |
+| `cloudpipe-finops` | — | CUR cost-and-usage reports, Athena query results (`grafana-query-results/` and `query-results/`, both expiring on `athena_result_retention_days`) |
 | `cloudpipe-logging` | — | Aggregated log archive: VPC flow logs, CloudTrail, ALB access logs, S3 access logs |
 | `cloudpipe-terraform-state` | **Yes** | Terraform remote state (managed by `terraform/bootstrap/`) |
 
@@ -318,6 +318,13 @@ Note that the data bucket is **not** versioned — deletes there are unrecoverab
 `cloudpipe-logging` lifecycle: → Glacier after 90 days → expire after 3 years (satisfies NIST 800-171 3.3.1 log retention).
 
 A gateway VPC endpoint routes all S3 traffic from the VPC through the AWS backbone, avoiding NAT gateway data charges on large transfers.
+
+Three buckets carry controls that the others do not, because three hold data the DUA's accountability obligation covers: the data bucket, the metrics bucket (every metrics table is subject-keyed) and the state bucket (state holds provider secrets in plain text). Each has CloudTrail **object-level data events** and a bucket policy denying any request that did not arrive over TLS. The data and metrics buckets also have S3 server access logging, which adds the request detail CloudTrail omits — referrer, user agent, HTTP status, turnaround time.
+
+Two traps live here, both silent:
+
+- The trail uses **advanced** event selectors. Those log management events only if a selector explicitly matches `eventCategory = Management` — unlike the basic selectors they replaced, which carried an `include_management_events` flag. Deleting that selector turns off the entire control-plane record without an error.
+- S3 allows **one policy per bucket**. The data bucket's TLS statement is folded into the same document as its retired-prefix deny (`terraform/abcd_v7_metrics_retire.tf`); adding a second policy resource for the same bucket means whichever applies last silently drops the other's statements.
 
 ---
 
@@ -388,7 +395,7 @@ All five hostnames are aliases for **one `internal` ALB**, shared through the AW
 - **Access logs:** one prefix, `alb-ui/`, in `cloudpipe-logging-access`. Filter per UI on each log line's `domain_name` field.
 - **Deletion protection** is on, via `deletion_protection.enabled=true` in the shared `load-balancer-attributes` (Security Hub control **ELB.6**). The controller can no longer delete the ALB, which changes teardown — see below.
 - **WAF:** the regional WAFv2 web ACL `cloudpipe-ui-alb` (`terraform/modules/stack/waf.tf`, Security Hub control **ELB.16**) is associated by the `wafv2-acl-arn` annotation on the **ArgoCD Ingress alone** — it is the one group-level setting the other four members do not repeat, because the ARN is Terraform-generated and Grafana's values cannot hardcode it. **Both managed rule groups block.** Known Bad Inputs was verified live 2026-09-23, a Log4j JNDI canary returns 403; the Core rule set was promoted out of Count on 2026-09-24 and verified the same way, an XSS canary on `/waf-canary-core` returning 403 where the same path without the payload still returns 404. Four Core rules stay at Count **permanently** — `SizeRestrictions_BODY`, `SizeRestrictions_QUERYSTRING`, `CrossSiteScripting_BODY` and `GenericRFI_BODY` — because normal admin-UI use trips them: Grafana panel queries POST whole dashboard JSON, which runs past WAF's 8 KB body-inspection cap. Check for them in the API response as `RuleActionOverrides`, not just for the group-level override, since an ACL that reads as promoted while those four have been flattened would 403 every dashboard load. Only BLOCK and COUNT records are logged, to `aws-waf-logs-cloudpipe-ui`, with the `authorization` and `cookie` headers redacted. Because plain allows are not logged, **an empty log group does not mean a clean review** — it is equally consistent with broken delivery, so the promotion procedure in `terraform/modules/stack/waf.tf` starts by sending canaries to establish a positive control, and carries the reviewed Logs Insights query.
-- **Teardown:** the ALB is deleted only once every member Ingress is gone. `terraform/cleanup.sh` stops the ArgoCD controllers first so the Grafana Ingress is not recreated, deletes the Ingresses, then clears deletion protection on each pass of its wait loop before checking the `ingress.k8s.aws/stack=cloudpipe-ui` tag. Clearing protection has to happen *after* the Ingresses are deleted: while the group is non-empty the controller re-applies the attribute on every reconcile. Deleting the ALB by hand needs the same `modify-load-balancer-attributes` call first.
+- **Teardown:** the ALB is deleted only once every member Ingress is gone. `scripts/stack/cleanup.sh` stops the ArgoCD controllers first so the Grafana Ingress is not recreated, deletes the Ingresses, then clears deletion protection on each pass of its wait loop before checking the `ingress.k8s.aws/stack=cloudpipe-ui` tag. Clearing protection has to happen *after* the Ingresses are deleted: while the group is non-empty the controller re-applies the attribute on every reconcile. Deleting the ALB by hand needs the same `modify-load-balancer-attributes` call first.
 
 ---
 
@@ -400,7 +407,7 @@ All five hostnames are aliases for **one `internal` ALB**, shared through the AW
 | Container Insights **metrics** | *removed 2026-09-08* — cluster metrics come from Prometheus → Grafana | — |
 | Container **logs** (pod stdout/stderr) | S3 `<bucket>/logs/{workflow}/{pod}/main.log` — *not* CloudWatch | Bucket lifecycle |
 | VPC flow logs | `cloudpipe-logging/vpc-flow-logs/` | 90d → Glacier → 3y expiry |
-| CloudTrail (all regions, all mgmt events + S3 data events on the data bucket) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
+| CloudTrail (all regions, all mgmt events + S3 data events on the data, metrics and Terraform state buckets) | `cloudpipe-logging/cloudtrail/` | 90d → Glacier → 3y expiry |
 | ALB access logs | `cloudpipe-logging/*/AWSLogs/` | 90d → Glacier → 3y expiry |
 | Web-UI WAF (BLOCK/COUNT records only; `authorization` and `cookie` redacted) | CloudWatch log group `aws-waf-logs-cloudpipe-ui` | 365 days, KMS encrypted |
 
@@ -465,7 +472,18 @@ The Globus instance is stopped when not actively transferring; `start-globus-ins
 
 ## Bootstrap and install sequence
 
-A fresh cluster install follows the phased sequence in `install.sh`. That script drives the reference deployment's own Terraform root and is not yet part of the published tree, so if you are deploying your own copy, work the table below by hand — every phase, in order. Do not run `terraform apply` directly on a new cluster either way; the phases are load-bearing.
+A fresh cluster install follows the phased sequence in `scripts/stack/install.sh`, which every deployment runs — this one included. Do not run `terraform apply` directly on a new cluster; the phases are load-bearing.
+
+```bash
+bash scripts/stack/install.sh --list-phases          # the table below, from the script itself
+bash scripts/stack/install.sh --root /path/to/root   # all phases, in order
+bash scripts/stack/install.sh --phase 4              # one phase
+bash scripts/stack/install.sh --from-phase 4         # that phase and everything after it
+```
+
+`--root` defaults to the current directory and is verified as a stack root before anything is applied. The region and the cluster name come from the stack's own `region` and `cluster_name` outputs (`--region` and `--name` override them); the module call's name and the stack's directory are resolved from the root's module manifest, so a root that names the call something other than `stack` gets correct `-target` addresses. Exit codes follow the setup CLI's taxonomy: `2` means a human has to do something, `3` a check failed, `4` the input was wrong.
+
+Each phase re-reads what it needs and re-checks its own preconditions, so a single phase can be run on its own after a failure — a failed phase prints the `--from-phase N` that continues the install. Phase 8 is the one that cannot be undone from outside, so it re-proves the tunnel and re-checks the user pool itself, every time it runs, and leaves the public endpoint open if either is unproven.
 
 Every `-target` address below is written as it reads **inside** the stack module. From a root that calls the stack as `module "stack"`, `module.vpc` is `-target=module.stack.module.vpc`; if you named your module call something else, use that name.
 
@@ -473,20 +491,22 @@ Every `-target` address below is written as it reads **inside** the stack module
 
 **Before Phase 8**, create at least one Cognito user — the commands, and what the operator then does at their first sign-in, are in [deployer-first-hour.md → create the operators' sign-in accounts](deployer-first-hour.md#step-8--create-the-operators-sign-in-accounts). Phase 8 closes the public EKS endpoint, after which the cluster is reached only over WARP, and nobody can sign in to WARP until the pool has a user. `install.sh` checks this and stops before Phase 8 if the pool is empty.
 
+The table is the same one `--list-phases` prints; a test holds the two equal, so a phase added, renamed or renumbered in the script cannot stay absent here.
+
 | Phase | What happens | Public endpoint |
 |---|---|---|
-| 1 | `-target` the VPC, then EKS, with `endpoint_public_access=true` (bootstrapping needs a reachable API). Then `aws eks update-kubeconfig`, log Helm in to ECR Public, and pre-create the `argo-workflows` namespace — Phase 2's resources need it before ArgoCD has synced anything | open |
-| 2 | `-target` each add-on module in turn: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, Globus, FinOps | open |
-| 3 | `-target` the kube-system NetworkPolicies, **before** strict VPC CNI mode — strict mode blocks every pod with no policy, CoreDNS included, and the cluster deadlocks | open |
-| 4 | Full apply, `crds_available=false`. Creates the Cloudflare tunnel, its Access applications, and the VPN. **Then sync the tunnel token** — see below | open |
-| 5 | Wait for ArgoCD to sync and install the CRDs (`clustersecretstores.external-secrets.io`, `prometheusrules.monitoring.coreos.com`), and for each to report `Established` | open |
-| 6 | Write `install-state.auto.tfvars` (see below), then apply with `crds_available=true`, `vpc_cni_network_policy_enabled=true` and `vpc_cni_strict_mode=true`, **endpoint still open**. This creates the External Secrets `ClusterSecretStore`, without which cloudflared cannot receive its token | open |
-| 7 | **Prove the tunnel before closing anything** — see below. If it is not healthy, stop here: the cluster stays reachable through the IAM-gated public endpoint | open |
-| 8 | Apply with the same three flags and no `endpoint_public_access`, which disables the public endpoint. Then refresh the kubeconfig | **closed** |
+| 1 | **Network and cluster, with the public endpoint open for bootstrapping.** `-target` the VPC, then EKS, with `endpoint_public_access=true` (bootstrapping needs a reachable API). Then `aws eks update-kubeconfig`, log Helm in to ECR Public, and pre-create the `argo-workflows` namespace — Phase 2's resources need it before ArgoCD has synced anything | open |
+| 2 | **Add-on modules, Pod Identity associations and the ArgoCD bootstrap.** `-target` each in turn: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, Globus, FinOps | open |
+| 3 | **The kube-system NetworkPolicies, before strict VPC CNI mode.** Strict mode blocks every pod with no policy, CoreDNS included, and the cluster deadlocks | open |
+| 4 | **Full apply with crds_available false, then sync the tunnel token.** Creates the Cloudflare tunnel, its Access applications, and the VPN. The token sync is part of this phase; the commands are below for an operator doing it by hand against a half-built cluster | open |
+| 5 | **Wait for ArgoCD to install the CRDs and report them established.** `clustersecretstores.external-secrets.io` and `prometheusrules.monitoring.coreos.com`, each polled for existence and then for `Established` | open |
+| 6 | **Record the post-install flags, then apply the CRD-dependent resources.** Write `install-state.auto.tfvars` (see below), then apply with `crds_available=true`, `vpc_cni_network_policy_enabled=true` and `vpc_cni_strict_mode=true`, **endpoint still open**. This creates the External Secrets `ClusterSecretStore`, without which cloudflared cannot receive its token | open |
+| 7 | **Prove the Cloudflare tunnel while the cluster is still reachable.** The four checks are below. If it is not healthy, stop here: the cluster stays reachable through the IAM-gated public endpoint | open |
+| 8 | **Close the public EKS endpoint.** Re-proves the tunnel and re-checks that the user pool has a user, then applies with the same three flags and no `endpoint_public_access`. Then refreshes the kubeconfig | **closed** |
 
 After Phase 8 the EKS API is private-only. Reach it through the Cloudflare tunnel (WARP), or the VPN as a fallback, for every later `kubectl` and `terraform` operation.
 
-> **Phase 6 persists its three flags to `terraform/install-state.auto.tfvars`,** and they must stay `true` for the life of the cluster. Terraform loads any `*.auto.tfvars` in the working directory, so a later plain `terraform apply` keeps them without `-var` flags. They cannot simply default to `true`, because Phases 1–4 run against a cluster that has neither the CRDs nor the kube-system policies. The file is gitignored (it is per-deployment state), so recreate it after a fresh clone — losing it destroys the ExternalSecrets and makes every NetworkPolicy inert, neither of which announces itself (#635).
+> **Phase 6 persists its three flags to `install-state.auto.tfvars` in your Terraform root,** and they must stay `true` for the life of the cluster. Terraform loads any `*.auto.tfvars` in the working directory, so a later plain `terraform apply` keeps them without `-var` flags. They cannot simply default to `true`, because Phases 1–4 run against a cluster that has neither the CRDs nor the kube-system policies. The file is gitignored (it is per-deployment state), so recreate it after a fresh clone — losing it destroys the ExternalSecrets and makes every NetworkPolicy inert, neither of which announces itself (#635).
 
 > **Phases 6, 7 and 8 used to be one apply,** which closed the public endpoint in the same step that created the store cloudflared needs — locking the cluster before the tunnel could possibly be up. They are separate on purpose. Do not merge them back.
 
@@ -523,7 +543,7 @@ Only then run Phase 8.
 
 #### Target validation
 
-Both scripts share their `-target` lists via `terraform/targets.sh`, which also validates every
+Both scripts share their `-target` lists via `scripts/stack/targets.sh`, which also validates every
 address against the `.tf` sources before Terraform is invoked. `terraform apply -target=` on an
 address declared nowhere is a hard error, not a no-op, so one stale entry used to abort the
 bootstrap partway through — which is what a deleted-but-still-referenced
@@ -553,3 +573,5 @@ its teardown order by reversing the same list rather than keeping a second copy.
 | `globus_s3_destination_bucket` | — | The data bucket (no default — must be provided) |
 | `kubernetes_version` | `1.35` | Bump for EKS version upgrades |
 | `domain` | — | Base domain for every service hostname, or `null` for port-forward mode (no default — must be provided) |
+| `athena_result_retention_days` | `7` | Expiry for Athena query results in the finops bucket. Does not touch the CUR data or the Kubecost store, which share that bucket. 7 is also the minimum — Athena's result-reuse window. Nothing reads these objects after the query that wrote them, so there is no reason to keep them longer |
+| `terraform_state_bucket` | `null` | The bucket holding this deployment's state, so CloudTrail can log object-level access to it. `null` derives `<name>-terraform-state`; set it only if your state bucket is named differently or lives in another account |

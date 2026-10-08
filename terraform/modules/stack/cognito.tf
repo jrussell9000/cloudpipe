@@ -28,6 +28,24 @@ locals {
   # Whether the object is null reveals nothing in it.
   use_cognito = nonsensitive(var.external_identity == null)
   cognito     = local.use_cognito ? 1 : 0
+  # The other mode's count, for the resources only a supplied provider needs.
+  external = local.use_cognito ? 0 : 1
+
+  # Whether an institutional provider is federated into the pool (design D5),
+  # and whether it proves MFA with a per-login claim rather than an attestation.
+  federated           = local.use_cognito && var.cognito_federation != null
+  federation_claim    = local.federated ? try(var.cognito_federation.mfa_evidence.claim, null) : null
+  federation_by_claim = local.federation_claim != null
+
+  # The pool attribute a federated provider's MFA claim is mapped into. Named
+  # once: it appears in the pool's schema, in the mapping, in the app clients'
+  # attribute lists, and in the Access policy, and a disagreement between any
+  # two of those is a login that is refused rather than a plan that fails.
+  cognito_mfa_attribute = "mfa_evidence"
+
+  # Cognito prefixes every custom attribute with `custom:`, in the user record
+  # and in the ID token alike, so this is the name Cloudflare must ask for.
+  cognito_mfa_claim = "custom:${local.cognito_mfa_attribute}"
 }
 
 # Cognito domain prefixes are global across every AWS account, and the provider
@@ -113,6 +131,31 @@ resource "aws_cognito_user_pool" "operators" {
     }
   }
 
+  # Where a federated provider's MFA claim lands (design D5). Declared in BOTH
+  # identity modes, and deliberately so: the provider adds a schema attribute
+  # in place, but REMOVING or changing one is an apply-time error — "cannot
+  # modify or remove schema items", read from the provider's own update path,
+  # not a replacement Terraform could plan around. A conditional attribute
+  # would therefore make enabling federation reversible only by destroying the
+  # pool, which `prevent_destroy` and Cognito's deletion protection both
+  # refuse. One always-present, unused-until-needed attribute is the cheaper
+  # end of that trade.
+  #
+  # The constraints are explicit because the Describe API returns defaults for
+  # a string attribute that omits them, which reads back as a permanent diff.
+  schema {
+    name                     = local.cognito_mfa_attribute
+    attribute_data_type      = "String"
+    mutable                  = true
+    required                 = false
+    developer_only_attribute = false
+
+    string_attribute_constraints {
+      min_length = 1
+      max_length = 2048
+    }
+  }
+
   lifecycle {
     prevent_destroy = true
   }
@@ -127,6 +170,28 @@ resource "aws_cognito_user_pool_domain" "operators" {
   domain                = "${var.name}-${random_id.cognito_domain[0].hex}"
   user_pool_id          = aws_cognito_user_pool.operators[0].id
   managed_login_version = 2
+
+  lifecycle {
+    # Cognito rejects a domain prefix containing `aws`, `amazon` or `cognito`,
+    # and the rejection comes from the API at apply rather than from the plan:
+    # `InvalidParameterException: Domain cannot contain reserved word: cognito`.
+    # The prefix is built from var.name, which is otherwise unconstrained — so a
+    # deployment named for the service it uses plans clean and then fails after
+    # the pool, its clients and their branding already exist.
+    #
+    # Found by the probe in scripts/investigations/cognito-mfa-probe, which was
+    # itself named `cognito-probe` and failed exactly this way on first apply.
+    #
+    # A precondition rather than a validation on var.name: the rule is Cognito's
+    # alone, so it should not reject a name in a deployment that supplies an
+    # external identity provider and creates no pool at all.
+    precondition {
+      condition = !anytrue([
+        for word in ["aws", "amazon", "cognito"] : strcontains(lower(var.name), word)
+      ])
+      error_message = "name must not contain \"aws\", \"amazon\" or \"cognito\": it becomes the Cognito login domain's prefix, and Cognito refuses those as reserved words. Rename the deployment, or supply external_identity so that no pool is created."
+    }
+  }
 }
 
 locals {
@@ -175,7 +240,8 @@ locals {
 #
 #   - authorization-code flow only, with a secret, through the managed login
 #     pages (`allowed_oauth_flows_user_pool_client`);
-#   - the COGNITO provider only, until federation adds one (group 4);
+#   - the COGNITO provider, plus the federated one when there is one, which is
+#     what puts the institution's button on the login page;
 #   - SRP for the password step, so the password never crosses the wire, and no
 #     plain USER_PASSWORD_AUTH or CUSTOM_AUTH;
 #   - existence errors suppressed, so the login page does not confirm which
@@ -194,12 +260,108 @@ resource "aws_cognito_user_pool_client" "this" {
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["openid", "email", "profile"]
-  supported_identity_providers         = ["COGNITO"]
   callback_urls                        = [each.value]
+
+  # The federated provider has to be listed here as well as created, or managed
+  # login offers only the pool's own form and nobody can reach the institution.
+  supported_identity_providers = concat(
+    ["COGNITO"],
+    local.federated ? [aws_cognito_identity_provider.federation[0].provider_name] : [],
+  )
+
+  # Read and write attributes, both set only when a provider is federated, and
+  # both load-bearing then:
+  #
+  #   - READ decides what reaches the ID token, and the default is "the standard
+  #     attributes of your user pool" — custom ones are NOT included. Left
+  #     alone, the MFA claim would be mapped into the user record and then be
+  #     invisible to the Access policy that requires it: every federated login
+  #     denied, with nothing wrong in the configuration to see.
+  #   - WRITE "must include all attributes that you have mapped to IdP
+  #     attributes. ... If your app client does not have write access to a
+  #     mapped attribute, Amazon Cognito throws an error when it tries to
+  #     update the attribute." That is a failed login, not a missing claim.
+  #
+  # Both are set to the pool's standard attributes plus the mapped ones, rather
+  # than to a minimal list: `email` and `email_verified` are what the UIs sign
+  # in on, and narrowing further buys nothing while risking a claim some UI
+  # turns out to need. In Cognito-only mode neither is set, which leaves AWS's
+  # own default in place and keeps the clients' plan empty.
+  read_attributes  = local.federated ? local.cognito_client_attributes : null
+  write_attributes = local.federated ? local.cognito_client_attributes : null
 
   explicit_auth_flows           = ["ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
   prevent_user_existence_errors = "ENABLED"
   enable_token_revocation       = true
+}
+
+locals {
+  # What the app clients may read and write when a provider is federated: the
+  # standard attributes a federated user can carry, plus every attribute the
+  # mapping writes — which always includes the MFA attribute on the claim path.
+  #
+  # `email_verified` is in the list on purpose. Cognito marks a federated
+  # user's address verified only if the mapping sets it, and the Dex connector
+  # in Cognito mode does NOT skip verification, so an address that arrives
+  # unverified is refused at the UI rather than at the pool.
+  cognito_client_attributes = sort(distinct(concat(
+    ["email", "email_verified"],
+    local.federated ? keys(var.cognito_federation.attribute_mapping) : [],
+    local.federation_by_claim ? [local.cognito_mfa_claim] : [],
+  )))
+}
+
+# --- The institution's provider, federated into the pool (design D5) ---------
+#
+# One resource, and the only place in the module that holds an institution's
+# values. Cloudflare Access and Dex are untouched by this: they authenticate
+# against the pool, and the pool authenticates against the institution. The
+# institution registers one redirect URI, the `cognito_federation_redirect_uri`
+# output below.
+data "aws_secretsmanager_secret_version" "federation_oidc" {
+  count = local.federated && var.cognito_federation.type == "oidc" ? 1 : 0
+
+  # Hand-created, never Terraform-owned: the credential belongs to the
+  # institution, and an aws_secretsmanager_secret here would put it in this
+  # deployment's plan output and delete it on a destroy.
+  secret_id = var.cognito_federation.client_secret_id
+}
+
+resource "aws_cognito_identity_provider" "federation" {
+  count = local.federated ? 1 : 0
+
+  user_pool_id  = aws_cognito_user_pool.operators[0].id
+  provider_name = var.cognito_federation.name
+  provider_type = var.cognito_federation.type == "saml" ? "SAML" : "OIDC"
+
+  # SAML is configured by metadata URL, so the signing certificate and the
+  # endpoints follow the institution's rotations without a Terraform change.
+  # OIDC is configured by issuer, and Cognito discovers the endpoints from it —
+  # unlike Cloudflare's connector, which has no discovery and is why the
+  # reference deployment's own integration carries three hard-coded paths.
+  provider_details = var.cognito_federation.type == "saml" ? {
+    MetadataURL             = var.cognito_federation.metadata_url
+    IDPSignout              = "true"
+    RequestSigningAlgorithm = "rsa-sha256"
+    } : {
+    oidc_issuer               = var.cognito_federation.oidc_issuer
+    authorize_scopes          = var.cognito_federation.authorize_scopes
+    client_id                 = jsondecode(data.aws_secretsmanager_secret_version.federation_oidc[0].secret_string)["clientID"]
+    client_secret             = jsondecode(data.aws_secretsmanager_secret_version.federation_oidc[0].secret_string)["clientSecret"]
+    attributes_request_method = "GET"
+  }
+
+  # The deployer's mapping, plus the MFA claim on the claim path. Keys are pool
+  # attributes, values are the IdP's claim names.
+  attribute_mapping = merge(
+    var.cognito_federation.attribute_mapping,
+    local.federation_by_claim ? { (local.cognito_mfa_attribute) = local.federation_claim } : {},
+  )
+}
+
+output "cognito_federation_redirect_uri" {
+  description = "The one redirect URI to give the institution's identity team, or null when no provider is federated. Everything else about the integration is theirs to configure."
+  value       = local.federated ? "https://${local.cognito_login_host}/oauth2/idpresponse" : null
 }
 
 # A client created through the API has no managed login page until a style is
@@ -231,6 +393,20 @@ resource "kubernetes_secret_v1" "cognito_dex_client" {
   depends_on = [helm_release.argocd]
 }
 
+# The supplied-provider half of that indirection is
+# kubernetes_secret_v1.institution_dex_connector, in argocd.tf beside the other
+# argocd-cm Secrets — this file holds Cognito-mode resources only, which
+# tests/test_terraform_cognito.py enforces. It reads the value through the local
+# below, because this file is also the only one allowed to read
+# var.external_identity (design D6, same test).
+locals {
+  # The supplied provider's Dex client secret, for the single Secret that holds
+  # it. Deliberately NOT part of local.dex_connector: that object's
+  # client_secret is the `$secret:key` reference argocd-cm renders, and keeping
+  # the two apart is what stops the value reaching the ConfigMap again (#644).
+  external_dex_client_secret = local.use_cognito ? null : var.external_identity.dex_connector.client_secret
+}
+
 # --- Cloudflare Access against the pool (design D4) --------------------------
 #
 # A generic OIDC provider whose three endpoints come from the locals above.
@@ -240,7 +416,9 @@ resource "kubernetes_secret_v1" "cognito_dex_client" {
 #
 # Cloudflare reads claims only from the ID token, never from userinfo. Cognito
 # puts `email` in the ID token for the `email` scope, which is the one claim
-# Access needs.
+# Access needs — plus the federated MFA claim on D5's claim path, which has to
+# be named in `claims` below: an OIDC-claim policy selector can only match a
+# claim the provider was told to surface.
 resource "cloudflare_zero_trust_access_identity_provider" "cognito" {
   count = local.cognito
 
@@ -256,6 +434,7 @@ resource "cloudflare_zero_trust_access_identity_provider" "cognito" {
     certs_url     = local.cognito_jwks_url
 
     scopes           = ["openid", "email", "profile"]
+    claims           = local.federation_by_claim ? [local.cognito_mfa_claim] : []
     email_claim_name = "email"
     pkce_enabled     = true
   }
@@ -279,9 +458,22 @@ resource "cloudflare_zero_trust_access_policy" "operators" {
   include = [for email in var.operator_emails : { email = { email = email } }]
 
   # Never empty: operator_emails' own validation requires an address.
-  require = [
-    { login_method = { id = cloudflare_zero_trust_access_identity_provider.cognito[0].id } },
-  ]
+  #
+  # On D5's claim path a second requirement is added, and `require` is AND, so
+  # a federated login that arrives without the institution's MFA claim is
+  # denied here rather than trusted. That is what makes the claim form the
+  # strong one: the attestation form has nothing to add to this list, and rests
+  # on the institution's written policy instead.
+  require = concat(
+    [{ login_method = { id = cloudflare_zero_trust_access_identity_provider.cognito[0].id } }],
+    local.federation_by_claim ? [{
+      oidc = {
+        identity_provider_id = cloudflare_zero_trust_access_identity_provider.cognito[0].id
+        claim_name           = local.cognito_mfa_claim
+        claim_value          = var.cognito_federation.mfa_evidence.claim_value
+      }
+    }] : [],
+  )
 }
 
 locals {
@@ -305,11 +497,18 @@ locals {
     get_user_info                = false
     insecure_skip_email_verified = false
     } : {
-    id                           = var.external_identity.dex_connector.id
-    name                         = var.external_identity.dex_connector.name
-    issuer                       = var.external_identity.dex_connector.issuer
-    client_id                    = var.external_identity.dex_connector.client_id
-    client_secret                = var.external_identity.dex_connector.client_secret
+    id        = var.external_identity.dex_connector.id
+    name      = var.external_identity.dex_connector.name
+    issuer    = var.external_identity.dex_connector.issuer
+    client_id = var.external_identity.dex_connector.client_id
+    # A reference, never the value: interpolating it into the Helm values put the
+    # supplied provider's client secret in plain text into the argocd-cm
+    # CONFIGMAP, which is outside the EKS KMS envelope that covers Secrets
+    # (eks.tf), readable by anything with `get configmaps` in argocd, and kept in
+    # Helm release history and Terraform plan output (#644). Resolved from
+    # kubernetes_secret_v1.institution_dex_connector below, the same way the
+    # Cognito branch and the three static clients already do it.
+    client_secret                = "$institution-dex-connector:clientSecret"
     get_user_info                = true
     insecure_skip_email_verified = true
   }
