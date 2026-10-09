@@ -428,7 +428,6 @@ phase_6_crd_dependent_resources() {
   terraform apply \
     -var="crds_available=true" \
     -var="vpc_cni_network_policy_enabled=true" \
-    -var="vpc_cni_strict_mode=true" \
     -var="endpoint_public_access=true" \
     -auto-approve 2>&1 | tee /dev/tty
 }
@@ -463,7 +462,15 @@ write_install_state() {
 # neither of which announces itself. See docs/operations.md.
 crds_available                 = true
 vpc_cni_network_policy_enabled = true
-vpc_cni_strict_mode            = true
+
+# vpc_cni_strict_mode is deliberately NOT set here; it defaults to false. Strict
+# mode denies any pod that no NetworkPolicy selects, and this repo ships policies
+# for four namespaces while a running cluster has around twenty — cert-manager,
+# external-secrets, the load balancer controller, prometheus, grafana, kubecost
+# and the rest. Enabling it at install time would bring the cluster up with the
+# control plane healthy and most add-ons mute. It is an opt-in hardening step for
+# a deployment that has written policies for its own namespaces first; see
+# docs/operations.md and issue #746.
 EOF
   if cmp -s "$tmp" "$INSTALL_STATE_FILE" 2>/dev/null; then
     rm -f "$tmp"
@@ -519,7 +526,6 @@ phase_8_close_the_public_endpoint() {
   terraform apply \
     -var="crds_available=true" \
     -var="vpc_cni_network_policy_enabled=true" \
-    -var="vpc_cni_strict_mode=true" \
     -auto-approve 2>&1 | tee /dev/tty
 
   # Refresh kubeconfig so kubectl uses the private endpoint from here on.

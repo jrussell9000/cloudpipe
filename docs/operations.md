@@ -1088,13 +1088,15 @@ them (GitHub #635):
 ```hcl
 crds_available                 = true
 vpc_cni_network_policy_enabled = true
-vpc_cni_strict_mode            = true
 ```
+
+(`vpc_cni_strict_mode` is a third flag of the same kind, but the installer leaves
+it at its default of `false` — see [Strict mode stays off](#strict-mode-stays-off).)
 
 `install.sh` writes the file in Phase 6, and Terraform loads any `*.auto.tfvars`
 in the working directory automatically. It is gitignored, so **a fresh clone of an
 existing deployment does not have it** — create it before running any apply.
-Without it all three fall back to `false`, and the plan will quietly:
+Without it both fall back to `false`, and the plan will quietly:
 
 - destroy the `ClusterSecretStore` and every `ExternalSecret` gated on
   `crds_available` — the Argo and Prefect RDS credentials, the pgbouncer userlist
@@ -1356,9 +1358,21 @@ and must stay `false` here. Nineteen namespaces have no NetworkPolicy at all —
 selects alone; strict mode denies it. Turning strict mode on without writing
 policies for all nineteen would take those namespaces down.
 
-Note that `install.sh` Phase 6 writes `vpc_cni_strict_mode = true` for a *fresh*
-deployment, and that path has never been exercised against a cluster carrying
-this much un-policied namespace. Treat it as unverified.
+The installer no longer sets it either (#746). It used to write
+`vpc_cni_strict_mode = true` in Phase 6 and pass it on two applies, which would
+have brought a *fresh* deployment up with the control plane healthy and most
+add-ons mute. Phase 6 now persists only `crds_available` and
+`vpc_cni_network_policy_enabled`, and the variable stays at its `false` default
+until a deployment chooses otherwise.
+
+If you ever do want strict mode, confirm the consequence before trusting it: it
+has never been enabled on this cluster, so "a pod no policy selects is denied" is
+read from the AWS documentation rather than observed here. With the agent already
+on, enable strict mode in a window and watch an un-policied namespace —
+`grafana` is the cheapest canary, because its one chart policy selects only the
+image-renderer, leaving the grafana pod itself unselected. If that pod loses
+egress, the behaviour is confirmed and the remaining namespaces each need a
+policy before strict mode can stay on.
 
 ---
 
