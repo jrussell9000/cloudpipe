@@ -148,6 +148,7 @@ module "argo_workflows" {
   cluster_name    = var.name
   vpc_id          = module.vpc.vpc_id
   vpc_cidr        = var.vpc_cidr
+  service_cidr    = module.eks.cluster_service_cidr
   private_subnets = module.vpc.private_subnets
   region          = var.region
 
@@ -161,7 +162,7 @@ module "argo_workflows" {
   # Argo Workflows config
   namespace      = var.argo_workflows_namespace
   bucket         = var.globus_s3_destination_bucket
-  metrics_bucket = aws_s3_bucket.metrics.id
+  metrics_bucket = local.metrics_bucket
 
   # Private ECR: layer blobs are served from S3 via the gateway endpoint the
   # cluster already has, so image pulls no longer traverse the NAT gateway.

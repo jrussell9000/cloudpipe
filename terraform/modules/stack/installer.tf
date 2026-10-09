@@ -28,3 +28,28 @@ output "cluster_name" {
   description = "The EKS cluster's name, which is var.name. Read by the install and teardown scripts for `aws eks update-kubeconfig`."
   value       = var.name
 }
+
+# The three buckets the bootstrap root owns and this stack only uses. The
+# teardown names them at the end, because they are what it deliberately did NOT
+# delete, and a deployer deciding whether they are finished needs to be told
+# which buckets are still costing them money.
+#
+# Stated here for the same reason as the two above: two of the three have
+# nullable variables that fall back to a `var.name` prefix, so a correct
+# deployment may name them in no tfvars file at all. The teardown reads these
+# BEFORE its destroy, since a destroyed root has no outputs left to read.
+
+output "data_bucket" {
+  description = "The imaging data bucket. An echo of globus_s3_destination_bucket, so the teardown can name a bucket it must not delete."
+  value       = var.globus_s3_destination_bucket
+}
+
+output "metrics_bucket" {
+  description = "The metrics bucket, resolved through its var.name fallback. Created by the bootstrap root; configured, never created, here."
+  value       = local.metrics_bucket
+}
+
+output "terraform_state_bucket" {
+  description = "The bucket holding this deployment's Terraform state, resolved through its var.name fallback."
+  value       = local.cloudtrail_state_bucket
+}

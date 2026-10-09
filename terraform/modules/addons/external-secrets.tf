@@ -117,104 +117,105 @@ module "external_secrets_pod_identity" {
 #     `external-secrets-webhook`, which is the cert this controller manages.
 #
 # Keep in lockstep with gitops/apps/cluster-config/templates/external-secrets-patch.yaml.
+#
+# `kubectl_manifest`, NOT the typed `kubernetes_*_v1` resources these used to be
+# (#719). The typed resources issue a CREATE, which fails outright when the
+# object is already there:
+#
+#   Error: roles.rbac.authorization.k8s.io
+#   "external-secrets-cert-controller-patch" already exists
+#
+# That is not a hypothetical. It happened applying #637 to this cluster, and it
+# is STRUCTURAL on a fresh install: install.sh brings ArgoCD up in Phase 5, which
+# starts syncing gitops/apps/* immediately, and the Phase 6 apply then tries to
+# create the four objects ArgoCD has already made. `kubectl_manifest` applies
+# rather than creates — the provider documents it as behaving like `kubectl
+# apply`, with in-place updates — so it adopts whatever is there instead.
+#
+# This is also why the ExternalSecrets and the ClusterSecretStore never hit
+# this: they were always kubectl_manifest.
+#
+# `ignore_fields` replaces the `lifecycle { ignore_changes }` the typed
+# resources carried. Same purpose: ArgoCD stamps its tracking-id annotation on
+# every sync, and without this every plan wants to strip it back off.
 
-resource "kubernetes_cluster_role_v1" "external_secrets_cert_controller_patch" {
-  metadata {
-    name = "external-secrets-cert-controller-patch"
-  }
+resource "kubectl_manifest" "external_secrets_cert_controller_patch" {
+  ignore_fields = ["metadata.annotations.argocd\\.argoproj\\.io/tracking-id"]
 
-  # Cluster-scoped objects, so this rule cannot be namespaced.
-  rule {
-    api_groups = ["admissionregistration.k8s.io"]
-    resources  = ["validatingwebhookconfigurations", "mutatingwebhookconfigurations"]
-    verbs      = ["get", "list", "watch", "update", "patch"]
-  }
-
-  # Also defined in gitops/apps/cluster-config (ArgoCD manages the live state
-  # post-bootstrap; this copy exists so the patch is in place before ArgoCD is
-  # up). Without this, every plan wants to strip ArgoCD's tracking-id annotation.
-  lifecycle {
-    ignore_changes = [
-      metadata[0].annotations["argocd.argoproj.io/tracking-id"],
-    ]
-  }
+  yaml_body = <<-YAML
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: external-secrets-cert-controller-patch
+    rules:
+      # Cluster-scoped objects, so this rule cannot be namespaced.
+      - apiGroups: ["admissionregistration.k8s.io"]
+        resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations"]
+        verbs: ["get", "list", "watch", "update", "patch"]
+  YAML
 }
 
-resource "kubernetes_cluster_role_binding_v1" "external_secrets_cert_controller_patch_binding" {
-  metadata {
-    name = "external-secrets-cert-controller-patch-binding"
-  }
+resource "kubectl_manifest" "external_secrets_cert_controller_patch_binding" {
+  ignore_fields = ["metadata.annotations.argocd\\.argoproj\\.io/tracking-id"]
 
-  role_ref {
-    api_group = "rbac.authorization.k8s.io"
-    kind      = "ClusterRole"
-    name      = kubernetes_cluster_role_v1.external_secrets_cert_controller_patch.metadata[0].name
-  }
+  yaml_body = <<-YAML
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: external-secrets-cert-controller-patch-binding
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: external-secrets-cert-controller-patch
+    subjects:
+      - kind: ServiceAccount
+        name: external-secrets-cert-controller
+        namespace: external-secrets
+  YAML
 
-  subject {
-    kind      = "ServiceAccount"
-    name      = "external-secrets-cert-controller"
-    namespace = "external-secrets"
-  }
-
-  # See lifecycle note on the ClusterRole above — same dual-ownership with
-  # gitops/apps/cluster-config.
-  lifecycle {
-    ignore_changes = [
-      metadata[0].annotations["argocd.argoproj.io/tracking-id"],
-    ]
-  }
+  depends_on = [kubectl_manifest.external_secrets_cert_controller_patch]
 }
 
 # The namespaced half of the patch (#637): the webhook cert secret, this
 # controller's own events, and its leader-election lease. All three live in
 # external-secrets, so none of them needs a cluster-wide grant.
-resource "kubernetes_role_v1" "external_secrets_cert_controller_patch" {
-  metadata {
-    name      = "external-secrets-cert-controller-patch"
-    namespace = "external-secrets"
-  }
+resource "kubectl_manifest" "external_secrets_cert_controller_patch_role" {
+  ignore_fields = ["metadata.annotations.argocd\\.argoproj\\.io/tracking-id"]
 
-  rule {
-    api_groups = [""]
-    resources  = ["secrets", "events"]
-    verbs      = ["get", "list", "watch", "update", "patch", "create"]
-  }
-
-  rule {
-    api_groups = ["coordination.k8s.io"]
-    resources  = ["leases"]
-    verbs      = ["get", "create", "update", "patch"]
-  }
-
-  lifecycle {
-    ignore_changes = [
-      metadata[0].annotations["argocd.argoproj.io/tracking-id"],
-    ]
-  }
+  yaml_body = <<-YAML
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: external-secrets-cert-controller-patch
+      namespace: external-secrets
+    rules:
+      - apiGroups: [""]
+        resources: ["secrets", "events"]
+        verbs: ["get", "list", "watch", "update", "patch", "create"]
+      - apiGroups: ["coordination.k8s.io"]
+        resources: ["leases"]
+        verbs: ["get", "create", "update", "patch"]
+  YAML
 }
 
-resource "kubernetes_role_binding_v1" "external_secrets_cert_controller_patch" {
-  metadata {
-    name      = "external-secrets-cert-controller-patch-binding"
-    namespace = "external-secrets"
-  }
+resource "kubectl_manifest" "external_secrets_cert_controller_patch_role_binding" {
+  ignore_fields = ["metadata.annotations.argocd\\.argoproj\\.io/tracking-id"]
 
-  role_ref {
-    api_group = "rbac.authorization.k8s.io"
-    kind      = "Role"
-    name      = kubernetes_role_v1.external_secrets_cert_controller_patch.metadata[0].name
-  }
+  yaml_body = <<-YAML
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: external-secrets-cert-controller-patch-binding
+      namespace: external-secrets
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: external-secrets-cert-controller-patch
+    subjects:
+      - kind: ServiceAccount
+        name: external-secrets-cert-controller
+        namespace: external-secrets
+  YAML
 
-  subject {
-    kind      = "ServiceAccount"
-    name      = "external-secrets-cert-controller"
-    namespace = "external-secrets"
-  }
-
-  lifecycle {
-    ignore_changes = [
-      metadata[0].annotations["argocd.argoproj.io/tracking-id"],
-    ]
-  }
+  depends_on = [kubectl_manifest.external_secrets_cert_controller_patch_role]
 }

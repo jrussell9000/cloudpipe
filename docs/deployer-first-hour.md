@@ -9,12 +9,13 @@ Two things to know before you start, because they set expectations for everythin
 
 ## What you need to have in hand
 
-The wizard will ask you for twelve values. Most you can read off a dashboard in a few minutes; two things you have to own first, and a third only if you want hostnames.
+The wizard will ask you for twelve values. Most you can read off a dashboard in a few minutes; two things you have to own first, and a third only if you want hostnames. Every bucket this deployment needs is created for you in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack).
 
 | You must already own | Why | Where it is checked |
 |---|---|---|
 | An **AWS account** you can reach with an AWS CLI v2 SSO profile | Static access keys are not supported anywhere in this tooling | `cloudpipe preflight`, check `aws.identity` |
 | A **Cloudflare account with Zero Trust enabled**, and an API token scoped to it | The deployment creates Access applications and policies | `cloudflare.token` |
+| A **name for the imaging data bucket**, which you supply as `globus_s3_destination_bucket` | The bucket itself is created in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack), by Terraform, along with the other two that outlive a cluster. You only have to decide what it is called — or name one you already have, and tell that root not to create it | `aws.data_bucket` |
 | *Optional:* a **Route53 hosted zone** in that account for the domain you will publish services under | Certificate validation is DNS-based, and it runs against the zone this account owns. Without a domain, answer `none`: nothing is published, and you reach each UI through a port-forward (see [below](#reaching-the-web-uis-without-a-domain)) | `aws.hosted_zone` |
 
 You do **not** need anything from your institution's IT department. Sign-in goes through an Amazon Cognito user pool the deployment creates in your own account, with an authenticator app required as a second factor. You only decide who the operators are: the wizard asks for their email addresses, and during the install you create a Cognito user for each (step 8).
@@ -125,20 +126,34 @@ Worth stating explicitly, because it changes how you prepare:
 - **The Cloudflare API token is read from `CLOUDFLARE_API_TOKEN` and nowhere else.** It is never prompted for, never written to a file, never printed, and never placed in a command's argument list where other processes on the machine could read it.
 - A credential field in your answers document is refused outright, naming the field and not its value.
 
-## Step 4 — create the state bucket
+## Step 4 — create the three buckets that come before the stack
 
-If you let the wizard render `backend.tf`, it names an S3 bucket that does not exist yet — because the wizard creates no AWS resource. It prints the three commands that create it, and they are worth running as given:
+Three buckets have to exist before the stack's first apply, and all three have to survive its last teardown. One published Terraform root creates them, and it is the first thing you apply:
 
+```bash
+terraform -chdir=<your-clone>/terraform/modules/bootstrap init
+terraform -chdir=<your-clone>/terraform/modules/bootstrap apply \
+  -var region=<region> \
+  -var state_bucket=<your-state-bucket> \
+  -var data_bucket=<your-imaging-data-bucket> \
+  -var metrics_bucket=<your-cluster-name>-metrics
 ```
-aws s3api create-bucket --bucket <your-state-bucket> --region <region> \
-  --create-bucket-configuration LocationConstraint=<region>
-aws s3api put-bucket-versioning --bucket <your-state-bucket> \
-  --versioning-configuration Status=Enabled
-aws s3api put-public-access-block --bucket <your-state-bucket> \
-  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-```
 
-Versioning is not optional advice. It is what makes a truncated or corrupted state file recoverable, which is the failure a remote backend exists to prevent in the first place.
+`cloudpipe setup` prints that command with your own answers filled in. What each bucket is, and why its settings differ:
+
+| Bucket | Holds | Versioning |
+|---|---|---|
+| `state_bucket` | The stack's Terraform state, which is what `backend.tf` names | **On.** It is what makes a truncated or corrupted state recoverable, which is the failure a remote backend exists to prevent |
+| `data_bucket` | The imaging data and every derivative — the stack's `globus_s3_destination_bucket` | **Off.** The contents are recomputable, and versioning hundreds of GB of derivatives that are rewritten on every reprocess is a cost with no matching benefit |
+| `metrics_bucket` | The run of record for pipeline QC | **On.** A metric record is overwritten in place when a unit is reprocessed, so the previous value exists only as a noncurrent version |
+
+All three block public access, encrypt at rest, and carry a policy refusing requests that are not over TLS.
+
+**This root keeps its state in a local file, on purpose.** It creates the bucket the stack's backend lives in, so it cannot use that backend itself. Keep that state file; losing it costs one `terraform import` per bucket, which is a far smaller problem than the one the state bucket exists to prevent.
+
+**Nothing can delete these buckets by accident.** They are in a state the stack's teardown cannot reach, each carries `prevent_destroy`, and none sets `force_destroy` — so Terraform refuses even when asked. `cleanup.sh` ends by naming them and the `aws s3 rb --force` that removes them, for the case where you are finished with the data too.
+
+If a bucket already exists — a cohort someone else staged, or a deployment you are rebuilding — name it and pass `-var create_data_bucket=false`. The stack configures the data bucket by name either way, so nothing downstream can tell which happened.
 
 ## Step 5 — render the Globus inputs
 
@@ -168,6 +183,7 @@ Nine checks, in order:
 | `aws.account` | The resolved account is the one you intended |
 | `aws.hosted_zone` | A hosted zone with exactly your domain's name exists in that account. Skipped, not failed, with `domain: null` |
 | `aws.prefix_lists` | The Globus managed prefix list ID resolves in this account and region |
+| `aws.data_bucket` | `globus_s3_destination_bucket` exists in this account. The stack configures that bucket — access logging, lifecycle rules, the Argo and Prefect policies scoped to its ARN — and never creates it; [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) is what does. Says so if it is in another region, which costs transfer on every ingest. Skipped when the Globus inputs have not been rendered yet |
 | `cloudflare.token` | The token is valid, active, and can read Zero Trust configuration in your account |
 | `federation.metadata` | A federated provider's discovery document or SAML metadata is reachable. Skipped when nothing is federated |
 | `federation.mfa_evidence` | Exactly one form of multifactor evidence is declared |
@@ -332,6 +348,18 @@ It checks the cluster is reachable, forwards the UI to its fixed local port, and
 | Kubecost | `http://localhost:9090` |
 
 It needs kubectl configured for the cluster and a connected WARP session. If the API server does not answer within about ten seconds, it exits `2` and names WARP as the likely cause, without opening a browser. It makes no AWS call and changes nothing. `--no-browser` prints the URL instead of opening it.
+
+## Tearing it down again
+
+`bash <your-clone>/scripts/stack/cleanup.sh --root <your-root>` destroys the cluster and everything the stack owns. It leaves the three buckets from [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) standing, and ends by naming them with the command that deletes each.
+
+That is deliberate in three independent ways, because deleting a cohort by accident is not a recoverable mistake: those buckets live in a Terraform state the teardown never touches, each carries `prevent_destroy`, and none sets `force_destroy` — so S3 refuses to delete a non-empty one even if the other two safeguards were gone.
+
+**Installing again into the same account reuses them.** The second install adopts the buckets rather than failing on names that already exist, which is the main reason not to clear them out reflexively between attempts. When you are genuinely finished:
+
+```bash
+aws s3 rb s3://<bucket> --force   # for each bucket the teardown named
+```
 
 ## Where to go next
 
