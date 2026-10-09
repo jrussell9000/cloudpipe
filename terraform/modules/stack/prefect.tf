@@ -9,6 +9,7 @@ module "prefect" {
   cluster_name   = var.name
   vpc_id         = module.vpc.vpc_id
   vpc_cidr       = var.vpc_cidr
+  service_cidr   = module.eks.cluster_service_cidr
   public_subnets = module.vpc.public_subnets
   region         = var.region
 
@@ -22,7 +23,7 @@ module "prefect" {
   bucket    = var.globus_s3_destination_bucket
   # Same bucket the argo-workflows module receives (argowf.tf) — the
   # kubecost-cost-scraper flow runs on the Prefect worker and writes here.
-  metrics_bucket = aws_s3_bucket.metrics.id
+  metrics_bucket = local.metrics_bucket
   work_pool      = var.prefect_work_pool
 
   # The batch gate starts the Globus host before listing through it (#652).

@@ -246,8 +246,9 @@ KUBE_SYSTEM_NETWORK_POLICIES=(
   kubernetes_network_policy_v1.kube_system_coredns_ingress_probe
   kubernetes_network_policy_v1.kube_system_metrics_server_egress_kubelet
   kubernetes_network_policy_v1.kube_system_metrics_server_ingress_probe
-  kubernetes_network_policy_v1.kube_system_karpenter_ingress_webhook
   kubernetes_network_policy_v1.kube_system_karpenter_ingress_probe
+  kubernetes_network_policy_v1.kube_system_karpenter_ingress_metrics
+  kubernetes_network_policy_v1.kube_system_karpenter_egress_pod_identity
 )
 
 # Every address either script targets. This is what identifies the stack module

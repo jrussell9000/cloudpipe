@@ -30,6 +30,12 @@ resource "kubernetes_network_policy_v1" "kube_system_default_deny" {
 # kube-system components communicate heavily with each other (e.g., Karpenter
 # leader election via API server, metrics-server discovery). Allowing unrestricted
 # intra-namespace traffic avoids enumerating every internal port.
+#
+# The egress side needs the Service CIDR as well as the pod selector. Egress is
+# evaluated before kube-proxy's DNAT, so a pod that dials a Service by name is
+# judged against the ClusterIP, which no podSelector can ever match. The peer is
+# still safe: ingress is evaluated at the destination pod, after DNAT, so the
+# target's own policies remain the gate.
 resource "kubernetes_network_policy_v1" "kube_system_intra_namespace" {
   metadata {
     name      = "allow-intra-namespace"
@@ -46,6 +52,11 @@ resource "kubernetes_network_policy_v1" "kube_system_intra_namespace" {
     egress {
       to {
         pod_selector {}
+      }
+      to {
+        ip_block {
+          cidr = module.eks.cluster_service_cidr
+        }
       }
     }
   }
@@ -213,9 +224,13 @@ resource "kubernetes_network_policy_v1" "kube_system_metrics_server_egress_kubel
 }
 
 # Allow ingress to metrics-server on port 10251 from node IPs (VPC CIDR).
-# The kubelet makes liveness/readiness probe requests from the node IP directly
-# to the pod IP on this port. With VPC CNI strict mode, probe traffic from the
-# host network is subject to NetworkPolicy and blocked by default-deny-all.
+#
+# This one is load-bearing, unlike the other probe rules. 10251 is
+# `--secure-port`, so the same port serves the kubelet's probes *and* the API
+# server's aggregation requests for `metrics.k8s.io` (Service 443 → targetPort
+# 10251). The 2026-10-08 window proved only that the **kubelet** is exempt from
+# NetworkPolicy; the API server reaches pods from a control-plane ENI, which was
+# not tested. Removing this could take out `kubectl top` and every HPA.
 resource "kubernetes_network_policy_v1" "kube_system_metrics_server_ingress_probe" {
   metadata {
     name      = "allow-ingress-metrics-server-probe"
@@ -247,8 +262,11 @@ resource "kubernetes_network_policy_v1" "kube_system_metrics_server_ingress_prob
 # Allow ingress to CoreDNS health probe ports from node IPs (VPC CIDR).
 # Kubelet liveness probe: GET http://<pod-ip>:8080/health
 # Kubelet readiness probe: GET http://<pod-ip>:8181/ready
-# With VPC CNI strict mode, probe traffic from the host network is blocked by
-# default-deny-all unless explicitly permitted.
+#
+# Not actually required — probe traffic is exempt, proven 2026-10-08
+# (docs/operations.md → Enabling NetworkPolicy enforcement). Kept as insurance:
+# these are health ports, and CoreDNS going NotReady would take DNS down
+# cluster-wide, so this is the cheapest rule in the file to keep.
 resource "kubernetes_network_policy_v1" "kube_system_coredns_ingress_probe" {
   metadata {
     name      = "allow-ingress-coredns-probe"
@@ -316,6 +334,9 @@ resource "kubernetes_network_policy_v1" "kube_system_karpenter_egress_pod_identi
 
 # Allow ingress to Karpenter health probe port from node IPs (VPC CIDR).
 # Kubelet liveness and readiness probes: GET http://<pod-ip>:8081/healthz|/readyz
+#
+# Not actually required — probe traffic is exempt, proven 2026-10-08. Kept as
+# insurance; 8081 is a health port, separate from the 8080 metrics port above.
 resource "kubernetes_network_policy_v1" "kube_system_karpenter_ingress_probe" {
   metadata {
     name      = "allow-ingress-karpenter-probe"
@@ -344,12 +365,16 @@ resource "kubernetes_network_policy_v1" "kube_system_karpenter_ingress_probe" {
   depends_on = [module.eks]
 }
 
-# Allow ingress to the Karpenter webhook (port 8443) from the API server.
-# The API server calls the Karpenter webhook for node scheduling decisions.
-# API server source IPs are within the VPC (control plane subnet).
-resource "kubernetes_network_policy_v1" "kube_system_karpenter_ingress_webhook" {
+# Allow Prometheus to scrape Karpenter's metrics port (8080, named http-metrics
+# on both the Deployment and the Service). The scraper runs in the `prometheus`
+# namespace via the `karpenter` ServiceMonitor; its pod IPs sit in the VPC CIDR.
+#
+# Without this rule the Karpenter metrics — node launches, disruption decisions,
+# the signal every capacity and cost dashboard reads — stop arriving, and nothing
+# else fails, so the loss is easy to miss.
+resource "kubernetes_network_policy_v1" "kube_system_karpenter_ingress_metrics" {
   metadata {
-    name      = "allow-ingress-karpenter-webhook"
+    name      = "allow-ingress-karpenter-metrics"
     namespace = "kube-system"
   }
   spec {
@@ -361,7 +386,7 @@ resource "kubernetes_network_policy_v1" "kube_system_karpenter_ingress_webhook" 
     policy_types = ["Ingress"]
     ingress {
       ports {
-        port     = "8443"
+        port     = "8080"
         protocol = "TCP"
       }
       from {
@@ -374,3 +399,9 @@ resource "kubernetes_network_policy_v1" "kube_system_karpenter_ingress_webhook" 
 
   depends_on = [module.eks]
 }
+
+# There is deliberately no karpenter webhook rule here. One used to allow 8443
+# from the VPC CIDR, but Karpenter has served no webhook since v1: its container
+# and Service expose only 8080 (http-metrics) and 8081 (http, the probes), and no
+# webhook configuration in the cluster points at a karpenter Service. If a future
+# upgrade reintroduces one, this is the rule to add back.

@@ -13,7 +13,7 @@ module "metrics" {
   # Crawler targets, Glue table locations, and the crawler/Grafana IAM policies
   # in modules/metrics/ are all scoped to "${var.bucket}/metrics/*", so they
   # follow from this one input.
-  bucket            = aws_s3_bucket.metrics.id
+  bucket            = local.metrics_bucket
   finops_bucket     = "${var.name}-finops"
   cluster_name      = var.name
   region            = var.region

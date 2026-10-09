@@ -5,6 +5,17 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
 
+  # The metrics bucket, which the bootstrap root creates and this module only
+  # configures (design D7 of openspec/changes/publish-bootstrap-buckets). The
+  # default preserves the name this module used to give the bucket it created,
+  # so a deployment that does not care keeps `<name>-metrics` and sets nothing.
+  #
+  # `var.metrics_bucket` defaults to null rather than having no default: a stack
+  # variable with no default must be owned by a published schema
+  # (tests/test_setup_wizard_schema.py), and this is not a question for the
+  # wizard — the bootstrap root is where a deployer names their buckets.
+  metrics_bucket = coalesce(var.metrics_bucket, "${var.name}-metrics")
+
   # Derive the VPC DNS resolver from the VPC CIDR (always base address + 2 in AWS).
   # Use this instead of hardcoding 10.0.0.2 so changes to var.vpc_cidr propagate automatically.
   vpc_dns_resolver = cidrhost(var.vpc_cidr, 2)

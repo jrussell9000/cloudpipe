@@ -493,10 +493,14 @@ resource "aws_s3_bucket_logging" "finops" {
 
 # The metrics bucket. Subject-keyed rows, so it carries the same obligation as
 # the data bucket and had neither data events nor access logging.
+#
+# Addressed by name, like the data bucket above: the bootstrap root creates it, so
+# this configures a bucket this module does not declare. An apply before that root
+# has run fails here, which is the right order to find out in.
 resource "aws_s3_bucket_logging" "metrics" {
-  bucket        = aws_s3_bucket.metrics.id
+  bucket        = local.metrics_bucket
   target_bucket = aws_s3_bucket.access_logs.id
-  target_prefix = "s3-access-logs/${aws_s3_bucket.metrics.id}/"
+  target_prefix = "s3-access-logs/${local.metrics_bucket}/"
 
   depends_on = [aws_s3_bucket_policy.access_logs]
 }
@@ -560,7 +564,7 @@ locals {
 
   cloudtrail_data_bucket_arns = [
     "arn:aws:s3:::${var.globus_s3_destination_bucket}/",
-    "${aws_s3_bucket.metrics.arn}/",
+    "arn:aws:s3:::${local.metrics_bucket}/",
     "arn:aws:s3:::${local.cloudtrail_state_bucket}/",
   ]
 }

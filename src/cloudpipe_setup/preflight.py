@@ -41,6 +41,7 @@ CHECK_IDENTITY = "aws.identity"
 CHECK_ACCOUNT = "aws.account"
 CHECK_HOSTED_ZONE = "aws.hosted_zone"
 CHECK_PREFIX_LISTS = "aws.prefix_lists"
+CHECK_DATA_BUCKET = "aws.data_bucket"
 CHECK_CLOUDFLARE = "cloudflare.token"
 CHECK_FEDERATION_METADATA = "federation.metadata"
 CHECK_FEDERATION_EVIDENCE = "federation.mfa_evidence"
@@ -63,6 +64,7 @@ ORDER = (
     CHECK_ACCOUNT,
     CHECK_HOSTED_ZONE,
     CHECK_PREFIX_LISTS,
+    CHECK_DATA_BUCKET,
     CHECK_CLOUDFLARE,
     CHECK_FEDERATION_METADATA,
     CHECK_FEDERATION_EVIDENCE,
@@ -193,6 +195,23 @@ class World:
         found = response.get("PrefixLists", ())
         return dict(found[0]) if found else None
 
+    def bucket_region(self, name: str) -> str:
+        """The bucket's region, which doubles as the existence test.
+
+        `GetBucketLocation`, not `HeadBucket`. A HEAD response carries no body, so
+        botocore can only report the status line — a missing bucket and a bucket in
+        someone else's account both arrive as an opaque `404`/`403` with no error
+        code to read, and `_error_code` below would classify neither. This returns
+        a real `NoSuchBucket` or `AccessDenied`.
+
+        `""` is what AWS returns for us-east-1, historically; it is passed through
+        rather than rewritten, because the caller reports it alongside the
+        deployment's own region and "" is not a region a deployer should be told
+        theirs matches.
+        """
+        response = self._client("s3").get_bucket_location(Bucket=name)
+        return str(response.get("LocationConstraint") or "us-east-1")
+
     def describe_secret(self, name: str) -> dict[str, Any]:
         """`DescribeSecret`, never `GetSecretValue`.
 
@@ -245,6 +264,7 @@ def run(
         _check_account(identity, expected_account),
         _check_hosted_zone(world, answers, identity),
         _check_prefix_lists(world, answers, root, identity),
+        _check_data_bucket(world, root, identity),
         _check_cloudflare(world, answers),
         _check_federation_metadata(world, answers),
         _check_federation_evidence(answers),
@@ -506,6 +526,83 @@ def _check_prefix_lists(
         state="pass",
         message="; ".join(resolved),
     )
+
+
+def _check_data_bucket(world: World, root: Path, identity: dict[str, Any] | None) -> Record:
+    """The data bucket the stack configures but never creates.
+
+    `terraform/modules/stack/logging.tf` says it outright — "the bucket predates
+    Terraform" — and four resources then act on it by name: its access logging,
+    its lifecycle rules, and the Argo and Prefect IAM policies that scope to its
+    ARN. On a fresh account the bucket is not there and those fail with
+    `NoSuchBucket`, in the untargeted apply, after the cluster exists. That is the
+    most expensive moment in the install to discover a bucket name.
+
+    Read from the rendered tfvars, not the answers document: like the prefix list,
+    `globus_s3_destination_bucket` is `globus init`'s field and not the wizard's
+    (design D4).
+    """
+    from . import roots
+
+    value, _ = roots.tfvars_assignments(root).get("globus_s3_destination_bucket", (None, None))
+    name = value if isinstance(value, str) and value else None
+    if not name:
+        return _skipped(
+            CHECK_DATA_BUCKET,
+            "Data bucket",
+            "globus_s3_destination_bucket is not set in any tfvars file in this root.",
+            Remedy("command", "pixi run globus init"),
+        )
+    if identity is None:
+        return _no_credentials(CHECK_DATA_BUCKET, "Data bucket")
+
+    try:
+        region = world.bucket_region(name)
+    except Exception as err:  # noqa: BLE001
+        code = _error_code(err)
+        if code in _DENIED_CODES:
+            # Not `_translate`, which the other denied reads use, because S3's
+            # namespace is global and this one answer has two causes: the
+            # credentials lack the permission, or the name belongs to another
+            # account entirely. A deployer who chose a short, generic bucket name
+            # hits the second, and "ask for s3:GetBucketLocation" would send them
+            # to the wrong person.
+            return _skipped(
+                CHECK_DATA_BUCKET,
+                "Data bucket",
+                f"s3://{name} could not be read ({code}). Either these credentials lack "
+                "s3:GetBucketLocation, or the name belongs to another AWS account — bucket "
+                "names are global, and both answer the same way.",
+                Remedy(
+                    "human",
+                    "Ask whoever owns your permission set for s3:GetBucketLocation. If they "
+                    f"confirm you have it, the name {name} is taken: choose another and set "
+                    "globus_s3_destination_bucket to it.",
+                ),
+            )
+        return Record(
+            identifier=CHECK_DATA_BUCKET,
+            title="Data bucket",
+            state="fail",
+            message=f"s3://{name} does not exist in account "
+            f"{identity.get('Account', 'unknown')} ({code or 'no error code'}). The stack "
+            "configures this bucket by name — access logging, lifecycle rules, and the Argo and "
+            "Prefect policies that scope to its ARN — and never creates it, so the apply fails "
+            "on those resources rather than on the name.",
+            remedy=Remedy(
+                "command",
+                f"aws s3api create-bucket --bucket {name} --region {world.region} "
+                f"--create-bucket-configuration LocationConstraint={world.region}",
+            ),
+        )
+
+    message = f"s3://{name} exists, in {region}"
+    if world.region not in ("the AWS profile's default region", region):
+        # Not a failure: the stack applies against a bucket in another region. It
+        # is said out loud because every transfer into it then crosses a region
+        # boundary, and nothing later in the install mentions it again.
+        message += f", which is not this deployment's region ({world.region})"
+    return Record(identifier=CHECK_DATA_BUCKET, title="Data bucket", state="pass", message=message)
 
 
 def _globus_prefix_list_id(root: Path) -> str | None:

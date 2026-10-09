@@ -17,6 +17,17 @@ variable "vpc_cidr" {
   type        = string
 }
 
+variable "service_cidr" {
+  description = <<-EOT
+    The cluster's Kubernetes Service CIDR (the ClusterIP range), read from
+    module.eks.cluster_service_cidr. NetworkPolicy egress is evaluated before
+    kube-proxy's DNAT, so a pod dialling a Service sees the ClusterIP as the
+    destination — an address in this range, not in the VPC CIDR. Any egress rule
+    for an in-cluster Service must therefore admit it.
+  EOT
+  type        = string
+}
+
 variable "private_subnets" {
   description = "List of private subnet IDs for the RDS subnet group."
   type        = list(string)

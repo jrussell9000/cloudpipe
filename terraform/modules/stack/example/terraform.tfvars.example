@@ -210,3 +210,10 @@ globus_owner_email = "globus-admins@example.edu"
 
 # Identity domain permitted to authenticate to the Globus storage gateway.
 globus_identity_domain = "example.edu"
+
+# Optional, and only optional if you follow the convention. The metrics bucket is
+# created by the bootstrap root — which requires its name — and the stack
+# configures it by name. Unset here means "<name>-metrics"; if you gave the
+# bootstrap root any other metrics_bucket, set the same string here, because
+# nothing can reconcile the two for you: the roots keep separate state.
+# metrics_bucket = "example-metrics"

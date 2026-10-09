@@ -528,6 +528,16 @@ data "aws_iam_policy_document" "github_actions_packer" {
       "ec2:DescribeVolumes",
       "ec2:DescribeRegions",
       "ec2:GetPasswordData",
+      # Read-only, and the guard that makes the AMI prune safe rather than merely
+      # automatic. `scripts/prune_amis.py` refuses to deregister an AMI that any
+      # launch template version still names: Karpenter writes a template per
+      # nodeclass/requirements combination and leaves superseded ones behind, and a
+      # deregistered AMI in a selectable template surfaces as InvalidAMIID.NotFound
+      # on the next RunInstances — a node that will not come up, reported as
+      # nothing about AMIs. The script fails closed if these are denied, so the
+      # prune does nothing until this is applied (#734).
+      "ec2:DescribeLaunchTemplates",
+      "ec2:DescribeLaunchTemplateVersions",
     ]
     resources = ["*"]
   }

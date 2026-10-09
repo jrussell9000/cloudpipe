@@ -1,0 +1,197 @@
+# Canary for one question: does the VPC CNI network-policy agent enforce the
+# kubelet's probe traffic? (GitHub #635)
+#
+# Probes arrive from the node IP, not a pod IP, so a policy written with a
+# podSelector or a namespaceSelector cannot admit them. Six rules in this repo
+# assume that matters and admit the VPC CIDR instead; nothing has ever confirmed
+# it on this cluster, because the agent has never been enabled. If probes turn
+# out to be exempt, those six rules are harmless but unnecessary, and the
+# image-renderer policy in gitops/apps/grafana/values.yaml can go back on.
+#
+# Two Deployments, identical but for the policy that covers them:
+#
+#   probe-denied   no rule admits 8080 -> only the namespace default-deny applies
+#   probe-allowed  allow-probe admits 8080 from anywhere
+#
+# Read the result from readiness alone:
+#
+#   denied NotReady, allowed Ready  -> probes ARE enforced. Keep the probe rules.
+#   both Ready                      -> probes are exempt. The probe rules are inert.
+#   both NotReady                   -> the canary itself is broken, or the agent is
+#                                      failing namespace-wide. Inconclusive: roll the
+#                                      add-on back and investigate before trusting
+#                                      anything else in the window.
+#
+# The second Deployment is the positive control. Without it, "NotReady" cannot be
+# told apart from a canary that never worked.
+#
+# Apply this BEFORE enabling the agent, and confirm both Deployments are Ready
+# while enforcement is still off — that is the baseline the comparison needs.
+#
+#   kubectl apply -f scripts/jobs/netpol-probe-canary.yaml
+#   kubectl -n netpol-canary rollout status deploy/probe-denied --timeout=120s
+#   kubectl -n netpol-canary rollout status deploy/probe-allowed --timeout=120s
+#
+# Then enable the agent (see docs/operations.md -> Enabling NetworkPolicy
+# enforcement) and watch:
+#
+#   kubectl -n netpol-canary get pods -w
+#
+# Delete the whole namespace when the window closes:
+#
+#   kubectl delete -f scripts/jobs/netpol-probe-canary.yaml
+#
+# NOTE: deleting a NetworkPolicy while the agent is OFF hangs. The controller that
+# clears the `networking.k8s.aws/resources` finalizer only runs while
+# enableNetworkPolicy is true, so the object sits in Terminating and the delete
+# never returns. Delete this namespace during the window, or clear the finalizer
+# by hand afterwards — see the same section in docs/operations.md.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netpol-canary
+  labels:
+    app.kubernetes.io/part-of: netpol-canary
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: netpol-canary
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+# The control. 0.0.0.0/0 is deliberate: the point is to prove an explicit allow
+# reaches the kubelet at all, not to express a rule worth shipping.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-probe
+  namespace: netpol-canary
+spec:
+  podSelector:
+    matchLabels:
+      app: probe-allowed
+  policyTypes:
+  - Ingress
+  ingress:
+  - ports:
+    - port: 8080
+      protocol: TCP
+    from:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: probe-denied
+  namespace: netpol-canary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: probe-denied
+  template:
+    metadata:
+      labels:
+        app: probe-denied
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: backend
+      tolerations:
+      - key: CriticalAddonsOnly
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: httpd
+        image: public.ecr.aws/docker/library/busybox:1.37.0
+        command:
+        - sh
+        - -c
+        - 'echo ok > /www/index.html && exec httpd -f -p 8080 -h /www'
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /index.html
+            port: 8080
+          periodSeconds: 10
+          failureThreshold: 2
+        volumeMounts:
+        - name: www
+          mountPath: /www
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            memory: 32Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop: ["ALL"]
+      volumes:
+      - name: www
+        emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: probe-allowed
+  namespace: netpol-canary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: probe-allowed
+  template:
+    metadata:
+      labels:
+        app: probe-allowed
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: backend
+      tolerations:
+      - key: CriticalAddonsOnly
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: httpd
+        image: public.ecr.aws/docker/library/busybox:1.37.0
+        command:
+        - sh
+        - -c
+        - 'echo ok > /www/index.html && exec httpd -f -p 8080 -h /www'
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /index.html
+            port: 8080
+          periodSeconds: 10
+          failureThreshold: 2
+        volumeMounts:
+        - name: www
+          mountPath: /www
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            memory: 32Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop: ["ALL"]
+      volumes:
+      - name: www
+        emptyDir: {}

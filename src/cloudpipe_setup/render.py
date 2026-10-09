@@ -107,25 +107,36 @@ def backend_tf(answers: dict[str, Any]) -> str:
     )
 
 
-def bucket_commands(answers: dict[str, Any]) -> list[str]:
-    """The commands that create and version the state bucket.
+#: The published root that creates every bucket which must exist before the
+#: stack's first apply and survive its teardown. Paired with the directory by
+#: `tests/test_setup_wizard_render.py`, so a rename cannot leave this naming a
+#: root that is not in the deployer's clone.
+BOOTSTRAP_ROOT = "terraform/modules/bootstrap"
 
-    Returned rather than run. Versioning is not optional advice: it is what makes
-    a corrupted or truncated state recoverable, which is the failure the backend
-    exists to prevent in the first place.
+
+def bootstrap_command(answers: dict[str, Any]) -> str:
+    """The one command that creates the pre-stack buckets.
+
+    This used to be three `aws s3api` calls for the state bucket alone. They are
+    gone on purpose: a bucket made that way has no transport-encryption policy and
+    no `prevent_destroy`, the data bucket was not created at all, and the metrics
+    bucket was created by the stack, which made it destroyable by a teardown. One
+    published root creates all three with the posture each needs.
+
+    The data bucket's name is `globus_s3_destination_bucket`, which `globus init`
+    renders rather than the wizard collecting — so it is named as a placeholder
+    here rather than filled in, which is also the honest thing to show a deployer
+    who has not run that tool yet.
     """
     bucket = answers["state_bucket"]
     region = answers["region"]
-    return [
-        f"aws s3api create-bucket --bucket {bucket} --region {region} "
-        f"--create-bucket-configuration LocationConstraint={region}",
-        f"aws s3api put-bucket-versioning --bucket {bucket} "
-        "--versioning-configuration Status=Enabled",
-        f"aws s3api put-public-access-block --bucket {bucket} "
-        "--public-access-block-configuration "
-        "BlockPublicAcls=true,IgnorePublicAcls=true,"
-        "BlockPublicPolicy=true,RestrictPublicBuckets=true",
-    ]
+    return (
+        f"terraform -chdir={BOOTSTRAP_ROOT} init && "
+        f"terraform -chdir={BOOTSTRAP_ROOT} apply "
+        f"-var region={region} -var state_bucket={bucket} "
+        "-var data_bucket=<globus_s3_destination_bucket> "
+        "-var metrics_bucket=<name>-metrics"
+    )
 
 
 def write(path: Path, content: str, *, force: bool) -> Path:
