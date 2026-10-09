@@ -82,13 +82,13 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 | `../<name>/` | Reusable sub-modules, siblings of `stack/` (see module reference below) |
 | `terraform/versions.tf` + `terraform/providers.tf` | Provider pins, AWS provider aliases, S3 backend config — in the root, see above |
 | `terraform/abcd_v7_metrics_retire.tf` | Bucket policy denying writes to the data bucket's retired `metrics/*` prefix — in the root |
-| `bootstrap/` | Separate Terraform root that creates the `cloudpipe-terraform-state` S3 bucket itself — its own local backend, not part of the main stack's state. Rarely touched; see ADR 015. |
+| `modules/bootstrap/` | Separate, published Terraform root that creates the three buckets which must exist before the stack and survive its teardown: the Terraform state bucket, the imaging data bucket, and the metrics bucket. Its own local backend — it cannot use the backend it creates — so a teardown of the stack cannot reach it. Applied once, before Phase 1; see ADR 015. |
 
 ---
 
 ## State management
 
-Terraform state lives in the `cloudpipe-terraform-state` S3 bucket (versioned, SSE-encrypted, public access blocked), configured via the `backend "s3"` block in the root's `versions.tf` with native state locking (`use_lockfile = true`, requires Terraform >= 1.10). This bucket is itself managed by a separate, small Terraform config in `terraform/bootstrap/` — deliberately kept off the main stack's backend to avoid a chicken-and-egg dependency.
+Terraform state lives in the `cloudpipe-terraform-state` S3 bucket (versioned, SSE-encrypted, public access blocked), configured via the `backend "s3"` block in the root's `versions.tf` with native state locking (`use_lockfile = true`, requires Terraform >= 1.10). This bucket is itself managed by a separate, published Terraform root in `terraform/modules/bootstrap/` — deliberately kept off the main stack's backend to avoid a chicken-and-egg dependency. That root also creates the other two buckets that must outlive any one cluster: the imaging data bucket and the metrics bucket.
 
 This replaced a local-only backend (no remote state at all) after a 2026-07 incident where the machine holding the only state file was lost, requiring a full `terraform import` recovery of the entire stack. See ADR 015 for the incident writeup, what was recovered, two pieces of pre-existing infrastructure drift it surfaced (Globus AMI pinning, Karpenter `expireAfter`), and a list of diffs that are now permanent/expected rather than bugs.
 
@@ -207,7 +207,7 @@ AWS Client VPN predates WARP and still works as a fallback: it source-NATs clien
 
 | Add-on | Notes |
 |---|---|
-| `vpc-cni` | Prefix delegation enabled (`ENABLE_PREFIX_DELEGATION=true`), with `MINIMUM_IP_TARGET=10` / `WARM_IP_TARGET=2` — these **override** `WARM_PREFIX_TARGET`, which is retained only as a fallback. See [pod IP address space](#pod-ip-address-space) for why. Strict network policy mode (`NETWORK_POLICY_ENFORCING_MODE=strict`) enabled after Phase 3 of `install.sh`. |
+| `vpc-cni` | Prefix delegation enabled (`ENABLE_PREFIX_DELEGATION=true`), with `MINIMUM_IP_TARGET=10` / `WARM_IP_TARGET=2` — these **override** `WARM_PREFIX_TARGET`, which is retained only as a fallback. See [pod IP address space](#pod-ip-address-space) for why. Network policy enforcement is **off** on this deployment: `enableNetworkPolicy` follows `vpc_cni_network_policy_enabled` and strict mode (`NETWORK_POLICY_ENFORCING_MODE=strict`) follows `vpc_cni_strict_mode`, two separate flags (#635). The agent has never been enabled here, so every NetworkPolicy is inert; strict mode would additionally deny all traffic in the nineteen namespaces that have no policy at all. |
 | `coredns` | Runs on `backend` node group; forwards to VPC DNS resolver |
 | `kube-proxy` | Standard |
 | `metrics-server` | Runs on `backend` node group |
@@ -309,7 +309,7 @@ The `ClusterSecretStore` and `ExternalSecret` resources are gated behind `crds_a
 | `cloudpipe-metrics` | **Yes** | All QC/cost metric records (`metrics/*`) and their compacted Parquet copies |
 | `cloudpipe-finops` | — | CUR cost-and-usage reports, Athena query results (`grafana-query-results/` and `query-results/`, both expiring on `athena_result_retention_days`) |
 | `cloudpipe-logging` | — | Aggregated log archive: VPC flow logs, CloudTrail, ALB access logs, S3 access logs |
-| `cloudpipe-terraform-state` | **Yes** | Terraform remote state (managed by `terraform/bootstrap/`) |
+| `cloudpipe-terraform-state` | **Yes** | Terraform remote state (managed by `terraform/modules/bootstrap/`) |
 
 Metrics live on their own **versioned** bucket, deliberately separated from the derivative data: the data bucket's derivative prefixes are flushed before each test batch, which previously destroyed QC history along with them. Writes to its retired `metrics/*` prefix are now actively **denied** by bucket policy (`terraform/abcd_v7_metrics_retire.tf`) so a misconfigured writer fails loudly instead of silently orphaning records from Athena.
 
@@ -472,7 +472,9 @@ The Globus instance is stopped when not actively transferring; `start-globus-ins
 
 ## Bootstrap and install sequence
 
-A fresh cluster install follows the phased sequence in `scripts/stack/install.sh`, which every deployment runs — this one included. Do not run `terraform apply` directly on a new cluster; the phases are load-bearing.
+**Before Phase 1, apply `terraform/modules/bootstrap/`.** It creates the three buckets that must exist before the stack and survive its teardown — the Terraform state bucket the stack's backend names, the imaging data bucket, and the metrics bucket — each with the posture its contents need, in a state the stack's teardown cannot reach. The stack configures the data and metrics buckets by name and creates neither, so Phase 4 fails with `NoSuchBucket` if this root has not run. See [deployer-first-hour.md → step 4](deployer-first-hour.md#step-4--create-the-three-buckets-that-come-before-the-stack).
+
+A fresh cluster install then follows the phased sequence in `scripts/stack/install.sh`, which every deployment runs — this one included. Do not run `terraform apply` directly on a new cluster; the phases are load-bearing.
 
 ```bash
 bash scripts/stack/install.sh --list-phases          # the table below, from the script itself
@@ -500,13 +502,15 @@ The table is the same one `--list-phases` prints; a test holds the two equal, so
 | 3 | **The kube-system NetworkPolicies, before strict VPC CNI mode.** Strict mode blocks every pod with no policy, CoreDNS included, and the cluster deadlocks | open |
 | 4 | **Full apply with crds_available false, then sync the tunnel token.** Creates the Cloudflare tunnel, its Access applications, and the VPN. The token sync is part of this phase; the commands are below for an operator doing it by hand against a half-built cluster | open |
 | 5 | **Wait for ArgoCD to install the CRDs and report them established.** `clustersecretstores.external-secrets.io` and `prometheusrules.monitoring.coreos.com`, each polled for existence and then for `Established` | open |
-| 6 | **Record the post-install flags, then apply the CRD-dependent resources.** Write `install-state.auto.tfvars` (see below), then apply with `crds_available=true`, `vpc_cni_network_policy_enabled=true` and `vpc_cni_strict_mode=true`, **endpoint still open**. This creates the External Secrets `ClusterSecretStore`, without which cloudflared cannot receive its token | open |
+| 6 | **Record the post-install flags, then apply the CRD-dependent resources.** Write `install-state.auto.tfvars` (see below), then apply with `crds_available=true` and `vpc_cni_network_policy_enabled=true`, **endpoint still open**. This creates the External Secrets `ClusterSecretStore`, without which cloudflared cannot receive its token. `vpc_cni_strict_mode` is left at its default of `false` — see the variable table below | open |
 | 7 | **Prove the Cloudflare tunnel while the cluster is still reachable.** The four checks are below. If it is not healthy, stop here: the cluster stays reachable through the IAM-gated public endpoint | open |
-| 8 | **Close the public EKS endpoint.** Re-proves the tunnel and re-checks that the user pool has a user, then applies with the same three flags and no `endpoint_public_access`. Then refreshes the kubeconfig | **closed** |
+| 8 | **Close the public EKS endpoint.** Re-proves the tunnel and re-checks that the user pool has a user, then applies with the same two flags and no `endpoint_public_access`. Then refreshes the kubeconfig | **closed** |
 
 After Phase 8 the EKS API is private-only. Reach it through the Cloudflare tunnel (WARP), or the VPN as a fallback, for every later `kubectl` and `terraform` operation.
 
-> **Phase 6 persists its three flags to `install-state.auto.tfvars` in your Terraform root,** and they must stay `true` for the life of the cluster. Terraform loads any `*.auto.tfvars` in the working directory, so a later plain `terraform apply` keeps them without `-var` flags. They cannot simply default to `true`, because Phases 1–4 run against a cluster that has neither the CRDs nor the kube-system policies. The file is gitignored (it is per-deployment state), so recreate it after a fresh clone — losing it destroys the ExternalSecrets and makes every NetworkPolicy inert, neither of which announces itself (#635).
+> **Phase 6 persists two flags to `install-state.auto.tfvars` in your Terraform root** — `crds_available` and `vpc_cni_network_policy_enabled` — and they must stay `true` for the life of the cluster. Terraform loads any `*.auto.tfvars` in the working directory, so a later plain `terraform apply` keeps them without `-var` flags. They cannot simply default to `true`, because Phases 1–4 run against a cluster that has neither the CRDs nor the kube-system policies. The file is gitignored (it is per-deployment state), so recreate it after a fresh clone — losing it destroys the ExternalSecrets and makes every NetworkPolicy inert, neither of which announces itself (#635).
+>
+> The third flag, `vpc_cni_strict_mode`, is **not** written and defaults to `false`. Strict mode denies any pod that no NetworkPolicy selects, and this repo ships policies for four namespaces while a running cluster has around twenty, so enabling it at install time would come up with the control plane healthy and most add-ons mute (#746).
 
 > **Phases 6, 7 and 8 used to be one apply,** which closed the public endpoint in the same step that created the store cloudflared needs — locking the cluster before the tunnel could possibly be up. They are separate on purpose. Do not merge them back.
 
@@ -567,7 +571,7 @@ its teardown order by reversing the same list rather than keeping a second copy.
 | `endpoint_public_access` | `false` | Set `true` for Phases 1–7 of the bootstrap; dropped in Phase 8, once the tunnel is proven |
 | `crds_available` | `false` | Set `true` from Phase 6, after ArgoCD has installed the CRDs (Phase 5). Persisted in `install-state.auto.tfvars`; `false` destroys every `ExternalSecret` |
 | `vpc_cni_network_policy_enabled` | `false` | Set `true` from Phase 6. Turns the VPC CNI network-policy **agent** on; `false` makes every NetworkPolicy in the cluster inert. Persisted in `install-state.auto.tfvars` |
-| `vpc_cni_strict_mode` | `false` | Set `true` from Phase 6, after the kube-system NetworkPolicies are in place (Phase 3). Chooses strict over standard enforcement; only has effect while the agent above is on |
+| `vpc_cni_strict_mode` | `false` | **Opt-in; the installer never sets it.** Chooses strict over standard enforcement, and only has effect while the agent above is on. Strict mode denies any pod that no NetworkPolicy selects, and this repo ships policies for four namespaces out of roughly twenty in a running cluster — see [Enabling NetworkPolicy enforcement](operations.md#enabling-networkpolicy-enforcement) and #746 |
 | `operator_emails` | — | The operators: administrators of every web UI and, with Cognito, who may reach the cluster |
 | `globus_client_id` | — | Globus service account app client ID (no default — must be provided) |
 | `globus_s3_destination_bucket` | — | The data bucket (no default — must be provided) |

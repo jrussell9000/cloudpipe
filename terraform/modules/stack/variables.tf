@@ -64,6 +64,24 @@ variable "name" {
   type    = string
 }
 
+# The metrics bucket is created by the bootstrap root, not by this module, because
+# it records what was processed and must outlive the cluster (design D7 of
+# openspec/changes/publish-bootstrap-buckets). This module configures it by name:
+# its access logging, the Glue table that reads it, and the workloads that write
+# to it.
+#
+# Null means "the name this module used to create", `<name>-metrics` — see
+# local.metrics_bucket. A deployer who named the bucket something else in the
+# bootstrap root sets the same string here. No validation block: the bootstrap
+# root validates the name where a deployer supplies it, and a validation on a
+# nullable variable would have to special-case null in a way the wizard's schema
+# mirror then has to translate.
+variable "metrics_bucket" {
+  description = "Name of the metrics bucket, created by the bootstrap root. Null uses <name>-metrics."
+  type        = string
+  default     = null
+}
+
 variable "kubernetes_version" {
   description = "Version of EKS to install on the control plane (Major and Minor version only, do not include the patch)"
   type        = string
@@ -145,7 +163,7 @@ variable "vpc_cni_network_policy_enabled" {
 }
 
 variable "vpc_cni_strict_mode" {
-  description = "Enable NETWORK_POLICY_ENFORCING_MODE=strict for VPC CNI. Set to true only after kube-system NetworkPolicies are in place (install.sh Phase 4)."
+  description = "Enable NETWORK_POLICY_ENFORCING_MODE=strict for VPC CNI. Opt-in, and install.sh deliberately never sets it: strict mode denies any pod that no NetworkPolicy selects, and this repo ships policies for four namespaces while a running cluster has around twenty (#746). Set it true only once your own namespaces have policies, and only while vpc_cni_network_policy_enabled is true — it has no effect otherwise."
   type        = bool
   default     = false
 }

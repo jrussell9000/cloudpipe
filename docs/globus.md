@@ -384,6 +384,12 @@ What makes this safe:
   Terraform (`lifecycle { ignore_changes = [value] }`), so replacing the instance
   cannot reset them.
 
+Each bake keeps the newest two Globus AMIs and deletes the rest with their
+snapshots — the retention policy, its guards and the `--dry-run` switch are in
+[Pre-baked node AMIs](pre-baked-amis.md#ami-retention). The image the host is
+pinned to is protected by name whatever its age, and a *stopped* instance counts
+as in use, which is this host's normal state.
+
 The boot registration is `cloudpipe-gcs-boot`, a systemd unit baked into the
 Packer AMI (`packer/globus-gcs/`). Its outcome is in
 `systemctl status cloudpipe-gcs-boot` and `journalctl -u cloudpipe-gcs-boot`: it

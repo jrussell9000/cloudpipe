@@ -162,6 +162,7 @@ Implemented in `.github/workflows/build-gpu-nodeclass-ami.yaml`. Triggers automa
 4. Runs `packer build` on a `g4dn.2xlarge` using the `AWS_PACKER_ROLE_ARN` OIDC role
 5. Sweeps up any builder instance, temporary key pair and temporary IAM profile/role that Packer did not delete (runs on cancel and failure too — see the gotcha below)
 6. Commits the updated `*_ami_digest` and `*_ami_tag` pairs in `terraform/modules/stack/karpenter.tf` with `[skip ci]`
+7. Prunes superseded GPU AMIs down to two generations — see [AMI retention](#ami-retention) below
 
 **The workflow does not roll the nodeclass.** It used to `kubectl apply` the
 rendered `gpu-nodeclass` directly, but the EKS API endpoint is private-only
@@ -196,6 +197,64 @@ the signal that a roll was built but never applied.
 
 **NVIDIA device plugin:**
 AL2023 nodes (unlike Bottlerocket) do not bundle the NVIDIA device plugin in the OS bootstrap. The plugin runs as a DaemonSet managed by ArgoCD from `gitops/apps/nvidia-device-plugin/`. It targets `karpenter.sh/nodepool=gpu-nodepool` nodes via `nodeSelector` (overriding the chart's default NFD-based affinity, which requires `feature.node.kubernetes.io/pci-10de.present` — a label not present without Node Feature Discovery).
+
+---
+
+## AMI retention
+
+**An AMI's snapshot is the AMI.** `deregister-image` on its own reclaims nothing —
+the snapshot survives and keeps billing, which is where the cost sits. Each GPU
+bake adds about 60 GiB of snapshot, each Globus bake about 20 GiB, and for the
+first two months nothing removed either: by 2026-10-08 the account held 17 AMIs
+and 700 GiB of snapshots, of which 2 AMIs were referenced (#734). That is also a
+cost that hides, because it is EBS *snapshot* storage rather than EC2 — invisible
+from anything that looks at compute, and larger at the time than the 325 GiB of
+live volumes sitting next to it.
+
+The policy is **current + one generation back, per kind**, applied by
+`scripts/prune_amis.py` as the last step of each bake workflow. 160 GiB (~$8/month)
+against ~$4/month for current-only. Both images are reproducible from pinned
+inputs — a commit plus two image digests for GPU, a GCS version for Globus — so
+strictly none of the old ones are needed. What the spare insures against is not the
+AMI but the *inputs*: a rebake takes 30+ minutes and needs upstream to still be
+serving `deepmi/fastsurfer` at that digest and the GCS tarball at that version.
+
+Run it by hand against either kind; `--dry-run` deletes nothing:
+
+```bash
+scripts/prune_amis.py --kind gpu --dry-run
+scripts/prune_amis.py --kind globus --dry-run
+```
+
+**The dangerous case is deleting an AMI something still needs**, which is
+unrecoverable and surfaces only the next time a node or the Globus host launches.
+Four independent guards decide what survives, and every one of them fails *closed* —
+an unreadable pin, a pin that resolves to no AMI, a missing `CreationDate`, an
+`AccessDenied` on any query, and the run aborts having deleted nothing:
+
+| Guard | Answers |
+|---|---|
+| The two newest by `CreationDate` | the retention policy itself |
+| The Terraform pin — `karpenter.tf`'s digest pair resolved through AMI tags, or `globus.tf`'s literal id | what Terraform says is current |
+| `describe-instances`, every state but `terminated` | what is running — including `stopped`, which is the Globus host's normal state |
+| `describe-launch-template-versions` across every template | what something is still *able* to launch |
+
+A protected AMI does not consume a retention slot, so if the live image is older
+than the two newest, three are kept. The launch-template guard is why the Packer
+role holds `ec2:DescribeLaunchTemplates` and
+`ec2:DescribeLaunchTemplateVersions`: Karpenter writes a launch template per
+nodeclass/requirements combination and leaves superseded ones behind, and a
+deregistered AMI in a template that is still selectable surfaces as
+`InvalidAMIID.NotFound` on the next `RunInstances` — a node that will not come up,
+reported as nothing about AMIs.
+
+Two consequences of where the step sits:
+
+- **It runs last**, after the pointer is pushed and the roll notice is written. A
+  prune that aborts should cost a red step, never an AMI that nothing references.
+- **It is skipped when the pin step fails.** Nothing accumulates by skipping:
+  retention is "newest N by creation date", not "whatever this run replaced", so
+  the next successful prune sweeps the orphan.
 
 ---
 

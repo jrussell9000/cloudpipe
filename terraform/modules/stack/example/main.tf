@@ -341,6 +341,19 @@ output "cluster_name" {
   value = module.stack.cluster_name
 }
 
+# Re-exported for the teardown, which names the buckets it did not delete.
+output "data_bucket" {
+  value = module.stack.data_bucket
+}
+
+output "metrics_bucket" {
+  value = module.stack.metrics_bucket
+}
+
+output "terraform_state_bucket" {
+  value = module.stack.terraform_state_bucket
+}
+
 output "region" {
   value = module.stack.region
 }

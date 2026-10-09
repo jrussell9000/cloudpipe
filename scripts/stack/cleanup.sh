@@ -49,6 +49,17 @@ assert_targets_declared module.vpc module.eks "${PHASE2_MODULES[@]}"
 require_deployment_region
 require_cluster_name
 
+# Read NOW, not at the end: these name the buckets this teardown must not delete,
+# and the destroy below leaves this root with no outputs to read them from. Empty
+# is tolerated — an older root may not re-export them — and the closing report
+# says where to look instead.
+SURVIVING_BUCKETS=()
+for _output in terraform_state_bucket data_bucket metrics_bucket; do
+  _bucket=$(terraform output -raw "$_output" 2>/dev/null || true)
+  [[ -n "$_bucket" && "$_bucket" != "null" ]] && SURVIVING_BUCKETS+=("$_bucket")
+done
+unset _output _bucket
+
 echo "==> WARNING: This will permanently destroy this deployment's infrastructure."
 echo "    Root:    $DEPLOYMENT_ROOT"
 echo "    Module:  module.$STACK_MODULE_NAME"
@@ -264,5 +275,45 @@ if [[ -n "$COGNITO_POOL_ID" ]]; then
   aws cognito-idp update-user-pool --user-pool-id "$COGNITO_POOL_ID" --deletion-protection INACTIVE
   aws cognito-idp delete-user-pool --user-pool-id "$COGNITO_POOL_ID"
 fi
+
+# The buckets this teardown deliberately did not touch.
+#
+# They are created by the bootstrap root, whose state is separate from this one,
+# so `terraform destroy` here cannot reach them — and each carries
+# `prevent_destroy` with no `force_destroy`, so it could not delete them anyway.
+# That is the design: a cluster is disposable, the data it processed is not, and a
+# second install in this account adopts these rather than failing on them.
+#
+# Named at the END, after the destroy, because that is when someone is deciding
+# whether they are finished. Printed rather than deleted, and there is no flag
+# that deletes them: that flag's misuse is the one that cannot be undone.
+report_surviving_buckets() {
+  echo ""
+  echo "==> These buckets were NOT deleted, on purpose:"
+  if [[ ${#SURVIVING_BUCKETS[@]} -gt 0 ]]; then
+    printf '      s3://%s\n' "${SURVIVING_BUCKETS[@]}"
+  else
+    echo "      (names unavailable — this root re-exports no bucket outputs;"
+    echo "       read them from the bootstrap root's terraform.tfvars)"
+  fi
+  echo ""
+  echo "    They hold this deployment's Terraform state, its imaging data, and its"
+  echo "    record of what was processed. The bootstrap root owns them and keeps its"
+  echo "    own state, so nothing here can delete them, and prevent_destroy means"
+  echo "    Terraform will refuse to even when asked."
+  echo ""
+  echo "    Re-installing into this account REUSES them. Only if you are finished"
+  echo "    with the data as well, and for each bucket above:"
+  echo "      aws s3 rb s3://<bucket> --force"
+  echo ""
+
+  # Interactive only. `cleanup.sh` takes no flags by decision, and a teardown
+  # driven from CI must not hang waiting for a terminal that is not there.
+  if [[ -t 0 ]]; then
+    read -r -p "    Press Enter once you have read the above. " _
+  fi
+}
+
+report_surviving_buckets
 
 echo "==> Cleanup complete."

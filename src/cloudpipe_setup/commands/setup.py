@@ -230,11 +230,15 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
         steps.append(
             {
                 "identifier": "state.bucket",
-                "title": "Terraform state bucket",
+                "title": "Pre-stack buckets",
                 "state": "blocked",
                 "message": "backend.tf names a bucket that this tool has not created, because it "
-                "creates no AWS resource.",
-                "remedy": {"kind": "command", "text": " && ".join(render.bucket_commands(answers))},
+                "creates no AWS resource. Two more buckets have to exist before the stack's first "
+                "apply and survive its teardown: the imaging data bucket and the metrics bucket.",
+                "remedy": {
+                    "kind": "command",
+                    "text": render.bootstrap_command(answers),
+                },
             }
         )
 

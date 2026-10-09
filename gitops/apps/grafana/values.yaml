@@ -175,8 +175,8 @@ grafana:
   # guidance (which is for report fleets). GOMEMLIMIT follows upstream's
   # 1 GiB per 8 GiB of limit, leaving the rest to Chromium.
   #
-  # The chart's NetworkPolicy is not enforced (VPC CNI network policy is off),
-  # so the shared token (terraform/modules/stack/grafana.tf) is the actual access control.
+  # The chart's NetworkPolicy is off (see networkPolicy below), so the shared
+  # token (terraform/modules/stack/grafana.tf) is the actual access control.
   # ---------------------------------------------------------------------------
   imageRenderer:
     enabled: true
@@ -202,6 +202,17 @@ grafana:
         memory: 512Mi
       limits:
         memory: 2Gi
+    # The chart's default policy admits 8081 only from grafana pods — which also
+    # excludes the kubelet, whose liveness probe hits the same 8081 from the node
+    # IP. It has never bitten because the VPC CNI network-policy agent has never
+    # been on (#635); the moment it is, the renderer fails its probe and no panel
+    # renders. There is no narrower source to allow instead: under the VPC CNI,
+    # node IPs come from the same subnets as pod IPs, so an ipBlock that admits
+    # the kubelet admits every in-VPC pod too, which is what this policy set out
+    # to prevent. The shared AUTH_TOKEN (terraform/modules/stack/grafana.tf) is
+    # the real access control, as it already was while the policy sat inert.
+    networkPolicy:
+      limitIngress: false
 
   # ---------------------------------------------------------------------------
   # Grafana configuration

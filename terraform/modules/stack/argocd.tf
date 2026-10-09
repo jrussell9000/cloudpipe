@@ -654,9 +654,19 @@ resource "kubernetes_network_policy_v1" "argocd_intra_namespace" {
         pod_selector {}
       }
     }
+    # The Service CIDR peer carries argocd-server → argocd-redis:6379 and
+    # → argocd-repo-server:8081, both dialled by Service name. Egress is
+    # evaluated before kube-proxy's DNAT, so the pod selector alone never
+    # matches a ClusterIP destination. Ingress is evaluated after DNAT at the
+    # destination pod, so the target's policies still gate the connection.
     egress {
       to {
         pod_selector {}
+      }
+      to {
+        ip_block {
+          cidr = module.eks.cluster_service_cidr
+        }
       }
     }
   }
@@ -754,8 +764,12 @@ resource "kubernetes_network_policy_v1" "argocd_ingress_server" {
 }
 
 # Allow kubelet liveness/readiness probes to argocd-repo-server (port 8084)
-# and argocd-application-controller (port 8082). Probe traffic originates from
-# the node IP (host network) and is blocked by default-deny-all without this rule.
+# and argocd-application-controller (port 8082).
+#
+# Not actually required — probe traffic is exempt from NetworkPolicy, proven in
+# the 2026-10-08 enforcement window (docs/operations.md → Enabling NetworkPolicy
+# enforcement). Kept as insurance against that undocumented behaviour changing;
+# both are health/metrics ports with no scraper, so the VPC CIDR peer costs little.
 resource "kubernetes_network_policy_v1" "argocd_ingress_repo_server_probe" {
   metadata {
     name      = "allow-ingress-repo-server-probe"

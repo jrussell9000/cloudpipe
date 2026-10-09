@@ -1088,13 +1088,15 @@ them (GitHub #635):
 ```hcl
 crds_available                 = true
 vpc_cni_network_policy_enabled = true
-vpc_cni_strict_mode            = true
 ```
+
+(`vpc_cni_strict_mode` is a third flag of the same kind, but the installer leaves
+it at its default of `false` — see [Strict mode stays off](#strict-mode-stays-off).)
 
 `install.sh` writes the file in Phase 6, and Terraform loads any `*.auto.tfvars`
 in the working directory automatically. It is gitignored, so **a fresh clone of an
 existing deployment does not have it** — create it before running any apply.
-Without it all three fall back to `false`, and the plan will quietly:
+Without it both fall back to `false`, and the plan will quietly:
 
 - destroy the `ClusterSecretStore` and every `ExternalSecret` gated on
   `crds_available` — the Argo and Prefect RDS credentials, the pgbouncer userlist
@@ -1114,6 +1116,263 @@ kubectl -n kube-system get ds aws-node \
 ```
 
 PRs touching `terraform/` are checked by CI (`terraform fmt`, `terraform validate`, `tflint`) — see [Running tests and CI checks](#running-tests-and-ci-checks) above.
+
+---
+
+## Enabling NetworkPolicy enforcement
+
+The VPC CNI network-policy agent has **never** been enabled on this cluster. All
+39 NetworkPolicies are inert, so until the flip no rule in them has ever been
+tested against live traffic, and a rule that selects the wrong label looks
+exactly like a working one. Two of the five defects a 2026-10-08 audit found
+(GitHub #635) were of that shape.
+
+Do this in a window with no workflows running, in the order below. Each step
+exists because something upstream of it fails silently.
+
+### 1. Clear any NetworkPolicy stuck in Terminating
+
+**A NetworkPolicy cannot be deleted while the agent is off.** The controller that
+clears the `networking.k8s.aws/resources` finalizer runs only while the add-on's
+`enableNetworkPolicy` is `true`, so the API accepts the delete, sets
+`deletionTimestamp`, and the object then sits in Terminating forever. Terraform
+treats the accepted delete as success and drops the resource from state, which
+leaves an object nothing manages — this happened to
+`kube-system/allow-ingress-karpenter-webhook` on 2026-10-08.
+
+```bash
+kubectl get netpol -A -o json \
+  | jq -r '.items[] | select(.metadata.deletionTimestamp) | "\(.metadata.namespace) \(.metadata.name)"'
+```
+
+For each one, clear the finalizer by hand, then delete its orphaned
+PolicyEndpoint:
+
+```bash
+kubectl -n <namespace> patch netpol <name> --type=merge -p '{"metadata":{"finalizers":null}}'
+kubectl -n <namespace> get policyendpoints | rg <name>
+kubectl -n <namespace> delete policyendpoints <name>-<suffix>
+```
+
+The same latch governs **any** change that removes a NetworkPolicy from
+Terraform. Do not apply one while the agent is off: the plan looks clean, the
+apply succeeds, the resource leaves state, and the object stays in the cluster
+forever. Either hold the change until enforcement is on — see step 4a — or
+expect to clear a finalizer by hand afterwards. Updates and creates are fine
+either way; only deletes latch.
+
+### 2. Know that the programmed rules are six months stale
+
+The agent does not read NetworkPolicy objects directly: the controller
+translates each one into a `PolicyEndpoint` (`policyendpoints.networking.k8s.aws`)
+and the node agent programs eBPF from those. That controller has also been dormant
+the whole time, so the 25 PolicyEndpoints in the cluster all date from the
+original install and describe the April policy set — not the current one.
+
+```bash
+kubectl get policyendpoints -A
+```
+
+So the flip has two distinct failure modes, and the second is the one to watch:
+enforcement turning on, and enforcement turning on **from stale rules**. After
+the flip, every policy must have a PolicyEndpoint with a fresh timestamp before
+any of the corrected rules mean anything. The sharpest single check is pgbouncer,
+whose port changed:
+
+```bash
+kubectl -n argo-workflows get policyendpoints -o json \
+  | jq '.items[] | select(.metadata.name | startswith("allow-ingress-pgbouncer")) | {name: .metadata.name, created: .metadata.creationTimestamp, ingress}'
+```
+
+It must show port 5432. A PolicyEndpoint that still says 6432, or none at all, means
+the controller has not caught up — roll back rather than wait.
+
+On the 2026-10-08 flip the controller caught up well inside the window: all 40
+policies had a PolicyEndpoint, every one resolving to live pod IPs, where
+beforehand 24 existed and **not one** of their ~170 baked-in addresses belonged
+to a running pod. Note what that means for the shape of the risk: a
+PolicyEndpoint holds resolved pod IPs rather than selectors, so a stale one does
+not merely misstate a port — it can admit an address that has since been
+recycled to a different pod.
+
+### 3. Apply the probe canary, before the flip
+
+`scripts/jobs/netpol-probe-canary.yaml` holds a denied pod and an allowed
+control pod; the file's own header explains how to read the result.
+
+```bash
+kubectl apply -f scripts/jobs/netpol-probe-canary.yaml
+kubectl -n netpol-canary rollout status deploy/probe-denied --timeout=120s
+kubectl -n netpol-canary rollout status deploy/probe-allowed --timeout=120s
+```
+
+Both must be Ready **before** the flip. That is the baseline; without it a later
+`NotReady` proves nothing.
+
+**The answer on 2026-10-08 was that probe traffic is exempt.** With the agent
+enabled, `probe-denied` stayed Ready with no `Unhealthy` event for three
+minutes, while every other direction was demonstrably enforced:
+
+| Path | Result |
+|---|---|
+| unpolicied `default` pod → `probe-allowed:8080` (explicit allow) | connected |
+| unpolicied `default` pod → `probe-denied:8080` (no allow) | timed out |
+| `probe-denied` → `probe-allowed:8080` (egress denied) | timed out |
+| kubelet → `probe-denied:8080` (no allow) | **connected** |
+
+So the six probe rules in this repo are inert, and the grafana image-renderer
+chart policy could go back on. None of that has been changed yet. Re-run the
+canary after any change to the agent's version or mode rather than trusting this
+table — in strict mode a pod starts denied before its policies are programmed,
+which is a different question from this one.
+
+### 3a. Test a ClusterIP destination
+
+**Egress is evaluated before kube-proxy's DNAT.** A pod that dials a Service is
+judged against the ClusterIP, so an egress rule naming only the VPC CIDR — or
+only a `podSelector` — blocks every connection to that Service while leaving
+pod-IP connections working. This took down the Argo database path on the first
+flip, silently: existing connections survived on conntrack, so nothing logged an
+error and no pod went unready.
+
+Test it directly, from a pod in a default-deny namespace:
+
+```bash
+# pgbouncer's ClusterIP and its pod IP
+kubectl -n argo-workflows get svc pgbouncer -o jsonpath='{.spec.clusterIP}{"\n"}'
+kubectl -n argo-workflows get pod -l app.kubernetes.io/name=pgbouncer \
+  -o jsonpath='{.items[0].status.podIP}{"\n"}'
+
+# from any pod in the namespace; both must connect
+nc -w 4 -zv <clusterIP> 5432
+nc -w 4 -zv <podIP> 5432
+```
+
+The pod IP answering while the ClusterIP times out is the signature. Every
+egress rule for an in-cluster Service must therefore admit the Service CIDR,
+which Terraform reads from `module.eks.cluster_service_cidr` and passes to the
+`argo-workflows` and `prefect` modules as `service_cidr` — never a literal, as
+`172.20.0.0/16` is only the EKS default. Widening egress this way does not open
+the destination: ingress is evaluated after DNAT at the target pod, so the
+target's own policies still gate the connection.
+
+### 4. Flip the agent on
+
+Set the flag in `terraform/install-state.auto.tfvars` (leave `vpc_cni_strict_mode`
+alone — see below):
+
+```hcl
+vpc_cni_network_policy_enabled = true
+```
+
+Then apply just the add-on:
+
+```bash
+terraform apply -target='module.stack.module.eks.aws_eks_addon.before_compute["vpc-cni"]'
+```
+
+This rolls the `aws-node` DaemonSet. Existing pods keep their networking across
+the restart, but do it with the cluster idle anyway.
+
+**Judge the result from the add-on, not from the apply.** The flag lives in a
+`*.auto.tfvars` that Terraform loads automatically, so an apply run before that
+file is edited reports success with no diff and changes nothing. On 2026-10-08
+the first rollback attempt did exactly that; `-var="vpc_cni_network_policy_enabled=false"`
+on the command line is what actually moved it.
+
+```bash
+aws eks describe-addon --cluster-name cloudpipe --addon-name vpc-cni \
+  --query 'addon.{cfg:configurationValues,modifiedAt:modifiedAt}' --output json
+```
+
+`modifiedAt` must be the time of this apply.
+
+### 4a. Apply any pending policy deletion, now that the agent is on
+
+This is the window for a change that removes a NetworkPolicy, because the
+finalizer in step 1 only clears while enforcement is on. Apply the merge, then
+confirm nothing is left behind:
+
+```bash
+terraform apply   # or -target the specific policies
+kubectl get netpol -A -o json \
+  | jq -r '.items[] | select(.metadata.deletionTimestamp) | "\(.metadata.namespace) \(.metadata.name)"'
+```
+
+That query must come back empty. If it does not, the controller has not caught
+up yet — wait before rolling anything back, since rolling back strands the
+object.
+
+### 5. Watch, in this order
+
+```bash
+# The agent is actually on — the flag, then the process
+aws eks describe-addon --cluster-name cloudpipe --addon-name vpc-cni \
+  --query 'addon.configurationValues' --output text
+kubectl -n kube-system get ds aws-node \
+  -o jsonpath='{range .spec.template.spec.containers[?(@.name=="aws-eks-nodeagent")]}{.args}{end}' \
+  | tr ',' '\n' | rg enable-network-policy
+
+# Rules were re-translated, not reused (step 2)
+kubectl get policyendpoints -A
+
+# The canary verdict (step 3)
+kubectl -n netpol-canary get pods
+
+# Nothing in the four default-deny namespaces lost its readiness
+kubectl get pods -n kube-system -n argo-workflows -n argocd -n prefect
+
+# Credentials still reachable: pod identity, then S3
+kubectl -n argo-workflows logs deploy/argo-workflows-workflow-controller --tail=50 | rg -i "credential|403|denied"
+
+# Karpenter metrics still arriving (the rule added in #728)
+kubectl -n prometheus exec -it sts/prometheus-kube-prometheus-prometheus -c prometheus -- \
+  wget -qO- 'http://localhost:9090/api/v1/query?query=up{job="karpenter"}'
+```
+
+Then the ClusterIP paths from step 3a — these are the ones that fail silently,
+because existing connections survive on conntrack and nothing logs an error:
+
+```bash
+# pgbouncer by Service name, from a pod in argo-workflows
+kubectl -n argo-workflows get svc pgbouncer -o jsonpath='{.spec.clusterIP}{"\n"}'
+# argocd-server → argocd-redis:6379, prefect oauth2-proxy → prefect-server:4200
+```
+
+Then submit one small workflow end to end. The DB write path (pgbouncer) and the
+S3 path (pod identity) are the two fixes that only a real run exercises.
+
+### 6. Rolling back
+
+Set `vpc_cni_network_policy_enabled = false` and re-run the same targeted apply.
+Enforcement stops as the DaemonSet rolls. Remember that the rollback re-creates
+the condition in step 1: with the agent off again, no NetworkPolicy can be
+deleted, so delete the canary namespace **before** rolling back.
+
+### Strict mode stays off
+
+`NETWORK_POLICY_ENFORCING_MODE=strict` is a separate flag (`vpc_cni_strict_mode`)
+and must stay `false` here. Nineteen namespaces have no NetworkPolicy at all —
+`cert-manager`, `external-secrets`, `aws-load-balancer-controller`, `prometheus`,
+`kubecost`, `cloudflared` and the rest. Standard mode leaves a pod that no policy
+selects alone; strict mode denies it. Turning strict mode on without writing
+policies for all nineteen would take those namespaces down.
+
+The installer no longer sets it either (#746). It used to write
+`vpc_cni_strict_mode = true` in Phase 6 and pass it on two applies, which would
+have brought a *fresh* deployment up with the control plane healthy and most
+add-ons mute. Phase 6 now persists only `crds_available` and
+`vpc_cni_network_policy_enabled`, and the variable stays at its `false` default
+until a deployment chooses otherwise.
+
+If you ever do want strict mode, confirm the consequence before trusting it: it
+has never been enabled on this cluster, so "a pod no policy selects is denied" is
+read from the AWS documentation rather than observed here. With the agent already
+on, enable strict mode in a window and watch an un-policied namespace —
+`grafana` is the cheapest canary, because its one chart policy selects only the
+image-renderer, leaving the grafana pod itself unselected. If that pod loses
+egress, the behaviour is confirmed and the remaining namespaces each need a
+policy before strict mode can stay on.
 
 ---
 
