@@ -157,17 +157,34 @@ All three block public access, encrypt at rest, and carry a policy refusing requ
 
 If a bucket already exists — a cohort someone else staged, or a deployment you are rebuilding — name it and pass `-var create_data_bucket=false`. The stack configures the data bucket by name either way, so nothing downstream can tell which happened.
 
-## Step 5 — render the Globus inputs
+## Step 5 — decide whether you are running the Globus ingress
 
-The eight Globus variables are owned by a separate tool, which renders them into a `globus.auto.tfvars` in the same root. Terraform loads `.auto.tfvars` files after `terraform.tfvars`, so those values win over anything you put in the latter. Setting them by hand in `terraform.tfvars` instead, as `terraform.tfvars.example` shows, works just as well — both `cloudpipe setup` and `cloudpipe preflight` check that each variable is set, not which file set it.
+**Skip this step unless you are standing up a Globus Connect Server.** `globus_enabled` defaults to `false`, and with it false the stack creates no Globus resource at all — 52 of them, including an EC2 host and an Elastic IP. The pipeline then runs in `ingress-mode=presynced`: it reads whatever is already under `mmps_mproc/` in the data bucket and never starts a transfer. That is a complete deployment, and it is the one most people want first, because getting imaging into the bucket by any means is a smaller problem than reproducing this ingress.
+
+Globus is one implementation of the data-ingress contract, not a requirement. If you are staging data another way, read [data-ingress.md](data-ingress.md) — it documents the S3 key contract the pipeline actually depends on, which is the only thing that has to be true.
+
+### If you are running it
+
+Enabling it needs four things this repository cannot give you:
+
+| What | Why it is not ours to give |
+|---|---|
+| A **Globus subscription** | The S3 connector is a paid feature. [globus-prerequisites.md](globus-prerequisites.md) covers the gates, which run days to weeks |
+| A **confidential service client**, registered in the Globus Developers Portal | The endpoint is created under it rather than under a person, so it survives someone leaving |
+| A **managed prefix list** in this region | The host's SSH rule references it by id, and a prefix list is regional |
+| A **GCS AMI** in your own account, built from `packer/globus-gcs/` | The `globus_ami_id` committed in `terraform/modules/stack/globus.tf` is the reference deployment's image, shared with nobody. Point it at yours |
+
+Then set `globus_enabled = true` and the seven inputs it makes mandatory. The module refuses an empty one once the flag is true, so this is one edit of eight lines rather than an apply that half-works. Those seven are owned by a separate tool, which renders them into a `globus.auto.tfvars` in the same root:
 
 ```
 pixi run globus init
 ```
 
-Read [globus-setup.md](globus-setup.md) for what that tool needs, and [globus-prerequisites.md](globus-prerequisites.md) for the gates ahead of it. Two tools writing one variable is two tools disagreeing about it, which is why the wizard reports on these variables and never writes them.
+Terraform loads `.auto.tfvars` files after `terraform.tfvars`, so those values win over anything you put in the latter. Setting them by hand in `terraform.tfvars` instead, as `terraform.tfvars.example` shows, works just as well — both `cloudpipe setup` and `cloudpipe preflight` check that each variable is set, not which file set it.
 
-Globus is one implementation of the data-ingress contract, not a requirement. If you are staging data another way, read [data-ingress.md](data-ingress.md) first — it documents the S3 key contract the pipeline actually depends on.
+Read [globus-setup.md](globus-setup.md) for what that tool needs. Two tools writing one variable is two tools disagreeing about it, which is why the wizard reports on these variables and never writes them.
+
+`globus_s3_destination_bucket` is the exception, and it is required either way: despite the name it is the imaging data bucket from [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack), which the Prefect worker, the Argo runner's IAM policy, the access logs and the lifecycle rules all name whether or not anything Globus wrote it.
 
 ## If your GitOps repository is private
 

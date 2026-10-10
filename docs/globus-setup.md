@@ -181,15 +181,25 @@ either without `--force`. If the document has a problem, `init` names the field.
 
 *`setup-status` step: `setup.infrastructure`*
 
+First, `globus_enabled = true` has to be in your root's `terraform.tfvars`. It
+defaults to `false`, which means the module has no instances and every command
+below reports "No changes" and exits 0 — success-looking output that created
+nothing. The seven inputs `globus init` rendered in 3.1 are refused as empty
+once the flag is on, so if any is still unset the plan fails naming it, which is
+the failure you want here.
+
 From the `terraform/` directory:
 
 ```bash
 cd terraform
 terraform init
-terraform plan -target=module.globus
-terraform apply -target=module.globus
+terraform plan -target=module.stack.module.globus
+terraform apply -target=module.stack.module.globus
 cd ..
 ```
+
+The address is `module.stack.module.globus`, not `module.globus`: every resource
+lives in the stack module, and a `-target` that matches nothing is not an error.
 
 Read the plan before typing `yes`. On a first build it only adds resources; a
 plan that **destroys or replaces** anything on an existing deployment should be

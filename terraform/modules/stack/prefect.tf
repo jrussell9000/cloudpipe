@@ -27,7 +27,16 @@ module "prefect" {
   work_pool      = var.prefect_work_pool
 
   # The batch gate starts the Globus host before listing through it (#652).
-  globus_instance_arn = "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/${module.globus.instance_id}"
+  # Empty when the ingress is not enabled, which the prefect module reads as "no
+  # host to start" and attaches no ec2:StartInstances policy (iam.tf).
+  #
+  # `join` over the splat rather than a conditional on `one(...)`: an empty list
+  # joins to "" with nothing to guard, where interpolating a null instance id
+  # into the ARN template would fail the plan.
+  globus_instance_arn = join("", [
+    for instance_id in module.globus[*].instance_id :
+    "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/${instance_id}"
+  ])
 
   # Shared internal UI ALB (ui_alb.tf)
   alb_group_annotations = local.ui_alb_group_annotations
