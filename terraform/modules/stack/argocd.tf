@@ -217,15 +217,43 @@ resource "kubernetes_secret_v1" "grafana_dex_client" {
 # or whatever the caller supplies through var.external_identity (design D6).
 
 # ------------------------------------------------------------------------------
-# ArgoCD Repository Credentials
-# PAT is stored in Secrets Manager at cloudpipe/github-pat as {"token":"..."}
-# ArgoCD auto-discovers secrets with this label at startup.
+# ArgoCD Repository Credentials — only for a PRIVATE GitOps repository.
+#
+# ArgoCD clones a public repository anonymously, so a deployment whose GitOps
+# repository is public needs no credential at all. Verified rather than assumed
+# (2026-10-09): cloning a public repo over HTTPS with a deliberately invalid
+# token succeeds — GitHub ignores Basic auth for public read — while the same
+# token against a private repo fails with "Invalid username or token".
+#
+# This used to be unconditional, which forced every deployer to create a Secrets
+# Manager secret by hand and put a token in it that, for a public repo, was never
+# used. It is a `data` source, so a missing secret failed the apply around Phase
+# 2, with the cluster already up and nothing in preflight having mentioned it.
+#
+# For a private repository the secret is `cloudpipe/github-pat`, holding
+# {"password": "<token>"} — the key is `password`, not `token`, whatever the old
+# comment here claimed. A personal access token is the one credential GitHub has
+# no API to create, so Terraform cannot provision it; a repository deploy key can
+# be, and docs/deployer-first-hour.md describes that as the better option.
 # ------------------------------------------------------------------------------
 data "aws_secretsmanager_secret_version" "github_pat" {
+  count     = var.gitops_repo_private ? 1 : 0
   secret_id = "cloudpipe/github-pat"
 }
 
+# The secret below gained a `count`, which changes its address from
+# `kubernetes_secret_v1.argocd_repo` to `...argocd_repo[0]`. Without this, a
+# deployment that already has it in state plans a destroy and a create — briefly
+# leaving ArgoCD with no credential for a private repository, which stalls every
+# sync. Do not remove it while any deployment predates this change.
+moved {
+  from = kubernetes_secret_v1.argocd_repo
+  to   = kubernetes_secret_v1.argocd_repo[0]
+}
+
 resource "kubernetes_secret_v1" "argocd_repo" {
+  count = var.gitops_repo_private ? 1 : 0
+
   metadata {
     name      = "cloudpipe-repo"
     namespace = "argocd"
@@ -241,7 +269,7 @@ resource "kubernetes_secret_v1" "argocd_repo" {
     type     = "git"
     url      = var.github_user_url
     username = "x-token"
-    password = jsondecode(data.aws_secretsmanager_secret_version.github_pat.secret_string)["password"]
+    password = jsondecode(data.aws_secretsmanager_secret_version.github_pat[0].secret_string)["password"]
   }
 
   depends_on = [helm_release.argocd]

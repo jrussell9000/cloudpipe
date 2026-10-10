@@ -88,6 +88,8 @@ pixi run --manifest-path ~/cloudpipe/pixi.toml cloudpipe setup
 
 The wizard asks for each input in turn, grouped into AWS, identity, source control, Cloudflare and state. For every field it shows the help text, where to obtain the value, and the rule it must satisfy — and it re-asks immediately rather than collecting a list of complaints at the end.
 
+**Choosing a region** is the one answer worth a minute's thought, because moving a deployment afterwards means rebuilding it. Pick the region closest to you, or to wherever your imaging data already sits — the cluster reads that data constantly, and keeping both in one region avoids inter-region transfer charges on every run. Then check two things in the [AWS region list](https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-regions.html): that EKS is offered there, and that the GPU instance types the anatomical steps use are too. Not every region has both, and the ones that do are not always the nearest.
+
 What it writes, and nothing else:
 
 | File | Where | What it is |
@@ -166,6 +168,40 @@ pixi run globus init
 Read [globus-setup.md](globus-setup.md) for what that tool needs, and [globus-prerequisites.md](globus-prerequisites.md) for the gates ahead of it. Two tools writing one variable is two tools disagreeing about it, which is why the wizard reports on these variables and never writes them.
 
 Globus is one implementation of the data-ingress contract, not a requirement. If you are staging data another way, read [data-ingress.md](data-ingress.md) first — it documents the S3 key contract the pipeline actually depends on.
+
+## If your GitOps repository is private
+
+Skip this if you forked the public repository and left it public: ArgoCD clones a public repository anonymously, needs no credential, and `gitops_repo_private` defaults to `false`.
+
+For a private repository, set `gitops_repo_private = true` and give ArgoCD a credential. Two ways, and the second is the better one:
+
+**A personal access token**, which the stack reads from a Secrets Manager secret named `cloudpipe/github-pat`:
+
+```bash
+aws secretsmanager create-secret --name cloudpipe/github-pat \
+  --secret-string '{"password":"<your-token>"}'
+```
+
+The key is `password`. GitHub has no API that creates a personal access token, so this is the one credential in the whole deployment that cannot be provisioned for you — and a token that expires takes ArgoCD's syncing with it, months later, with no warning.
+
+**A deploy key**, which avoids both problems. A read-only SSH key scoped to the one repository, created by Terraform rather than by hand, and it does not expire:
+
+```hcl
+resource "tls_private_key" "argocd" {
+  algorithm = "ED25519"
+}
+
+resource "github_repository_deploy_key" "argocd" {
+  repository = "<your-gitops-repo>"
+  title      = "ArgoCD read-only"
+  key        = tls_private_key.argocd.public_key_openssh
+  read_only  = true
+}
+```
+
+That needs the GitHub provider configured, which means exporting `GITHUB_TOKEN` for the apply — the same arrangement `CLOUDFLARE_API_TOKEN` already uses, and for the same reason: a credential passed as a Terraform variable would persist in state. Hand the private key to ArgoCD as a `repo-creds` secret with `sshPrivateKey` instead of `password`.
+
+> **A GitHub App is a third option** and the right one for an organization deploying several times: ArgoCD supports `githubAppID`, `githubAppInstallationID` and `githubAppPrivateKey` directly, and mints short-lived installation tokens itself. Creating the App is still a manual step, but unlike a PAT the credential does not expire. This deployment does not use it, so nothing here is tested against it.
 
 ## Step 6 — preflight
 
