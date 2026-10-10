@@ -259,32 +259,53 @@ variable "globus_s3_destination_bucket" {
   type = string
 }
 
+# The Globus ingress and the seven inputs it needs.
+#
+# These do have defaults in the module — `globus_enabled` is false and the seven
+# are empty — so by the rule above they would not be declared here at all. They
+# are, because they are the one group of optional inputs a deployer is likely to
+# want and cannot discover from an empty root: turning the ingress on means
+# setting eight values at once, and the module refuses an empty one once the
+# flag is true. Leaving them out would mean editing this file before editing
+# tfvars.
+variable "globus_enabled" {
+  type    = bool
+  default = false
+}
+
 variable "globus_source_collection_id" {
-  type = string
+  type    = string
+  default = ""
 }
 
 variable "globus_client_id" {
-  type = string
+  type    = string
+  default = ""
 }
 
 variable "globus_admin_prefix_list_id" {
-  type = string
+  type    = string
+  default = ""
 }
 
 variable "globus_org_name" {
-  type = string
+  type    = string
+  default = ""
 }
 
 variable "globus_contact_email" {
-  type = string
+  type    = string
+  default = ""
 }
 
 variable "globus_owner_email" {
-  type = string
+  type    = string
+  default = ""
 }
 
 variable "globus_identity_domain" {
-  type = string
+  type    = string
+  default = ""
 }
 
 ################################################################################
@@ -312,6 +333,7 @@ module "stack" {
   cloudflare_account_id        = var.cloudflare_account_id
   cloudflare_team_domain       = var.cloudflare_team_domain
   cloudflare_team_name         = var.cloudflare_team_name
+  globus_enabled               = var.globus_enabled
   globus_s3_destination_bucket = var.globus_s3_destination_bucket
   globus_source_collection_id  = var.globus_source_collection_id
   globus_client_id             = var.globus_client_id

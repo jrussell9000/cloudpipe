@@ -365,8 +365,8 @@ S3 credential. Only the node, the machine that serves the endpoint, changes.
 With no workflows running (`pixi run globus tasks` lists none), from `terraform/`:
 
 ```bash
-terraform plan -target=module.globus    # expect the instance to be replaced, and little else
-terraform apply -target=module.globus
+terraform plan -target=module.stack.module.globus    # expect the instance to be replaced, and little else
+terraform apply -target=module.stack.module.globus
 cd .. && pixi run globus doctor --start-instance
 ```
 

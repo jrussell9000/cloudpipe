@@ -269,8 +269,25 @@ variable "github_oidc_allowed_subs" {
 # Globus Variables    #
 #######################
 
+# Whether this deployment stands up the Globus ingress at all, and therefore
+# whether the seven variables below are required. See the header of
+# `globus.tf` for what enabling it costs the deployer, and the Globus
+# section of docs/deployer-first-hour.md for how to turn it on later.
+variable "globus_enabled" {
+  description = "Stand up the Globus Connect Server ingress — an EC2 host, an Elastic IP, its S3 signing roles and the staging test-bed. False is a complete deployment that reads imaging someone else staged into the data bucket (`ingress-mode=presynced`). Default false because enabling it needs a Globus subscription, a registered Globus service client, a managed prefix list, and a GCS AMI built from `packer/globus-gcs/` in your own account — none of which a fork of this repository inherits. The reference deployment sets it true."
+  type        = bool
+  default     = false
+}
+
+# Not a Globus variable despite the name: this is the imaging data bucket, read
+# by the Prefect worker, the Argo runner's IAM policy, the S3 access-logging
+# configuration, the lifecycle rules and the CloudTrail data-event selector. It
+# stays required with `globus_enabled = false`, and `globus init` still owns the
+# name. Renaming it is a separate change — it is one string in six Terraform
+# files, the wizard's preflight, the Globus answers schema and this deployment's
+# tfvars, and every one of them has to move together.
 variable "globus_s3_destination_bucket" {
-  description = "S3 bucket name that the Globus Connect Server will access"
+  description = "S3 bucket name holding the imaging data. The Globus Connect Server writes into it when the ingress is enabled; the pipeline reads it either way. Created by the bootstrap root, not by the stack."
   type        = string
 
   validation {
@@ -279,42 +296,77 @@ variable "globus_s3_destination_bucket" {
   }
 }
 
+# The seven variables below are required only when `globus_enabled` is true.
+#
+# Each one defaults to the empty string and each validation refuses the empty
+# string once the ingress is on, which keeps #526's rule — a default must not be
+# able to stand up an endpoint advertising a stranger's organization — while
+# costing a deployment that runs no ingress nothing. The old arrangement, no
+# default at all, made seven values mandatory for every deployment including the
+# ones that never create a Globus resource.
+#
+# `var.globus_enabled` inside a `validation` block needs Terraform 1.9; this
+# module's floor is 1.10 (versions.tf).
+
 variable "globus_admin_prefix_list_id" {
-  description = "ID (not ARN) of the AWS managed prefix list allowed SSH access to the Globus Connect Server (e.g. pl-xxxxxxxx)"
+  description = "ID (not ARN) of the AWS managed prefix list allowed SSH access to the Globus Connect Server (e.g. pl-xxxxxxxx). Required when globus_enabled is true."
   type        = string
+  default     = ""
 
   validation {
-    condition     = startswith(var.globus_admin_prefix_list_id, "pl-")
+    condition     = !var.globus_enabled || startswith(var.globus_admin_prefix_list_id, "pl-")
     error_message = "globus_admin_prefix_list_id must be a prefix list ID (pl-...), not an ARN."
   }
 }
 
-# No defaults on the four institution-identifying variables below, on purpose
-# (#526). Each default was this deployment's own value, and a default cannot
-# fail: an apply that never rendered the answers document would stand up an
-# endpoint advertising a stranger's organization and mailbox
-# (`globus_org_name` and `globus_contact_email` are baked into the bootstrap
-# SSM document) behind a gateway that admits only that stranger's institution
-# (`globus_identity_domain` is the gateway's `--domain`). `globus init` renders
-# all four.
+# The four institution-identifying variables below carry no deployment's value
+# as a default (#526). A default that named one would stand up an endpoint
+# advertising a stranger's organization and mailbox (`globus_org_name` and
+# `globus_contact_email` are baked into the bootstrap SSM document) behind a
+# gateway that admits only that stranger's institution (`globus_identity_domain`
+# is the gateway's `--domain`). `globus init` renders all four.
 variable "globus_org_name" {
-  description = "Organization name displayed on the Globus endpoint. Baked into the bootstrap SSM document as `endpoint setup --organization`. Rendered by `globus init` from the answers document."
+  description = "Organization name displayed on the Globus endpoint. Baked into the bootstrap SSM document as `endpoint setup --organization`. Rendered by `globus init` from the answers document. Required when globus_enabled is true."
   type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.globus_enabled || var.globus_org_name != ""
+    error_message = "globus_org_name must be set when globus_enabled is true: it is the organization the endpoint advertises."
+  }
 }
 
 variable "globus_contact_email" {
-  description = "Contact email displayed on the Globus endpoint. Baked into the bootstrap SSM document as `endpoint setup --contact-email`. Rendered by `globus init` from the answers document's `contact_email`."
+  description = "Contact email displayed on the Globus endpoint. Baked into the bootstrap SSM document as `endpoint setup --contact-email`. Rendered by `globus init` from the answers document's `contact_email`. Required when globus_enabled is true."
   type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.globus_enabled || var.globus_contact_email != ""
+    error_message = "globus_contact_email must be set when globus_enabled is true: it is the mailbox the endpoint advertises."
+  }
 }
 
 variable "globus_owner_email" {
-  description = "Email of the person an institution contacts about this endpoint — typically an institutional Globus admin. The human in the subscription request `globus bootstrap-endpoint` prints; NOT `endpoint setup --owner`, which is the service client. Rendered by `globus init` from the answers document's `owner_email`."
+  description = "Email of the person an institution contacts about this endpoint — typically an institutional Globus admin. The human in the subscription request `globus bootstrap-endpoint` prints; NOT `endpoint setup --owner`, which is the service client. Rendered by `globus init` from the answers document's `owner_email`. Required when globus_enabled is true."
   type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.globus_enabled || var.globus_owner_email != ""
+    error_message = "globus_owner_email must be set when globus_enabled is true: it names the human in the subscription request."
+  }
 }
 
 variable "globus_identity_domain" {
-  description = "Identity domain permitted to authenticate to the Globus storage gateway (e.g. your institution's domain). Passed as the gateway's `--domain`. Rendered by `globus init` from the answers document's `identity_domain`."
+  description = "Identity domain permitted to authenticate to the Globus storage gateway (e.g. your institution's domain). Passed as the gateway's `--domain`. Rendered by `globus init` from the answers document's `identity_domain`. Required when globus_enabled is true."
   type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.globus_enabled || var.globus_identity_domain != ""
+    error_message = "globus_identity_domain must be set when globus_enabled is true: an empty --domain admits no identity to the gateway."
+  }
 }
 
 variable "globus_gateway_name" {
@@ -330,16 +382,23 @@ variable "globus_collection_name" {
 }
 
 variable "globus_client_id" {
-  description = "Client ID of the Globus service client registered in the Globus Developers Portal. `globus bootstrap-endpoint` creates the endpoint under it rather than under a personal identity."
+  description = "Client ID of the Globus service client registered in the Globus Developers Portal. `globus bootstrap-endpoint` creates the endpoint under it rather than under a personal identity. Required when globus_enabled is true."
   type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.globus_enabled || var.globus_client_id != ""
+    error_message = "globus_client_id must be set when globus_enabled is true: the endpoint is created under the service client, not a personal identity."
+  }
 }
 
 variable "globus_source_collection_id" {
-  description = "Globus source collection UUID (NBDC Data Hub collection)."
+  description = "Globus source collection UUID (NBDC Data Hub collection). Required when globus_enabled is true."
   type        = string
+  default     = ""
 
   validation {
-    condition     = can(regex("^[0-9a-f-]{36}$", var.globus_source_collection_id))
+    condition     = !var.globus_enabled || can(regex("^[0-9a-f-]{36}$", var.globus_source_collection_id))
     error_message = "globus_source_collection_id must be a Globus collection UUID."
   }
 }
