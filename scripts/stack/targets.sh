@@ -221,6 +221,12 @@ stack_address() {
 
 # Phase 2 modules, in apply order. cleanup.sh destroys these in reverse.
 # shellcheck disable=SC2034
+# `module.globus` stays in this list even though `globus_enabled` defaults to
+# false. A `-target` that resolves to a module call with zero instances is a
+# no-op: Terraform reports "No changes" and exits 0 (verified 2026-10-09 against
+# a null-provider probe), and the declaration check below passes because the
+# `module` block is declared either way. So one list covers both deployment
+# shapes, and nobody has to keep a second one in step.
 PHASE2_MODULES=(
   module.aws_ebs_csi_pod_identity
   module.external_dns_pod_identity

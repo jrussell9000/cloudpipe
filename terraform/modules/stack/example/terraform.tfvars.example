@@ -176,21 +176,45 @@ cloudflare_team_domain = "example-team.cloudflareaccess.com"
 cloudflare_team_name   = "example-team-0000.cloudflareaccess.com"
 
 
-# --- Globus ------------------------------------------------------------------
-# These do not have to be filled in by hand. Write the answers document
-# (../../../../docs/globus-setup.md, step 3.1) and run `pixi run globus init`:
-# it renders all but the bucket into a globus.auto.tfvars that Terraform loads
-# AFTER this file, so a value there wins over the same value here.
-
-# Bucket the Globus Connect Server reads from and writes to. Must already exist.
+# --- Data bucket -------------------------------------------------------------
+# The imaging data bucket. Named `globus_*` for historical reasons, but the
+# pipeline reads it whether or not the Globus ingress below is enabled: the
+# Prefect worker, the Argo runner's IAM policy, the access logs, the lifecycle
+# rules and the CloudTrail data-event selector all name it. Created by the
+# bootstrap root (`terraform/modules/bootstrap`), not by the stack.
 globus_s3_destination_bucket = "example-neuroimaging-data"
+
+
+# --- Globus ingress (optional) -----------------------------------------------
+# Leave `globus_enabled = false` unless you are standing up a Globus Connect
+# Server to pull imaging in. Enabling it needs four things this repository
+# cannot give you:
+#
+#   * a Globus subscription — the S3 connector is a paid feature;
+#   * a confidential service client registered in the Globus Developers Portal;
+#   * a managed prefix list in this region for the SSH rule;
+#   * a GCS AMI built from `packer/globus-gcs/` in your own AWS account, and
+#     `globus_ami_id` in `terraform/modules/stack/globus.tf` pointed at it. The
+#     id committed there is the reference deployment's, shared with nobody.
+#
+# With it false, the pipeline runs in `ingress-mode=presynced`: it reads
+# whatever is already in the data bucket above and never starts a transfer.
+#
+# The seven values below are required once the flag is true, and the module
+# refuses an empty one — so turning the ingress on is one edit of eight lines,
+# not an apply that half-works. They do not have to be filled in by hand: write
+# the answers document (../../../../docs/globus-setup.md, step 3.1) and run
+# `pixi run globus init`, which renders all seven into a globus.auto.tfvars that
+# Terraform loads AFTER this file, so a value there wins over the same value
+# here.
+globus_enabled = false
 
 # The source (sending) collection, and the confidential service client that owns
 # the endpoint. Both are UUIDs, and both placeholders below are deliberately not
 # UUID-shaped: this file is published, and a well-formed UUID here would be
 # indistinguishable from a real collection identifier to the reader and to the
-# publish gate alike. Terraform rejects them until they are replaced, which is
-# the intended failure.
+# publish gate alike. Terraform rejects them once `globus_enabled` is true,
+# which is the intended failure; with it false they are inert.
 globus_source_collection_id = "<source-collection-uuid>"
 globus_client_id            = "<service-client-uuid>"
 

@@ -233,10 +233,10 @@ STACK_VARIABLES = Path(__file__).resolve().parents[2] / "terraform/modules/stack
 
 
 def globus_variables(variables_tf: Path = STACK_VARIABLES) -> tuple[str, ...] | None:
-    """The required stack variables this wizard does not own — `globus init`'s.
+    """The stack variables a deployer must supply that this wizard does not own.
 
-    Derived as every variable with no default, minus the ones this schema binds.
-    That is the ownership split itself (design D4), which
+    Derived as every variable the stack requires, minus the ones this schema
+    binds. That is the ownership split itself (design D4), which
     `tests/test_setup_wizard_schema.py` holds exact: every required variable has
     exactly one owner. So the result is the Globus set without listing it here,
     and without importing `globus_admin`, whose package pulls in `globus-sdk`.
@@ -249,7 +249,23 @@ def globus_variables(variables_tf: Path = STACK_VARIABLES) -> tuple[str, ...] | 
     except OSError:
         return None
     owned = {field.terraform_variable for field in terraform_fields()}
-    return tuple(sorted(variables_without_default(text) - owned))
+    return tuple(sorted(required_variables(text) - owned))
+
+
+def required_variables(text: str) -> set[str]:
+    """Every variable a deployer may have to supply: unconditional and conditional.
+
+    "No default" alone stopped being the whole answer when the Globus ingress
+    became opt-in. Its seven inputs now default to the empty string and are
+    rejected as empty only when `globus_enabled` is true, so by the old reading
+    they are optional — and a deployer who turned the ingress on would be told
+    nothing about them until `terraform plan` refused the empty values.
+
+    Terraform has no "conditionally required" keyword, so the cross-variable
+    validation IS the declaration, and reading it is reading the source of truth
+    rather than keeping a parallel list in step with it.
+    """
+    return variables_without_default(text) | variables_required_by_another(text)
 
 
 def variables_without_default(text: str) -> set[str]:
@@ -261,11 +277,37 @@ def variables_without_default(text: str) -> set[str]:
     quote one.
     """
     names = set()
-    for match in re.finditer(r'^variable\s+"([^"]+)"\s*\{', text, re.M):
-        body = _block_body(text, match.end())
+    for name, body in _variable_bodies(text):
         if not re.search(r"^\s*default\s*=", body, re.M):
-            names.add(match.group(1))
+            names.add(name)
     return names
+
+
+def variables_required_by_another(text: str) -> set[str]:
+    """Variables whose own validation turns on the value of a different variable.
+
+    A `validation` condition of the form `!var.flag || <rule>` says the rule
+    applies only when `flag` is set — which is how a defaulted variable declares
+    that it is required under some condition. Matched by the cross-reference
+    rather than by the `!var.x ||` spelling, so a condition written
+    `var.x == false || ...` or `var.x ? <rule> : true` counts the same.
+
+    Self-references are excluded: every condition names its own variable.
+    """
+    names = set()
+    for name, body in _variable_bodies(text):
+        for condition in re.findall(r"^\s*condition\s*=\s*(.+)$", body, re.M):
+            if {ref for ref in re.findall(r"var\.([a-z0-9_]+)", condition) if ref != name}:
+                names.add(name)
+    return names
+
+
+def _variable_bodies(text: str) -> list[tuple[str, str]]:
+    """Each `variable "name" { ... }` as (name, body), brace-matched."""
+    return [
+        (match.group(1), _block_body(text, match.end()))
+        for match in re.finditer(r'^variable\s+"([^"]+)"\s*\{', text, re.M)
+    ]
 
 
 def _block_body(text: str, start: int) -> str:

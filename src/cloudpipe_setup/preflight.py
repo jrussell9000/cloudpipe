@@ -472,6 +472,20 @@ def _check_prefix_lists(
     with contract 2.0, because nothing read it; the check keeps its identifier,
     and a dict, so a second id is one more entry rather than a new check.
     """
+    if not _globus_ingress_enabled(root):
+        # The only prefix list the stack references is the Globus host's SSH
+        # rule, inside `module.globus`. With the ingress off that module has no
+        # instances, so there is no rule to resolve an id for — and reporting
+        # this as outstanding would send a deployer to look up an id nothing
+        # reads. See the spec: a check whose subject is not configured is not run.
+        return _skipped(
+            CHECK_PREFIX_LISTS,
+            "Managed prefix lists",
+            "globus_enabled is not true in this root, so the stack creates no security-group "
+            "rule that references a managed prefix list.",
+            Remedy("human", "Nothing to do unless you enable the Globus ingress."),
+        )
+
     wanted = {}
     globus_id = _globus_prefix_list_id(root)
     if globus_id:
@@ -603,6 +617,23 @@ def _check_data_bucket(world: World, root: Path, identity: dict[str, Any] | None
         # boundary, and nothing later in the install mentions it again.
         message += f", which is not this deployment's region ({world.region})"
     return Record(identifier=CHECK_DATA_BUCKET, title="Data bucket", state="pass", message=message)
+
+
+def _globus_ingress_enabled(root: Path) -> bool:
+    """Whether this root stands up the Globus ingress — `globus_enabled`.
+
+    False when unset, which is the stack module's own default. The tfvars reader
+    returns a quoted string as its text and any other HCL value as source text,
+    so a bool arrives as `"true"`; a JSON tfvars file gives a real bool. Both are
+    accepted, and anything else is read as false, because the only value that
+    turns 52 resources on is one Terraform itself would read as true.
+    """
+    from . import roots
+
+    value, _ = roots.tfvars_assignments(root).get("globus_enabled", (None, None))
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() == "true"
 
 
 def _globus_prefix_list_id(root: Path) -> str | None:
@@ -756,6 +787,13 @@ def _check_globus_inputs(root: Path, repo: Path) -> Record:
     `terraform.tfvars.example` explicitly allows — that eight variables were unset
     when none was. Terraform does not care which file a value came from, so this
     does not either.
+
+    How many of the eight are checked depends on `globus_enabled`. Seven of them
+    are required only when the ingress is on, and demanding them from a
+    deployment that creates no Globus resource would be this command reporting a
+    prerequisite that does not exist. `globus_s3_destination_bucket` is checked
+    either way: despite the name it is the imaging data bucket, which the
+    pipeline reads whether or not anything Globus wrote it.
     """
     from . import roots, schema
 
@@ -770,6 +808,11 @@ def _check_globus_inputs(root: Path, repo: Path) -> Record:
             "Run this from a clone of the repository.",
             Remedy("human", f"Check that {variables_tf} is present and readable."),
         )
+
+    enabled = _globus_ingress_enabled(root)
+    if not enabled:
+        conditional = schema.variables_required_by_another(variables_tf.read_text())
+        expected = tuple(name for name in expected if name not in conditional)
 
     found = roots.globus_inputs(root, expected)
     if found.missing:
@@ -787,11 +830,12 @@ def _check_globus_inputs(root: Path, repo: Path) -> Record:
             "example terraform.tfvars.example shows; either satisfies Terraform.",
             remedy=Remedy("command", "pixi run globus init"),
         )
+    ingress = "" if enabled else " (globus_enabled is not true, so the ingress inputs are not)"
     return Record(
         identifier=CHECK_GLOBUS_INPUTS,
         title=title,
         state="pass",
-        message=f"all {len(expected)} Globus variables are set, in "
+        message=f"all {len(expected)} Globus variables are set{ingress}, in "
         f"{', '.join(path.name for path in found.sources)}.",
     )
 

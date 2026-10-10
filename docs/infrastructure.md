@@ -28,23 +28,24 @@ Its lock file is a byte-for-byte copy of the root's, asserted by that test. Afte
 
 ### Variables that must be set
 
-**Eighteen** variables have **no default**, because a default is one deployment's value handed to everyone who does not set it — and nothing errors. A fork inheriting `domain` publishes services under a domain it does not own; one inheriting `github_oidc_allowed_subs` trusts this repository's workflows to assume its roles. Without a default, Terraform prompts, or fails under `-input=false` naming the variable.
+**Eighteen** variables must be supplied, because a default is one deployment's value handed to everyone who does not set it — and nothing errors. A fork inheriting `domain` publishes services under a domain it does not own; one inheriting `github_oidc_allowed_subs` trusts this repository's workflows to assume its roles. Without a default, Terraform prompts, or fails under `-input=false` naming the variable.
 
-The five Globus identity variables — `globus_client_id`, `globus_org_name`, `globus_contact_email`, `globus_owner_email`, `globus_identity_domain` — are rendered by `globus init`. The other thirteen are below, because their defaults would be a claim about who is deploying. Both `terraform.tfvars.example` files are checked against the full eighteen, derived from `variables.tf` rather than listed, so a nineteenth is covered without anyone editing a test.
+Eleven have no default at all. The other seven are the Globus ingress's, and they are required **only when `globus_enabled` is true**: each defaults to the empty string and each `validation` refuses the empty string once the flag is on. Terraform has no "conditionally required" keyword, so that cross-variable validation *is* the declaration — and both the wizard and the tests derive the eighteen from it rather than keeping a list, so a nineteenth is covered without anyone editing anything.
 
-| Group | Variables |
-|---|---|
-| Identity | `domain` (may be `null`, for port-forward mode — see [deployer-first-hour.md](deployer-first-hour.md#reaching-the-web-uis-without-a-domain)), `operator_emails` |
-| AWS | `region`, `cloudflare_account_id`, `globus_admin_prefix_list_id` |
-| Source control | `github_user_url`, `github_repo`, `gitops_repo_url`, `github_oidc_allowed_subs` |
-| Data | `globus_s3_destination_bucket`, `globus_source_collection_id` |
-| Cloudflare Zero Trust | `cloudflare_team_domain`, `cloudflare_team_name` |
+| Group | Variables | Required |
+|---|---|---|
+| Identity | `domain` (may be `null`, for port-forward mode — see [deployer-first-hour.md](deployer-first-hour.md#reaching-the-web-uis-without-a-domain)), `operator_emails` | Always |
+| AWS | `region`, `cloudflare_account_id` | Always |
+| Source control | `github_user_url`, `github_repo`, `gitops_repo_url`, `github_oidc_allowed_subs` | Always |
+| Data | `globus_s3_destination_bucket` — the imaging data bucket, under a historical name | Always |
+| Cloudflare Zero Trust | `cloudflare_team_domain`, `cloudflare_team_name` | Always |
+| Globus ingress | `globus_admin_prefix_list_id`, `globus_source_collection_id`, `globus_client_id`, `globus_org_name`, `globus_contact_email`, `globus_owner_email`, `globus_identity_domain` | Only with `globus_enabled = true`; `globus init` renders all seven |
 
 `operator_emails` is who runs the deployment: the administrators of every web UI, and — with the Amazon Cognito user pool the stack creates by default — who may enroll a WARP device and reach the cluster.
 
-All thirteen carry a `validation` block except `cloudflare_team_name`, which Cloudflare generates, so there is no shape to check. `tests/test_terraform_required_variables.py` keeps the facts aligned: no default, a validation block, and a line in the example file for each one the root does not compute itself.
+All of them carry a `validation` block except `cloudflare_team_name`, which Cloudflare generates, so there is no shape to check. `tests/test_terraform_required_variables.py` keeps the facts aligned: no inherited value, a validation block, and a line in the example file for each one the root does not compute itself. An empty default passes that test only beside a validation that refuses the empty value when another variable says it is needed — which is the Globus shape, and nothing else.
 
-Two placeholders in the example root's `terraform.tfvars.example` are deliberately **not** well-formed. `globus_source_collection_id` and `globus_client_id` are UUIDs, that file is published, and the publish gate fails on any 8-4-4-4-12 hex string — a valid-looking placeholder is indistinguishable from a real collection identifier both to the gate and to a reader. Terraform's `validation` rejects them until they are replaced, which is the intended failure.
+Two placeholders in the example root's `terraform.tfvars.example` are deliberately **not** well-formed. `globus_source_collection_id` and `globus_client_id` are UUIDs, that file is published, and the publish gate fails on any 8-4-4-4-12 hex string — a valid-looking placeholder is indistinguishable from a real collection identifier both to the gate and to a reader. Terraform's `validation` rejects them once `globus_enabled` is true, which is the intended failure; with the ingress off they are inert, so that file applies as shipped.
 
 Everything else keeps its default on purpose. `prefect_namespace` and `vpc_cidr` are sane starting values, not claims about who is deploying.
 
@@ -421,6 +422,8 @@ Container Insights was removed entirely on 2026-09-08, for the same reason fluen
 
 ## Globus Connect Server (EC2)
 
+**Optional, and off by default.** Everything in this section exists only when `globus_enabled = true`. The module is 52 resources behind one `count`, and enabling it needs a Globus subscription, a registered service client, a managed prefix list and a GCS AMI built from `packer/globus-gcs/` in the deploying account — the `globus_ami_id` committed in `terraform/modules/stack/globus.tf` is this deployment's image and is shared with nobody. With the flag false the pipeline runs in `ingress-mode=presynced` and reads whatever is already in the data bucket. See [deployer-first-hour.md](deployer-first-hour.md#step-5--decide-whether-you-are-running-the-globus-ingress).
+
 The Globus Connect Server runs on a standalone EC2 instance in a public subnet, separate from EKS.
 
 | Attribute | Value |
@@ -463,7 +466,7 @@ The Globus instance is stopped when not actively transferring; `start-globus-ins
 | `addons` | `modules/addons` | Pod Identity associations for cert-manager, External Secrets, AWS LBC |
 | `argo-workflows` | `modules/argo-workflows` | RDS instance, IAM/Pod Identity, RBAC, network policies, metrics; PgBouncer Deployment + Service in `gitops/apps/argo-workflows/templates/` |
 | `finops` | `modules/finops` | Kubecost Helm release, Athena CUR table, IAM for cost data |
-| `globus` | `modules/globus` | EC2 instance, EIP, security group, IAM role, SSM parameters |
+| `globus` | `modules/globus` | EC2 instance, EIP, security group, IAM role, SSM parameters. Only with `globus_enabled = true` |
 | `karpenter` | `modules/karpenter` | Karpenter Helm release, NodePool/NodeClass manifests |
 | `metrics` | `modules/metrics` | Glue catalog database + 9 raw and 9 compacted hand-declared catalog tables (**no crawlers**), Athena `cloudpipe_metrics_workgroup`, Grafana Pod Identity |
 | `prefect` | `modules/prefect` | RDS instance, IAM/Pod Identity, RBAC, network policies |
@@ -498,7 +501,7 @@ The table is the same one `--list-phases` prints; a test holds the two equal, so
 | Phase | What happens | Public endpoint |
 |---|---|---|
 | 1 | **Network and cluster, with the public endpoint open for bootstrapping.** `-target` the VPC, then EKS, with `endpoint_public_access=true` (bootstrapping needs a reachable API). Then `aws eks update-kubeconfig`, log Helm in to ECR Public, and pre-create the `argo-workflows` namespace — Phase 2's resources need it before ArgoCD has synced anything | open |
-| 2 | **Add-on modules, Pod Identity associations and the ArgoCD bootstrap.** `-target` each in turn: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, Globus, FinOps | open |
+| 2 | **Add-on modules, Pod Identity associations and the ArgoCD bootstrap.** `-target` each in turn: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, Globus, FinOps. The Globus target is a no-op when `globus_enabled` is false — Terraform reports "No changes" for a module call with no instances, rather than an error | open |
 | 3 | **The kube-system NetworkPolicies, before strict VPC CNI mode.** Strict mode blocks every pod with no policy, CoreDNS included, and the cluster deadlocks | open |
 | 4 | **Full apply with crds_available false, then sync the tunnel token.** Creates the Cloudflare tunnel, its Access applications, and the VPN. The token sync is part of this phase; the commands are below for an operator doing it by hand against a half-built cluster | open |
 | 5 | **Wait for ArgoCD to install the CRDs and report them established.** `clustersecretstores.external-secrets.io` and `prometheusrules.monitoring.coreos.com`, each polled for existence and then for `Established` | open |
@@ -573,7 +576,8 @@ its teardown order by reversing the same list rather than keeping a second copy.
 | `vpc_cni_network_policy_enabled` | `false` | Set `true` from Phase 6. Turns the VPC CNI network-policy **agent** on; `false` makes every NetworkPolicy in the cluster inert. Persisted in `install-state.auto.tfvars` |
 | `vpc_cni_strict_mode` | `false` | **Opt-in; the installer never sets it.** Chooses strict over standard enforcement, and only has effect while the agent above is on. Strict mode denies any pod that no NetworkPolicy selects, and this repo ships policies for four namespaces out of roughly twenty in a running cluster — see [Enabling NetworkPolicy enforcement](operations.md#enabling-networkpolicy-enforcement) and #746 |
 | `operator_emails` | — | The operators: administrators of every web UI and, with Cognito, who may reach the cluster |
-| `globus_client_id` | — | Globus service account app client ID (no default — must be provided) |
+| `globus_enabled` | `false` | Set `true` to stand up the Globus Connect Server ingress — 52 resources, and four prerequisites no fork inherits. False is a complete deployment reading pre-staged data |
+| `globus_client_id` | `""` | Globus service account app client ID. Required, and refused empty, once `globus_enabled` is true — as are the other six ingress inputs |
 | `globus_s3_destination_bucket` | — | The data bucket (no default — must be provided) |
 | `kubernetes_version` | `1.35` | Bump for EKS version upgrades |
 | `domain` | — | Base domain for every service hostname, or `null` for port-forward mode (no default — must be provided) |
