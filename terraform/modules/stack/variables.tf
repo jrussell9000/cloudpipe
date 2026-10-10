@@ -76,6 +76,19 @@ variable "name" {
 # root validates the name where a deployer supplies it, and a validation on a
 # nullable variable would have to special-case null in a way the wizard's schema
 # mirror then has to translate.
+# False is the published default because a deployer who forked the public tree has
+# a public GitOps repository, and ArgoCD clones those anonymously — no credential,
+# no hand-made Secrets Manager secret, nothing to expire. This deployment sets it
+# true from the internal root, because its GitOps repository is private.
+#
+# There is no way to derive this from the URL: whether a repository is private is
+# not visible in its clone address.
+variable "gitops_repo_private" {
+  description = "Whether gitops_repo_url needs credentials to clone. True reads a PAT from the Secrets Manager secret cloudpipe/github-pat as {\"password\": \"...\"}."
+  type        = bool
+  default     = false
+}
+
 variable "metrics_bucket" {
   description = "Name of the metrics bucket, created by the bootstrap root. Null uses <name>-metrics."
   type        = string

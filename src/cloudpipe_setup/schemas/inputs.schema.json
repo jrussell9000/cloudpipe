@@ -27,7 +27,7 @@
       "pattern": "^[a-z]{2}(-gov)?-[a-z]+-[0-9]$",
       "x-error-message": "region must be an AWS region id: two letters, a dash, a word, a dash, a digit.",
       "title": "AWS region",
-      "description": "The region holding the cluster and almost everything else. Two things are always us-east-1 regardless of this value — ACM certificates attached to CloudFront, and the ECR Public token — which is why the example root configures that as a separate provider alias rather than deriving it.",
+      "description": "Where this deployment runs. Choose a region close to you, or to wherever your imaging data already sits — every transfer between the data bucket and the cluster stays inside one region, so the two should match. Region ids look like eu-west-1 or ap-southeast-2; the full list is at https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-regions.html. Check EKS and the GPU instance types you want are offered there before committing: not every region has both.",
       "x-section": "aws",
       "x-source": "deployer-choice",
       "x-terraform-variable": "region"
@@ -190,7 +190,7 @@
       "pattern": "^[0-9a-f]{32}$",
       "x-error-message": "cloudflare_account_id must be the 32-character hex account id from the Cloudflare dashboard.",
       "title": "Cloudflare account ID",
-      "description": "The account that owns the Zero Trust organization: 32 lowercase hex characters. It is in the Cloudflare dashboard URL once you have selected the account.",
+      "description": "The account this deployment builds in: 32 lowercase hex characters, not your login email. Quickest way to get it: in the Cloudflare dashboard press Cmd/Ctrl+K, type 'Copy account ID', and select the result — it copies to your clipboard. It is also under Workers & Pages > Account Details, with a copy button. If you already have the API token exported, `curl -s https://api.cloudflare.com/client/v4/accounts -H \"Authorization: Bearer $CLOUDFLARE_API_TOKEN\"` lists every account the token can see, which also confirms the token is scoped to the one you mean.",
       "x-section": "cloudflare",
       "x-source": "cloudflare-dashboard",
       "x-terraform-variable": "cloudflare_account_id"
@@ -200,7 +200,7 @@
       "pattern": "\\.cloudflareaccess\\.com$",
       "x-error-message": "cloudflare_team_domain must end in .cloudflareaccess.com.",
       "title": "Zero Trust team domain",
-      "description": "The Zero Trust team domain, <team>.cloudflareaccess.com. It is the organization's auth_domain and the host that WARP and the browser are sent to, so it has to match what Cloudflare assigned this account — it is not a name you choose here.",
+      "description": "The host your operators sign in at: <team>.cloudflareaccess.com. You choose the <team> part — it is the team name you set when you turn on Zero Trust in the Cloudflare dashboard, and this field is where you repeat the result. It becomes the organization's auth_domain, so it appears in every URL WARP and the browser send people to. If this account already has Zero Trust enabled, give the domain it already has rather than inventing a new one.",
       "x-section": "cloudflare",
       "x-source": "cloudflare-dashboard",
       "x-terraform-variable": "cloudflare_team_domain"
@@ -209,7 +209,7 @@
       "type": "string",
       "minLength": 1,
       "title": "Zero Trust organization name",
-      "description": "The organization's name as Cloudflare generated it. A separate value from the team domain and NOT derivable from it: reading it back from the dashboard is the only way to get it right.\n\nNo pattern is checked here, deliberately — Cloudflare generates the value and there is no shape to check, which is also why Terraform does not constrain it. Get it wrong and nothing rejects it: the organization is silently renamed.",
+      "description": "A label for the Zero Trust organization — choose one, there is nothing to look up. The deployment's own name is a good answer.\n\nTerraform sets this on the organization, so whatever you give replaces the placeholder Cloudflare generated when Zero Trust was first enabled. That placeholder often looks like a domain, which is not the team domain above — the two are separate fields. No pattern is checked because any readable string is valid.",
       "x-section": "cloudflare",
       "x-source": "cloudflare-dashboard",
       "x-terraform-variable": "cloudflare_team_name"
