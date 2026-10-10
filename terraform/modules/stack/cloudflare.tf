@@ -119,6 +119,17 @@ locals {
   cloudflare_team_domain = var.cloudflare_team_domain
 }
 
+# Both `auth_domain` and `name` are values this deployment SETS, not values it
+# reads back: the provider writes them with `PUT /accounts/{id}/access/organizations`.
+# A deployer therefore chooses them — the team domain when they turn Zero Trust on
+# in the dashboard, the name freely — which is what the wizard's prompts now say.
+#
+# The API's own warning applies to anything NOT listed below: "to avoid
+# overwriting existing configurations, provide all organization fields". So MFA
+# settings, AMR matching and session durations configured in the dashboard can be
+# reset by an apply here. Only the three fields below are managed; if a
+# deployment needs one of the others, declare it rather than setting it in the
+# dashboard, because a later apply will not preserve it.
 resource "cloudflare_zero_trust_organization" "this" {
   account_id                 = var.cloudflare_account_id
   auth_domain                = local.cloudflare_team_domain
