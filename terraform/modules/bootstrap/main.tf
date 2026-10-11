@@ -1,13 +1,15 @@
 ################################################################################
 # The buckets that must exist before the stack's first apply.
 #
-# Apply this root ONCE, before anything else, from the directory it lives in:
+# Apply this root ONCE, before anything else — from a COPY OUTSIDE YOUR CLONE,
+# never from here. Its state is a local file (see versions.tf), and applied in
+# place that file lands inside a git checkout, where `git clean -fdx` or deleting
+# the clone to start again takes the only record of the three buckets that
+# outlive every cluster. `pixi run cloudpipe setup` prints the command, which
+# copies this directory to <your deployment root>/bootstrap and applies it there.
 #
-#   terraform init && terraform apply
-#
-# with a terraform.tfvars naming the three buckets and the region. It creates
-# nothing else: there is no `module` block here, so the worst an accidental
-# apply can do is make buckets.
+# It creates nothing else: there is no `module` block here, so the worst an
+# accidental apply can do is make buckets.
 #
 # WHY THIS IS A SEPARATE ROOT, with its own local state (see versions.tf):
 #

@@ -14,9 +14,34 @@ The wizard will ask you for twelve values. Most you can read off a dashboard in 
 | You must already own | Why | Where it is checked |
 |---|---|---|
 | An **AWS account** you can reach with an AWS CLI v2 SSO profile | Static access keys are not supported anywhere in this tooling | `cloudpipe preflight`, check `aws.identity` |
-| A **Cloudflare account with Zero Trust enabled**, and an API token scoped to it | The deployment creates Access applications and policies | `cloudflare.token` |
+| A **Cloudflare account with Zero Trust enabled**, and an API token for it with four permission groups — see [below](#the-cloudflare-account-and-its-token) | The deployment creates a tunnel, Access applications and policies, and the WARP device settings | `cloudflare.token` |
 | A **name for the imaging data bucket**, which you supply as `globus_s3_destination_bucket` | The bucket itself is created in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack), by Terraform, along with the other two that outlive a cluster. You only have to decide what it is called — or name one you already have, and tell that root not to create it | `aws.data_bucket` |
 | *Optional:* a **Route53 hosted zone** in that account for the domain you will publish services under | Certificate validation is DNS-based, and it runs against the zone this account owns. Without a domain, answer `none`: nothing is published, and you reach each UI through a port-forward (see [below](#reaching-the-web-uis-without-a-domain)) | `aws.hosted_zone` |
+
+### The Cloudflare account and its token
+
+**Use a Cloudflare account of its own for each deployment.** The Access organization, the WARP device profile and the device settings are one-per-account, and the stack manages all three. Pointing a second deployment at an account another deployment already uses rewrites that deployment's settings, with no error. A Zero Trust organization belongs to exactly one account, so a second deployment means a second account.
+
+**Enable Zero Trust once, in the dashboard.** Open **Zero Trust** from the account's sidebar. Cloudflare asks you to choose a **team name**, and that choice becomes your **team domain**, `<team-name>.cloudflareaccess.com`. The Free plan asks for payment details and charges nothing. Note both values: the wizard asks for them, together with the account id. All three are values you chose or that Cloudflare shows you, not ones you have to look up somewhere else.
+
+**Create the API token from the link the tooling prints.** `cloudpipe setup` ends by printing a dashboard link, and `cloudpipe preflight` prints it again whenever the token is missing or wrong. The link opens Cloudflare's token form with every permission already selected and the token already scoped to your account, so there is nothing to choose: review it, create it, and export it in the shell you install from:
+
+```bash
+export CLOUDFLARE_API_TOKEN=<the token>
+```
+
+If you would rather fill the form in by hand, these are the four rows. Each is scoped to **Account**, and **Account Resources** must include this deployment's account:
+
+| Permission group | Level | The stack needs it for |
+|---|---|---|
+| Access: Organizations, Identity Providers, and Groups | Write | the Zero Trust organization |
+| Access: Apps and Policies | Write | the two Access applications and their policies |
+| Cloudflare Tunnel | Write | the tunnel and its private-network route |
+| Zero Trust | Edit | the WARP device profile and device settings |
+
+The levels really do differ between rows: the dashboard offers Read/Write for the first three groups and Read/Edit for the last.
+
+Two mistakes look identical from the outside, and preflight tells them apart. If **every** permission is refused, the token almost certainly belongs to a different account; the usual cause is having another deployment's token exported in the same shell. If only **some** are refused, the token is missing those groups. A permission you add to an existing token reaches Cloudflare's endpoints unevenly over several minutes, so wait and re-run preflight rather than editing the token again.
 
 You do **not** need anything from your institution's IT department. Sign-in goes through an Amazon Cognito user pool the deployment creates in your own account, with an authenticator app required as a second factor. You only decide who the operators are: the wizard asks for their email addresses, and during the install you create a Cognito user for each (step 8).
 
@@ -104,7 +129,10 @@ Three details that matter in practice:
 - **One field is computed, not asked.** The GitHub OIDC subject claim is derived from the repository you gave. It is displayed and you can change it: set it explicitly in the answers document and the wizard keeps your value, saying so rather than silently recomputing it. This matters because a wrong subject claim does not fail anything — it just quietly denies your CI the credentials it asked for.
 - **It will not overwrite a file it did not write.** An existing `terraform.tfvars` is an error, not a merge. Pass `--force` if you mean to replace it.
 
-The eight Globus variables are deliberately **not** asked for here. They belong to a separate tool, covered in step 5.
+Two kinds of value are deliberately **not** asked for here:
+
+- **`globus_s3_destination_bucket`**, the imaging data bucket. Despite the prefix it is required whether or not you run Globus. You choose its name in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) and then add it to `terraform.tfvars` by hand; the header of the rendered file says so, and preflight reports it if you forget.
+- **The Globus ingress's seven inputs**, needed only if you enable the ingress. They belong to a separate tool, covered in step 5.
 
 ### Driving it from a script
 
@@ -130,18 +158,32 @@ Worth stating explicitly, because it changes how you prepare:
 
 ## Step 4 — create the three buckets that come before the stack
 
-Three buckets have to exist before the stack's first apply, and all three have to survive its last teardown. One published Terraform root creates them, and it is the first thing you apply:
+Three buckets have to exist before the stack's first apply, and all three have to survive its last teardown. One published Terraform root creates them, and it is the first thing you apply. **Apply a copy of it in your deployment root, never the original in your clone**:
 
 ```bash
-terraform -chdir=<your-clone>/terraform/modules/bootstrap init
-terraform -chdir=<your-clone>/terraform/modules/bootstrap apply \
+mkdir -p ~/my-cloudpipe-deployment/bootstrap
+cp ~/cloudpipe/terraform/modules/bootstrap/*.tf \
+   ~/cloudpipe/terraform/modules/bootstrap/.terraform.lock.hcl \
+   ~/my-cloudpipe-deployment/bootstrap/
+terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap init
+terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap apply \
   -var region=<region> \
   -var state_bucket=<your-state-bucket> \
   -var data_bucket=<your-imaging-data-bucket> \
   -var metrics_bucket=<your-cluster-name>-metrics
 ```
 
-`cloudpipe setup` prints that command with your own answers filled in. What each bucket is, and why its settings differ:
+`cloudpipe setup` prints that command with your own paths and answers filled in. Why the copy matters: this root keeps its state in a local file, and applied in place that file would sit inside a git checkout, where `git clean -fdx` or deleting the clone to start again would take the only record of the three buckets. Terraform reads only the top level of a directory, so the stack root ignores the `bootstrap/` subdirectory.
+
+Then add the data bucket's name to the stack root's `terraform.tfvars`. It is the one stack input the wizard does not write:
+
+```hcl
+globus_s3_destination_bucket = "<your-imaging-data-bucket>"
+```
+
+`terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap output` prints all three names if you need them again.
+
+What each bucket is, and why its settings differ:
 
 | Bucket | Holds | Versioning |
 |---|---|---|
@@ -228,22 +270,25 @@ pixi run cloudpipe preflight --account <your-aws-account-id>
 
 Preflight checks what your answers assert about the world, which is a different question from whether the answers are well-formed. It is read-only: every call it makes is a read, and it creates, modifies and deletes nothing. You can re-run it, paste its output into a ticket, and run it against a deployment somebody else built.
 
-Nine checks, in order:
+Eleven checks, in order:
 
 | Check | What it confirms |
 |---|---|
 | `aws.identity` | Credentials resolve, are not expired, and came from an SSO profile |
 | `aws.account` | The resolved account is the one you intended |
 | `aws.hosted_zone` | A hosted zone with exactly your domain's name exists in that account. Skipped, not failed, with `domain: null` |
-| `aws.prefix_lists` | The Globus managed prefix list ID resolves in this account and region |
-| `aws.data_bucket` | `globus_s3_destination_bucket` exists in this account. The stack configures that bucket — access logging, lifecycle rules, the Argo and Prefect policies scoped to its ARN — and never creates it; [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) is what does. Says so if it is in another region, which costs transfer on every ingest. Skipped when the Globus inputs have not been rendered yet |
-| `cloudflare.token` | The token is valid, active, and can read Zero Trust configuration in your account |
+| `aws.prefix_lists` | The Globus managed prefix list ID resolves in this account and region. Skipped when `globus_enabled` is not true, because no rule references one |
+| `aws.data_bucket` | `globus_s3_destination_bucket` exists in this account. The stack configures that bucket — access logging, lifecycle rules, the Argo and Prefect policies scoped to its ARN — and never creates it; [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) is what does. Says so if it is in another region, which costs transfer on every ingest. Skipped when the variable is not set yet |
+| `aws.amis` | The machine images the stack launches are visible from this account. **Fails** if `globus_enabled` is true and the Globus host's AMI is not visible, because the phase 4 apply would fail on it after the cluster exists. Reports **WAIT** if no GPU node image matches the Karpenter selector yet: that image is baked from your own container images after the install ([pre-baked-amis.md](pre-baked-amis.md)), and until one exists the GPU steps get no node. WAIT does not change the exit code |
+| `cloudflare.token` | The token is valid and active, and each of the [four permission groups](#the-cloudflare-account-and-its-token) can read its part of your account. Says whether a refusal looks like a token for a different account or one missing particular groups. Read is what a read-only check can prove; a token made from the printed link has Write |
 | `federation.metadata` | A federated provider's discovery document or SAML metadata is reachable. Skipped when nothing is federated |
 | `federation.mfa_evidence` | Exactly one form of multifactor evidence is declared |
 | `federation.client_secret` | A federated OIDC provider's hand-created client secret exists |
-| `globus.inputs` | Every Globus variable is set in a file Terraform loads — rendered by `globus init`, or by hand in `terraform.tfvars` |
+| `globus.inputs` | Every Globus variable this deployment needs is set in a file Terraform loads — rendered by `globus init`, or by hand in `terraform.tfvars`. With the ingress off that is only the data bucket |
 
-Exit `3` if any check failed, `0` if they all passed or were skipped.
+Exit `3` if any check failed, `0` if every check passed, was skipped, or is marked WAIT.
+
+The marks in the output are `ok`, `FAIL`, `skip` and `WAIT`.
 
 **Read the skips.** A check that could not be performed reports `skipped`, never `pass`, and names what was missing — usually an IAM action your credentials do not have. A skip is not a failure: the apply itself may not need you to hold that read permission, so preflight exits `0` with skips and says in its closing line how many there were. But it is also not a pass. A green exit code on a run that could not look at half the world is the one outcome this command is built to avoid handing you, and the count is there so you can tell the difference.
 
