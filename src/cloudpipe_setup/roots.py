@@ -176,6 +176,63 @@ def globus_inputs(root: Path, expected: tuple[str, ...]) -> GlobusInputs:
     return GlobusInputs(tuple(expected), tuple(missing), tuple(sources))
 
 
+#: Despite the `globus_` prefix, the imaging data bucket: required with or without
+#: the ingress, and created by the bootstrap root rather than by `globus init`.
+DATA_BUCKET_VARIABLE = "globus_s3_destination_bucket"
+
+
+def globus_ingress_enabled(root: Path) -> bool:
+    """Whether this root stands up the Globus ingress — `globus_enabled`.
+
+    False when unset, which is the stack module's own default. The tfvars reader
+    returns a quoted string as its text and any other HCL value as source text,
+    so a bool arrives as `"true"`; a JSON tfvars file gives a real bool. Both are
+    accepted, and anything else is read as false, because the only value that
+    turns 52 resources on is one Terraform itself would read as true.
+    """
+    value, _ = tfvars_assignments(root).get("globus_enabled", (None, None))
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def wanted_globus_inputs(root: Path, variables_tf: Path) -> tuple[str, ...] | None:
+    """The Globus-owned variables THIS root has to set, or None if underivable.
+
+    All eight with the ingress on; only the data bucket with it off, because the
+    other seven are required only when `globus_enabled` says so. One function for
+    both `cloudpipe setup`'s closing message and `cloudpipe preflight`, which
+    disagreed once: preflight learned about the flag and setup went on telling a
+    no-ingress deployment that seven variables were missing.
+    """
+    from . import schema
+
+    expected = schema.globus_variables(variables_tf)
+    if expected is None or globus_ingress_enabled(root):
+        return expected
+    conditional = schema.variables_required_by_another(variables_tf.read_text())
+    return tuple(name for name in expected if name not in conditional)
+
+
+def missing_globus_remedy(root: Path, missing: tuple[str, ...]) -> tuple[str, str]:
+    """(kind, text) of the action that sets `missing` — which depends on what is missing.
+
+    `pixi run globus init` renders the ingress's inputs from a Globus answers
+    document. It is the wrong advice for the data bucket alone: a deployment
+    without the ingress has no reason to write that document, and the bucket's
+    name is one the deployer already chose for the bootstrap root.
+    """
+    if tuple(missing) == (DATA_BUCKET_VARIABLE,):
+        return (
+            "human",
+            f"Add `{DATA_BUCKET_VARIABLE} = \"<name>\"` to {root / 'terraform.tfvars'}, using the "
+            "data_bucket name you gave the bootstrap root (`terraform -chdir="
+            f"{root / 'bootstrap'} output` prints it). The prefix is historical: this is the "
+            "imaging data bucket, and the stack needs it whether or not Globus is enabled.",
+        )
+    return ("command", "pixi run globus init")
+
+
 def _hcl_assignments(text: str) -> dict[str, Any]:
     found: dict[str, Any] = {}
     depth = 0

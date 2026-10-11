@@ -1,0 +1,215 @@
+# Pre-registered equivalence margins for the cloudpipe / fMRIPrep comparison.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ STATUS: draft. These numbers are PROPOSALS, not pre-registered margins.  │
+# │ `load_margins()` refuses to serve a draft for a primary analysis.        │
+# │                                                                          │
+# │ To pre-register: review every entry, overwrite the numbers, rewrite the  │
+# │ justifications in your own terms, set `status: committed`, and commit.    │
+# │ The COMMIT DATE is the evidence that the margins preceded the results    │
+# │ (D7), so that commit must land before the first comparison is computed.  │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Set these BEFORE the pilot, not after. The pilot produces the same endpoint
+# values the main run does, and the spec permits its numbers to inform the
+# VARIANCE only (for sizing), never the levels. Choosing a threshold after
+# seeing where the pilot's means landed is peeking, and it converts a
+# pre-registered comparison into an exploratory one.
+#
+# `confidence` is the drafter's, and says how much reviewer attention an entry
+# needs — it is not part of the decision rule.
+#   high   — the number follows from the quantity's definition
+#   medium — argued from convention or from the endpoint's role
+#   low    — a placeholder with no anchor; a reviewer should expect to replace it
+#
+# Tier-1 agreement statistics take a one-sided non-inferiority threshold, tested
+# on the Fisher z scale for correlations. Tier-2 differences take a symmetric
+# TOST margin on `cloudpipe - reference`. See D7 and D13.
+
+status: draft
+drafted: 2026-10-09
+drafted_by: claude-opus-5
+power: 0.8
+alpha: 0.05
+
+endpoints:
+  # ---------------------------------------------------------------- tier 1
+  - name: mean_image_correlation
+    tier: 1
+    test: non_inferiority
+    scale: fisher_z
+    threshold: 0.95
+    unit: pearson_r
+    confidence: medium
+    anchor: convention
+    justification: >
+      Voxelwise correlation of the temporal mean image within the shared mask.
+      Both arms consume the same input, share the same anatomy and write the
+      same grid, so the only differences are the functional stages under test;
+      a value below 0.95 would indicate a gross failure rather than a
+      difference in method. Set to catch that, not to resolve fine structure.
+      The storage quantisation floor sits around 0.9999 and so does not
+      constrain this. No cross-pipeline reliability literature exists for this
+      quantity on matched grids, which is why the confidence is not high.
+
+  - name: brain_mask_dice
+    tier: 1
+    test: non_inferiority
+    scale: identity
+    threshold: 0.90
+    unit: dice
+    confidence: medium
+    anchor: role
+    justification: >
+      Dice of the two arms' brain masks. Justified by this endpoint's role
+      rather than by a reliability figure: the mask intersection is the support
+      for every other tier-1 comparison, so the threshold's job is to guarantee
+      the intersection is large enough for those numbers to mean something. The
+      spec already requires this Dice to be reported alongside every masked
+      comparison, so a value near the threshold is visible to a reader rather
+      than hidden inside a correlation.
+
+  - name: tsnr_map_correlation
+    tier: 1
+    test: non_inferiority
+    scale: fisher_z
+    threshold: 0.90
+    unit: pearson_r
+    confidence: low
+    anchor: convention
+    justification: >
+      Voxelwise correlation of the tSNR maps. Looser than the mean-image
+      threshold because tSNR is a ratio of two noisy estimates and is
+      correspondingly less stable, but the factor by which it is looser is a
+      guess. A reviewer should either anchor this on a published tSNR
+      reproducibility figure or argue the endpoint down to descriptive.
+
+  - name: grayordinate_tail_correlation
+    tier: 1
+    test: non_inferiority
+    scale: fisher_z
+    threshold: 0.60
+    unit: pearson_r
+    confidence: low
+    anchor: none
+    justification: >
+      Fifth percentile of the per-grayordinate temporal correlation across the
+      59412 cortical grayordinates (GRAYORDINATE_TAIL_PERCENTILE). This is a
+      TEMPORAL correlation of two timeseries, not a spatial one, so it is
+      inherently far below the spatial endpoints, and the tail is the hardest
+      part of its distribution by construction. 0.60 is a placeholder with no
+      anchor behind it. This is the entry most likely to be wrong and the one
+      where a statistical reviewer is worth the most.
+
+  - name: tsnr_median_difference
+    tier: 1
+    test: tost
+    scale: identity
+    margin: 5.0
+    unit: tsnr
+    confidence: medium
+    anchor: proportion_of_typical
+    justification: >
+      Signed difference in median tSNR, cloudpipe minus reference. A difference
+      rather than an agreement statistic, so it takes a symmetric TOST margin.
+      Typical cloudpipe values run 45-50, so +/-5 is roughly a tenth of the
+      measurement. Preferable to an absolute-difference formulation because the
+      sign distinguishes which arm is higher, which D13 requires.
+      NOTE: `tsnr_median` also appears as a tier-2 ICC and Bland-Altman
+      endpoint. Decide whether both are reported or whether the tier-2 entry is
+      descriptive, so one quantity does not contribute twice to the verdict.
+
+  # ---------------------------------------------------------------- tier 2
+  - name: gcor
+    tier: 2
+    test: tost
+    scale: identity
+    margin: 0.05
+    unit: correlation
+    confidence: medium
+    anchor: proportion_of_typical
+    justification: >
+      Global correlation. Observed cloudpipe values run roughly 0.12-0.26, so
+      +/-0.05 is a substantial fraction of the range and is deliberately
+      generous: gcor absorbs real global neural signal as well as artefact and
+      has no agreed quality direction (QUALITY_DIRECTION leaves it undirected),
+      so a tight margin here would be the weakest claim in the study.
+
+  - name: aor
+    tier: 2
+    test: tost
+    scale: identity
+    margin: 0.002
+    unit: fraction
+    confidence: low
+    anchor: none
+    justification: >
+      AFNI outlier ratio, mean fraction of outlier voxels per frame. Observed
+      values are small (order 0.005), so an absolute margin is awkward and
+      +/-0.002 is close to half the typical value. A reviewer should consider
+      testing the ratio rather than the difference, or demoting this to
+      descriptive.
+
+  - name: aqi
+    tier: 2
+    test: tost
+    scale: identity
+    margin: 0.002
+    unit: index
+    confidence: low
+    anchor: none
+    justification: >
+      AFNI quality index, mean 1 minus the Spearman correlation with the median
+      volume. Same difficulty as `aor`: observed values are order 0.001-0.005,
+      so this margin is of the same size as the measurement. Placeholder.
+
+  - name: n_cosines
+    tier: 2
+    test: tost
+    scale: identity
+    margin: 0.0
+    unit: count
+    confidence: high
+    anchor: definition
+    justification: >
+      Count of discrete-cosine drift regressors. Both pipelines build the same
+      basis from the run length and the TR, so for runs that passed the
+      frame-count eligibility gate the counts must be identical. The margin is
+      exact: any disagreement is a defect in one implementation, not a
+      difference to be tolerated, and should be investigated rather than
+      reported as non-equivalence.
+
+# Endpoints the drafter recommends reporting DESCRIPTIVELY rather than as
+# equivalence endpoints. Each is a quantity the two pipelines are designed to
+# compute differently, so a margin would test a known design difference and
+# report it as a pipeline disagreement. Moving any of these out of the endpoint
+# set is a spec change and needs the operator's decision, not the drafter's.
+recommended_descriptive:
+  - name: mean_fd
+    reason: >
+      The arms derive FD from different motion estimates by design — ABCD's
+      3dvolreg parameters against fMRIPrep's own mcflirt re-estimation — so a
+      difference is an estimator difference and carries no quality direction. A
+      margin here tests whether two motion estimators agree, which is not this
+      study's question. The same reasoning put the cloudpipe/ABCD FD pair on
+      the abcd_tabulated refusal list.
+
+  - name: max_fd
+    reason: >
+      Same estimator difference as `mean_fd`, and a maximum over ~370 frames is
+      additionally unstable: one frame decides it.
+
+  - name: mean_dvars
+    reason: >
+      DVARS is in arbitrary intensity units that depend on the scaling of the
+      input, so an absolute margin is not portable and a relative one needs a
+      ratio test this harness does not implement. Report the ICC and the
+      Bland-Altman limits instead.
+
+  - name: acompcor_principal_angles
+    reason: >
+      cloudpipe runs aCompCor per tissue mask and fMRIPrep runs it on a merged
+      mask (D3), so the two subspaces are built from different inputs and are
+      EXPECTED to differ. The principal angles are informative about how much,
+      and that is worth reporting, but a threshold on them would test a design
+      difference that is already documented.

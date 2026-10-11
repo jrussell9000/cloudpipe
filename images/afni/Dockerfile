@@ -33,8 +33,8 @@ FROM public.ecr.aws/docker/library/debian:bookworm-slim AS afni-dist
 # NIMH publishes no versioned artifact. `--build-arg AFNI_SHA256=` (empty) skips
 # the digest check for an emergency build; the version assertion still applies.
 ARG AFNI_URL=https://afni.nimh.nih.gov/pub/dist/tgz/linux_ubuntu_24_64.tgz
-ARG AFNI_SHA256=d5b20bf8b7af281bea0341800632916d8b124145d7a9f4668d1b2896aa9d7daa
-ARG AFNI_VERSION=AFNI_26.2.09
+ARG AFNI_SHA256=b2f834925818d1b8b38a4ae2a337af067bd8ad160d05d39c642ecc7661840d85
+ARG AFNI_VERSION=AFNI_26.3.02
 
 # Programs lifted out of the tarball. preproc.py shells out to exactly ONE AFNI
 # binary — 3dcalc, for Stage 5's MNI masking — so that is all that ships. Adding
@@ -148,6 +148,10 @@ RUN echo "#!/bin/bash" > /entrypoint.sh && \
     chmod +x /entrypoint.sh
 
 COPY images/afni/preproc.py images/afni/surf_geometry.py ./
+
+# The IQMs and FuncQC record preproc.py imports. Shared with src/equivalence, which
+# recomputes the same record from another pipeline's outputs with this same code.
+COPY images/shared/func_iqm.py /app/func_iqm.py
 
 # Exploded-derivative link replay (ADR 017). ONLY restore_links.py — this image
 # has no boto3 and no AWS CLI, and deliberately keeps it that way: Argo does the

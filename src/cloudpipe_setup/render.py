@@ -20,6 +20,7 @@ that decides where their state lives.
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +38,14 @@ TFVARS_HEADER = """\
 # editing the answers document and re-rendering with --force, so that the two do
 # not drift and the next machine you resume on has the same values.
 #
-# The Globus inputs are NOT here. `pixi run globus init` renders them into
-# globus.auto.tfvars, which Terraform loads after this file.
+# Two kinds of value are NOT here, because this tool does not own them:
+#
+#   * globus_s3_destination_bucket — the imaging data bucket, despite the name,
+#     and required either way. Add it below by hand: the data_bucket name you
+#     gave the bootstrap root (`terraform -chdir=bootstrap output data_bucket`).
+#   * The Globus ingress's seven inputs, needed only with globus_enabled = true.
+#     `pixi run globus init` renders them into globus.auto.tfvars, which
+#     Terraform loads after this file.
 #
 # Next step is not `terraform apply`. A fresh deployment's first apply is phased,
 # because the root's providers look up a cluster that does not exist yet. Run
@@ -113,28 +120,53 @@ def backend_tf(answers: dict[str, Any]) -> str:
 #: root that is not in the deployer's clone.
 BOOTSTRAP_ROOT = "terraform/modules/bootstrap"
 
+#: Where the bootstrap root is applied from: a subdirectory of the deployment's
+#: own root, never the clone. Terraform loads only the top level of a directory,
+#: so the stack root does not read these files.
+BOOTSTRAP_DIR = "bootstrap"
 
-def bootstrap_command(answers: dict[str, Any]) -> str:
-    """The one command that creates the pre-stack buckets.
+#: The clone this package was imported from — the published tree the deployer
+#: copies the bootstrap root out of.
+CLONE = Path(__file__).resolve().parents[2]
+
+
+def bootstrap_command(answers: dict[str, Any], root: Path, *, clone: Path = CLONE) -> str:
+    """The one command that creates the pre-stack buckets, from outside the clone.
+
+    It copies the published root into `<root>/bootstrap` and applies it THERE.
+    The previous form applied it in place, `-chdir=<clone>/terraform/modules/
+    bootstrap`, which put the only state file for the three buckets that outlive
+    every cluster inside a git checkout: `git clean -fdx`, or deleting the clone
+    to start again, took it. The deployment root is the directory the deployer
+    already keeps, beside `terraform.tfvars` and `backend.tf`.
+
+    Copying the `.tf` files rather than calling the root as a module keeps the
+    state addresses the reference deployment already has. The copy is code, not
+    state: re-running this overwrites the `.tf` files and the lock, never `terraform.tfstate`.
 
     This used to be three `aws s3api` calls for the state bucket alone. They are
     gone on purpose: a bucket made that way has no transport-encryption policy and
     no `prevent_destroy`, the data bucket was not created at all, and the metrics
-    bucket was created by the stack, which made it destroyable by a teardown. One
-    published root creates all three with the posture each needs.
+    bucket was created by the stack, which made it destroyable by a teardown.
 
-    The data bucket's name is `globus_s3_destination_bucket`, which `globus init`
-    renders rather than the wizard collecting — so it is named as a placeholder
-    here rather than filled in, which is also the honest thing to show a deployer
-    who has not run that tool yet.
+    The data bucket's name is a placeholder because the wizard does not collect
+    it. Whatever the deployer puts there, they then set
+    `globus_s3_destination_bucket` to the same name; preflight's `aws.data_bucket`
+    and `globus.inputs` both point back at `terraform output` here if they do not.
     """
-    bucket = answers["state_bucket"]
-    region = answers["region"]
+    source = clone / BOOTSTRAP_ROOT
+    target = root / BOOTSTRAP_DIR
+    quoted = shlex.quote(str(target))
+    # A glob rather than a list of names, so a file added to the root is copied
+    # without anyone remembering this function. The lock file is copied too, so
+    # the copy resolves the same provider build the published root was tested with.
+    files = f"{shlex.quote(str(source))}/*.tf {shlex.quote(str(source / '.terraform.lock.hcl'))}"
     return (
-        f"terraform -chdir={BOOTSTRAP_ROOT} init && "
-        f"terraform -chdir={BOOTSTRAP_ROOT} apply "
-        f"-var region={region} -var state_bucket={bucket} "
-        "-var data_bucket=<globus_s3_destination_bucket> "
+        f"mkdir -p {quoted} && cp {files} {quoted}/ && "
+        f"terraform -chdir={quoted} init && "
+        f"terraform -chdir={quoted} apply "
+        f"-var region={answers['region']} -var state_bucket={answers['state_bucket']} "
+        "-var data_bucket=<your-data-bucket> "
         "-var metrics_bucket=<name>-metrics"
     )
 

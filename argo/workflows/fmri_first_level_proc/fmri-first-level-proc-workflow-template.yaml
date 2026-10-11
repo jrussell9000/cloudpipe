@@ -103,7 +103,7 @@ spec:
       karpenter.sh/nodepool: first-level-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:3cccb6de417e09ef3c355d97e408f7a55d82663f5efa967d3c7a0439bd81eff3"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:c8ddddb5edace3f60666e14a8b93f847b53d70e4473f05268b529810adef2d71"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

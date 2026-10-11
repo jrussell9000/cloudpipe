@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -42,6 +43,7 @@ CHECK_ACCOUNT = "aws.account"
 CHECK_HOSTED_ZONE = "aws.hosted_zone"
 CHECK_PREFIX_LISTS = "aws.prefix_lists"
 CHECK_DATA_BUCKET = "aws.data_bucket"
+CHECK_AMIS = "aws.amis"
 CHECK_CLOUDFLARE = "cloudflare.token"
 CHECK_FEDERATION_METADATA = "federation.metadata"
 CHECK_FEDERATION_EVIDENCE = "federation.mfa_evidence"
@@ -65,6 +67,7 @@ ORDER = (
     CHECK_HOSTED_ZONE,
     CHECK_PREFIX_LISTS,
     CHECK_DATA_BUCKET,
+    CHECK_AMIS,
     CHECK_CLOUDFLARE,
     CHECK_FEDERATION_METADATA,
     CHECK_FEDERATION_EVIDENCE,
@@ -212,6 +215,16 @@ class World:
         response = self._client("s3").get_bucket_location(Bucket=name)
         return str(response.get("LocationConstraint") or "us-east-1")
 
+    def images(self, **query: Any) -> list[dict[str, Any]]:
+        """`DescribeImages` — the images visible to these credentials.
+
+        An AMI id that is neither owned by nor shared with this account is not
+        visible, and that is precisely the question: EC2 fails the launch with
+        `InvalidAMIID.NotFound` for the same reason.
+        """
+        response = self._client("ec2").describe_images(**query)
+        return [dict(image) for image in response.get("Images", ())]
+
     def describe_secret(self, name: str) -> dict[str, Any]:
         """`DescribeSecret`, never `GetSecretValue`.
 
@@ -265,6 +278,7 @@ def run(
         _check_hosted_zone(world, answers, identity),
         _check_prefix_lists(world, answers, root, identity),
         _check_data_bucket(world, root, identity),
+        _check_amis(world, root, repo, identity),
         _check_cloudflare(world, answers),
         _check_federation_metadata(world, answers),
         _check_federation_evidence(answers),
@@ -472,7 +486,9 @@ def _check_prefix_lists(
     with contract 2.0, because nothing read it; the check keeps its identifier,
     and a dict, so a second id is one more entry rather than a new check.
     """
-    if not _globus_ingress_enabled(root):
+    from . import roots
+
+    if not roots.globus_ingress_enabled(root):
         # The only prefix list the stack references is the Globus host's SSH
         # rule, inside `module.globus`. With the ingress off that module has no
         # instances, so there is no rule to resolve an id for — and reporting
@@ -558,14 +574,15 @@ def _check_data_bucket(world: World, root: Path, identity: dict[str, Any] | None
     """
     from . import roots
 
-    value, _ = roots.tfvars_assignments(root).get("globus_s3_destination_bucket", (None, None))
+    value, _ = roots.tfvars_assignments(root).get(roots.DATA_BUCKET_VARIABLE, (None, None))
     name = value if isinstance(value, str) and value else None
     if not name:
+        kind, text = roots.missing_globus_remedy(root, (roots.DATA_BUCKET_VARIABLE,))
         return _skipped(
             CHECK_DATA_BUCKET,
             "Data bucket",
-            "globus_s3_destination_bucket is not set in any tfvars file in this root.",
-            Remedy("command", "pixi run globus init"),
+            f"{roots.DATA_BUCKET_VARIABLE} is not set in any tfvars file in this root.",
+            Remedy(kind, text),
         )
     if identity is None:
         return _no_credentials(CHECK_DATA_BUCKET, "Data bucket")
@@ -603,10 +620,15 @@ def _check_data_bucket(world: World, root: Path, identity: dict[str, Any] | None
             "configures this bucket by name — access logging, lifecycle rules, and the Argo and "
             "Prefect policies that scope to its ARN — and never creates it, so the apply fails "
             "on those resources rather than on the name.",
+            # Not `aws s3api create-bucket`, which this used to print: a bucket made
+            # that way has no transport-encryption policy and no `prevent_destroy`,
+            # which is the posture the bootstrap root exists to give it.
             remedy=Remedy(
-                "command",
-                f"aws s3api create-bucket --bucket {name} --region {world.region} "
-                f"--create-bucket-configuration LocationConstraint={world.region}",
+                "human",
+                f"Apply the bootstrap root with data_bucket={name} — step 4 of "
+                "docs/deployer-first-hour.md, and `pixi run cloudpipe setup` prints the command. "
+                "If it is already applied under another name, set "
+                f"{roots.DATA_BUCKET_VARIABLE} to that name instead.",
             ),
         )
 
@@ -617,23 +639,6 @@ def _check_data_bucket(world: World, root: Path, identity: dict[str, Any] | None
         # boundary, and nothing later in the install mentions it again.
         message += f", which is not this deployment's region ({world.region})"
     return Record(identifier=CHECK_DATA_BUCKET, title="Data bucket", state="pass", message=message)
-
-
-def _globus_ingress_enabled(root: Path) -> bool:
-    """Whether this root stands up the Globus ingress — `globus_enabled`.
-
-    False when unset, which is the stack module's own default. The tfvars reader
-    returns a quoted string as its text and any other HCL value as source text,
-    so a bool arrives as `"true"`; a JSON tfvars file gives a real bool. Both are
-    accepted, and anything else is read as false, because the only value that
-    turns 52 resources on is one Terraform itself would read as true.
-    """
-    from . import roots
-
-    value, _ = roots.tfvars_assignments(root).get("globus_enabled", (None, None))
-    if isinstance(value, bool):
-        return value
-    return isinstance(value, str) and value.strip().lower() == "true"
 
 
 def _globus_prefix_list_id(root: Path) -> str | None:
@@ -648,55 +653,134 @@ def _globus_prefix_list_id(root: Path) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _check_cloudflare(world: World, answers: dict[str, Any]) -> Record:
-    """The token is present, valid, active, and carries the Zero Trust scope.
+def _verify_cloudflare_token(
+    world: World, headers: dict[str, str], account: str | None
+) -> tuple[int, Any]:
+    """(status, body) of the first verify endpoint that accepts the token, else the last.
 
-    The scope half needs its own read. `tokens/verify` reports validity and says
-    nothing about permissions, so stopping there would report `pass` for the thing
-    the deployer most often gets wrong — a token minted with the default scopes.
-    `access/identity_providers` is a list, so the probe mutates nothing.
+    A user token answers `/user/tokens/verify`; an account-owned token answers
+    only `/accounts/<id>/tokens/verify`. Both are valid for Terraform, so both
+    are tried — the second only when an account id is known to build it from.
+    """
+    urls = [f"{CLOUDFLARE_API}/user/tokens/verify"]
+    if account:
+        urls.append(f"{CLOUDFLARE_API}/accounts/{account}/tokens/verify")
+    status, body = 0, None
+    for url in urls:
+        status, body = world.fetch_json(url, headers=headers)
+        if status == 200 and isinstance(body, dict) and body.get("success"):
+            break
+    return status, body
+
+
+def _probe_cloudflare_permissions(
+    world: World, headers: dict[str, str], account: str
+) -> tuple[list[Any], list[Any], list[str]]:
+    """(granted, refused, unclear) across `cloudflare.PERMISSIONS`, one read each.
+
+    The status alone is not the answer. Every Cloudflare v4 response carries a
+    `success` flag, and a 200 whose body says `success: false` is a refusal —
+    judging by status alone would report that as a grant, which is the one
+    outcome this check exists to rule out.
+    """
+    from . import cloudflare
+
+    granted, refused, unclear = [], [], []
+    for permission in cloudflare.PERMISSIONS:
+        status, body = world.fetch_json(
+            f"{CLOUDFLARE_API}/accounts/{account}{permission.probe}", headers=headers
+        )
+        succeeded = body.get("success") if isinstance(body, dict) else None
+        if status in (401, 403) or (status == 200 and succeeded is False):
+            # Cloudflare's own reason travels with the refusal, so the deployer
+            # sees why and not only that.
+            reason = _cloudflare_errors(body)
+            refused.append((permission, f"HTTP {status}{': ' + reason if reason else ''}"))
+        elif status == 200 and succeeded is True:
+            granted.append(permission)
+        else:
+            unclear.append(f"{permission.name} (HTTP {status})")
+    return granted, refused, unclear
+
+
+def _check_cloudflare(world: World, answers: dict[str, Any]) -> Record:
+    """The token is present, valid, active, and can reach every group the stack uses.
+
+    Four permission groups, one read-only probe each (`cloudflare.PERMISSIONS`).
+    This used to probe one, `access/identity_providers`, so a token holding that
+    group alone passed and then failed at phase 4 on the tunnel or the device
+    settings — after the cluster existed.
+
+    The probes prove READ access, and that is the most a read-only check can
+    prove: Cloudflare offers no call that reports a token's own permissions
+    without "API Tokens: Read", which a deployment token should not carry. The
+    gap is closed from the other side — the link this check prints selects Write
+    for every group, so a token made from it has the level the apply needs.
+
+    Two failures look identical at Cloudflare's end and need different fixes, so
+    they are told apart here. A token that verifies but is refused by EVERY probe
+    is almost always scoped to a different account (a second deployment's token
+    exported in the first one's shell is the case that prompted this); a token
+    refused by SOME probes is missing those groups.
+
+    Both token kinds verify. A user token answers `/user/tokens/verify`; an
+    account-owned token answers only `/accounts/<id>/tokens/verify`, so the second
+    is tried when the first refuses and an account id is known.
 
     The token value appears in no message, no detail and no argument list. Only
     the header it is sent in, which is why this goes through `urllib`.
     """
+    from . import cloudflare
+
+    title = "Cloudflare API token"
+    account = answers.get("cloudflare_account_id")
+    link = cloudflare.token_template_url(account)
+    create = Remedy(
+        "human",
+        f"Create a token from this link, which selects every permission the stack needs"
+        f"{f' and scopes it to account {account}' if account else ''}: {link} — then "
+        f"`export {TOKEN_ENV}=<the token>` in the shell you install from. By hand, the rows "
+        f"are: {cloudflare.permission_rows()}.",
+    )
+
     token = os.environ.get(TOKEN_ENV, "").strip()
     if not token:
         return _skipped(
             CHECK_CLOUDFLARE,
-            "Cloudflare API token",
+            title,
             f"{TOKEN_ENV} is not set in this environment, so there is no token to verify. It is "
             "read from the environment only: this tool never prompts for it, stores it or prints "
             "it.",
-            Remedy("human", f"export {TOKEN_ENV}=<a token with Zero Trust read and edit scopes>"),
+            create,
         )
 
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    unreachable = Remedy("human", "Try again from a network that can reach api.cloudflare.com.")
+
     try:
-        status, body = world.fetch_json(f"{CLOUDFLARE_API}/user/tokens/verify", headers=headers)
+        status, body = _verify_cloudflare_token(world, headers, account)
     except (urllib.error.URLError, OSError, ValueError) as err:
         return _skipped(
             CHECK_CLOUDFLARE,
-            "Cloudflare API token",
-            f"the Cloudflare API could not be reached from here ({err}).",
-            Remedy("human", "Try again from a network that can reach api.cloudflare.com."),
+            title,
+            f"the Cloudflare API could not be reached ({err}).",
+            unreachable,
         )
 
-    if status == 401 or status == 403:
+    if status in (400, 401, 403) or (isinstance(body, dict) and body.get("success") is False):
         return Record(
             identifier=CHECK_CLOUDFLARE,
-            title="Cloudflare API token",
+            title=title,
             state="fail",
-            message=f"Cloudflare rejected the token in {TOKEN_ENV} (HTTP {status}).",
-            remedy=Remedy(
-                "human",
-                "Mint a new token in the Cloudflare dashboard under My Profile > API Tokens, and "
-                f"re-export {TOKEN_ENV}.",
-            ),
+            message=f"Cloudflare rejected the token in {TOKEN_ENV} (HTTP {status}"
+            f"{': ' + _cloudflare_errors(body) if _cloudflare_errors(body) else ''}). It is not "
+            "a valid token — mistyped, revoked, or the wrong variable exported.",
+            remedy=create,
         )
     if status != 200 or not isinstance(body, dict) or not body.get("success"):
         return Record(
             identifier=CHECK_CLOUDFLARE,
-            title="Cloudflare API token",
+            title=title,
             state="fail",
             message=f"token verification returned HTTP {status} without a success body.",
             remedy=Remedy("human", f"Check {TOKEN_ENV} and the Cloudflare API's status page."),
@@ -706,72 +790,227 @@ def _check_cloudflare(world: World, answers: dict[str, Any]) -> Record:
     if state != "active":
         return Record(
             identifier=CHECK_CLOUDFLARE,
-            title="Cloudflare API token",
+            title=title,
             state="fail",
             message=f"the token in {TOKEN_ENV} is {state}, not active.",
-            remedy=Remedy("human", "Re-enable or replace the token in the Cloudflare dashboard."),
+            remedy=create,
         )
 
-    account = answers.get("cloudflare_account_id")
     if not account:
         return _skipped(
             CHECK_CLOUDFLARE,
-            "Cloudflare API token",
-            "the token is valid and active, and cloudflare_account_id is not set, so its Zero "
-            "Trust scope could not be checked. A valid token with the wrong scopes fails at apply.",
-            Remedy("command", "cloudpipe setup"),
+            title,
+            "the token is valid and active, and cloudflare_account_id is not set, so what it can "
+            "reach could not be checked. A valid token with the wrong scope fails at apply.",
+            Remedy("command", "pixi run cloudpipe setup"),
         )
 
     try:
-        scope_status, scope_body = world.fetch_json(
-            f"{CLOUDFLARE_API}/accounts/{account}/access/identity_providers", headers=headers
-        )
+        granted, refused, unclear = _probe_cloudflare_permissions(world, headers, account)
     except (urllib.error.URLError, OSError, ValueError) as err:
         return _skipped(
             CHECK_CLOUDFLARE,
-            "Cloudflare API token",
-            f"the token is valid and active, but its Zero Trust scope could not be checked ({err}).",
-            Remedy("human", "Try again from a network that can reach api.cloudflare.com."),
+            title,
+            f"the token is valid and active, but what it can reach could not be checked ({err}).",
+            unreachable,
         )
 
-    # The status alone is not the answer. Every Cloudflare v4 response carries a
-    # `success` flag, and a 200 whose body says `success: false` is a refusal —
-    # judging by status alone would report that as a grant, which is the one
-    # outcome this check exists to rule out. The verify call above reads `success`
-    # for the same reason.
-    succeeded = scope_body.get("success") if isinstance(scope_body, dict) else None
-    if scope_status in (401, 403) or (scope_status == 200 and succeeded is False):
-        reported = _cloudflare_errors(scope_body)
+    if refused and not granted:
         return Record(
             identifier=CHECK_CLOUDFLARE,
-            title="Cloudflare API token",
+            title=title,
             state="fail",
-            message=f"the token is valid but cannot read Access identity providers in account "
-            f"{account} (HTTP {scope_status}{': ' + reported if reported else ''}). The "
-            "deployment creates Access applications and policies, so it needs Zero Trust edit, "
-            "not just read.",
+            message=f"the token is valid, but every one of the {len(refused)} probes in account "
+            f"{account} was refused. A token that verifies and can see nothing in the account is "
+            "almost always scoped to a DIFFERENT account — check that the token you exported is "
+            "this deployment's, not another one's.",
+            remedy=create,
+        )
+    if refused:
+        names = ", ".join(f"{p.name} ({p.dashboard_level})" for p, _ in refused)
+        why = "; ".join(f"{p.name}: {reason}" for p, reason in refused)
+        return Record(
+            identifier=CHECK_CLOUDFLARE,
+            title=title,
+            state="fail",
+            message=f"the token is valid and reaches account {account}, but is missing "
+            f"{len(refused)} of the {len(cloudflare.PERMISSIONS)} permission groups the stack "
+            f"needs: {names}. The phase 4 apply would fail on "
+            f"{'; '.join(p.needed_by for p, _ in refused)}. Cloudflare said: {why}.",
             remedy=Remedy(
                 "human",
-                "Add the Account > Access: Organizations, Identity Providers and Groups > Edit "
-                f"permission to the token, and confirm it is scoped to account {account}.",
+                f"Edit the token and add {names}, scope Account, for account {account} — or "
+                f"replace it with one made from this link: {link}. Permission changes take "
+                "several minutes to reach every endpoint, so re-run this after a short wait "
+                "rather than editing again.",
             ),
         )
-    if scope_status != 200 or succeeded is not True:
+    if unclear:
         return _skipped(
             CHECK_CLOUDFLARE,
-            "Cloudflare API token",
-            f"the token is valid and active; the Zero Trust scope probe returned HTTP "
-            f"{scope_status}{' with no success flag in its body' if scope_status == 200 else ''}, "
-            "which is neither a grant nor a refusal.",
+            title,
+            f"the token is valid and active; {', '.join(unclear)} returned neither a grant nor a "
+            "refusal.",
             Remedy("human", "Check the Cloudflare API's status page and run this again."),
         )
     return Record(
         identifier=CHECK_CLOUDFLARE,
-        title="Cloudflare API token",
+        title=title,
         state="pass",
-        message=f"the token in {TOKEN_ENV} is active and can read Zero Trust configuration in "
-        f"account {account}.",
+        message=f"the token in {TOKEN_ENV} is active and can read all "
+        f"{len(cloudflare.PERMISSIONS)} permission groups the stack uses in account {account}. "
+        "Read is what can be checked without changing anything; a token made from the link "
+        "this tool prints has Write.",
     )
+
+
+#: Where the stack names the machine images it launches. Read, never restated:
+#: a check that kept its own copy of an AMI id would pass against an id the stack
+#: no longer uses.
+_GLOBUS_CALL = "terraform/modules/stack/globus.tf"
+_KARPENTER_CALL = "terraform/modules/stack/karpenter.tf"
+_STACK_VARIABLES = "terraform/modules/stack/variables.tf"
+_GPU_AMI_DOC = "docs/pre-baked-amis.md"
+
+
+def _check_amis(world: World, root: Path, repo: Path, identity: dict[str, Any] | None) -> Record:
+    """Whether the machine images the stack launches exist in this account.
+
+    Two images, with different consequences, so they are judged differently:
+
+    * **The Globus host's AMI**, a literal id in `globus.tf`, launched only with
+      `globus_enabled`. Not visible means the phase 4 apply fails with
+      `InvalidAMIID.NotFound` after the cluster exists — which is how the second
+      deployment found that the id was this project's own image, shared with
+      nobody. `fail`.
+    * **The GPU node AMI**, selected by tag in the Karpenter node class. Not
+      matching means nothing fails at all: the install completes and every GPU
+      step waits for a node that never launches. It cannot be a `fail` before the
+      install, because the AMI is baked from the deployment's own images after
+      they exist. `blocked` — a step the deployer still owes — so it is visible
+      without stopping a first install.
+
+    `terraform plan` would catch neither. An AMI is only resolved at apply, and a
+    tag selector only by Karpenter at runtime.
+    """
+    from . import roots
+
+    title = "Machine images"
+    if identity is None:
+        return _no_credentials(CHECK_AMIS, title)
+
+    sources = _ami_sources(root, repo)
+    if sources is None:
+        return _skipped(
+            CHECK_AMIS,
+            title,
+            f"the image references could not be read from {repo / _GLOBUS_CALL} and "
+            f"{repo / _KARPENTER_CALL}. Run this from a clone of the repository.",
+            Remedy("human", "Check that the clone's terraform/modules/stack/ is intact."),
+        )
+    globus_ami, gpu_tags = sources
+    account = identity.get("Account", "unknown")
+
+    try:
+        globus_missing = False
+        if roots.globus_ingress_enabled(root):
+            try:
+                globus_missing = not world.images(ImageIds=[globus_ami])
+            except Exception as err:  # noqa: BLE001
+                if _error_code(err) not in ("InvalidAMIID.NotFound", "InvalidAMIID.Unavailable"):
+                    raise
+                globus_missing = True
+        gpu_found = world.images(
+            Owners=["self"],
+            Filters=[{"Name": f"tag:{key}", "Values": [value]} for key, value in gpu_tags.items()],
+        )
+    except Exception as err:  # noqa: BLE001
+        if _error_code(err) in _DENIED_CODES:
+            return _translate(err, CHECK_AMIS, title, "ec2:DescribeImages")
+        raise
+
+    selector = ", ".join(
+        f"{key}={value[:19] + '…' if len(value) > 20 else value}" for key, value in gpu_tags.items()
+    )
+    gpu_note = (
+        f"GPU node AMI: found ({gpu_found[0].get('ImageId', 'unknown id')})."
+        if gpu_found
+        else f"GPU node AMI: none in account {account} matches the node class selector "
+        f"({selector})."
+    )
+
+    if globus_missing:
+        return Record(
+            identifier=CHECK_AMIS,
+            title=title,
+            state="fail",
+            message=f"globus_enabled is true, and the Globus host's AMI {globus_ami} is not "
+            f"visible from account {account} — neither owned by it nor shared with it. The phase "
+            f"4 apply would fail with InvalidAMIID.NotFound, after the cluster exists. {gpu_note}",
+            remedy=Remedy(
+                "human",
+                "Build the Globus Connect Server image in this account from packer/globus-gcs/, "
+                f"and set globus_ami_id in {_GLOBUS_CALL} to its id — or leave globus_enabled "
+                "unset; the pipeline runs without the ingress.",
+            ),
+        )
+    if not gpu_found:
+        return Record(
+            identifier=CHECK_AMIS,
+            title=title,
+            state="blocked",
+            message=f"{gpu_note} The install does not need it, and nothing will fail: GPU steps "
+            "(FastSurfer, FireANTs registration) wait for a node that never launches until one "
+            "is built. It is baked from this deployment's own images, so it comes after the "
+            "install and the first image build.",
+            remedy=Remedy(
+                "human",
+                f"After the install, bake one as {_GPU_AMI_DOC} describes (Rebuilding the AMI). "
+                f"The selector's digests live in {_KARPENTER_CALL}; the bake workflow updates them.",
+            ),
+        )
+    globus = (
+        f"Globus host AMI {globus_ami}: visible. "
+        if roots.globus_ingress_enabled(root)
+        else "Globus host AMI: not needed, globus_enabled is not true. "
+    )
+    return Record(identifier=CHECK_AMIS, title=title, state="pass", message=f"{globus}{gpu_note}")
+
+
+def _ami_sources(root: Path, repo: Path) -> tuple[str, dict[str, str]] | None:
+    """(Globus AMI id, GPU selector tags) as the stack will use them, or None.
+
+    The GPU selector is the three tags in
+    `terraform/modules/karpenter/helm-values/gpu-nodeclass.yaml`: two image
+    digests from the stack's `module "karpenter"` call, and the EKS version —
+    `kubernetes_version` from this root's tfvars if it sets one, else the
+    stack's default.
+    """
+    from . import roots
+
+    try:
+        globus_text = (repo / _GLOBUS_CALL).read_text()
+        karpenter_text = (repo / _KARPENTER_CALL).read_text()
+        variables_text = (repo / _STACK_VARIABLES).read_text()
+    except OSError:
+        return None
+
+    globus = re.search(r'^\s*globus_ami_id\s*=\s*"(ami-[0-9a-f]+)"', globus_text, re.M)
+    fastsurfer = re.search(r'^\s*fastsurfer_ami_digest\s*=\s*"([^"]+)"', karpenter_text, re.M)
+    fireants = re.search(r'^\s*fireants_ami_digest\s*=\s*"([^"]+)"', karpenter_text, re.M)
+    default = re.search(
+        r'variable "kubernetes_version"\s*\{[^}]*?default\s*=\s*"([^"]+)"', variables_text, re.S
+    )
+    if not (globus and fastsurfer and fireants and default):
+        return None
+
+    override, _ = roots.tfvars_assignments(root).get("kubernetes_version", (None, None))
+    version = override if isinstance(override, str) and override else default.group(1)
+    return globus.group(1), {
+        "fastsurfer-image-digest": fastsurfer.group(1),
+        "fireants-image-digest": fireants.group(1),
+        "eks-version": version,
+    }
 
 
 def _check_globus_inputs(root: Path, repo: Path) -> Record:
@@ -795,11 +1034,11 @@ def _check_globus_inputs(root: Path, repo: Path) -> Record:
     either way: despite the name it is the imaging data bucket, which the
     pipeline reads whether or not anything Globus wrote it.
     """
-    from . import roots, schema
+    from . import roots
 
     title = "Globus inputs"
     variables_tf = repo / "terraform/modules/stack/variables.tf"
-    expected = schema.globus_variables(variables_tf)
+    expected = roots.wanted_globus_inputs(root, variables_tf)
     if expected is None:
         return _skipped(
             CHECK_GLOBUS_INPUTS,
@@ -809,35 +1048,48 @@ def _check_globus_inputs(root: Path, repo: Path) -> Record:
             Remedy("human", f"Check that {variables_tf} is present and readable."),
         )
 
-    enabled = _globus_ingress_enabled(root)
-    if not enabled:
-        conditional = schema.variables_required_by_another(variables_tf.read_text())
-        expected = tuple(name for name in expected if name not in conditional)
-
+    enabled = roots.globus_ingress_enabled(root)
     found = roots.globus_inputs(root, expected)
     if found.missing:
-        none_set = len(found.missing) == len(expected)
-        where = "in any file Terraform loads from" if none_set else "in"
+        missing = len(found.missing)
+        where = "in any file Terraform loads from" if missing == len(expected) else "in"
+        kind, text = roots.missing_globus_remedy(root, found.missing)
+        how = (
+            "Render them with `globus init`, or set them by hand in terraform.tfvars as the "
+            "example terraform.tfvars.example shows; either satisfies Terraform."
+            if kind == "command"
+            else "It is set by hand; nothing renders it."
+        )
         return Record(
             identifier=CHECK_GLOBUS_INPUTS,
             title=title,
             state="fail",
-            message=f"{len(found.missing)} of the {len(expected)} Globus variables "
-            f"{'are' if len(found.missing) != 1 else 'is'} not set {where} {root}: "
+            message=f"{_count(missing, len(expected))} {_noun(len(expected))} "
+            f"{'is' if missing == 1 else 'are'} not set {where} {root}: "
             f"{', '.join(found.missing)}. Terraform would prompt for "
-            f"{'them' if len(found.missing) != 1 else 'it'} — or fail, under -input=false. "
-            "Render them with `globus init`, or set them by hand in terraform.tfvars as the "
-            "example terraform.tfvars.example shows; either satisfies Terraform.",
-            remedy=Remedy("command", "pixi run globus init"),
+            f"{'it' if missing == 1 else 'them'} — or fail, under -input=false. {how}",
+            remedy=Remedy(kind, text),
         )
-    ingress = "" if enabled else " (globus_enabled is not true, so the ingress inputs are not)"
+    ingress = (
+        "" if enabled else " (globus_enabled is not true, so the ingress inputs are not needed)"
+    )
+    every = "the one" if len(expected) == 1 else f"all {len(expected)}"
     return Record(
         identifier=CHECK_GLOBUS_INPUTS,
         title=title,
         state="pass",
-        message=f"all {len(expected)} Globus variables are set{ingress}, in "
-        f"{', '.join(path.name for path in found.sources)}.",
+        message=f"{every} {_noun(len(expected))} {'is' if len(expected) == 1 else 'are'} "
+        f"set{ingress}, in {', '.join(path.name for path in found.sources)}.",
     )
+
+
+def _noun(count: int) -> str:
+    return "Globus variable" if count == 1 else "Globus variables"
+
+
+def _count(part: int, whole: int) -> str:
+    """ "the 1" / "3 of the 8" — `1 of the 1` reads as a counting bug."""
+    return "the" if part == whole == 1 else f"{part} of the {whole}"
 
 
 # --------------------------------------------------------------------------- #

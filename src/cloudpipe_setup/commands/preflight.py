@@ -74,11 +74,18 @@ def _preamble(emitter: Emitter, root: Path, answers_path: Path) -> None:
     )
 
 
+#: Four characters each, so the messages line up. Words rather than symbols: the
+#: skipped mark was `????`, which a deployer reasonably read as a rendering fault
+#: rather than as "this check could not look" — the one state they most need to
+#: tell apart from `ok`.
+MARKS = {"pass": " ok ", "fail": "FAIL", "skipped": "skip", "blocked": "WAIT"}
+
+
 def _report(emitter: Emitter, records: list[Record]) -> None:
     emitter.note()
     emitter.note("Preflight")
     for record in records:
-        mark = {"pass": " ok ", "fail": "FAIL", "skipped": "????", "blocked": "WAIT"}[record.state]
+        mark = MARKS[record.state]
         emitter.note(f"  [{mark}] {record.title}: {record.message}")
         if record.remedy and record.state != "pass":
             label = "run" if record.remedy.kind == "command" else "do"
@@ -86,6 +93,7 @@ def _report(emitter: Emitter, records: list[Record]) -> None:
 
     failed = [record for record in records if record.state == "fail"]
     skipped = [record for record in records if record.state == "skipped"]
+    blocked = [record for record in records if record.state == "blocked"]
 
     emitter.note()
     if failed:
@@ -98,6 +106,14 @@ def _report(emitter: Emitter, records: list[Record]) -> None:
         emitter.note(
             f"{len(skipped)} check(s) could not be performed and are reported as skipped, not "
             "passed. Each names what was missing."
+        )
+    if blocked:
+        # Not failures and they do not change the exit code: each is something the
+        # deployer still owes, at a point the check names — the GPU node image,
+        # which is baked after the install, is the case this exists for.
+        emitter.note(
+            f"{len(blocked)} check(s) marked WAIT name a step that comes later; they do not "
+            "stop the install."
         )
 
 
