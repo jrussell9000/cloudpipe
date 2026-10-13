@@ -12,7 +12,7 @@
 # Comment on its own line because Dockerfiles have no inline comments — see the
 # note in images/fastsurfer/Dockerfile.
 # tag: 3-python3.12 (upstream pushed 2026-10-06)
-FROM prefecthq/prefect@sha256:57e02b3f63d663e02b06d4127362ea48d92d4b361fbd96c8ba8f01e5702755f4
+FROM prefecthq/prefect@sha256:100044e13170771546fcf29d76d8edffa269baf3f452a1cc5fd2fffc176d02cc
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). `upgrade`, not
 # `dist-upgrade`: it only moves already-installed packages to a newer revision of the

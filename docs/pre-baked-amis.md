@@ -4,6 +4,16 @@ Karpenter provisions GPU nodes on-demand from fresh EC2 instances. Without pre-b
 
 The solution is a custom AMI that has both images already in containerd's image store. Karpenter selects the pre-baked AMI via `amiSelectorTerms` tags. When a new node starts, the images are already present and kubelet skips the pull.
 
+**A deployment without its own bake still gets GPU nodes.** Terraform decides which single selector term the node class gets (`terraform/modules/gpu-ami-choice`), because Karpenter refuses an `alias` term beside any other:
+
+1. The tags above, when this account owns a matching AMI.
+2. Otherwise, a published AMI for this region, by the ID pinned in `terraform/modules/karpenter/published-gpu-amis.json`, when that file's digests and EKS version match the current ones. **No pre-baked AMI is published, so this file is empty and this step never applies.**
+3. Otherwise, `alias: al2023@latest` (`gpu_ami_alias`), the stock EKS-optimized AMI. Karpenter resolves its NVIDIA variant for GPU instance types.
+
+Set `gpu_ami_selection = "alias"` to force the third. A plan that changes which one applies changes the node class, so new GPU nodes launch from the new choice.
+
+**Why no AMI is published, and what it costs you.** The reference deployment's account encrypts every EBS volume by default, so every AMI it makes is encrypted, and AWS will not make an encrypted AMI public. So a deployment without its own bake runs GPU nodes on the stock AMI. The first GPU pod on each new node pulls FastSurfer (5.8 GB compressed) and FireANTs (5.3 GB) through your pull-through cache, over the S3 gateway endpoint rather than the NAT. That costs minutes per new node, not data-transfer charges, and nothing fails. To avoid it, bake your own AMI as this page describes. Be aware that `build-gpu-nodeclass-ami.yaml` and the Packer template still carry the reference deployment's subnet, security group and registry as defaults, so a fork has to override them.
+
 ---
 
 ## Architecture
@@ -193,7 +203,7 @@ the signal that a roll was built but never applied.
 
 **Required secrets/variables:**
 - `AWS_PACKER_ROLE_ARN` — output of `terraform output github_actions_packer_role_arn`
-- `ECR_REGISTRY` — output of `terraform output ecr_registry` (already set for image builds)
+- `ECR_REGISTRY` — output of `terraform output ecr_private_registry` (already set for image builds). Not `ecr_registry`: that is the ECR Public prefix, and it is null unless the deployment publishes.
 
 **NVIDIA device plugin:**
 AL2023 nodes (unlike Bottlerocket) do not bundle the NVIDIA device plugin in the OS bootstrap. The plugin runs as a DaemonSet managed by ArgoCD from `gitops/apps/nvidia-device-plugin/`. It targets `karpenter.sh/nodepool=gpu-nodepool` nodes via `nodeSelector` (overriding the chart's default NFD-based affinity, which requires `feature.node.kubernetes.io/pci-10de.present` — a label not present without Node Feature Discovery).

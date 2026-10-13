@@ -48,15 +48,64 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 3. Architecture-Sensitive Download
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
-RUN if [ "${TARGETARCH}" = "arm64" ]; then \
-        AFNI_URL="https://afni.nimh.nih.gov/pub/dist/tgz/linux_ubuntu_24_ARM.tgz" ; \
+# AFNI's upstream tarballs are UNVERSIONED and roll in place, so they are pinned
+# the same two ways as images/afni/Dockerfile — see the longer note there for why
+# there is no third option (NIMH publishes no versioned artifact and keeps no
+# archive of previous builds):
+#
+#   AFNI_SHA256_*  byte-pins the exact tarball, per architecture, because the
+#                  amd64 and ARM builds are different files with different
+#                  digests. When NIMH rolls one, the build fails loudly with the
+#                  observed digest printed instead of silently changing AFNI
+#                  version on whatever unrelated PR triggered a rebuild.
+#   AFNI_VERSION   asserted against the tarball's own AFNI_version.txt, so a
+#                  digest bump cannot quietly land a different release. Only the
+#                  FIRST line is compared: line 2 is the platform string, which
+#                  differs per architecture (linux_ubuntu_24_64 against
+#                  linux_ubuntu_24_ARM) while the version does not.
+#
+# This image keeps the whole distribution at /opt/afni rather than an allow-list
+# of programs — the orchestrator calls 3dDeconvolve, 3dLSS, 3dmerge and
+# 3dBlurToFWHM among others — so there is no per-program check to make here, and
+# the version assertion is what guards the contents.
+#
+# `--build-arg AFNI_SHA256_ARM64=` (empty) skips the digest check for an
+# emergency build; the version assertion still applies.
+ARG AFNI_VERSION=AFNI_26.3.02
+ARG AFNI_SHA256_AMD64=b2f834925818d1b8b38a4ae2a337af067bd8ad160d05d39c642ecc7661840d85
+ARG AFNI_SHA256_ARM64=09fc3ffbe279606bd0f4e75d1203290ac5c20a5e3bb1e2acf1d1b2288e86700f
+
+RUN set -eu; \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        AFNI_URL="https://afni.nimh.nih.gov/pub/dist/tgz/linux_ubuntu_24_ARM.tgz"; \
+        AFNI_SHA256="${AFNI_SHA256_ARM64}"; \
         MAMBA_ARCH="aarch64"; \
     else \
-        AFNI_URL="https://afni.nimh.nih.gov/pub/dist/tgz/linux_ubuntu_24_64.tgz" ; \
-        MAMBA_ARCH="64" ; \
-    fi && \
-    mkdir -p /opt/afni && \
-    curl -fsL "${AFNI_URL}" | tar -xzf - -C /opt/afni --strip-components=1 && \
+        AFNI_URL="https://afni.nimh.nih.gov/pub/dist/tgz/linux_ubuntu_24_64.tgz"; \
+        AFNI_SHA256="${AFNI_SHA256_AMD64}"; \
+        MAMBA_ARCH="64"; \
+    fi; \
+    curl -fsSL -o /tmp/afni.tgz "${AFNI_URL}"; \
+    if [ -n "${AFNI_SHA256}" ]; then \
+        got=$(sha256sum /tmp/afni.tgz | cut -d' ' -f1); \
+        if [ "${got}" != "${AFNI_SHA256}" ]; then \
+            echo "FATAL: AFNI tarball digest mismatch (${TARGETARCH})."; \
+            echo "  expected ${AFNI_SHA256}"; \
+            echo "  observed ${got}"; \
+            echo "Upstream rolled the unversioned tarball. Verify the new one, then set"; \
+            echo "the matching AFNI_SHA256_* to the observed digest and AFNI_VERSION to match."; \
+            exit 1; \
+        fi; \
+    fi; \
+    mkdir -p /opt/afni; \
+    tar xzf /tmp/afni.tgz -C /opt/afni --strip-components=1; \
+    rm -f /tmp/afni.tgz; \
+    ver=$(sed -n 1p /opt/afni/AFNI_version.txt); \
+    if [ "${ver}" != "${AFNI_VERSION}" ]; then \
+        echo "FATAL: tarball reports ${ver} but AFNI_VERSION says ${AFNI_VERSION}"; \
+        exit 1; \
+    fi; \
+    echo "AFNI ${ver} (${TARGETARCH}): $(ls /opt/afni | wc -l) files extracted"; \
     curl -fsL "https://micro.mamba.pm/api/micromamba/linux-${MAMBA_ARCH}/latest" \
         | tar -xvj -C /usr/local/bin --strip-components=1 bin/micromamba
 
