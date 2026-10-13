@@ -13,24 +13,10 @@ module "karpenter_infra" {
   create_pod_identity_association   = true
   node_iam_role_additional_policies = var.node_iam_role_additional_policies
 
-  # The controller may pass only the shared node role (AllowPassingInstanceRole).
-  # The ingress node class runs under its own role (ingress.tf), so the controller
-  # needs one more PassRole — on that role alone, with the same condition. The
-  # module appends this to its own policy document; it replaces nothing.
-  iam_policy_statements = [
-    {
-      sid       = "AllowPassingIngressNodeRole"
-      actions   = ["iam:PassRole"]
-      resources = [aws_iam_role.ingress_node.arn]
-      condition = [
-        {
-          test     = "StringEquals"
-          variable = "iam:PassedToService"
-          values   = ["ec2.amazonaws.com"]
-        }
-      ]
-    }
-  ]
+  # No `iam_policy_statements` here. The controller policy is a single managed
+  # policy at 6068 of IAM's 6144-character limit, so even one more statement fails
+  # the apply (CreatePolicyVersion: LimitExceeded, PolicySize, 2026-10-13). The
+  # ingress role's PassRole is a separate policy instead (ingress.tf).
 }
 
 # Install Karpenter and modify default configuration

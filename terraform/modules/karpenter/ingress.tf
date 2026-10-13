@@ -62,6 +62,35 @@ resource "aws_eks_access_entry" "ingress_node" {
   type          = "EC2_LINUX"
 }
 
+# The controller may pass only the shared node role (the module's
+# AllowPassingInstanceRole). This lets it pass the ingress role too, with the same
+# condition, and nothing wider. It is a separate policy on the controller role,
+# not an `iam_policy_statements` entry on module.karpenter_infra: the module's
+# policy is at 6068 of IAM's 6144-character managed-policy limit (main.tf).
+data "aws_iam_policy_document" "controller_passes_ingress_role" {
+  statement {
+    sid       = "AllowPassingIngressNodeRole"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.ingress_node.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_policy" "controller_passes_ingress_role" {
+  name        = "${var.cluster_name}-karpenter-pass-ingress-role"
+  description = "Lets the Karpenter controller pass the ingress node role to EC2, and nothing else"
+  policy      = data.aws_iam_policy_document.controller_passes_ingress_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "controller_passes_ingress_role" {
+  role       = module.karpenter_infra.iam_role_name
+  policy_arn = aws_iam_policy.controller_passes_ingress_role.arn
+}
+
 resource "kubectl_manifest" "ingress-nodeclass" {
   server_side_apply = true
   force_conflicts   = true
@@ -76,6 +105,7 @@ resource "kubectl_manifest" "ingress-nodeclass" {
     helm_release.karpenter,
     aws_eks_access_entry.ingress_node,
     aws_iam_role_policy_attachment.ingress_node,
+    aws_iam_role_policy_attachment.controller_passes_ingress_role,
   ]
 }
 
