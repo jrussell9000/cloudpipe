@@ -65,10 +65,20 @@ def login(ctx: Context) -> ExitCode:
             "transfer pod(s) are running; they keep using the token they already hold."
         )
 
+    # The source collection's `/https` scope comes with the same login, for
+    # `ingress-mode=https`. Without a configured source there is nothing to ask for.
+    https_collection_id = ctx.config.source_collection_id
+    if not https_collection_id:
+        emitter.note(
+            "note: no source_collection_id is configured, so this login does not grant the "
+            "HTTPS scope that ingress-mode=https needs."
+        )
+
     result = login_module.LoginSession(
         client_id=client_id,
         domains=domains,
         no_browser=bool(getattr(ctx.args, "no_browser", False)),
+        https_collection_id=https_collection_id,
     ).run()
     emitter.note(f"Logged in as {result.username}")
 

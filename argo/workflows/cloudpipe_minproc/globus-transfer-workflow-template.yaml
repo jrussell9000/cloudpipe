@@ -166,7 +166,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:5262089eb4e03e2c65a81aec9968d1d4024527523bc27f1b1e9e95ad7ec9fa79"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:3ecd9e648607aec552d911af4ce88ea9a74f9fca64671ceb4839eedf754312cf"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -208,4 +208,125 @@ spec:
         # so the image could ship before this line existed.
         - --workflow-uid
         - '{{workflow.uid}}'
+
+  ###########################################################################
+  # ingress-mode=https (openspec add-https-ingress-mode). Lists the subject
+  # through the Transfer API with globus-transfer-template's filter, then copies
+  # it with rclone over the source collection's own HTTPS server, straight into
+  # s3://{dest-bucket}{dest-base-path}/{subject}/, and checks every object's
+  # size against the listing (images/globus/https_ingress.py). No Globus host
+  # of ours is involved, so nothing starts one.
+  #
+  # Runs on ingress-nodepool: public-subnet nodes whose public address carries
+  # this download, so it pays no NAT. Nothing else tolerates that pool's taint
+  # (tests/argo/test_ingress_modes.py), and the nodes admit no inbound from the
+  # internet (tests/test_ingress_node_isolation.py; plan 018 §8, option B).
+  #
+  # Inputs: as globus-transfer-template, minus dest-collection-id (there is no
+  # destination collection in this path), plus dest-bucket.
+  ###########################################################################
+
+  - name: https-transfer-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: transfer
+        cloudpipe.io/step: https-transfer
+    # Its own key, not globus-transfer's, so the two modes can run side by side
+    # during the test batch without sharing a cap (design D7).
+    synchronization:
+      semaphores:
+        - configMapKeyRef:
+            name: cloudpipe-semaphores
+            key: https-transfer
+    # globus-transfer-template's strategy, for its reasons (above), with one
+    # exception: exit 78 is the step REFUSING — a session past the 30-day rule,
+    # or no HTTPS token — and it fails identically on every attempt, so a retry
+    # would only delay the message. Any other code, including an absent one
+    # (an init or wait container died), still retries. This is the one
+    # expression tests/argo/test_retry_expression.py allows to differ from the
+    # canonical string, and only as exactly this.
+    retryStrategy:
+      limit: "3"
+      retryPolicy: Always
+      expression: 'lastRetry.exitCode != "78"'
+      backoff:
+        duration: "60s"
+        factor: "2"
+    activeDeadlineSeconds: 7200
+
+    inputs:
+      parameters:
+        - name: source-collection-id
+        - name: source-base-path
+        - name: dest-bucket
+        - name: dest-base-path
+        - name: scan-types
+
+    nodeSelector:
+      karpenter.sh/nodepool: ingress-nodepool
+    tolerations:
+      - key: cloudpipe.io/ingress
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+
+    container:
+      # The same image and digest as globus-transfer-template: the HTTPS step
+      # imports transfer.py's listing, and the pin job rewrites both lines.
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:3ecd9e648607aec552d911af4ce88ea9a74f9fca64671ceb4839eedf754312cf"
+      imagePullPolicy: IfNotPresent
+
+      # Plan 018 §7: one subject peaked at 1,118 MiB, about 8.4 CPU-s per GiB
+      # at ~420 MiB/s.
+      resources:
+        requests:
+          memory: 2Gi
+          cpu: '2'
+          ephemeral-storage: 200M
+        limits:
+          memory: 3Gi
+
+      # Tokens only ever arrive as env, never args: argv is visible in the pod
+      # spec and in Argo's UI.
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+        - name: GLOBUS_NATIVE_APP_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: globus-credentials
+              key: native-app-client-id
+        - name: GLOBUS_REFRESH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: globus-credentials
+              key: refresh-token
+        # Optional, so a Secret that does not carry the key yet (no login has
+        # granted the HTTPS scope) gives an immediate refusal — exit 78, naming
+        # `pixi run globus login` — rather than a pod stuck in
+        # CreateContainerConfigError until the deadline.
+        - name: GLOBUS_HTTPS_REFRESH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: globus-credentials
+              key: https-refresh-token
+              optional: true
+
+      command: [python, /app/https_ingress.py]
+      args:
+        - --subject-id
+        - '{{workflow.parameters.subjID}}'
+        - --source-collection-id
+        - '{{inputs.parameters.source-collection-id}}'
+        - --source-base-path
+        - '{{inputs.parameters.source-base-path}}'
+        - --dest-bucket
+        - '{{inputs.parameters.dest-bucket}}'
+        - --dest-base-path
+        - '{{inputs.parameters.dest-base-path}}'
+        - --scan-types
+        - '{{inputs.parameters.scan-types}}'
 

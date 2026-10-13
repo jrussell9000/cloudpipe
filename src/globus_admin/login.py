@@ -24,6 +24,12 @@ long-lived transfer credential on every workstation that ever ran setup.
 identity produces a token that authenticates fine and then cannot read the source
 collection — a failure that looks like a broken gateway. Refusing at login is the
 only place the mistake is still cheap.
+
+**One login, both ingress modes** (openspec add-https-ingress-mode). With a source
+collection configured, the same login also requests that collection's `/https`
+scope. The grant is stored beside the transfer token as `https-refresh-token`,
+and one session time serves both modes. A login that comes back without it is
+refused whole, rather than stored half-working.
 """
 
 from __future__ import annotations
@@ -49,10 +55,21 @@ class LoginResult:
     username: str
     identity_id: str | None
     established_at: datetime
+    #: The source collection's `/https` grant, for `ingress-mode=https`
+    #: (openspec add-https-ingress-mode). None when no source collection is
+    #: configured, so the login asked for no such scope.
+    https_refresh_token: str | None = None
 
     def secret_payload(self) -> dict[str, str]:
-        """Exactly the shape `transfer.py` and the ExternalSecret already expect."""
-        return {"native-app-client-id": self.client_id, "refresh-token": self.refresh_token}
+        """The shape `transfer.py` and the ExternalSecret expect, plus the HTTPS key when granted.
+
+        The first two keys never change: Globus ingress, the Prefect gate and the
+        cluster-sync check all read them, before and after the HTTPS mode exists.
+        """
+        payload = {"native-app-client-id": self.client_id, "refresh-token": self.refresh_token}
+        if self.https_refresh_token:
+            payload["https-refresh-token"] = self.https_refresh_token
+        return payload
 
 
 @dataclass
@@ -70,12 +87,20 @@ class LoginSession:
     app_factory: Callable[..., Any] | None = None
     userinfo: Callable[[Any], dict[str, Any]] | None = None
     now: Callable[[], datetime] | None = None
+    #: The source collection whose `/https` scope this login also requests. One
+    #: login, both scopes, one session time for both ingress modes.
+    https_collection_id: str | None = None
 
     def run(self) -> LoginResult:
         storage = _memory_storage()
-        app = (self.app_factory or _build_app)(
-            client_id=self.client_id, no_browser=self.no_browser, storage=storage
-        )
+        factory_args: dict[str, Any] = {
+            "client_id": self.client_id,
+            "no_browser": self.no_browser,
+            "storage": storage,
+        }
+        if self.https_collection_id:
+            factory_args["https_collection_id"] = self.https_collection_id
+        app = (self.app_factory or _build_app)(**factory_args)
 
         # `force=True` because a login that silently reuses a valid-looking token
         # is the one thing this command must never do: it is run precisely when
@@ -100,6 +125,26 @@ class LoginSession:
                 ),
             )
 
+        https_refresh_token = None
+        if self.https_collection_id:
+            https_data = storage.get_token_data(self.https_collection_id)
+            https_refresh_token = getattr(https_data, "refresh_token", None) if https_data else None
+            if not https_refresh_token:
+                # Refused rather than stored without it: a payload holding only the
+                # transfer token would leave `globus` working and `https` broken,
+                # with nothing saying so until a batch failed.
+                raise CliError(
+                    "globus.no_https_token",
+                    "The login returned no token for the source collection's HTTPS scope "
+                    f"({https_scope(self.https_collection_id)}), so HTTPS ingress could not "
+                    "read the source. Nothing was stored.",
+                    exit_code=ExitCode.CHECK_FAILED,
+                    remedy=Remedy(
+                        "human",
+                        "run the login again and approve every scope on the consent screen",
+                    ),
+                )
+
         moment = (self.now or (lambda: datetime.now(UTC)))()
         return LoginResult(
             client_id=self.client_id,
@@ -107,6 +152,7 @@ class LoginSession:
             username=username,
             identity_id=identity_id,
             established_at=moment,
+            https_refresh_token=str(https_refresh_token) if https_refresh_token else None,
         )
 
     def _auth_params(self) -> Any:
@@ -202,7 +248,18 @@ def _memory_storage() -> Any:
     return MemoryTokenStorage()
 
 
-def _build_app(*, client_id: str, no_browser: bool, storage: Any) -> Any:
+def https_scope(collection_id: str) -> str:
+    """A collection's HTTPS scope. A guest or High Assurance collection needs only this.
+
+    From https://docs.globus.org/globus-connect-server/v5/https-access-collections/
+    §4.2.1. Only a mapped, non-High-Assurance collection also needs `data_access`.
+    """
+    return f"https://auth.globus.org/scopes/{collection_id}/https"
+
+
+def _build_app(
+    *, client_id: str, no_browser: bool, storage: Any, https_collection_id: str | None = None
+) -> Any:
     import globus_sdk
 
     config = globus_sdk.GlobusAppConfig(
@@ -211,14 +268,15 @@ def _build_app(*, client_id: str, no_browser: bool, storage: Any) -> Any:
         login_flow_manager="command-line" if no_browser else "local-server",
         request_refresh_tokens=True,
     )
+    scope_requirements: dict[str, Any] = {
+        TRANSFER_RESOURCE_SERVER: [globus_sdk.TransferClient.scopes.all],
+        AUTH_RESOURCE_SERVER: ["openid", "profile", "email"],
+    }
+    if https_collection_id:
+        # A collection's tokens are issued under its own id as resource server.
+        scope_requirements[https_collection_id] = [https_scope(https_collection_id)]
     return globus_sdk.UserApp(
-        APP_NAME,
-        client_id=client_id,
-        config=config,
-        scope_requirements={
-            TRANSFER_RESOURCE_SERVER: [globus_sdk.TransferClient.scopes.all],
-            AUTH_RESOURCE_SERVER: ["openid", "profile", "email"],
-        },
+        APP_NAME, client_id=client_id, config=config, scope_requirements=scope_requirements
     )
 
 

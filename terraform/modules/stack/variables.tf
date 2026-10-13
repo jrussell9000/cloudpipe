@@ -890,7 +890,9 @@ variable "cloudflare_team_domain" {
   description = <<-EOT
     The Zero Trust team domain, `<team>.cloudflareaccess.com`. It is the
     `auth_domain` of the organization and the host WARP and the browser are sent
-    to, so it has to match what Cloudflare assigned this account.
+    to. The team name is chosen when Zero Trust is turned on in the dashboard,
+    which has to happen before the first apply: the provider updates the
+    organization and cannot create one.
   EOT
   type        = string
 
@@ -902,10 +904,9 @@ variable "cloudflare_team_domain" {
 
 variable "cloudflare_team_name" {
   description = <<-EOT
-    The organization's `name` as Cloudflare generated it — a separate value from
-    the team domain, and not derivable from it. Reading it back from the dashboard
-    is the only way to get it right; a wrong value is accepted and renames the
-    organization.
+    The organization's `name`, a label the deployer chooses. It is a separate
+    value from the team domain, and an apply replaces whatever name the
+    organization had, including the placeholder Cloudflare generated.
   EOT
   type        = string
 }
