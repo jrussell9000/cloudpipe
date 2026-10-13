@@ -584,4 +584,4 @@ its teardown order by reversing the same list rather than keeping a second copy.
 | `kubernetes_version` | `1.35` | Bump for EKS version upgrades |
 | `domain` | — | Base domain for every service hostname, or `null` for port-forward mode (no default — must be provided) |
 | `athena_result_retention_days` | `7` | Expiry for Athena query results in the finops bucket. Does not touch the CUR data or the Kubecost store, which share that bucket. 7 is also the minimum — Athena's result-reuse window. Nothing reads these objects after the query that wrote them, so there is no reason to keep them longer |
-| `terraform_state_bucket` | `null` | The bucket holding this deployment's state, so CloudTrail can log object-level access to it. `null` derives `<name>-terraform-state`; set it only if your state bucket is named differently or lives in another account |
+| `terraform_state_bucket` | `null` | The bucket holding this deployment's state, so CloudTrail can log object-level access to it. `null` derives `<name>-<bucket_suffix>-terraform-state` (`<name>-terraform-state` with no suffix); set it only if your state bucket is named differently or lives in another account |

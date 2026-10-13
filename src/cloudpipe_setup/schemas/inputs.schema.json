@@ -32,6 +32,29 @@
       "x-source": "deployer-choice",
       "x-terraform-variable": "region"
     },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,18}[a-z0-9]$",
+      "x-error-message": "name must be 3 to 20 characters: lowercase letters, digits and hyphens, starting with a letter and not ending in a hyphen.",
+      "default": "cloudpipe",
+      "title": "Deployment name",
+      "description": "The prefix of every resource this deployment creates, and the name of its EKS cluster. Names in your AWS account only have to be unique within it, so the default is fine unless one account holds two deployments.\n\nS3 bucket names are global across every AWS account, so the buckets also carry a random suffix the wizard generates (bucket_suffix): <name>-<suffix>-metrics, and so on.\n\nAvoid aws, amazon and cognito anywhere in it: the Cognito sign-in domain starts with this name, and Cognito refuses a domain that contains them.",
+      "x-section": "aws",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": "name"
+    },
+    "bucket_suffix": {
+      "type": "string",
+      "pattern": "^([a-z0-9]{6})?$",
+      "x-error-message": "bucket_suffix must be empty or exactly 6 lowercase letters and digits.",
+      "title": "S3 bucket name suffix",
+      "description": "Six random lowercase letters and digits that go into every S3 bucket name, after the deployment name. Bucket names are global across all AWS accounts, so without it two deployments with the same name collide, and anyone can claim a predictable name before you do.\n\nGenerated once and kept in the answers document, so every re-run and every machine you resume on uses the same buckets. Change it only before the bootstrap apply: once the buckets exist, a different suffix names buckets that do not.",
+      "x-section": "aws",
+      "x-source": "derived",
+      "x-terraform-variable": "bucket_suffix",
+      "x-derived": true,
+      "x-derived-random": 6
+    },
     "domain": {
       "type": [
         "string",
@@ -219,10 +242,16 @@
       "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
       "x-error-message": "state_bucket must be a valid S3 bucket name.",
       "title": "Terraform state bucket",
-      "description": "The S3 bucket holding this deployment's Terraform state. It must exist before the first `terraform init`, and creating it is the one step the wizard will not take for you — nothing here creates an AWS resource. The closing output prints the commands that create it, enable versioning on it, and block public access to it.\n\nUse a bucket dedicated to state, not the data bucket. Remote state is not optional in practice: local state is one laptop away from a deployment nobody can change, and versioning is what makes a truncated state recoverable. `cloudpipe setup --no-backend` skips the backend file entirely if you manage state another way.",
+      "description": "The S3 bucket holding this deployment's Terraform state, derived as <name>-<bucket_suffix>-terraform-state. It must exist before the first `terraform init`, and nothing here creates an AWS resource: the closing output prints the bootstrap command that creates it, versioned and with public access blocked.\n\nThe stack's CloudTrail data events watch the bucket by its derived name. Override this only to use a state bucket you already have, and then set terraform_state_bucket to the same name in a `.auto.tfvars` file, or the trail watches a bucket that does not exist. Use a bucket dedicated to state, not the data bucket. `cloudpipe setup --no-backend` skips the backend file entirely if you manage state another way.",
       "x-section": "terraform-state",
-      "x-source": "deployer-choice",
-      "x-terraform-variable": null
+      "x-source": "derived",
+      "x-terraform-variable": null,
+      "x-derived": true,
+      "x-derived-from": [
+        "name",
+        "bucket_suffix"
+      ],
+      "x-derived-template": "{name}-{bucket_suffix}-terraform-state"
     },
     "state_key": {
       "type": "string",

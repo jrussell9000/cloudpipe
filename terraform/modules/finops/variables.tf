@@ -33,6 +33,13 @@ variable "root_name" {
   type        = string
 }
 
+# Passed in rather than built from root_name: S3 names are global, so the stack
+# chooses it with its bucket suffix (stack variable bucket_suffix).
+variable "bucket_name" {
+  description = "Name of the finops bucket this module creates."
+  type        = string
+}
+
 variable "region" {
   type        = string
   description = "Infrastructure creation region"
