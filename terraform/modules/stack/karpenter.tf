@@ -26,4 +26,9 @@ module "karpenter" {
   # selects or pulls on these, they exist so a digest can be traced to a commit.
   fastsurfer_ami_tag = "sha-8621ce52cbf8b8097f9681cb9440476efe672441"
   fireants_ami_tag   = "sha-6d954b039097afba85b45679d39fd51864a2837c"
+
+  # Which AMI the GPU node class launches when this account has no bake of its
+  # own; see ../gpu-ami-choice.
+  gpu_ami_selection = var.gpu_ami_selection
+  gpu_ami_alias     = var.gpu_ami_alias
 }

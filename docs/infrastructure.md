@@ -73,7 +73,9 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 | `grafana.tf` | Grafana's Terraform-owned Secrets (Dex SSO client, local admin, image-renderer token) + OIDC ConfigMap. The release itself, its Ingress and the image renderer are GitOps (`gitops/apps/grafana/`) |
 | `logging.tf` | S3 log bucket, CloudTrail |
 | `dns.tf` | Route53 zone lookup, ACM certificates (us-east-1 + the deployment region) |
-| `ecr.tf` | ECR private repositories (primary registry for pipeline images) |
+| `ecr.tf` | ECR private repositories (primary registry for pipeline images); the ECR Public repositories and the CI role's push grant to them, only with `publish_public_artifacts = true` |
+| `image_cache.tf` | Where the workflows' images come from (`image_registry`): by default an ECR pull-through cache of the published images on ECR Public, with its repository creation template and the node roles' first-pull grant; `private` for a deployment that builds its own |
+| `public_amis.tf` | AMI block-public-access, declared `block-new-sharing` in each of `public_ami_regions`, only with `publish_public_artifacts = true` |
 | `s3_lifecycle.tf` | S3 lifecycle rules for data bucket |
 | `kube-system-network-policy.tf` | Default-deny/allow network policies in `kube-system` |
 | `locals.tf` | Derived locals — service URLs, VPC DNS resolver |

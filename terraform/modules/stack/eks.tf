@@ -3,7 +3,7 @@
 module "eks" {
 
   source  = "terraform-aws-modules/eks/aws"
-  version = "21.15.1"
+  version = "21.29.0"
 
   # Name and version of the EKS cluster
   name               = var.name

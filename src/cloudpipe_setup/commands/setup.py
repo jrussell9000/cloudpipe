@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .. import config, render, roots, schema
+from .. import cloudflare, config, render, roots, schema
 from ..cli import register
 from ..exits import CliError, ExitCode, Remedy
 
@@ -201,28 +201,33 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
     steps = []
 
     # Set anywhere Terraform loads — rendered by `globus init` or written by hand
-    # into terraform.tfvars — counts as done. See preflight's `globus.inputs`.
-    expected = schema.globus_variables() or ()
+    # into terraform.tfvars — counts as done. Narrowed by `globus_enabled` exactly
+    # as preflight's `globus.inputs` is, through the same function: this list used
+    # to demand all eight from a deployment with no ingress after preflight had
+    # stopped doing so.
+    expected = roots.wanted_globus_inputs(root, schema.STACK_VARIABLES) or ()
     globus = roots.globus_inputs(root, expected)
     done = bool(expected) and not globus.missing
+    kind, text = roots.missing_globus_remedy(root, globus.missing)
+    if kind == "command":
+        text += (
+            "  (read docs/globus-prerequisites.md first — several of its inputs come from "
+            "gates that take days)"
+        )
+    one = len(expected) == 1
     steps.append(
         {
             "identifier": "globus.inputs",
             "title": "Globus Terraform inputs",
             "state": "pass" if done else "blocked",
             "message": (
-                f"all {len(expected)} set, in {', '.join(p.name for p in globus.sources)}"
+                f"{'the one' if one else f'all {len(expected)}'} set, in "
+                f"{', '.join(p.name for p in globus.sources)}"
                 if done
-                else f"{len(globus.missing) or 'the'} Globus variable(s) not set: "
-                f"{', '.join(globus.missing) or 'unknown'}; this tool does not own them"
+                else f"not set: {', '.join(globus.missing) or 'unknown'}; this tool does not own "
+                f"{'it' if len(globus.missing) == 1 else 'them'}"
             ),
-            "remedy": None
-            if done
-            else {
-                "kind": "command",
-                "text": "pixi run globus init  (read docs/globus-prerequisites.md first — "
-                "several of its inputs come from gates that take days)",
-            },
+            "remedy": None if done else {"kind": kind, "text": text},
         }
     )
 
@@ -237,7 +242,7 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
                 "apply and survive its teardown: the imaging data bucket and the metrics bucket.",
                 "remedy": {
                     "kind": "command",
-                    "text": render.bootstrap_command(answers),
+                    "text": render.bootstrap_command(answers, root),
                 },
             }
         )
@@ -277,9 +282,11 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
             "as a Terraform variable, which would persist it in state.",
             "remedy": {
                 "kind": "human",
-                "text": "Export an account-scoped token with Zero Trust: Edit, plus Tunnel and "
-                "Access permissions, in the shell you install from. "
-                "`pixi run cloudpipe preflight` checks it before you start.",
+                "text": "Create the token from this link, which selects the four permission "
+                "groups the stack needs and scopes the token to your account: "
+                f"{cloudflare.token_template_url(answers.get('cloudflare_account_id'))} — then "
+                "export it as CLOUDFLARE_API_TOKEN in the shell you install from. "
+                "`pixi run cloudpipe preflight` checks every group before you start.",
             },
         }
     )

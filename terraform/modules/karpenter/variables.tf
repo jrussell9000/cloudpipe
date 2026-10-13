@@ -39,6 +39,18 @@ variable "fireants_ami_tag" {
 # would keep matching the OLD AMI while the workflow templates pinned the new
 # digest — the pre-bake would silently become a cache miss and every GPU node
 # would re-pull ~16 GB at pod start (the #123 failure mode).
+variable "gpu_ami_selection" {
+  description = "How the GPU node class picks its AMI: `auto` (this account's pre-baked AMI, else the publisher's pinned public one, else the stock AL2023 AMI) or `alias` (always the stock one). See ../gpu-ami-choice."
+  type        = string
+  default     = "auto"
+}
+
+variable "gpu_ami_alias" {
+  description = "Karpenter alias for the stock AMI, used when no pre-baked AMI applies. `al2023@latest` follows Amazon's releases, so GPU nodes drift to each new AMI; pin `al2023@vYYYYMMDD` to hold one."
+  type        = string
+  default     = "al2023@latest"
+}
+
 variable "fastsurfer_ami_digest" {
   description = "Fastsurfer image digest (sha256:...) pre-baked into the GPU AMI, used to select it via Karpenter amiSelectorTerms. MUST equal the digest pinned in the workflow templates."
   type        = string

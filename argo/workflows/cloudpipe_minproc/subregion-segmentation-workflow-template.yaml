@@ -286,7 +286,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:fb478b4635bb23fa93bc117f9274a49d4d1008b4c974b3182c7fd63bf8c44c70"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:3abfd19aa254d7bf340b981ab8ed7d6575140df84168ca399094ba9d4a89fa40"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

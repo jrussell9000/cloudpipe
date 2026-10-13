@@ -104,6 +104,13 @@ locals {
     # build-fmri-first-level-proc.yaml in this same change, and nothing else in
     # the tree references the image.
     "fmri-first-level-proc",
+    # fsl, diffusion: both install FSL, which may not be redistributed publicly
+    # (openspec/changes/publish-images-for-deployers, tasks 0.1 and 2.6).
+    # Both repositories held 0 images on 2026-10-11, no template pins either,
+    # and nothing has pushed to ECR Public since 2026-08-17, so retiring them
+    # destroys two empty repositories and nothing else.
+    "diffusion",
+    "fsl",
   ]
 
   # The public set is DERIVED, so a name can only ever leave it by being listed
@@ -245,6 +252,17 @@ resource "aws_ecr_registry_scanning_configuration" "this" {
         filter_type = "WILDCARD"
       }
     }
+
+    # Images pulled through the cache (image_cache.tf). They are the publisher's
+    # scanned images byte for byte, but this account's scan is this account's
+    # evidence, and a CVE published after the copy surfaces only on a rescan.
+    dynamic "repository_filter" {
+      for_each = local.image_cache_enabled ? ["${var.image_cache_prefix}/*"] : []
+      content {
+        filter      = repository_filter.value
+        filter_type = "WILDCARD"
+      }
+    }
   }
 }
 
@@ -252,7 +270,11 @@ resource "aws_ecrpublic_repository" "images" {
   # Deliberately local.ecr_images_public, NOT local.ecr_images: the public
   # registry is being retired image by image while the private one keeps every
   # repo. See local.ecr_images_public_retired for the preconditions.
-  for_each = local.ecr_images_public
+  #
+  # Gated on the empty set rather than by count, so the publisher's addresses are
+  # unchanged (`images["afni"]` before and after) and no `moved` block is needed.
+  # A deployment that pulls the published images creates none of these.
+  for_each = var.publish_public_artifacts ? local.ecr_images_public : toset([])
   provider = aws.us_east_1
 
   repository_name = "${var.name}/${each.key}"
@@ -270,8 +292,13 @@ resource "aws_ecrpublic_repository" "images" {
 
 # Extract the registry prefix (public.ecr.aws/<alias>) from any one repo URI.
 # URI format: public.ecr.aws/<alias>/<repo-name>
+#
+# Null when this deployment publishes nothing. Indexing `values(...)[0]` directly
+# fails at plan on an empty map, and only for deployers, so never here.
 locals {
-  ecr_public_registry = regex("public\\.ecr\\.aws/[^/]+", values(aws_ecrpublic_repository.images)[0].repository_uri)
+  ecr_public_registry = one(distinct([
+    for repo in aws_ecrpublic_repository.images : regex("public\\.ecr\\.aws/[^/]+", repo.repository_uri)
+  ]))
 }
 
 ################################################################################
@@ -411,24 +438,30 @@ resource "aws_iam_role" "github_actions_ecr" {
   description        = "Assumed by GitHub Actions to push images to private ECR"
 }
 
-# No ecr-public PUSH grant. The ECRPublicAuth and ECRPublicPush statements were
-# removed 2026-08-17 with the transitional dual-push (Step 6, push side). Dropping
-# the workflow refs alone would not have stopped a public push -- any future edit
-# could have re-added one and it would have succeeded silently. Revoking the grant
-# is the enforcement point, and it is what makes the RA-5 claim ("every image we
-# publish is inside the Inspector scanning configuration") true by construction
-# rather than by convention. The 13 public repositories still exist as a frozen
-# rollback target; nothing can write to them.
+# The ecr-public PUSH grant is ECRPublicPush below, and it exists only on the
+# publisher (`publish_public_artifacts`). It was removed on 2026-08-17 with the
+# transitional dual-push, as POAM P1-5b's control: nothing could write to ECR
+# Public, so every published image was inside the Inspector scanning
+# configuration by construction. It returned on purpose, when publishing for
+# other deployers was decided (openspec/changes/publish-images-for-deployers),
+# and P1-5b was reopened for it on 2026-10-10.
 #
-# ECRPublicPullAuth below is NOT that grant coming back. It lets build-images.yaml
-# log Docker in to public.ecr.aws so the base-image pulls (`FROM public.ecr.aws/
-# docker/library/...`) are authenticated: anonymous ones are metered per source
-# IP, GitHub-hosted runners share their IPs, and builds were failing with
-# `429 Too Many Requests ... toomanyrequests: Data limit exceeded`. The token
-# only identifies the caller. Every push API -- InitiateLayerUpload,
-# UploadLayerPart, CompleteLayerUpload, PutImage -- is still authorized per call
-# against this role, and none is granted, so a push with this token is denied
-# exactly as before.
+# What replaces "nothing can write" is "only a digest-equal copy of a scanned
+# private image is written". The grant cannot express that; the copy step does,
+# by copying `@<digest>` from private ECR and failing unless the public digest is
+# the same, so the public artifact is the scanned one byte for byte. That step is
+# task 2.1 of the change; until it lands in build-images.yaml, nothing pushes.
+# The grant is scoped to the public repositories this file declares, and a
+# deployment that does not publish has no such statement.
+#
+# ECRPublicPullAuth is a different thing and is NOT gated. It lets
+# build-images.yaml log Docker in to public.ecr.aws so the base-image pulls
+# (`FROM public.ecr.aws/docker/library/...`) are authenticated: anonymous ones
+# are metered per source IP, GitHub-hosted runners share their IPs, and builds
+# were failing with `429 Too Many Requests ... toomanyrequests: Data limit
+# exceeded`. The token only identifies the caller. Every push API is authorized
+# per call against this role, so without ECRPublicPush a push with this token is
+# denied.
 data "aws_iam_policy_document" "github_actions_ecr" {
   statement {
     sid    = "ECRPrivateAuth"
@@ -469,6 +502,24 @@ data "aws_iam_policy_document" "github_actions_ecr" {
       [aws_ecr_repository.build_cache.arn],
       [for repo in aws_ecr_repository.images : repo.arn],
     )
+  }
+  # The publisher's copy to ECR Public; see the comment above this document.
+  # Push actions only: public reads are anonymous, so the digest check after
+  # the copy needs no grant.
+  dynamic "statement" {
+    for_each = var.publish_public_artifacts ? ["ECRPublicPush"] : []
+    content {
+      sid    = statement.value
+      effect = "Allow"
+      actions = [
+        "ecr-public:BatchCheckLayerAvailability",
+        "ecr-public:CompleteLayerUpload",
+        "ecr-public:InitiateLayerUpload",
+        "ecr-public:PutImage",
+        "ecr-public:UploadLayerPart",
+      ]
+      resources = [for repo in aws_ecrpublic_repository.images : repo.arn]
+    }
   }
 }
 
@@ -697,7 +748,7 @@ output "github_actions_packer_role_arn" {
 }
 
 output "ecr_registry" {
-  description = "ECR Public registry prefix (e.g. public.ecr.aws/<alias>) — legacy; being retired"
+  description = "ECR Public registry prefix (e.g. public.ecr.aws/<alias>) this deployment publishes to; null unless publish_public_artifacts is true. Not what the workflows pull from: that is ecr_private_registry"
   value       = local.ecr_public_registry
 }
 

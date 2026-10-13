@@ -27,6 +27,11 @@ spec:
     httpPutResponseHopLimit: 3
     httpTokens: required
   detailedMonitoring: true
+  # Explicit, never left to the subnet's default. Only the ingress node class may
+  # set true (openspec change add-https-ingress-mode, ingress-node-isolation);
+  # tests/test_ingress_node_isolation.py holds every node class to that.
+  # Changing this field drifts every node of the class: apply it with no batch running.
+  associatePublicIPAddress: false
   role: ${ karpenter_node_iam_role_name }
   subnetSelectorTerms:
   - tags:

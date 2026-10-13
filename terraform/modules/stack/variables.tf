@@ -264,6 +264,88 @@ variable "github_oidc_allowed_subs" {
   }
 }
 
+# Off for everyone but the publisher. A deployment pulls the published images and
+# AMI; it publishes nothing, so it needs no public repository, no push grant, and
+# no opinion on its account's AMI sharing block. See
+# openspec/changes/publish-images-for-deployers.
+variable "publish_public_artifacts" {
+  description = "Create the resources that publish this deployment's images and GPU AMI for other deployers: the ECR Public repositories, the CI role's push grant to them, and the declared AMI block-public-access state in each of `public_ami_regions`. Default false, because a deployment that pulls the published artifacts has no use for any of them. The reference deployment sets it true."
+  type        = bool
+  default     = false
+}
+
+variable "image_registry" {
+  description = "Where the workflows pull their images from. `public-cache` (default): an ECR pull-through cache of the images the publisher copies to ECR Public, so a deployment that builds no image can run every workflow. `private`: this deployment's own private ECR, for a deployment that builds and pins its own images. The reference deployment sets `private`. See image_cache.tf."
+  type        = string
+  default     = "public-cache"
+
+  validation {
+    condition     = contains(["public-cache", "private"], var.image_registry)
+    error_message = "image_registry must be \"public-cache\" or \"private\"."
+  }
+}
+
+variable "image_publisher_alias" {
+  description = "ECR Public registry alias the published images live under (public.ecr.aws/<alias>/cloudpipe/...). Read only with image_registry = \"public-cache\". The default is the reference deployment's, which publishes them; change it only to pull from a different publisher."
+  type        = string
+  default     = "l9e7l1h1"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-_]{1,49}$", var.image_publisher_alias))
+    error_message = "image_publisher_alias must be an ECR Public registry alias: lowercase letters, digits, - and _."
+  }
+}
+
+variable "image_cache_prefix" {
+  description = "Repository-name prefix of the pull-through cache in this account's private ECR. Read only with image_registry = \"public-cache\"."
+  type        = string
+  default     = "ecr-public"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9._-]{1,29}$", var.image_cache_prefix))
+    error_message = "image_cache_prefix must be 2-30 characters of lowercase letters, digits, ., _ and -."
+  }
+}
+
+variable "image_cache_keep" {
+  description = "Cached images kept per repository before the oldest expire. Must exceed the number of digests of one image that a template or an in-flight workflow can still reference."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.image_cache_keep >= 3
+    error_message = "image_cache_keep below 3 can expire a digest an in-flight workflow still runs."
+  }
+}
+
+variable "gpu_ami_selection" {
+  description = "How the GPU node class picks its AMI. `auto` (default): this account's own pre-baked AMI for the current images, else the publisher's public one pinned for this region in modules/karpenter/published-gpu-amis.json, else the stock EKS-optimized AL2023 AMI, on which GPU nodes pull the images at start. `alias`: always the stock AMI, for when the pinned public AMI cannot be launched."
+  type        = string
+  default     = "auto"
+
+  validation {
+    condition     = contains(["auto", "alias"], var.gpu_ami_selection)
+    error_message = "gpu_ami_selection must be \"auto\" or \"alias\"."
+  }
+}
+
+variable "gpu_ami_alias" {
+  description = "Karpenter alias for the stock GPU AMI. `al2023@latest` follows Amazon's releases, so GPU nodes drift to each new AMI, which Karpenter's documentation warns about for production; pin `al2023@vYYYYMMDD` to hold one."
+  type        = string
+  default     = "al2023@latest"
+}
+
+variable "public_ami_regions" {
+  description = "Regions whose AMI block-public-access is declared `block-new-sharing`. Read only when `publish_public_artifacts` is true. No AMI is shared publicly from the publisher (see public_amis.tf); the declaration makes a block lifted by hand show as drift."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for region in var.public_ami_regions : can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", region))])
+    error_message = "public_ami_regions entries must be AWS region names, shaped like var.region."
+  }
+}
+
 
 #######################
 # Globus Variables    #

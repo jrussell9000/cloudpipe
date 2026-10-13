@@ -49,6 +49,47 @@ resource "kubectl_manifest" "nodeclass" {
   ]
 }
 
+# Does this account own a pre-baked GPU AMI for the current images? The same three
+# tags the node class selects on. `aws_ami_ids` returns an empty list rather than
+# failing, which is what lets a deployment with no bake fall through to the
+# published AMI or the stock one. Not read with selection = "alias".
+data "aws_ami_ids" "gpu_baked" {
+  count  = var.gpu_ami_selection == "alias" ? 0 : 1
+  owners = ["self"]
+
+  filter {
+    name   = "tag:fastsurfer-image-digest"
+    values = [var.fastsurfer_ami_digest]
+  }
+  filter {
+    name   = "tag:fireants-image-digest"
+    values = [var.fireants_ami_digest]
+  }
+  filter {
+    name   = "tag:eks-version"
+    values = [var.eks_version]
+  }
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+}
+
+data "aws_region" "current" {}
+
+module "gpu_ami" {
+  source = "../gpu-ami-choice"
+
+  baked_ami_found   = length(flatten(data.aws_ami_ids.gpu_baked[*].ids)) > 0
+  published         = jsondecode(file("${path.module}/published-gpu-amis.json"))
+  fastsurfer_digest = var.fastsurfer_ami_digest
+  fireants_digest   = var.fireants_ami_digest
+  eks_version       = var.eks_version
+  region            = data.aws_region.current.region
+  selection         = var.gpu_ami_selection
+  alias             = var.gpu_ami_alias
+}
+
 resource "kubectl_manifest" "gpu-nodeclass" {
   server_side_apply = true
   force_conflicts   = true
@@ -59,6 +100,11 @@ resource "kubectl_manifest" "gpu-nodeclass" {
       fastsurfer_ami_digest        = var.fastsurfer_ami_digest
       fireants_ami_digest          = var.fireants_ami_digest
       eks_version                  = var.eks_version
+      gpu_ami_kind                 = module.gpu_ami.kind
+      # Not coalesce(..., ""): coalesce skips empty strings as well as nulls, so
+      # with no published AMI it has nothing to return and fails the plan.
+      gpu_ami_id    = module.gpu_ami.ami_id == null ? "" : module.gpu_ami.ami_id
+      gpu_ami_alias = var.gpu_ami_alias
   })
 
   depends_on = [
