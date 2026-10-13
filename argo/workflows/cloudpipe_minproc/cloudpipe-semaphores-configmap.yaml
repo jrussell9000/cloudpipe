@@ -8,3 +8,8 @@ data:
   # The GCS instance (c5n.xlarge, 4 vCPU / 10.5 GB RAM) runs one GridFTP process
   # per active transfer. 8 is a safe ceiling for large BOLD file transfers.
   globus-transfer: "8"
+  # Maximum concurrent ingress-mode=https copies. Not bound by our GCS host —
+  # there is none in that path — but 8 is the concurrency production already
+  # places on the NBDC source through Globus, so switching modes adds no load.
+  # Raise it only in measured steps (plan 018 §9, T2: 8 was clean, 16 never ran).
+  https-transfer: "8"

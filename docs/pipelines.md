@@ -714,7 +714,10 @@ Retry limit: 8, as a per-template override of the same spec-level budget. This i
 S3 output — one tarball per run, built by the driver (`tar` rooted at `{task}_{run}/`) and uploaded via a single directory artifact keyed on `derivatives/func/{subj}/{ses}/`. The filename is inventory's `func_exists` marker, so it is unchanged:
 ```
 derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
+derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_events.tsv    # n-back only
 ```
+
+The `_events.tsv` is ABCD's own task timing (`onset`, `duration`, `response_time`, `trial_type`), copied unchanged from the staged `mmps_mproc/` input next to each fresh tarball. Staged input is deleted when a workflow succeeds, so this copy is the only one we keep. It is a separate object so a first-level reader can fetch it without unpacking the tarball. Onsets count from the first acquired frame. The MNI BOLD keeps every frame (non-steady-state frames are flagged in the confounds, not removed), so the onsets apply to it unchanged. Resting-state runs have no events file. An n-back run staged without one logs a `WARNING` and keeps its BOLD.
 
 #### Grayordinate extraction (Stage 5b)
 

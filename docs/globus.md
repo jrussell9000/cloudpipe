@@ -342,6 +342,13 @@ asks External Secrets to re-sync the Kubernetes Secret. The client ID comes from
 stored credential, so there is nothing to export. On a machine with no browser, add
 `--no-browser` to get a URL to open elsewhere.
 
+When the answers document names a `source_collection_id`, the same login also asks
+for that collection's HTTPS scope (`https://auth.globus.org/scopes/<id>/https`), for
+`ingress-mode=https`. Approve every scope on the consent screen. The grant is stored
+beside the transfer token as `https-refresh-token`. A login that comes back without
+it is refused, and stores nothing, so the two modes never drift onto different
+sessions. One login, and one recorded session time, serve both.
+
 The re-sync needs Cloudflare WARP. Without it the login still succeeds and says so,
 and the cluster picks the token up on External Secrets' hourly refresh instead.
 

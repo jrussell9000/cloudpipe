@@ -32,6 +32,11 @@ gate lets the batch through. So from the day the listing shipped (#437) until
 #652, every batch submitted after an idle midnight was refused with a connect
 timeout that read like an outage. `wake_host` starts the host first, the same
 way the workflow step does.
+
+`ingress-mode=https` asks the same two questions against different things. Life
+is measured against our 30-day rule, not a gateway's timeout. The live check lists
+the *source* and refreshes the HTTPS token once, and it wakes nothing: no Globus
+host of ours is in that path.
 """
 
 from __future__ import annotations
@@ -62,6 +67,14 @@ DEFAULT_WARN_DAYS = 5.0
 # Only used when nothing declares a timeout. Matches the declared production
 # value; if the two ever disagree, the declaration wins.
 DEFAULT_SESSION_TIMEOUT_MINUTES = 30 * 24 * 60
+
+#: `ingress-mode=https` holds a login to 30 days. That is this deployment's own
+#: re-authentication rule (plan 018 §8), not a gateway's timeout: the source's is a
+#: year, and nothing of ours sits in the HTTPS path to declare one. The ingress pod
+#: enforces the same number (`images/globus/https_ingress.py`, `MAX_SESSION_DAYS`);
+#: a test holds the two equal.
+HTTPS_RULE_MINUTES = 30 * 24 * 60
+HTTPS_RULE_SOURCE = "this deployment's 30-day re-authentication rule for ingress-mode=https"
 
 
 class AmbiguousGatewayError(RuntimeError):
@@ -297,11 +310,60 @@ def destination_reachable(transfer_client: Any, collection_id: str, path: str) -
     except Exception as exc:
         if getattr(exc, "http_status", None) == 404:
             return True, "listing returned 404 (path absent), so the session is still good"
-        return False, _explain(exc)
+        return False, _explain(exc, "destination")
     return True, "destination listing succeeded"
 
 
-def _explain(exc: Exception) -> str:
+def source_reachable(transfer_client: Any, collection_id: str, path: str) -> tuple[bool, str]:
+    """One listing of the source base path — the `https` gate's Transfer half.
+
+    Unlike the destination's, a 404 here is a refusal. The base path is where
+    every subject in the batch is read from, so its absence fails every
+    workflow, and the gate exists to say that once instead of N times.
+    """
+    try:
+        transfer_client.operation_ls(collection_id, path=path)
+    except Exception as exc:
+        if getattr(exc, "http_status", None) == 404:
+            return False, (
+                f"The source base path {path} does not exist on collection {collection_id}, "
+                "so no subject in this batch could be read. Check "
+                "/cloudpipe/globus/source-base-path or the flow's globus_source_base_path."
+            )
+        return False, _explain(exc, "source")
+    return True, "source listing succeeded"
+
+
+def https_token_refreshes(
+    auth_client: Any, refresh_token: str | None, collection_id: str
+) -> tuple[bool, str]:
+    """One refresh of the stored HTTPS token — the `https` gate's second half.
+
+    The listing proves the transfer token; it says nothing about the second
+    token, which a login can omit (no source configured then) or Globus can
+    revoke on its own. Checks the same thing the ingress pod will need: an
+    access token for the source collection's resource server.
+    """
+    remedy = f"Grant the HTTPS scope again with `{LOGIN_COMMAND}`."
+    if not refresh_token:
+        return False, (
+            f"The stored Globus credential ({SECRET_ID}) has no https-refresh-token, so no "
+            f"ingress pod could read the source over HTTPS. {remedy}"
+        )
+    try:
+        response = auth_client.oauth2_refresh_token(refresh_token)
+    except Exception as exc:
+        return False, f"Globus refused the HTTPS refresh token: {exc}. {remedy}"
+    tokens = response.by_resource_server.get(collection_id) or {}
+    if not tokens.get("access_token"):
+        return False, (
+            f"The HTTPS refresh token carries no grant for source collection {collection_id}. "
+            f"{remedy}"
+        )
+    return True, "HTTPS token refresh succeeded"
+
+
+def _explain(exc: Exception, role: str) -> str:
     """Name the lapsed-session case, which does not look like one."""
     raw = str(exc)
     payload = getattr(exc, "raw_json", None)
@@ -310,11 +372,11 @@ def _explain(exc: Exception) -> str:
         "session_required_identities"
     ):
         return (
-            "The destination collection refused the stored credential because the Globus "
+            f"The {role} collection refused the stored credential because the Globus "
             "session behind it has lapsed. A refresh token cannot fix this — sessions are "
             f"extended by an interactive login. Run `{LOGIN_COMMAND}`. Raw error: {raw}"
         )
-    return f"The destination collection could not be listed: {raw}"
+    return f"The {role} collection could not be listed: {raw}"
 
 
 def _parse(value: str | datetime | None) -> datetime | None:

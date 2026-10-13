@@ -115,6 +115,14 @@ TARBALL_RE = re.compile(
     r"^derivatives/func/(sub-[^/]+)/(ses-[^/]+)/\1_\2_(task-[^_]+)_(run-[^_]+)"
     r"_space-MNI152NLin2009cAsym_bold\.tar\.gz$"
 )
+# ABCD's task timing, copied beside each fresh n-back tarball by the func driver.
+EVENTS_RE = re.compile(
+    r"^derivatives/func/(sub-[^/]+)/(ses-[^/]+)/\1_\2_(task-[^_]+)_(run-[^_]+)_events\.tsv$"
+)
+# The tasks whose runs should carry an events file: ABCD ships one for every
+# n-back run it releases, and none for rest. verify reports a missing one; it
+# does not retry for it.
+EVENTS_TASKS = ("task-nback",)
 DTSERIES_RE = re.compile(
     r"^derivatives/func_surf/(sub-[^/]+)/(ses-[^/]+)/fsLR32k/\1_\2_(task-[^_]+)_(run-[^_]+)"
     r"_space-fsLR32k_bold\.dtseries\.nii$"
@@ -757,6 +765,7 @@ class Evidence:
     baseline: set = field(default_factory=set)
     tarballs: dict = field(default_factory=dict)
     dtseries: dict = field(default_factory=dict)
+    events: dict = field(default_factory=dict)
     qc_raw: dict = field(default_factory=lambda: defaultdict(list))
     surf_raw: dict = field(default_factory=lambda: defaultdict(list))
     qc_compacted: Counter = field(default_factory=Counter)
@@ -770,6 +779,11 @@ class Evidence:
 
 def unit_of_tarball(key: str):
     m = TARBALL_RE.match(key)
+    return m.groups() if m else None
+
+
+def unit_of_events(key: str):
+    m = EVENTS_RE.match(key)
     return m.groups() if m else None
 
 
@@ -842,7 +856,16 @@ def classify_subject(subject: str, ev: Evidence) -> SubjectResult:
         lag = [u for u in units if counter[u] == 0]
         if lag:
             pending.append(f"{len(lag)} run(s) not yet in compacted {name}")
-    return SubjectResult(subject, "PENDING" if pending else "OK", pending)
+    # A note, never a RETRY: the timing is ABCD's file, copied as-is, and a
+    # subject reprocessed before the driver kept it (the 2026-10-13 pilot) is
+    # not worth a whole reprocess just to gain it.
+    no_events = [
+        u
+        for u in units
+        if u[2] in EVENTS_TASKS and not (ev.events.get(u) and ev.events[u] > ev.flushed_at)
+    ]
+    notes = [f"note: {len(no_events)} n-back run(s) have no _events.tsv"] if no_events else []
+    return SubjectResult(subject, "PENDING" if pending else "OK", pending + notes)
 
 
 def gather_derivatives(s3, args, evidence: dict[str, Evidence]) -> None:
@@ -858,6 +881,8 @@ def gather_derivatives(s3, args, evidence: dict[str, Evidence]) -> None:
             for o in objs:
                 if u := unit_of_tarball(o["Key"]):
                     evidence[u[0]].tarballs[u] = o["LastModified"]
+                elif u := unit_of_events(o["Key"]):
+                    evidence[u[0]].events[u] = o["LastModified"]
                 elif u := unit_of_dtseries(o["Key"]):
                     evidence[u[0]].dtseries[u] = o["LastModified"]
 

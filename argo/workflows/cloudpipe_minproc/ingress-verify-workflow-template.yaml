@@ -5,8 +5,14 @@ metadata:
   namespace: argo-workflows
 
 # Staged-input validator for `ingress-mode=presynced` (#336,
-# plans/011-pluggable-data-ingress.md §6). Invoked only through templateRef from
-# cloudpipe-long-master, so it has no entrypoint and no spec.arguments.
+# plans/011-pluggable-data-ingress.md §6), and for `ingress-mode=https` after its
+# copy (openspec add-https-ingress-mode, design D2). Invoked only through
+# templateRef from cloudpipe-long-master, so it has no entrypoint and no
+# spec.arguments.
+#
+# In https mode the copy has already checked every object's size against the
+# listing. This checks the contract — session naming, the literal T1w key, at
+# least one rest/nback run, the NSS row — which a size check cannot see.
 #
 # It checks the ingress contract in docs/data-ingress.md against what an
 # operator staged by hand, BEFORE inventory consumes it. Everything it fails on
@@ -67,18 +73,18 @@ spec:
 
         sys.path.insert(0, "/app")
 
-        INGRESS_MODES = ("globus", "presynced")
+        INGRESS_MODES = ("globus", "presynced", "https")
 
 
         def unknown_mode_error(mode):
             """An error message if this step should not be validating `mode` at all."""
-            if mode == "presynced":
+            if mode in ("presynced", "https"):
                 return None
             return (
                 f"ingress-mode={mode!r} is not one of {list(INGRESS_MODES)}. The Globus "
-                f"tasks were skipped because it is not 'globus', so nothing was "
-                f"transferred; refusing to run inventory over whatever is staged. "
-                f"Resubmit with a valid mode."
+                f"and HTTPS tasks were skipped because it is neither 'globus' nor "
+                f"'https', so nothing was transferred; refusing to run inventory over "
+                f"whatever is staged. Resubmit with a valid mode."
             )
 
 
