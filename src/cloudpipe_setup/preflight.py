@@ -86,10 +86,10 @@ check after it is `skipped` without one."""
 TOKEN_ENV = "CLOUDFLARE_API_TOKEN"
 
 
-def _cli(subcommand: str) -> str:
+def _cli(subcommand: str, *, task: str = "cloudpipe") -> str:
     from .render import cli_command
 
-    return cli_command(subcommand)
+    return cli_command(subcommand, task=task)
 
 
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
@@ -552,7 +552,7 @@ def _check_prefix_lists(
             CHECK_PREFIX_LISTS,
             "Managed prefix lists",
             "globus_admin_prefix_list_id is not set in any tfvars file in this root.",
-            Remedy("command", "pixi run globus init"),
+            Remedy("command", _cli("init", task="globus")),
         )
     if identity is None:
         return _no_credentials(CHECK_PREFIX_LISTS, "Managed prefix lists")

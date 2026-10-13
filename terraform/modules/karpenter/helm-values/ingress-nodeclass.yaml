@@ -3,14 +3,15 @@ kind: EC2NodeClass
 metadata:
   name: ingress-nodeclass
 # For `ingress-mode=https` pods only (openspec add-https-ingress-mode). The same
-# image, disks and metadata options as `nodeclass`, with four differences:
+# image, disks and metadata options as `nodeclass`, with five differences:
 #   - public IPv4 addresses, so ingress bytes skip the NAT gateway;
 #   - the ingress subnets and the ingress-node security group, selected by ID.
 #     A tag would match any subnet in the account that carries it, and an ID
 #     cannot;
 #   - its own, narrower node role (ingress.tf);
 #   - no karpenter.sh/discovery selector anywhere, so it cannot land in the
-#     general subnets or groups, and they cannot land here.
+#     general subnets or groups, and they cannot land here;
+#   - no SSM agent (userData, below).
 spec:
   amiFamily: Bottlerocket
   amiSelectorTerms:
@@ -47,3 +48,18 @@ spec:
 
   kubelet:
     maxPods: 110
+
+  # No SSM session path to these nodes (design D9). Leaving SSM out of the node
+  # role is not enough: this account has SSM's Default Host Management
+  # Configuration on, which registers every instance through an account-wide
+  # role whatever its own role holds. Task 3.6 found the first ingress node
+  # `Online` in SSM that way (2026-10-13). On Bottlerocket the SSM agent runs in
+  # the control host container, so it is switched off here; admin, off by
+  # default, is pinned off too. Karpenter merges this TOML with its own
+  # settings and copies keys it does not set as they are.
+  userData: |
+    [settings.host-containers.control]
+    enabled = false
+
+    [settings.host-containers.admin]
+    enabled = false

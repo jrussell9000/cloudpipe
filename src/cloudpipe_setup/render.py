@@ -41,11 +41,13 @@ TFVARS_HEADER = """\
 # Two kinds of value are NOT here, because this tool does not own them:
 #
 #   * globus_s3_destination_bucket — the imaging data bucket, despite the name,
-#     and required either way. Add it below by hand: the data_bucket name you
-#     gave the bootstrap root (`terraform -chdir=bootstrap output data_bucket`).
+#     and required either way. Put it in data-bucket.auto.tfvars beside this
+#     file, not here: a re-render with --force drops lines added to this file.
+#     The value is the data_bucket name you gave the bootstrap root
+#     (`terraform -chdir=bootstrap output data_bucket`).
 #   * The Globus ingress's seven inputs, needed only with globus_enabled = true.
-#     `pixi run globus init` renders them into globus.auto.tfvars, which
-#     Terraform loads after this file.
+#     `globus init`, run from this directory, renders them into
+#     globus.auto.tfvars, which Terraform loads after this file.
 #
 # Next step is not `terraform apply`. A fresh deployment's first apply is phased,
 # because the root's providers look up a cluster that does not exist yet. Run
@@ -130,16 +132,15 @@ BOOTSTRAP_DIR = "bootstrap"
 CLONE = Path(__file__).resolve().parents[2]
 
 
-def cli_command(subcommand: str) -> str:
+def cli_command(subcommand: str, *, task: str = "cloudpipe") -> str:
     """How to run a wizard command from the deployment root, with this clone's real path.
 
     A bare `pixi run cloudpipe ...` only works from inside the clone, and the
     deployer runs these from their root, so every printed command carries
-    `--manifest-path`.
+    `--manifest-path`. `task="globus"` gives the same for `globus init`, which
+    also resolves its paths against the directory it is run from.
     """
-    return (
-        f"pixi run --manifest-path {shlex.quote(str(CLONE / 'pixi.toml'))} cloudpipe {subcommand}"
-    )
+    return f"pixi run --manifest-path {shlex.quote(str(CLONE / 'pixi.toml'))} {task} {subcommand}"
 
 
 def bootstrap_command(answers: dict[str, Any], root: Path, *, clone: Path = CLONE) -> str:
@@ -196,15 +197,27 @@ def write(path: Path, content: str, *, force: bool) -> Path:
     a deployer who meant to overwrite should not have to guess what it is called.
     """
     if path.exists() and not force:
+        # A file an earlier run rendered is the usual case: re-running setup is how
+        # a deployer changes an answer. The message used to say "a file it did not
+        # write" there too, which was false and hid the real risk — the docs have
+        # deployers add a line to terraform.tfvars by hand, and --force drops it
+        # (second-account rerun, 2026-10-13).
+        ours = path.read_text(errors="replace").startswith(TFVARS_HEADER.splitlines()[0])
+        text = (
+            f"Re-run with --force to render {path.name} again from the answers document. "
+            "That drops any line you added to it by hand: move such lines into a "
+            "`<name>.auto.tfvars` file beside it first, which Terraform also loads and this "
+            "tool never writes."
+            if ours
+            else f"Re-run with --force to overwrite it, or move {path.name} aside first. "
+            "This tool did not write it and does not merge into it."
+        )
         raise CliError(
             "render.exists",
-            f"{path} already exists",
+            f"{path} already exists"
+            + (", rendered by an earlier `cloudpipe setup` run" if ours else ""),
             exit_code=ExitCode.INVALID,
-            remedy=Remedy(
-                "command",
-                f"Re-run with --force to overwrite it, or move {path.name} aside first. "
-                "This tool does not merge into a file it did not write.",
-            ),
+            remedy=Remedy("command", text),
             detail={"path": str(path)},
         )
     path.write_text(content)

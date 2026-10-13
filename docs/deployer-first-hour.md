@@ -135,7 +135,7 @@ Three details that matter in practice:
 
 Two kinds of value are deliberately **not** asked for here:
 
-- **`globus_s3_destination_bucket`**, the imaging data bucket. Despite the prefix it is required whether or not you run Globus. You choose its name in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) and then add it to `terraform.tfvars` by hand; the header of the rendered file says so, and preflight reports it if you forget.
+- **`globus_s3_destination_bucket`**, the imaging data bucket. Despite the prefix it is required whether or not you run Globus. You choose its name in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) and then write it into `data-bucket.auto.tfvars` by hand; the header of the rendered file says so, and preflight reports it if you forget.
 - **The Globus ingress's seven inputs**, needed only if you enable the ingress. They belong to a separate tool, covered in step 5.
 
 ### Driving it from a script
@@ -179,9 +179,10 @@ terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap apply \
 
 `cloudpipe setup` prints that command with your own paths and answers filled in. Why the copy matters: this root keeps its state in a local file, and applied in place that file would sit inside a git checkout, where `git clean -fdx` or deleting the clone to start again would take the only record of the three buckets. Terraform reads only the top level of a directory, so the stack root ignores the `bootstrap/` subdirectory.
 
-Then add the data bucket's name to the stack root's `terraform.tfvars`. It is the one stack input the wizard does not write:
+Then write the data bucket's name into a file of its own in the stack root, `data-bucket.auto.tfvars`. It is the one stack input the wizard does not write. Use that file, not `terraform.tfvars`: re-running `cloudpipe setup --force` renders `terraform.tfvars` again from your answers and drops any line you added to it. Terraform loads every `*.auto.tfvars` file in the root, and the wizard never writes this one:
 
 ```hcl
+# data-bucket.auto.tfvars
 globus_s3_destination_bucket = "<your-imaging-data-bucket>"
 ```
 
@@ -217,14 +218,14 @@ The workflows stage five things from `config/` in the data bucket, and a new buc
 Seed the templates and meshes. The script downloads each from its upstream source, checks it against a pinned checksum, and writes `config/reference-sources.json` recording each file's source and license:
 
 ```bash
-pixi run python scripts/seed_reference_files.py --bucket <data bucket> --dry-run
-pixi run python scripts/seed_reference_files.py --bucket <data bucket>
+pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/seed_reference_files.py --bucket <data bucket> --dry-run
+pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/seed_reference_files.py --bucket <data bucket>
 ```
 
 Build `nss_volumes.csv` from the ABCD release your data use agreement gives you: the `mr_y_adm__info` table and its data dictionary (`mr_y_adm__info.tsv` and `.json`). The number of non-steady-state frames depends on the scanner, which the images don't record: GE DV25 → 5, GE DV26 and later → 16, Philips and Siemens → 8. A session that matches no rule stops the script; it never guesses. The reference deployment's own table is keyed by subject ID and is never published.
 
 ```bash
-pixi run python scripts/make_nss_volumes.py --mr-info /path/to/mr_y_adm__info --out nss_volumes.csv
+pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/make_nss_volumes.py --mr-info /path/to/mr_y_adm__info --out nss_volumes.csv
 aws s3 cp nss_volumes.csv s3://<data bucket>/config/nss_volumes.csv
 ```
 
@@ -248,8 +249,10 @@ Enabling it needs four things this repository cannot give you:
 Then set `globus_enabled = true` and the seven inputs it makes mandatory. The module refuses an empty one once the flag is true, so this is one edit of eight lines rather than an apply that half-works. Those seven are owned by a separate tool, which renders them into a `globus.auto.tfvars` in the same root:
 
 ```
-pixi run globus init
+pixi run --manifest-path <your clone>/pixi.toml globus init
 ```
+
+Run it from your root, like `cloudpipe setup`: it reads `globus-answers.yaml` from there and writes into it.
 
 Terraform loads `.auto.tfvars` files after `terraform.tfvars`, so those values win over anything you put in the latter. Setting them by hand in `terraform.tfvars` instead, as `terraform.tfvars.example` shows, works just as well — both `cloudpipe setup` and `cloudpipe preflight` check that each variable is set, not which file set it.
 
