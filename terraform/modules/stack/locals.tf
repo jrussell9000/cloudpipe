@@ -14,7 +14,18 @@ locals {
   # variable with no default must be owned by a published schema
   # (tests/test_setup_wizard_schema.py), and this is not a question for the
   # wizard — the bootstrap root is where a deployer names their buckets.
-  metrics_bucket = coalesce(var.metrics_bucket, "${var.name}-metrics")
+  metrics_bucket = coalesce(var.metrics_bucket, "${local.bucket_prefix}-metrics")
+
+  # The start of every S3 bucket name this module chooses by default. The suffix
+  # is what makes those names globally unique (see var.bucket_suffix); empty, it
+  # is left out, which keeps the reference deployment's existing names.
+  bucket_prefix = var.bucket_suffix == "" ? var.name : "${var.name}-${var.bucket_suffix}"
+
+  # Conditionals rather than coalesce, which fails outright when the default
+  # would be empty rather than falling through.
+  log_bucket        = var.log_bucket != null ? var.log_bucket : "${local.bucket_prefix}-logging"
+  access_log_bucket = var.access_log_bucket != null ? var.access_log_bucket : "${local.bucket_prefix}-logging-access"
+  finops_bucket     = "${local.bucket_prefix}-finops"
 
   # Derive the VPC DNS resolver from the VPC CIDR (always base address + 2 in AWS).
   # Use this instead of hardcoding 10.0.0.2 so changes to var.vpc_cidr propagate automatically.

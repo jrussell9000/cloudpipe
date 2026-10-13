@@ -162,10 +162,13 @@ def bootstrap_command(answers: dict[str, Any], root: Path, *, clone: Path = CLON
     no `prevent_destroy`, the data bucket was not created at all, and the metrics
     bucket was created by the stack, which made it destroyable by a teardown.
 
-    The data bucket's name is a placeholder because the wizard does not collect
-    it. Whatever the deployer puts there, they then set
-    `globus_s3_destination_bucket` to the same name; preflight's `aws.data_bucket`
-    and `globus.inputs` both point back at `terraform output` here if they do not.
+    Every bucket name carries the deployment's random `bucket_suffix`, because
+    S3 names are global: with the default name, `cloudpipe-metrics` is a bucket
+    the reference deployment already owns (second-account rerun, 2026-10-13). The
+    data bucket's name is a suggestion, because the wizard does not own
+    `globus_s3_destination_bucket`; the deployer sets that to the same name, and
+    preflight's `aws.data_bucket` and `globus.inputs` point back at
+    `terraform output` here if they do not.
     """
     source = clone / BOOTSTRAP_ROOT
     target = root / BOOTSTRAP_DIR
@@ -180,14 +183,29 @@ def bootstrap_command(answers: dict[str, Any], root: Path, *, clone: Path = CLON
     license_var = (
         f" -var freesurfer_license_path={shlex.quote(str(license_path))}" if license_path else ""
     )
+    # The metrics name is the stack's own default, so the two agree with nothing
+    # set in the stack root. The data bucket's is only a suggestion the deployer
+    # may change, then repeats in data-bucket.auto.tfvars.
+    prefix = bucket_prefix(answers)
     return (
         f"mkdir -p {quoted} && cp {files} {quoted}/ && "
         f"terraform -chdir={quoted} init && "
         f"terraform -chdir={quoted} apply "
         f"-var region={answers['region']} -var state_bucket={answers['state_bucket']} "
-        "-var data_bucket=<your-data-bucket> "
-        "-var metrics_bucket=<name>-metrics" + license_var
+        f"-var data_bucket={prefix}-data "
+        f"-var metrics_bucket={prefix}-metrics" + license_var
     )
+
+
+def bucket_prefix(answers: dict[str, Any]) -> str:
+    """`<name>-<bucket_suffix>`: the stack's `local.bucket_prefix`, from the answers.
+
+    The same rule as `terraform/modules/stack/locals.tf`, so the bucket names the
+    bootstrap command creates are the ones the stack configures by default.
+    """
+    name = str(answers.get("name") or "cloudpipe")
+    suffix = str(answers.get("bucket_suffix") or "")
+    return f"{name}-{suffix}" if suffix else name
 
 
 def write(path: Path, content: str, *, force: bool) -> Path:

@@ -86,6 +86,12 @@ def collect(
         if on_answer is not None:
             on_answer(current)
 
+    if not with_backend:
+        # The state bucket is derived now, so it is never asked; but shown and
+        # then ignored it would read as a setting that did not take effect.
+        for field in schema.fields():
+            if field.is_derived and field.required_when is not None:
+                current.pop(field.identifier, None)
     _show_derived(emitter, style, current)
     return current
 
@@ -263,7 +269,9 @@ def _show_derived(emitter: Emitter, style: _Style, answers: dict[str, Any]) -> N
     Shown rather than asked, and the message says where to change it. A value
     computed silently is one the deployer did not agree to.
     """
-    derived = [field for field in schema.fields() if field.is_derived]
+    derived = [
+        field for field in schema.fields() if field.is_derived and field.identifier in answers
+    ]
     if not derived:
         return
     emitter.note()
@@ -271,10 +279,15 @@ def _show_derived(emitter: Emitter, style: _Style, answers: dict[str, Any]) -> N
     for field in derived:
         value = answers.get(field.identifier)
         emitter.note(f"  {field.identifier} = {value!r}")
+        origin = (
+            "generated once at random and kept"
+            if field.derived_random
+            else f"computed from {', '.join(field.derived_from)}"
+        )
         emitter.note(
             style.dim(
-                f"    computed from {', '.join(field.derived_from)}. Edit it in the answers "
-                "document to override; see its description in the input schema for when to."
+                f"    {origin}. Edit it in the answers document to override; see its "
+                "description in the input schema for when to."
             )
         )
 

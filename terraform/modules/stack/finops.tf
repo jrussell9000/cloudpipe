@@ -4,6 +4,7 @@ module "finops" {
   eks_cluster = module.eks
   account_id  = data.aws_caller_identity.current.account_id
   root_name   = var.name
+  bucket_name = local.finops_bucket
   region      = var.region
   publish_ui  = local.publish_uis
   ui_host     = local.kubecost_url

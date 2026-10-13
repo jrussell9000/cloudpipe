@@ -14,7 +14,7 @@ module "metrics" {
   # in modules/metrics/ are all scoped to "${var.bucket}/metrics/*", so they
   # follow from this one input.
   bucket            = local.metrics_bucket
-  finops_bucket     = "${var.name}-finops"
+  finops_bucket     = local.finops_bucket
   cluster_name      = var.name
   region            = var.region
   grafana_namespace = var.grafana_namespace

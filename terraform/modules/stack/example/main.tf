@@ -189,6 +189,22 @@ variable "name" {
   default     = "cloudpipe"
 }
 
+# The random part of every default S3 bucket name, which `cloudpipe setup`
+# generates once. Bucket names are global, so without it `<name>-metrics` and its
+# siblings collide with any other deployment that kept the default name.
+variable "bucket_suffix" {
+  type    = string
+  default = ""
+}
+
+# The state bucket's name, for the CloudTrail data events on it. Null derives
+# `<name>-<bucket_suffix>-terraform-state`, which is the name `cloudpipe setup`
+# derives for backend.tf; set it only if you overrode that one.
+variable "terraform_state_bucket" {
+  type    = string
+  default = null
+}
+
 variable "region" {
   type = string
 }
@@ -322,6 +338,8 @@ module "stack" {
   }
 
   name                         = var.name
+  bucket_suffix                = var.bucket_suffix
+  terraform_state_bucket       = var.terraform_state_bucket
   region                       = var.region
   domain                       = var.domain
   external_identity            = var.external_identity
