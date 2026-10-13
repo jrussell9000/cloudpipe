@@ -161,13 +161,19 @@ def bootstrap_command(answers: dict[str, Any], root: Path, *, clone: Path = CLON
     # without anyone remembering this function. The lock file is copied too, so
     # the copy resolves the same provider build the published root was tested with.
     files = f"{shlex.quote(str(source))}/*.tf {shlex.quote(str(source / '.terraform.lock.hcl'))}"
+    # The license by PATH only: the bootstrap root uploads the file with `source`,
+    # so its contents are in neither this command, the answers, nor state.
+    license_path = answers.get("freesurfer_license_path")
+    license_var = (
+        f" -var freesurfer_license_path={shlex.quote(str(license_path))}" if license_path else ""
+    )
     return (
         f"mkdir -p {quoted} && cp {files} {quoted}/ && "
         f"terraform -chdir={quoted} init && "
         f"terraform -chdir={quoted} apply "
         f"-var region={answers['region']} -var state_bucket={answers['state_bucket']} "
         "-var data_bucket=<your-data-bucket> "
-        "-var metrics_bucket=<name>-metrics"
+        "-var metrics_bucket=<name>-metrics" + license_var
     )
 
 

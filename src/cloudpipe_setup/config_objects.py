@@ -52,7 +52,9 @@ class Provider:
 LICENSE = Provider(
     "your FreeSurfer license",
     "FreeSurfer licenses are issued per person, free, at "
-    f"{LICENSE_REGISTRATION}. No published file carries one. Upload yours with "
+    f"{LICENSE_REGISTRATION}. No published file carries one. Set `freesurfer_license_path` "
+    "in your answers (`pixi run cloudpipe setup`) and re-run the bootstrap command it prints, "
+    "which uploads it to config/fslicense; or upload it yourself with "
     "`aws s3 cp <path to license.txt> s3://<your data bucket>/config/fslicense`.",
 )
 REFERENCE = Provider(

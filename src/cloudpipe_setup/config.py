@@ -243,7 +243,35 @@ def validate_field(field: schema.Field, value: Any) -> list[Record]:
         return _check_object(field, value)
     if field.is_list:
         return _check_list(field, value)
-    return _check_scalar(field, value)
+    problems = _check_scalar(field, value)
+    if not problems and field.identifier == LICENSE_FIELD:
+        problems = _check_license(field, value)
+    return problems
+
+
+LICENSE_FIELD = "freesurfer_license_path"
+
+
+def _check_license(field: schema.Field, value: str) -> list[Record]:
+    """The license file, checked on this machine. Its contents never reach a message."""
+    from . import license
+
+    text = license.problem(value)
+    if text is None:
+        return []
+    return [
+        Record(
+            identifier=field.identifier,
+            title=field.title,
+            state="fail",
+            message=text,
+            remedy=Remedy(
+                "human",
+                "Give the absolute path to the license.txt FreeSurfer emailed you, or leave this "
+                "unset and upload it to config/fslicense yourself.",
+            ),
+        )
+    ]
 
 
 def _is_required(field: schema.Field, *, with_backend: bool) -> bool:
