@@ -564,7 +564,7 @@ locals {
                   catalog        = "AwsDataCatalog"
                   database       = module.metrics.glue_database_name
                   workgroup      = module.metrics.athena_workgroup_name
-                  outputLocation = "s3://${var.name}-finops/grafana-query-results/"
+                  outputLocation = "s3://${local.finops_bucket}/grafana-query-results/"
                 }
               },
             ]

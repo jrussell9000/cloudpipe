@@ -59,9 +59,36 @@ variable "secondary_cidr_blocks" {
 # EKS Variables #
 #################
 
+# Short enough for every name built from it: `<name>-<suffix>-logging-access` is
+# an S3 bucket (63), `<name>-karpenter-nodegroup-iam-role` an IAM role (64).
 variable "name" {
   default = "cloudpipe"
   type    = string
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{1,18}[a-z0-9]$", var.name))
+    error_message = "name must be 3 to 20 characters: lowercase letters, digits and hyphens, starting with a letter and not ending in a hyphen."
+  }
+}
+
+# S3 bucket names are global across every AWS account, and `<name>-metrics` with
+# the default name is a bucket the reference deployment already owns. So every
+# bucket this module names by default is `<name>-<bucket_suffix>-<role>`, with a
+# suffix `cloudpipe setup` generates once and keeps (second-account rerun,
+# 2026-10-13). A random suffix also makes the name hard to claim first: anyone
+# can create a bucket with a predictable name in their own account.
+#
+# Empty, the default, leaves the suffix out, which is how the reference
+# deployment keeps the names its buckets already have.
+variable "bucket_suffix" {
+  description = "Random suffix for default S3 bucket names: <name>-<bucket_suffix>-<role>. Empty omits it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^([a-z0-9]{6})?$", var.bucket_suffix))
+    error_message = "bucket_suffix must be empty or exactly 6 lowercase letters and digits."
+  }
 }
 
 # The metrics bucket is created by the bootstrap root, not by this module, because
@@ -90,7 +117,7 @@ variable "gitops_repo_private" {
 }
 
 variable "metrics_bucket" {
-  description = "Name of the metrics bucket, created by the bootstrap root. Null uses <name>-metrics."
+  description = "Name of the metrics bucket, created by the bootstrap root. Null uses <name>-<bucket_suffix>-metrics."
   type        = string
   default     = null
 }
@@ -588,9 +615,9 @@ variable "split_tunnel" {
 #####################
 
 variable "log_bucket" {
-  description = "Master bucket for holding (or archiving) diverse log streams"
+  description = "Master bucket for holding (or archiving) diverse log streams. Null uses <name>-<bucket_suffix>-logging."
   type        = string
-  default     = "cloudpipe-logging"
+  default     = null
 }
 
 # Access logs cannot share the master bucket. ALB access logs are written by a
@@ -606,9 +633,9 @@ variable "log_bucket" {
 # bucket. That also removes per-object KMS request charges, which matter here
 # precisely because these logs are many tiny objects.
 variable "access_log_bucket" {
-  description = "SSE-S3 bucket for ALB access logs and S3 server access logs. Separate from log_bucket because neither producer can write to an SSE-KMS destination."
+  description = "SSE-S3 bucket for ALB access logs and S3 server access logs. Separate from log_bucket because neither producer can write to an SSE-KMS destination. Null uses <name>-<bucket_suffix>-logging-access."
   type        = string
-  default     = "cloudpipe-logging-access"
+  default     = null
 }
 
 # Retention is tiered by how much each log class is actually worth, because the
@@ -659,7 +686,7 @@ variable "athena_result_retention_days" {
 # explicitly. A selector on a bucket that does not exist matches nothing and is
 # harmless.
 variable "terraform_state_bucket" {
-  description = "Bucket holding this deployment's Terraform state, for CloudTrail data events. Defaults to <name>-terraform-state."
+  description = "Bucket holding this deployment's Terraform state, for CloudTrail data events. Defaults to <name>-<bucket_suffix>-terraform-state."
   type        = string
   default     = null
 }

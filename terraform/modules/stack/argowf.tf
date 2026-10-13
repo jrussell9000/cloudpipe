@@ -176,6 +176,6 @@ module "argo_workflows" {
 
   crds_available = var.crds_available
 
-  log_bucket            = var.log_bucket
+  log_bucket            = local.log_bucket
   alb_group_annotations = local.ui_alb_group_annotations
 }

@@ -1,5 +1,5 @@
 resource "aws_s3_bucket" "logs" {
-  bucket = var.log_bucket
+  bucket = local.log_bucket
   region = var.region
 }
 
@@ -213,7 +213,7 @@ data "aws_iam_policy_document" "logs_kms" {
 }
 
 resource "aws_kms_key" "logs" {
-  description             = "CMK for the ${var.log_bucket} log bucket (VPC flow logs + CloudTrail)"
+  description             = "CMK for the ${local.log_bucket} log bucket (VPC flow logs + CloudTrail)"
   deletion_window_in_days = 7
   enable_key_rotation     = true
   policy                  = data.aws_iam_policy_document.logs_kms.json
@@ -359,7 +359,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
 # partially amortise, and they can carry a much shorter retention than the
 # CloudTrail record without weakening it.
 resource "aws_s3_bucket" "access_logs" {
-  bucket = var.access_log_bucket
+  bucket = local.access_log_bucket
   region = var.region
 }
 
@@ -484,9 +484,9 @@ resource "aws_s3_bucket_logging" "data" {
 # Repointed off the SSE-KMS bucket, where it has silently delivered nothing
 # since April.
 resource "aws_s3_bucket_logging" "finops" {
-  bucket        = "${var.name}-finops"
+  bucket        = local.finops_bucket
   target_bucket = aws_s3_bucket.access_logs.id
-  target_prefix = "s3-access-logs/${var.name}-finops/"
+  target_prefix = "s3-access-logs/${local.finops_bucket}/"
 
   depends_on = [module.finops, aws_s3_bucket_policy.access_logs]
 }
@@ -511,7 +511,7 @@ resource "aws_s3_bucket_logging" "metrics" {
 resource "aws_s3_bucket_logging" "logs" {
   bucket        = aws_s3_bucket.logs.id
   target_bucket = aws_s3_bucket.access_logs.id
-  target_prefix = "s3-access-logs/${var.log_bucket}/"
+  target_prefix = "s3-access-logs/${local.log_bucket}/"
 
   depends_on = [aws_s3_bucket_policy.access_logs]
 }
@@ -560,7 +560,7 @@ resource "aws_s3_bucket_logging" "logs" {
 locals {
   # A trailing slash means "every object in the bucket"; without it the selector
   # matches the bucket itself and logs nothing.
-  cloudtrail_state_bucket = coalesce(var.terraform_state_bucket, "${var.name}-terraform-state")
+  cloudtrail_state_bucket = coalesce(var.terraform_state_bucket, "${local.bucket_prefix}-terraform-state")
 
   cloudtrail_data_bucket_arns = [
     "arn:aws:s3:::${var.globus_s3_destination_bucket}/",

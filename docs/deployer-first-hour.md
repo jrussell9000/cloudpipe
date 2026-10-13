@@ -130,8 +130,11 @@ What it writes, and nothing else:
 Three details that matter in practice:
 
 - **The answers document is written after every single answer.** An interrupted run resumes from where it stopped; there is no separate progress file, and re-running picks up your previous answers as defaults.
-- **One field is computed, not asked.** The GitHub OIDC subject claim is derived from the repository you gave. It is displayed and you can change it: set it explicitly in the answers document and the wizard keeps your value, saying so rather than silently recomputing it. This matters because a wrong subject claim does not fail anything — it just quietly denies your CI the credentials it asked for.
-- **It will not overwrite a file it did not write.** An existing `terraform.tfvars` is an error, not a merge. Pass `--force` if you mean to replace it.
+- **Three fields are computed, not asked.** Each is displayed, and you can change it: set it explicitly in the answers document and the wizard keeps your value, saying so rather than silently recomputing it.
+  - The GitHub OIDC subject claim is derived from the repository you gave. A wrong one fails nothing; it just quietly denies your CI the credentials it asked for.
+  - `bucket_suffix` is six random lowercase letters and digits, generated once and kept. S3 bucket names are global across every AWS account, so every bucket name carries it: `<name>-<suffix>-metrics`, `<name>-<suffix>-logging` and so on. Without it, two deployments that kept the default name would collide, and anyone could claim a predictable name first. Change it only before step 4: once the buckets exist, a new suffix names buckets that do not.
+  - The state bucket is `<name>-<suffix>-terraform-state`.
+- **It will not overwrite an existing `terraform.tfvars` or `backend.tf`**, even one an earlier run wrote. Pass `--force` to render them again from your answers. That drops any line you added by hand, which is why the one value you add yourself goes in a file of its own (step 4).
 
 Two kinds of value are deliberately **not** asked for here:
 
@@ -172,18 +175,18 @@ cp <your clone>/terraform/modules/bootstrap/*.tf \
 terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap init
 terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap apply \
   -var region=<region> \
-  -var state_bucket=<your-state-bucket> \
-  -var data_bucket=<your-imaging-data-bucket> \
-  -var metrics_bucket=<your-cluster-name>-metrics
+  -var state_bucket=<name>-<suffix>-terraform-state \
+  -var data_bucket=<name>-<suffix>-data \
+  -var metrics_bucket=<name>-<suffix>-metrics
 ```
 
-`cloudpipe setup` prints that command with your own paths and answers filled in. Why the copy matters: this root keeps its state in a local file, and applied in place that file would sit inside a git checkout, where `git clean -fdx` or deleting the clone to start again would take the only record of the three buckets. Terraform reads only the top level of a directory, so the stack root ignores the `bootstrap/` subdirectory.
+`cloudpipe setup` prints that command with your own paths, name and suffix filled in, so nothing in it needs replacing. The metrics name has to stay as it is: the stack configures `<name>-<suffix>-metrics` unless you set `metrics_bucket` in the stack root too. The data bucket's name is only a suggestion. Why the copy matters: this root keeps its state in a local file, and applied in place that file would sit inside a git checkout, where `git clean -fdx` or deleting the clone to start again would take the only record of the three buckets. Terraform reads only the top level of a directory, so the stack root ignores the `bootstrap/` subdirectory.
 
 Then write the data bucket's name into a file of its own in the stack root, `data-bucket.auto.tfvars`. It is the one stack input the wizard does not write. Use that file, not `terraform.tfvars`: re-running `cloudpipe setup --force` renders `terraform.tfvars` again from your answers and drops any line you added to it. Terraform loads every `*.auto.tfvars` file in the root, and the wizard never writes this one:
 
 ```hcl
 # data-bucket.auto.tfvars
-globus_s3_destination_bucket = "<your-imaging-data-bucket>"
+globus_s3_destination_bucket = "<name>-<suffix>-data"
 ```
 
 `terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap output` prints all three names if you need them again.

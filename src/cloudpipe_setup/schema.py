@@ -77,6 +77,9 @@ class Field:
     #: the dataclass stays hashable and needs no mutable default.
     properties: tuple[tuple[str, Any], ...] = ()
     required_properties: tuple[str, ...] = ()
+    #: For a field derived from nothing but randomness, `bucket_suffix`: how many
+    #: characters to generate. Generated once, when the field is absent, and kept.
+    derived_random: int | None = None
 
     @property
     def property_schemas(self) -> dict[str, Any]:
@@ -88,7 +91,7 @@ class Field:
 
     @property
     def is_derived(self) -> bool:
-        return bool(self.derived_template)
+        return bool(self.derived_template) or bool(self.derived_random)
 
     @property
     def is_list(self) -> bool:
@@ -101,7 +104,21 @@ class Field:
         `deployment-setup-wizard` spec requires both halves. Returning None rather
         than raising lets collection reach the field before its source is
         answered, which an out-of-order answers document can do.
+
+        A random field returns the value it already has, so it is never reported
+        as overridden or refreshed: its sources are fixed, and only an absent value
+        is generated. `secrets`, not `random`: the suffix is what makes a bucket
+        name hard to claim first.
         """
+        if self.derived_random:
+            stored = answers.get(self.identifier)
+            if stored not in (None, ""):
+                return stored
+            import secrets
+            import string
+
+            alphabet = string.ascii_lowercase + string.digits
+            return "".join(secrets.choice(alphabet) for _ in range(self.derived_random))
         if not self.derived_template:
             return None
         if any(
@@ -203,6 +220,7 @@ def fields() -> tuple[Field, ...]:
             terraform_variable=body["x-terraform-variable"],
             derived_from=tuple(body.get("x-derived-from", ())),
             derived_template=body.get("x-derived-template"),
+            derived_random=body.get("x-derived-random"),
             required_when=required_when.get(identifier),
         )
         by_section[field.section].append(field)
