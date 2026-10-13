@@ -94,3 +94,22 @@ variable "zones" {
     error_message = "zones must not be empty: a NodePool with no zone requirement can provision anywhere, including a zone with no subnet."
   }
 }
+
+variable "ingress_subnet_ids" {
+  description = <<-EOT
+    The stack's ingress subnets (ingress_network.tf), which the ingress node class
+    selects by ID. Passed rather than looked up by tag: a tag matches any subnet in
+    the account that carries it, and an ID cannot.
+  EOT
+  type        = list(string)
+
+  validation {
+    condition     = length(var.ingress_subnet_ids) > 0
+    error_message = "ingress_subnet_ids must not be empty: the ingress node class would select no subnet, and its nodes would never launch."
+  }
+}
+
+variable "ingress_security_group_id" {
+  description = "The stack's ingress-node security group (ingress_network.tf), selected by ID for the same reason."
+  type        = string
+}

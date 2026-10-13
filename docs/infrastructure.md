@@ -494,7 +494,7 @@ Each phase re-reads what it needs and re-checks its own preconditions, so a sing
 
 Every `-target` address below is written as it reads **inside** the stack module. From a root that calls the stack as `module "stack"`, `module.vpc` is `-target=module.stack.module.vpc`; if you named your module call something else, use that name.
 
-**Before Phase 1**, confirm `CLOUDFLARE_API_TOKEN` is exported (`pixi run cloudpipe preflight` checks it). It is first needed by the Phase 4 full apply, and failing there leaves a half-built cluster. With the default Cognito identity, no identity-provider secret is created by hand: Terraform creates the pool's clients and passes their secrets on.
+**Before Phase 1**, confirm `CLOUDFLARE_API_TOKEN` is exported (`cloudpipe preflight` checks it; see step 6 of [the deployer's first hour](deployer-first-hour.md)). It is first needed by the Phase 4 full apply, and failing there leaves a half-built cluster. With the default Cognito identity, no identity-provider secret is created by hand: Terraform creates the pool's clients and passes their secrets on.
 
 **Before Phase 8**, create at least one Cognito user — the commands, and what the operator then does at their first sign-in, are in [deployer-first-hour.md → create the operators' sign-in accounts](deployer-first-hour.md#step-8--create-the-operators-sign-in-accounts). Phase 8 closes the public EKS endpoint, after which the cluster is reached only over WARP, and nobody can sign in to WARP until the pool has a user. `install.sh` checks this and stops before Phase 8 if the pool is empty.
 

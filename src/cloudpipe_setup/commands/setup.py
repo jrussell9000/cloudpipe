@@ -286,7 +286,7 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
                 "groups the stack needs and scopes the token to your account: "
                 f"{cloudflare.token_template_url(answers.get('cloudflare_account_id'))} — then "
                 "export it as CLOUDFLARE_API_TOKEN in the shell you install from. "
-                "`pixi run cloudpipe preflight` checks every group before you start.",
+                f"`{render.cli_command('preflight')}` checks every group before you start.",
             },
         }
     )

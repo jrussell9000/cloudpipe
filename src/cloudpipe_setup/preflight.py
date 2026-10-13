@@ -83,6 +83,13 @@ check after it is `skipped` without one."""
 
 TOKEN_ENV = "CLOUDFLARE_API_TOKEN"
 
+
+def _cli(subcommand: str) -> str:
+    from .render import cli_command
+
+    return cli_command(subcommand)
+
+
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 
 HTTP_TIMEOUT = 15
@@ -461,7 +468,7 @@ def _check_hosted_zone(
             "looked for.",
             Remedy(
                 "human",
-                "Nothing to fix. Reach the web UIs with `pixi run cloudpipe ui <name>`; set a "
+                f"Nothing to fix. Reach the web UIs with `{_cli('ui <name>')}`; set a "
                 "domain only if you want them published under hostnames.",
             ),
         )
@@ -655,7 +662,7 @@ def _check_data_bucket(world: World, root: Path, identity: dict[str, Any] | None
             remedy=Remedy(
                 "human",
                 f"Apply the bootstrap root with data_bucket={name} — step 4 of "
-                "docs/deployer-first-hour.md, and `pixi run cloudpipe setup` prints the command. "
+                f"docs/deployer-first-hour.md, and `{_cli('setup')}` prints the command. "
                 "If it is already applied under another name, set "
                 f"{roots.DATA_BUCKET_VARIABLE} to that name instead.",
             ),
@@ -924,7 +931,7 @@ def _check_cloudflare(world: World, answers: dict[str, Any]) -> Record:
             title,
             "the token is valid and active, and cloudflare_account_id is not set, so what it can "
             "reach could not be checked. A valid token with the wrong scope fails at apply.",
-            Remedy("command", "pixi run cloudpipe setup"),
+            Remedy("command", _cli("setup")),
         )
 
     try:
