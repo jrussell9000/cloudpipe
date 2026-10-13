@@ -244,8 +244,7 @@ def _preamble(emitter: Emitter, style: _Style, *, total: int) -> None:
     )
     emitter.note("  Nothing is created in any cloud account, and no credential is asked for.")
     emitter.note(
-        "  The Globus values are not here: `pixi run globus init` owns them and renders them "
-        "separately."
+        "  The Globus values are not here: `globus init` owns them and renders them separately."
     )
 
 

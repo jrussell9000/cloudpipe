@@ -24,7 +24,7 @@ from typing import Any
 import yaml
 
 from .. import answers as answers_module
-from .. import render
+from .. import config, render
 from ..cli import Context, register
 from ..exits import CliError, ExitCode, Remedy
 
@@ -48,7 +48,7 @@ def init(ctx: Context) -> ExitCode:
             exit_code=ExitCode.INVALID,
         )
 
-    out_dir = Path(ctx.args.output_dir or DEFAULT_OUTPUT_DIR)
+    out_dir = _output_dir(ctx.args.output_dir)
     artifacts = {
         out_dir / TFVARS_NAME: render.tfvars(document),
         out_dir / CONFIG_NAME: render.gcs_config_json(document),
@@ -84,6 +84,21 @@ def init(ctx: Context) -> ExitCode:
             "problems": [],
         }
     )
+
+
+def _output_dir(explicit: str | None) -> Path:
+    """Where the rendered files go, relative to where the command was run.
+
+    Without `--output-dir`: the directory the command was run from when it is a
+    Terraform root (it holds a `.tf` file), which is a deployer's own root; else
+    its `terraform/`, which is the reference checkout's root. Before this the
+    default was `terraform/` under the clone whatever directory the deployer was
+    in, so the file landed in a root nobody applies.
+    """
+    if explicit:
+        return config.from_invocation(explicit)
+    here = config.invocation_dir()
+    return here if any(here.glob("*.tf")) else here / DEFAULT_OUTPUT_DIR
 
 
 def _read(ctx: Context) -> Any:

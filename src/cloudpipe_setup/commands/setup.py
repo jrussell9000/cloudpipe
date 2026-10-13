@@ -12,6 +12,7 @@ D1).
 
 from __future__ import annotations
 
+import shlex
 from typing import TYPE_CHECKING
 
 from .. import cloudflare, config, render, roots, schema
@@ -313,6 +314,9 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
     # deployment runs that same copy. Naming the command is what the capability
     # requires, and it is also what keeps this message true as the phases change —
     # the script's own --list-phases is the phase list, and nothing here restates it.
+    # The clone's real path, not `scripts/...`: the deployer runs this from their
+    # root, where a relative path names nothing (second-account rerun, 2026-10-13).
+    installer = shlex.quote(str(render.CLONE / INSTALLER))
     steps.append(
         {
             "identifier": "install.phased",
@@ -322,9 +326,9 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
             "cluster lookup: the providers read a cluster that does not exist yet.",
             "remedy": {
                 "kind": "command",
-                "text": f"bash {INSTALLER} --root {root}   "
+                "text": f"bash {installer} --root {shlex.quote(str(root))}   "
                 f"(or one phase at a time with --phase N, which a first install wants; "
-                f"`bash {INSTALLER} --list-phases` prints them)",
+                f"`bash {installer} --list-phases` prints them)",
             },
         }
     )
