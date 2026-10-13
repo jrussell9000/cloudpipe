@@ -148,10 +148,34 @@ class DeploymentConfig:
         return self.bucket
 
 
+def invocation_dir() -> Path:
+    """The directory the operator ran the command from.
+
+    pixi runs a defined task, `globus` included, from the project root and records
+    where it was invoked in `INIT_CWD`. From the reference checkout the two are the
+    same directory. A deployer runs `pixi run --manifest-path <clone>/pixi.toml
+    globus ...` from their own Terraform root, and reading only the cwd sent the
+    answers lookup and the rendered files into the clone. The same defect, and the
+    same fix, as `cloudpipe_setup.roots.invocation_dir` (second-account rerun,
+    2026-10-12).
+    """
+    invoked = os.environ.get("INIT_CWD")
+    if invoked and Path(invoked).is_dir():
+        return Path(invoked)
+    return Path.cwd()
+
+
+def from_invocation(path: str | os.PathLike[str]) -> Path:
+    """`path` as the operator meant it: relative to where they ran the command."""
+    candidate = Path(path).expanduser()
+    return candidate if candidate.is_absolute() else invocation_dir() / candidate
+
+
 def find_answers(explicit: str | os.PathLike[str] | None = None) -> Path | None:
-    """Locate the answers document: explicit path, then `$GLOBUS_ANSWERS`, then the cwd."""
+    """Locate the answers document: explicit path, then `$GLOBUS_ANSWERS`, then where
+    the command was run from."""
     if explicit is not None:
-        path = Path(explicit)
+        path = from_invocation(explicit)
         if not path.is_file():
             raise CliError(
                 "config.answers_not_found",
@@ -166,7 +190,7 @@ def find_answers(explicit: str | os.PathLike[str] | None = None) -> Path | None:
         return find_answers(from_env)
 
     for name in DEFAULT_ANSWERS_NAMES:
-        candidate = Path.cwd() / name
+        candidate = invocation_dir() / name
         if candidate.is_file():
             return candidate
     return None

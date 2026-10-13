@@ -248,12 +248,15 @@ def missing_globus_remedy(root: Path, missing: tuple[str, ...]) -> tuple[str, st
     if tuple(missing) == (DATA_BUCKET_VARIABLE,):
         return (
             "human",
-            f"Add `{DATA_BUCKET_VARIABLE} = \"<name>\"` to {root / 'terraform.tfvars'}, using the "
+            f"Write `{DATA_BUCKET_VARIABLE} = \"<name>\"` into {root / 'data-bucket.auto.tfvars'} "
+            "(not terraform.tfvars, which a re-render with --force replaces), using the "
             "data_bucket name you gave the bootstrap root (`terraform -chdir="
             f"{root / 'bootstrap'} output` prints it). The prefix is historical: this is the "
             "imaging data bucket, and the stack needs it whether or not Globus is enabled.",
         )
-    return ("command", "pixi run globus init")
+    from .render import cli_command
+
+    return ("command", cli_command("init", task="globus"))
 
 
 def _hcl_assignments(text: str) -> dict[str, Any]:
