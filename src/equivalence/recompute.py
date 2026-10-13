@@ -31,7 +31,7 @@ _SHARED = Path(__file__).resolve().parents[2] / "images" / "shared"
 if str(_SHARED) not in sys.path:
     sys.path.insert(0, str(_SHARED))
 
-from func_iqm import func_qc_measures  # noqa: E402
+from func_iqm import FUNC_QC_SCHEMA_VERSION, func_qc_measures  # noqa: E402
 
 #: The fields the calibration gate compares against the in-pod record. Nine, per
 #: the spec; the rest of the schema is identity, provenance or runtime, none of
@@ -94,7 +94,7 @@ def recompute_func_qc(inputs: RunInputs, arm: str) -> dict:
     )
 
     return {
-        "schema_version": "1.1",
+        "schema_version": FUNC_QC_SCHEMA_VERSION,
         "pipeline": arm,
         "image_tag": "",
         "subject": inputs.subject,

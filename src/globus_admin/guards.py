@@ -20,7 +20,9 @@ from .output import Emitter
 from .shell import Runner, subprocess_runner
 
 ACTIVE_PHASES = ("Running", "Pending")
-TRANSFER_STEP_LABEL = "cloudpipe.io/step=globus-transfer"
+# Both ingress steps hold the stored Globus token: globus-transfer, and the
+# ingress-mode=https copy, which lists through Transfer before it reads.
+TRANSFER_STEP_LABEL = "cloudpipe.io/step in (globus-transfer,https-transfer)"
 
 
 def _answer(prompt_fn) -> str:

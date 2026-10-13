@@ -41,7 +41,7 @@
       "x-error-message": "domain must be null (port-forward mode) or a bare DNS name with a TLD, e.g. example.org — no scheme and no trailing dot.",
       "x-null-meaning": "port-forward mode: no published web UIs, and no domain or hosted zone needed",
       "title": "Service domain",
-      "description": "Where the web UIs are published, as <ui>.<domain> over WARP, or none. With a domain, a Route53 hosted zone for it must already exist in the account you are deploying into — ACM validates its certificates against that zone, so a domain you do not own fails at apply rather than here. `cloudpipe preflight` checks for the zone before you get that far.\n\nWith none, nothing is published: no load balancer, certificate or DNS record. Each UI is reached on a fixed localhost port with `pixi run cloudpipe ui <name>`, which port-forwards over WARP.\n\nA bare DNS name: no scheme, no trailing dot.",
+      "description": "Where the web UIs are published, as <ui>.<domain> over WARP, or none. With a domain, a Route53 hosted zone for it must already exist in the account you are deploying into — ACM validates its certificates against that zone, so a domain you do not own fails at apply rather than here. `cloudpipe preflight` checks for the zone before you get that far.\n\nWith none, nothing is published: no load balancer, certificate or DNS record. Each UI is reached on a fixed localhost port with `pixi run --manifest-path <your clone>/pixi.toml cloudpipe ui <name>`, which port-forwards over WARP.\n\nA bare DNS name: no scheme, no trailing dot.",
       "x-section": "identity",
       "x-source": "deployer-choice",
       "x-terraform-variable": "domain"
@@ -200,7 +200,7 @@
       "pattern": "\\.cloudflareaccess\\.com$",
       "x-error-message": "cloudflare_team_domain must end in .cloudflareaccess.com.",
       "title": "Zero Trust team domain",
-      "description": "The host your operators sign in at: <team>.cloudflareaccess.com. You choose the <team> part — it is the team name you set when you turn on Zero Trust in the Cloudflare dashboard, and this field is where you repeat the result. It becomes the organization's auth_domain, so it appears in every URL WARP and the browser send people to. If this account already has Zero Trust enabled, give the domain it already has rather than inventing a new one.",
+      "description": "The host your operators sign in at: <team name>.cloudflareaccess.com.\n\nZero Trust has to be turned on in this Cloudflare account before the install, and only the dashboard can do that: Terraform updates the Zero Trust organization but cannot create one. If it is not on yet, open Zero Trust from the account's sidebar. Cloudflare asks you to choose a team name and a plan (Free asks for payment details and charges nothing). Your answer here is that team name followed by .cloudflareaccess.com. If Zero Trust is already on, give the team domain the account already has; the Zero Trust dashboard shows it under Settings.\n\nIt becomes the organization's auth_domain, so it appears in every URL WARP and the browser send people to. docs/deployer-first-hour.md, \"The Cloudflare account and its token\", covers the same step.",
       "x-section": "cloudflare",
       "x-source": "cloudflare-dashboard",
       "x-terraform-variable": "cloudflare_team_domain"

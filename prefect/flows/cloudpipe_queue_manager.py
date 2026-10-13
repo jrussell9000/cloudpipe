@@ -29,8 +29,8 @@ second Prefect variable overrides the detector while the flow is running:
     prefect variable set cloudpipe-fastsurfer-device cpu    # force the fallback
     prefect variable set cloudpipe-fastsurfer-device cuda   # force the GPU
 
-In Globus mode the run stops before the first submission if the Globus session
-cannot carry the batch (lib/globus_session.py). Two Prefect variables tune it:
+In Globus and HTTPS modes the run stops before the first submission if the Globus
+session cannot carry the batch (lib/globus_session.py). Two Prefect variables tune it:
 
     prefect variable set cloudpipe-globus-session-margin-hours 24
     prefect variable set cloudpipe-globus-session-warn-days 5
@@ -137,6 +137,15 @@ def _transfer_client():
     return globus_sdk.TransferClient(authorizer=authorizer)
 
 
+def _https_token():
+    """The Auth client and the stored HTTPS refresh token (None if the login granted none)."""
+    import globus_sdk
+
+    secret = _read_secret(globus_session.SECRET_ID)
+    native_client = globus_sdk.NativeAppAuthClient(secret["native-app-client-id"])
+    return native_client, secret.get("https-refresh-token")
+
+
 def check_globus_session(
     logger,
     *,
@@ -160,15 +169,7 @@ def check_globus_session(
     the batch's first workflow would start the host minutes later anyway, and the
     nightly schedule stops it again if the batch is refused.
     """
-    get_variable = read_variable or (lambda name, default: Variable.get(name, default=default))
-    margin_hours = _as_float(
-        get_variable(globus_session.MARGIN_VARIABLE, globus_session.DEFAULT_MARGIN_HOURS),
-        globus_session.DEFAULT_MARGIN_HOURS,
-    )
-    warn_days = _as_float(
-        get_variable(globus_session.WARN_VARIABLE, globus_session.DEFAULT_WARN_DAYS),
-        globus_session.DEFAULT_WARN_DAYS,
-    )
+    margin_hours, warn_days = _gate_thresholds(read_variable)
 
     # Name the gateway. Without it, a document declaring more than one gateway
     # sent this lookup to a default that happened to match production's
@@ -233,6 +234,82 @@ def check_globus_session(
     return decision
 
 
+def check_https_session(
+    logger,
+    *,
+    source_collection_id: str,
+    source_base_path: str,
+    read_ssm=_read_ssm_optional,
+    read_variable=None,
+    transfer_client_factory=_transfer_client,
+    https_token_factory=_https_token,
+) -> globus_session.GateDecision:
+    """The `ingress-mode=https` gate: `check_globus_session`'s questions, other answers.
+
+    Life is measured against our 30-day rule, never a gateway's declared timeout:
+    no gateway of ours is in the HTTPS path, and the source's year is not the
+    rule. The live check is one listing of the source base path with the transfer
+    token, then one refresh of the HTTPS token — a login can grant the first and
+    not the second. Nothing is woken: the Globus host plays no part.
+
+    The ingress pod checks the age again before any request. This gate is the
+    courtesy that refuses a batch once; the pod is the control, because a hand
+    `argo submit` never passes through here.
+    """
+    margin_hours, warn_days = _gate_thresholds(read_variable)
+    decision = globus_session.evaluate(
+        read_ssm(globus_session.SSM_SESSION_PARAM),
+        timeout_minutes=globus_session.HTTPS_RULE_MINUTES,
+        margin_hours=margin_hours,
+        warn_days=warn_days,
+    )
+    logger.info(
+        f"Globus session limit: {globus_session.HTTPS_RULE_MINUTES} minutes, from "
+        f"{globus_session.HTTPS_RULE_SOURCE}"
+    )
+    logger.info(decision.reason)
+    if not decision.allowed:
+        raise RuntimeError(
+            f"Refusing to submit: {decision.reason} (The limit is "
+            f"{globus_session.HTTPS_RULE_SOURCE}, not the source collection's timeout.)"
+        )
+
+    try:
+        reachable, detail = globus_session.source_reachable(
+            transfer_client_factory(), source_collection_id, source_base_path
+        )
+        if reachable:
+            logger.info(detail)
+            reachable, detail = globus_session.https_token_refreshes(
+                *https_token_factory(), source_collection_id
+            )
+    except ImportError:
+        logger.warning(
+            "globus-sdk is not installed in this image, so the live source and HTTPS token "
+            "checks were skipped. The session's age was checked; a revoked session or a "
+            "missing HTTPS grant would not be caught."
+        )
+        return decision
+    if not reachable:
+        raise RuntimeError(f"Refusing to submit: {detail}")
+    logger.info(detail)
+    return decision
+
+
+def _gate_thresholds(read_variable) -> tuple[float, float]:
+    """The margin (hours) and warning window (days), from Prefect variables."""
+    get_variable = read_variable or (lambda name, default: Variable.get(name, default=default))
+    margin_hours = _as_float(
+        get_variable(globus_session.MARGIN_VARIABLE, globus_session.DEFAULT_MARGIN_HOURS),
+        globus_session.DEFAULT_MARGIN_HOURS,
+    )
+    warn_days = _as_float(
+        get_variable(globus_session.WARN_VARIABLE, globus_session.DEFAULT_WARN_DAYS),
+        globus_session.DEFAULT_WARN_DAYS,
+    )
+    return margin_hours, warn_days
+
+
 def _as_float(value, default: float) -> float:
     try:
         return float(str(value))
@@ -242,7 +319,7 @@ def _as_float(value, default: float) -> float:
 
 # Must match the `ingress-mode` enum in cloudpipe-long-master-workflow-template.yaml
 # (tests/prefect/test_ingress_mode.py pins the two together).
-INGRESS_MODES = ("globus", "presynced")
+INGRESS_MODES = ("globus", "presynced", "https")
 
 
 def ingress_params(
@@ -264,6 +341,10 @@ def ingress_params(
     has none to read. The globus-* workflow parameters are still sent, empty,
     because the template declares them without defaults and Argo rejects a
     submission that omits them.
+
+    In https mode the destination collection is not read either — the copy goes
+    straight to S3, so there is no destination collection in the path — and is
+    sent empty for the same reason.
     """
     if ingress_mode not in INGRESS_MODES:
         raise ValueError(f"ingress_mode={ingress_mode!r} is not one of {list(INGRESS_MODES)}")
@@ -280,6 +361,15 @@ def ingress_params(
         source_collection_id = read_ssm(SSM_SOURCE_COLLECTION_PARAM)
     if source_base_path is None:
         source_base_path = read_ssm(SSM_SOURCE_BASE_PATH_PARAM)
+    if ingress_mode == "https":
+        return {
+            "ingress-mode": ingress_mode,
+            "globus-source-collection-id": source_collection_id,
+            "globus-source-base-path": source_base_path,
+            "globus-dest-collection-id": "",
+            "globus-dest-base-path": dest_base_path,
+            "globus-scan-types": scan_types,
+        }
     # No "ingress-mode" key: the template defaults it to globus, so the production
     # submission stays exactly what it was before #336 — and still submits cleanly
     # to a template ArgoCD has not yet synced to declare the parameter.
@@ -338,6 +428,11 @@ def cloudpipe_queue_manager(
                                   the staged input instead, and does NOT delete it on success.
                                   No Globus SSM parameters are read, and the globus_* arguments
                                   are ignored. See docs/data-ingress.md.
+                                  "https" lists each subject through Globus Transfer as globus
+                                  mode does, then copies it over the source collection's HTTPS
+                                  server straight to S3. No Globus host is used. The batch is
+                                  refused if the last `pixi run globus login` would pass 30 days
+                                  within the safety margin.
 
     Concurrency
     -----------
@@ -402,6 +497,16 @@ def cloudpipe_queue_manager(
             logger,
             dest_collection_id=params["globus-dest-collection-id"],
             dest_base_path=params["globus-dest-base-path"],
+        )
+    elif ingress_mode == "https":
+        logger.info(
+            f"Ingress mode https: source {params['globus-source-collection-id']} read over "
+            "HTTPS, straight to S3"
+        )
+        check_https_session(
+            logger,
+            source_collection_id=params["globus-source-collection-id"],
+            source_base_path=params["globus-source-base-path"],
         )
     else:
         logger.info(

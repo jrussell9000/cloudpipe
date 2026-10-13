@@ -216,6 +216,10 @@ spec:
       #   presynced — it is already under mmps_mproc/ in S3; verify it and proceed.
       #               The Globus tasks are Skipped and the input is NOT deleted on
       #               success, because the pipeline cannot re-fetch it.
+      #   https     — copy it over the source collection's HTTPS server straight
+      #               to S3 (openspec add-https-ingress-mode), then verify it as
+      #               presynced input is verified. No Globus host is started;
+      #               the input is deleted on success, as in globus mode.
       # Omitting it gives the globus DAG unchanged. See docs/data-ingress.md.
       #
       # The enum is a UI dropdown and NOTHING MORE: Argo v4.0.6 accepted
@@ -223,13 +227,15 @@ spec:
       # Prefect path) and `argo submit --from workflowtemplate/` (probe, #336).
       # Typos are caught by the DAG instead — the Globus tasks run on
       # `== "globus"` and verify-staged-input on its exact complement
-      # `!= "globus"`, so every value takes exactly one arm, and the validator
-      # fails any value that is not `presynced`.
+      # `!= "globus"`, so every value reaches either the Globus arm or the
+      # validator, and the validator fails any value that is not `presynced`
+      # or `https`.
       - name: ingress-mode
         value: globus
         enum:
           - globus
           - presynced
+          - https
 
       # Where FastSurfer segmentation inference runs (#373). "cuda" is the normal
       # path: template-build and long-segmentation on gpu-nodepool, time-sliced.
@@ -333,16 +339,46 @@ spec:
               - name: scan-types
                 value: '{{workflow.parameters.globus-scan-types}}'
 
-        # Checks pre-staged input against the ingress contract before anything
-        # consumes it. Skipped in globus mode. No `depends`, so it can never be
-        # Omitted — it is Skipped or it ran. See docs/data-ingress.md.
+        # ingress-mode=https: list through Globus Transfer, copy over the source's
+        # HTTPS server straight to S3, check every size. A head task like
+        # start-globus-instance: no `depends`, so it is Skipped or it ran, never
+        # Omitted. It writes where globus-transfer does —
+        # {globus-dest-base-path}/{subjID}/ in the bucket — so inventory and
+        # delete-globus-input need no change of prefix.
+        - name: https-transfer-dagtask
+          when: '"{{workflow.parameters.ingress-mode}}" == "https"'
+          templateRef:
+            name: globus-transfer
+            template: https-transfer-template
+          arguments:
+            parameters:
+              - name: source-collection-id
+                value: '{{workflow.parameters.globus-source-collection-id}}'
+              - name: source-base-path
+                value: '{{workflow.parameters.globus-source-base-path}}'
+              - name: dest-bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: dest-base-path
+                value: '{{workflow.parameters.globus-dest-base-path}}'
+              - name: scan-types
+                value: '{{workflow.parameters.globus-scan-types}}'
+
+        # Checks staged input against the ingress contract before anything
+        # consumes it: what an operator staged (presynced), or what the HTTPS
+        # copy wrote (https). Skipped in globus mode. See docs/data-ingress.md.
         #
         # `!= "globus"`, NOT `== "presynced"`: this must be the exact complement
         # of the Globus guard. With `== "presynced"` a misspelt mode skips both
         # arms and inventory runs over whatever is staged (observed live — the
         # parameter enum does not stop it). The template fails any mode other
-        # than presynced, so a typo fails the workflow instead.
+        # than presynced or https, so a typo fails the workflow instead.
+        #
+        # Its one `depends` is the HTTPS copy, Succeeded or Skipped. In every mode
+        # but https that task is Skipped by its `when`, so this runs exactly as it
+        # did with no `depends`. In https mode a failed copy leaves this Omitted,
+        # and so inventory too — the validator never inspects a half-copied tree.
         - name: verify-staged-input-dagtask
+          depends: "https-transfer-dagtask.Succeeded || https-transfer-dagtask.Skipped"
           when: '"{{workflow.parameters.ingress-mode}}" != "globus"'
           templateRef:
             name: ingress-verify
@@ -360,16 +396,17 @@ spec:
           templateRef:
             name: inventory
             template: subject-data-inventory-template
-          # Waits for the transfer to finish (globus mode) or be Skipped
-          # (presynced), AND for the staged-input check to pass (presynced) or be
-          # Skipped (globus). Exactly one arm runs in either mode; the other is
-          # Skipped, which both sides accept.
+          # Waits for every ingress task to succeed or be Skipped:
+          #   globus    — globus-transfer runs; https-transfer and the check Skip.
+          #   presynced — the check runs; both transfers Skip.
+          #   https     — https-transfer, then the check; globus-transfer Skips.
           #
-          # No `.Omitted` on either side — see the Ingress note above. This now
-          # depends on globus-transfer directly rather than on the deleted
-          # s3-sync task, so a failed transfer leaves this Omitted and inventory
-          # does not run over a failed ingress.
-          depends: "(globus-transfer-dagtask.Succeeded || globus-transfer-dagtask.Skipped) && (verify-staged-input-dagtask.Succeeded || verify-staged-input-dagtask.Skipped)"
+          # No `.Omitted` on any term — see the Ingress note above. A failed
+          # transfer of either kind, or a failed check, leaves this Omitted, so
+          # inventory never runs over a failed ingress. The HTTPS copy is named
+          # here as well as in the check's `depends`, so the gate still covers
+          # it if that `depends` is ever edited away.
+          depends: "(globus-transfer-dagtask.Succeeded || globus-transfer-dagtask.Skipped) && (https-transfer-dagtask.Succeeded || https-transfer-dagtask.Skipped) && (verify-staged-input-dagtask.Succeeded || verify-staged-input-dagtask.Skipped)"
 
         # Anatomical processing pipeline
         - name: anatomical-processing-pipeline-dagtask
@@ -1212,12 +1249,15 @@ spec:
               value: cloudpipe_minproc
             - name: batch-label
               value: '{{workflow.parameters.batch-label}}'
-    # globus mode only. In presynced mode mmps_mproc/{subj}/ is data the operator
-    # staged by hand and the pipeline cannot re-fetch, so deleting it on success
-    # is data loss, not cleanup (#336).
+    # Every mode but presynced. In presynced mode mmps_mproc/{subj}/ is data the
+    # operator staged by hand and the pipeline cannot re-fetch, so deleting it on
+    # success is data loss, not cleanup (#336). `!= "presynced"` rather than
+    # naming globus and https: a fourth mode then defaults to cleaning up, and
+    # the other default — mmps_mproc/ silently filling — is the one nobody sees
+    # (design D8). A misspelt mode fails the workflow, so it never gets here.
     - - name: delete-globus-input
         template: delete-globus-input-template
-        when: '{{workflow.status}} == Succeeded && "{{workflow.parameters.ingress-mode}}" == "globus"'
+        when: '{{workflow.status}} == Succeeded && "{{workflow.parameters.ingress-mode}}" != "presynced"'
 
 ##################################################
 #----- Globus Input Cleanup -----#

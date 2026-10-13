@@ -124,6 +124,12 @@ def _gcor(ts: np.ndarray) -> float:
 # The FuncQC record
 # ---------------------------------------------------------------------------
 
+# FuncQC.schema_version as this module writes it. It must equal the default in
+# src/metrics/schemas.py; tests/metrics/test_funcqc_schema_version_sync.py holds
+# them together. It sat at "1.1" here after #643 moved schemas.py to "1.2", so
+# every record computed with the #643 CompCor was still labelled 1.1.
+FUNC_QC_SCHEMA_VERSION = "1.2"
+
 
 def tsnr_map_from_file(mni_bold: Path) -> np.ndarray:
     """Voxelwise temporal SNR (mean / population std over time), 0 where std is 0.
@@ -261,7 +267,7 @@ def compute_func_qc_summary(
         tsnr_map=tsnr_map,
     )
     return {
-        "schema_version": "1.1",
+        "schema_version": FUNC_QC_SCHEMA_VERSION,
         "pipeline": getattr(args, "pipeline", "cloudpipe_minproc"),
         "image_tag": getattr(args, "image_tag", ""),
         "subject": args.subj,

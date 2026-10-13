@@ -128,14 +128,75 @@ def _report(
         )
 
     emitter.note()
-    emitter.note("Still to do:")
-    for step in outstanding:
-        mark = "done" if step["state"] == "pass" else "todo"
-        emitter.note(f"  [{mark}] {step['title']} — {step['message']}")
+    emitter.note("Next steps, in order:")
+    ordered = sorted(
+        outstanding, key=lambda step: STEP_ORDER.get(step["identifier"], len(STEP_ORDER))
+    )
+    for number, step in enumerate(ordered, 1):
+        done = step["state"] == "pass"
+        emitter.note()
+        emitter.note(f" {number}. {step['title']}{'  (done)' if done else ''}")
         remedy = step["remedy"]
-        if remedy:
-            label = "run" if remedy["kind"] == "command" else "do"
-            emitter.note(f"         {label}: {remedy['text']}")
+        if remedy and remedy["kind"] == "command":
+            command, aside = _split_aside(remedy["text"])
+            placeholder = "<" in command
+            emitter.note(f"    Run{' (replace each <placeholder> first)' if placeholder else ''}:")
+            for line in display_command(command):
+                emitter.note(f"      {line}")
+            if aside:
+                emitter.note(f"    {aside}")
+        elif remedy:
+            emitter.note(f"    Do: {remedy['text']}")
+        emitter.note(f"    Why: {step['message']}")
+
+
+#: The order a deployer does these in, which is the order they are printed. The
+#: JSON `outstanding` list keeps its own order: it is contract, and a consumer may
+#: index it.
+STEP_ORDER = {
+    "state.bucket": 0,
+    "globus.inputs": 1,
+    "install.cloudflare_token": 2,
+    "install.phased": 3,
+    "install.operator_accounts": 4,
+}
+
+
+def _split_aside(text: str) -> tuple[str, str]:
+    """A command and the parenthetical note some remedies trail it with."""
+    command, sep, aside = text.partition("   (")
+    return command.strip(), f"({aside}" if sep else ""
+
+
+def display_command(command: str) -> list[str]:
+    """One shell command per line, and long `-var` lists one per continuation line.
+
+    A remedy is stored as one string, and as one line it ran to several hundred
+    characters, with four commands joined by `&&` and the `-var` flags of the
+    last one, all wrapped into prose. That is what made the bootstrap command hard
+    to find in the closing output (second-account rerun, 2026-10-12). The lines
+    returned still paste and run in the same order.
+    """
+    import shlex
+
+    lines: list[str] = []
+    for part in command.split(" && "):
+        if part.startswith("cp "):
+            # Sources and target on their own lines: with real paths they are long.
+            words = shlex.split(part)
+            quoted = [shlex.quote(w) if "*" not in w else w for w in words]
+            lines.append(f"cp {quoted[1]} \\")
+            lines.extend(f"   {word} \\" for word in quoted[2:-1])
+            lines.append(f"   {quoted[-1]}")
+            continue
+        head, *flags = part.split(" -var ")
+        if not flags:
+            lines.append(part)
+            continue
+        lines.append(head + " \\")
+        lines.extend(f"  -var {flag} \\" for flag in flags[:-1])
+        lines.append(f"  -var {flags[-1]}")
+    return lines
 
 
 def _render(root: Path, name: str, content: str, ctx: Context) -> Path:

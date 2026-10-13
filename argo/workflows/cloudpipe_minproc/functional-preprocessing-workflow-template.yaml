@@ -137,6 +137,7 @@ spec:
   #
   # Downloads from S3 (once per session, not once per run):
   #   mmps_mproc/{subj}/{ses}/func/     → /data/func   every run's BOLD + sidecar + motion
+  #                                     (+ ABCD's _events.tsv for n-back)
   #   derivatives/registration/{subj}/{ses}/ → /tmp/registration
   #                                     t1w_to_mni/ and bold_to_t1w_{task}_{run}/
   #   derivatives/fastsurfer/{subj}/{ses}/mri/aseg.auto.mgz + surf/ + _links.json
@@ -155,6 +156,7 @@ spec:
   # Uploads to S3, one tarball per run (built by the driver — see the outputs):
   #   derivatives/func/{subjID}/{session}/
   #     {subjID}_{session}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
+  #     {subjID}_{session}_{task}_{run}_events.tsv   (n-back: ABCD's task timing, copied)
   #   derivatives/func_surf/{subjID}/{session}/components/
   #     {subjID}_{session}_{task}_{run}_desc-grayordcomponents_bold.tar.gz
   #
@@ -220,7 +222,7 @@ spec:
         # correctly. Output artifacts are the opposite — they must keep the
         # trailing slash (Argo docs: artifact GC).
 
-        # Every run's _bold.nii.gz, _bold.json and _motion.tsv.
+        # Every run's _bold.nii.gz, _bold.json and _motion.tsv, and n-back's _events.tsv.
         - name: func-inputs
           path: /data/func
           archive:
@@ -931,6 +933,27 @@ spec:
                 with tarfile.open(tarball, "w:gz") as tar:
                     tar.add(str(work_dir), arcname=f"{task}_{rid}", filter=_vol_only)
                 print(f"[driver] wrote {tarball.name}")
+
+                # ABCD ships task timing as {prefix}_events.tsv beside the BOLD
+                # (n-back has one; rest has none). It is staged into FUNC_DIR
+                # with the other inputs, and staged input is deleted once the
+                # workflow succeeds, so without this copy the onsets are kept
+                # nowhere. A plain object beside the tarball, not inside it, so
+                # a first-level reader fetches 5 KB rather than unpacking
+                # ~125 MB. Onsets count from the first acquired frame, and the
+                # MNI BOLD keeps every frame (non-steady-state frames are
+                # flagged in the confounds, never cut), so they apply unchanged.
+                # Copied only with a fresh tarball, so the two always come from
+                # the same run.
+                events = FUNC_DIR / f"{prefix}_events.tsv"
+                if events.exists():
+                    shutil.copy2(events, OUT_DIR / events.name)
+                    print(f"[driver] wrote {events.name}")
+                elif task == "task-nback":
+                    # ABCD drops an n-back run with no valid E-Prime file before
+                    # release, so a staged run without its timing is unexpected.
+                    # Loud, not fatal: the BOLD itself is still valid.
+                    print(f"[driver] WARNING: {prefix}: no {events.name} staged for an n-back run")
 
             surf_failed = False
             surf_message = ""
