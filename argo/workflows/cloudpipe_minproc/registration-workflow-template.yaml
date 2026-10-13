@@ -487,7 +487,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:074d91905eb65016b51c0e41feb3a2304e77a0d214a3cf74af8422435b8bef86"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:9379589c767ccd80fd155a4bd7f885bfad0c9f19a221bd8b814c0cf810de557d"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -832,7 +832,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:fb478b4635bb23fa93bc117f9274a49d4d1008b4c974b3182c7fd63bf8c44c70"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:3abfd19aa254d7bf340b981ab8ed7d6575140df84168ca399094ba9d4a89fa40"
       imagePullPolicy: IfNotPresent
 
       # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the

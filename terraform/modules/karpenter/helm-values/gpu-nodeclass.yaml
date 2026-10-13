@@ -21,11 +21,25 @@ spec:
   # NOTE: an AMI baked before the digest-pinning change carries no *-image-digest
   # tag and can therefore never match this selector. Rolling back to one requires
   # adding the tags to it first (aws ec2 create-tags).
+  #
+  # Exactly ONE kind of term is rendered, chosen by Terraform in
+  # terraform/modules/gpu-ami-choice: the tags above when this account owns a
+  # matching bake, else the publisher's pinned public AMI by id, else the stock
+  # AL2023 alias. Karpenter refuses an alias next to any other term, which is
+  # why the choice cannot be left to it.
   amiSelectorTerms:
+%{ if gpu_ami_kind == "tags" ~}
     - tags:
         fastsurfer-image-digest: "${ fastsurfer_ami_digest }"
         fireants-image-digest: "${ fireants_ami_digest }"
         eks-version: "${ eks_version }"
+%{ else ~}
+%{ if gpu_ami_kind == "id" ~}
+    - id: "${ gpu_ami_id }"
+%{ else ~}
+    - alias: "${ gpu_ami_alias }"
+%{ endif ~}
+%{ endif ~}
 
   # Use any available NVMe instance store as scratch for containers.
   # Single root volume for AL2023 (unlike Bottlerocket's OS + data split).
@@ -69,6 +83,11 @@ spec:
     httpPutResponseHopLimit: 3
     httpTokens: required
   detailedMonitoring: true
+  # Explicit, never left to the subnet's default. Only the ingress node class may
+  # set true (openspec change add-https-ingress-mode, ingress-node-isolation);
+  # tests/test_ingress_node_isolation.py holds every node class to that.
+  # Changing this field drifts every node of the class: apply it with no batch running.
+  associatePublicIPAddress: false
   role: ${ karpenter_node_iam_role_name }
   subnetSelectorTerms:
     - tags:

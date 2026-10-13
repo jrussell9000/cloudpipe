@@ -164,11 +164,10 @@ module "argo_workflows" {
   bucket         = var.globus_s3_destination_bucket
   metrics_bucket = local.metrics_bucket
 
-  # Private ECR: layer blobs are served from S3 via the gateway endpoint the
-  # cluster already has, so image pulls no longer traverse the NAT gateway.
-  # Rollback is this one line back to local.ecr_public_registry -- images are
-  # dual-pushed to both registries during the migration, so both resolve.
-  ecr_registry = local.ecr_private_registry
+  # This deployment's private ECR, or the pull-through cache of the published
+  # images; var.image_registry decides, see image_cache.tf. Either way layer blobs
+  # are served from S3 via the gateway endpoint, not across the NAT gateway.
+  ecr_registry = local.ecr_registry
 
   # Database
   db_name       = var.argo_workflows_db_name

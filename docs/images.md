@@ -1,8 +1,40 @@
 # Docker Images
 
-Pipeline images live in a private ECR registry (`{account-id}.dkr.ecr.{region}.amazonaws.com/cloudpipe/`). Most are still **dual-pushed** to ECR Public (`public.ecr.aws/l9e7l1h1/cloudpipe/`) as a secondary — a rollback target held over from the NAT-cost migration. The registry prefix actually used is set by Terraform (`local.ecr_registry` in `terraform/modules/stack/argowf.tf`) and passed as the `ecr-registry` parameter to every workflow.
+Every workflow template names its images as `{{ecr-registry}}/cloudpipe/<name>@sha256:<digest>`. Terraform sets `ecr-registry` from the stack input `image_registry` (`terraform/modules/stack/image_cache.tf`):
 
-**`fmri-first-level-proc` is private-only** as of 2026-08-17: its dual-push and its ECR Public repository are gone, so rollback for that one image would be a rebuild rather than a registry flip. Public repos are being retired image by image via `local.ecr_images_public_retired` in `terraform/modules/stack/ecr.tf` — see `handoffs/ecr-private-registry-migration.md` Step 6 (internal repo only).
+| `image_registry` | `ecr-registry` | For |
+|---|---|---|
+| `public-cache` (default) | `<account>.dkr.ecr.<region>.amazonaws.com/ecr-public/<publisher alias>`, an ECR pull-through cache of ECR Public | A deployment that builds no images. The publisher copies each pinned image to `public.ecr.aws/<alias>/cloudpipe/`, and the first pull of each digest imports it into your private ECR |
+| `private` | `<account>.dkr.ecr.<region>.amazonaws.com` | A deployment that builds and pins its own images, as the reference deployment does |
+
+Either way, pods pull from a private ECR registry in your own account, over the S3 gateway endpoint.
+
+`fmri-first-level-proc` is not published, so a `public-cache` deployment cannot run the first-level GLM pipeline without building that image itself. Neither are `fsl` and `diffusion`: FSL may not be redistributed without a license, and no published workflow uses them.
+
+## How the images are trusted
+
+This section is for a deployment that runs the published images and must account for them, for example under NIST SP 800-171. The controls below are the publisher's and the stack's. Your own SSP still has to describe them as they apply to your system.
+
+**The digest is the trust anchor, not the registry.** A template pins `@sha256:<digest>`, and a digest names exactly one sequence of bytes. No registry, cache or administrator can serve different bytes under it. So what you run is fixed by the commit you deploy, and reviewing that commit reviews the images. A rebuilt image has a new digest, and it reaches you only through a commit that changes the pin.
+
+**When an image is published.** Each image build copies its image to ECR Public right after pushing it to the publisher's private registry. `publish-images.yaml` covers anything a build did not publish. A new pin reaches the public repository only through its sync, and the sync refuses to run until ECR Public serves every pinned image, checked anonymously, the way your cache asks. So the public `main` never pins an image you cannot pull.
+
+**What the publisher checks before each copy** (`.github/scripts/publish_images.py`):
+
+- The image is copied from the publisher's private registry by digest, and the copy fails unless the public digest equals the private one. The public copy is therefore the image the publisher's Amazon Inspector scanned, byte for byte.
+- Every layer is scanned for a FreeSurfer license file. Licenses are per registrant, so none is ever published; you supply your own at `config/fslicense` in your data bucket.
+- Any image whose Dockerfile installs FSL is refused.
+- Any image carrying a build attestation is refused, because buildx provenance embeds the publisher's build metadata.
+
+**What your account does:**
+
+- **Scanning.** The stack puts the cache's repositories under continuous Amazon Inspector scanning, so the vulnerability findings for the images you run are in your own account. That works only with Inspector's ECR scanning enabled in your account and region, which the stack does not do. Organizations usually manage Inspector centrally, and a stack that took it over could switch it off on destroy. Preflight's `aws.image_scanning` check reports **WAIT** until it is enabled.
+- **Boundary.** Your pods never contact ECR Public. On a digest's first pull, the ECR service fetches it from upstream into your registry; later pulls never leave your account. The images contain software only. Your data stays in your data bucket.
+- **Node permissions.** Node roles gain `ecr:BatchImportUpstreamImage` and `ecr:CreateRepository`, limited to repositories under the cache prefix.
+
+**If your policy forbids running binaries built elsewhere,** set `image_registry = "private"` and build the images yourself, then pin your own digests. That path is not turnkey yet. The build workflows still name the reference deployment's account in their build-cache references, and `build-prefect-flow-runner.yaml` names it in its image. A fork has to edit those lines, then set its own `ECR_REGISTRY` variable and `AWS_ROLE_ARN` secret from the stack's `ecr_private_registry` and `github_actions_ecr_role_arn` outputs.
+
+What the publisher cannot give you yet is proof of *who* published an image, beyond the fact that it matches the commit. Signing the published images is not done.
 
 ---
 
