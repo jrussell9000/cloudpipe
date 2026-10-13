@@ -233,6 +233,18 @@
       "x-section": "terraform-state",
       "x-source": "deployer-choice",
       "x-terraform-variable": null
+    },
+    "freesurfer_license_path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "title": "FreeSurfer license file",
+      "description": "The absolute path to your FreeSurfer license file, the license.txt FreeSurfer emails you after free registration at https://surfer.nmr.mgh.harvard.edu/registration.html. Every FreeSurfer and FastSurfer step needs it, and licenses are issued per person, so no published file carries one.\n\nOnly the path is recorded. The wizard checks the file locally (it exists and is shaped like a license) and never reads its contents into the answers document or prints them. The bootstrap command passes the path to the bootstrap root, which uploads the file to config/fslicense in the data bucket; Terraform state keeps the path and the object's ETag, not the license.",
+      "x-section": "reference-data",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": null,
+      "x-null-meaning": "you upload the license yourself, to config/fslicense in the data bucket; preflight's aws.config_objects says whether it is there"
     }
   },
   "$defs": {
@@ -258,6 +270,10 @@
         {
           "identifier": "terraform-state",
           "title": "Terraform state"
+        },
+        {
+          "identifier": "reference-data",
+          "title": "Reference data"
         }
       ]
     },
