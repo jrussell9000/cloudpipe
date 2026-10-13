@@ -14,6 +14,7 @@ anyway. So a directory that does not call the stack module is refused with exit
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,14 +37,36 @@ _MODULE_CALL = re.compile(r'^\s*module\s+"[^"]+"\s*\{', re.M)
 _FINGERPRINT = ("domain", "region", "cloudflare_account_id")
 
 
+def invocation_dir() -> Path:
+    """The directory the deployer ran the command from.
+
+    Not `Path.cwd()` alone. The documented command is `cd <your root>` and then
+    `pixi run --manifest-path <clone>/pixi.toml cloudpipe ...`, and pixi runs a
+    defined task from the project root (the clone), recording where it was
+    invoked in `INIT_CWD`. Reading only the cwd made every default and every
+    relative path land in the clone, so the documented command could never write
+    to the deployer's root (found in the second-account rerun, 2026-10-12).
+    """
+    invoked = os.environ.get("INIT_CWD")
+    if invoked and Path(invoked).is_dir():
+        return Path(invoked)
+    return Path.cwd()
+
+
+def from_invocation(path: str | Path) -> Path:
+    """`path` as the deployer meant it: relative to where they ran the command."""
+    candidate = Path(path).expanduser()
+    return candidate if candidate.is_absolute() else invocation_dir() / candidate
+
+
 def resolve(root: str | Path | None) -> Path:
     """The directory to write into, verified.
 
-    `None` means the current directory, which is only accepted when it looks like
-    a stack root — an unverified default here would be a file written into a
-    checkout at random.
+    `None` means the directory the command was run from, which is only accepted
+    when it looks like a stack root — an unverified default here would be a file
+    written into a checkout at random.
     """
-    candidate = Path(root).expanduser() if root is not None else Path.cwd()
+    candidate = from_invocation(root) if root is not None else invocation_dir()
 
     if not candidate.is_dir():
         raise CliError(

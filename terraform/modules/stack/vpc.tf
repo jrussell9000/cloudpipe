@@ -181,9 +181,14 @@ data "aws_vpc_endpoint_service" "s3" {
 
 # Be very careful adding policies to this - doing so can interfere with ECR image pulls
 resource "aws_vpc_endpoint" "s3" {
-  vpc_id              = module.vpc.vpc_id
-  service_name        = data.aws_vpc_endpoint_service.s3.service_name
-  route_table_ids     = data.aws_route_tables.rts.ids
+  vpc_id       = module.vpc.vpc_id
+  service_name = data.aws_vpc_endpoint_service.s3.service_name
+  # The ingress route table is named explicitly (ingress_network.tf): the data
+  # source is read at plan time, before that table exists, so on the first apply
+  # it would be missing. distinct() keeps later plans, whose data source does
+  # include it, from showing a change. A separate
+  # aws_vpc_endpoint_route_table_association would fight this list instead.
+  route_table_ids     = distinct(concat(data.aws_route_tables.rts.ids, [aws_route_table.ingress.id]))
   private_dns_enabled = false
 }
 

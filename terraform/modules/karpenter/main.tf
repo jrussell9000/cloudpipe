@@ -12,6 +12,25 @@ module "karpenter_infra" {
   cluster_name                      = var.cluster_name
   create_pod_identity_association   = true
   node_iam_role_additional_policies = var.node_iam_role_additional_policies
+
+  # The controller may pass only the shared node role (AllowPassingInstanceRole).
+  # The ingress node class runs under its own role (ingress.tf), so the controller
+  # needs one more PassRole — on that role alone, with the same condition. The
+  # module appends this to its own policy document; it replaces nothing.
+  iam_policy_statements = [
+    {
+      sid       = "AllowPassingIngressNodeRole"
+      actions   = ["iam:PassRole"]
+      resources = [aws_iam_role.ingress_node.arn]
+      condition = [
+        {
+          test     = "StringEquals"
+          variable = "iam:PassedToService"
+          values   = ["ec2.amazonaws.com"]
+        }
+      ]
+    }
+  ]
 }
 
 # Install Karpenter and modify default configuration

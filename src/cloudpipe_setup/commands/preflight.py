@@ -123,14 +123,18 @@ def _no_answers(given: str | None) -> CliError:
     Every check against absent answers would report `skipped`, and a report of
     eight skips reads like a permissions problem rather than a missing file.
     """
-    looked_for = given or f"./{config.DEFAULT_ANSWERS_NAME}"
+    from .. import render
+
+    # The resolved path, not "./": under pixi the process cwd is the clone, so "./"
+    # would name the wrong directory.
+    looked_for = config.resolve_path(given)
     return CliError(
         "answers.absent",
         f"no answers document at {looked_for}, so there is nothing to check the world against",
         exit_code=ExitCode.INVALID,
         remedy=Remedy(
             "command",
-            "pixi run cloudpipe setup  (or pass --answers <path> if your document is elsewhere)",
+            f"{render.cli_command('setup')}  (or pass --answers <path> if your document is elsewhere)",
         ),
         detail={"looked_for": str(looked_for)},
     )

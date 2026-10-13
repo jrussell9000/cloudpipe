@@ -31,4 +31,8 @@ module "karpenter" {
   # own; see ../gpu-ami-choice.
   gpu_ami_selection = var.gpu_ami_selection
   gpu_ami_alias     = var.gpu_ami_alias
+
+  # The ingress node pool's network (ingress_network.tf), by ID.
+  ingress_subnet_ids        = [for s in aws_subnet.ingress : s.id]
+  ingress_security_group_id = aws_security_group.ingress_node.id
 }

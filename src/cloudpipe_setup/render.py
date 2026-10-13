@@ -31,7 +31,7 @@ TFVARS_NAME = "terraform.tfvars"
 BACKEND_NAME = "backend.tf"
 
 TFVARS_HEADER = """\
-# Rendered by `pixi run cloudpipe setup` from the answers document.
+# Rendered by `cloudpipe setup` from the answers document.
 #
 # Safe to edit, unlike globus.auto.tfvars beside it: this tool refuses to
 # overwrite the file once it exists, so an edit here survives a re-run. Prefer
@@ -56,7 +56,7 @@ TFVARS_HEADER = """\
 """
 
 BACKEND_HEADER = """\
-# Rendered by `pixi run cloudpipe setup` from the answers document.
+# Rendered by `cloudpipe setup` from the answers document.
 #
 # The state bucket must exist before the first `terraform init`. This tool does
 # not create it — it creates no AWS resource at all — so `cloudpipe setup` prints
@@ -128,6 +128,18 @@ BOOTSTRAP_DIR = "bootstrap"
 #: The clone this package was imported from — the published tree the deployer
 #: copies the bootstrap root out of.
 CLONE = Path(__file__).resolve().parents[2]
+
+
+def cli_command(subcommand: str) -> str:
+    """How to run a wizard command from the deployment root, with this clone's real path.
+
+    A bare `pixi run cloudpipe ...` only works from inside the clone, and the
+    deployer runs these from their root, so every printed command carries
+    `--manifest-path`.
+    """
+    return (
+        f"pixi run --manifest-path {shlex.quote(str(CLONE / 'pixi.toml'))} cloudpipe {subcommand}"
+    )
 
 
 def bootstrap_command(answers: dict[str, Any], root: Path, *, clone: Path = CLONE) -> str:

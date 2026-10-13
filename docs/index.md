@@ -197,4 +197,4 @@ docs-internal/        — Architecture Decision Records, dated investigations an
 | ArgoCD | `https://argocd.<domain>` |
 | Grafana | `https://grafana.<domain>` |
 
-A deployment with no domain (`domain = null`) publishes none of those hostnames. Each UI is reached on a fixed `localhost` port with `pixi run cloudpipe ui <name>` — see [the deployer's first hour](deployer-first-hour.md#reaching-the-web-uis-without-a-domain).
+A deployment with no domain (`domain = null`) publishes none of those hostnames. Each UI is reached on a fixed `localhost` port with `cloudpipe ui <name>` — see [the deployer's first hour](deployer-first-hour.md#reaching-the-web-uis-without-a-domain).

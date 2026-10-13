@@ -56,7 +56,7 @@ Two answers change what gets built. Both are decided by what you put in the answ
 | The UIs are at | `https://<ui>.example.org`, over WARP | a fixed `localhost` port, over a port-forward |
 | Built for them | an internal load balancer, an ACM certificate, DNS records, a web-application firewall | nothing |
 | You must own | a Route53 hosted zone for the domain | nothing |
-| To open one | a bookmark | `pixi run cloudpipe ui <name>` ([below](#reaching-the-web-uis-without-a-domain)) |
+| To open one | a bookmark | `cloudpipe ui <name>` ([below](#reaching-the-web-uis-without-a-domain)) |
 
 Everything else — the cluster, the pipeline, Globus ingress, the metrics store — is identical. Port-forward mode is not a reduced deployment; it is the same deployment without public hostnames for its private UIs.
 
@@ -79,7 +79,9 @@ cd cloudpipe
 python3 scripts/cloudpipe-setup
 ```
 
-`scripts/cloudpipe-setup` is the only command here that runs before anything is installed, so it imports nothing but the Python standard library. It checks for pixi, Terraform at or above the version the stack module requires, AWS CLI v2 and an active SSO session, reports what is missing with the command or URL that gets it, and then hands off to the wizard.
+The rest of this page calls that directory `<your clone>`. Use its real path wherever you see it, for example `~/cloudpipe` if you cloned into your home directory.
+
+`scripts/cloudpipe-setup` is the only command here that runs before anything is installed, so it imports nothing but the Python standard library. It checks for pixi, Terraform at or above the version the stack module requires, AWS CLI v2 and an active SSO session. It reports what is missing, with the command or URL that gets it. If everything is in place, it prints the next two steps (below) with your clone's real path filled in. Run it with `--root <your deployment root>` once that root exists, and it goes straight on to the wizard.
 
 It reports rather than fixes, with one exception: if pixi is absent it offers to install it, shows you the URL it would run first, and does nothing if you decline. Under `--non-interactive` it never offers and exits `2` instead.
 
@@ -108,8 +110,10 @@ The wizard verifies the directory you point it at before writing anything. A dir
 
 ```
 cd ~/my-cloudpipe-deployment
-pixi run --manifest-path ~/cloudpipe/pixi.toml cloudpipe setup
+pixi run --manifest-path <your clone>/pixi.toml cloudpipe setup
 ```
+
+Run it **from your deployment root**. pixi runs the task from the clone, so the wizard works on the directory you ran the command from, which pixi passes on as `INIT_CWD`. That directory is the default `--root`, and it's where `cloudpipe-answers.yaml` is written. Every command the wizard prints for you already carries the `--manifest-path`.
 
 The wizard asks for each input in turn, grouped into AWS, identity, source control, Cloudflare and state. For every field it shows the help text, where to obtain the value, and the rule it must satisfy — and it re-asks immediately rather than collecting a list of complaints at the end.
 
@@ -162,8 +166,8 @@ Three buckets have to exist before the stack's first apply, and all three have t
 
 ```bash
 mkdir -p ~/my-cloudpipe-deployment/bootstrap
-cp ~/cloudpipe/terraform/modules/bootstrap/*.tf \
-   ~/cloudpipe/terraform/modules/bootstrap/.terraform.lock.hcl \
+cp <your clone>/terraform/modules/bootstrap/*.tf \
+   <your clone>/terraform/modules/bootstrap/.terraform.lock.hcl \
    ~/my-cloudpipe-deployment/bootstrap/
 terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap init
 terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap apply \
@@ -289,8 +293,10 @@ That needs the GitHub provider configured, which means exporting `GITHUB_TOKEN` 
 
 ## Step 6 — preflight
 
+From your deployment root, as in step 3:
+
 ```
-pixi run cloudpipe preflight --account <your-aws-account-id>
+pixi run --manifest-path <your clone>/pixi.toml cloudpipe preflight --account <your-aws-account-id>
 ```
 
 Preflight checks what your answers assert about the world, which is a different question from whether the answers are well-formed. It is read-only: every call it makes is a read, and it creates, modifies and deletes nothing. You can re-run it, paste its output into a ticket, and run it against a deployment somebody else built.
@@ -459,7 +465,7 @@ This path has not yet been exercised against a real institutional provider — s
 With a domain, each UI is at `https://<ui>.<domain>` over WARP. With `domain = null`, nothing is published, and you reach a UI through a port-forward instead:
 
 ```bash
-pixi run cloudpipe ui grafana        # or argocd, argo, prefect, kubecost
+pixi run --manifest-path <your clone>/pixi.toml cloudpipe ui grafana   # or argocd, argo, prefect, kubecost
 ```
 
 It checks the cluster is reachable, forwards the UI to its fixed local port, and opens your browser there. It runs until you press Ctrl-C. The ports are fixed because each UI's sign-in redirect is registered on its port, and a redirect URI has to match exactly:

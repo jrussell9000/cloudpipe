@@ -1,0 +1,50 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: ingress-nodepool
+# HTTPS ingress pods only (openspec add-https-ingress-mode). The taint keeps
+# every other pipeline pod off these public-IP nodes; only the ingress step
+# tolerates it, apart from DaemonSets that tolerate everything.
+#
+# Sized for the https-transfer semaphore (8 concurrent steps at 2 CPU / 4 Gi):
+# one 2xlarge carries them all. The cpu limit of 64 allows headroom to raise the
+# semaphore later without a pool change.
+spec:
+  limits:
+    cpu: 64
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+  template:
+    metadata:
+      labels:
+        cloudpipe.io/node-role: ingress
+    spec:
+      expireAfter: 720h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: ingress-nodeclass
+      taints:
+        - key: cloudpipe.io/ingress
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: "kubernetes.io/arch"
+          operator: In
+          values: ["amd64"]
+        - key: "kubernetes.io/os"
+          operator: In
+          values: ["linux"]
+        - key: "karpenter.sh/capacity-type"
+          operator: In
+          values: ["spot"]
+        - key: "karpenter.k8s.aws/instance-category"
+          operator: In
+          values: ["c", "m"]
+        - key: "karpenter.k8s.aws/instance-size"
+          operator: In
+          values: ["2xlarge"]
+        - key: "karpenter.k8s.aws/instance-hypervisor"
+          operator: In
+          values: ["nitro"]

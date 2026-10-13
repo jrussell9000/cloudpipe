@@ -23,7 +23,7 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-from . import config, schema
+from . import config, render, schema
 from .exits import CliError, ExitCode, Remedy
 from .output import Emitter
 
@@ -287,8 +287,8 @@ def _skipped(field: schema.Field) -> CliError:
         exit_code=ExitCode.BLOCKED,
         remedy=Remedy(
             "human",
-            "Find the value and run `pixi run cloudpipe setup` again. Everything answered so "
-            "far has been saved and is offered back as the default.",
+            f"Find the value and run `{render.cli_command('setup')}` again. Everything answered "
+            "so far has been saved and is offered back as the default.",
         ),
         detail={"field_errors": [{"identifier": field.identifier, "message": "skipped"}]},
     )

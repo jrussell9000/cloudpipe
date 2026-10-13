@@ -472,7 +472,24 @@ def _hand_off(repo: Path, args: argparse.Namespace, forwarded: list[str]) -> int
     can swallow Ctrl-C or renumber an exit code, and the exit codes are a
     published contract.
     """
-    command = ["pixi", "run", "cloudpipe", "setup"]
+    # Without a root there is nothing to hand off TO. This runs from the clone, and
+    # the deployer's root does not exist until step 2 of docs/deployer-first-hour.md
+    # copies it, so a bare hand-off always ended in "not a CloudPipe stack root"
+    # (found in the second-account rerun, 2026-10-12). Say what comes next instead.
+    if not any(arg == "--root" or arg.startswith("--root=") for arg in forwarded):
+        _note("")
+        _note("Prerequisites are in place. Next, outside this clone:")
+        _note(f"  cp -r {repo / 'terraform/modules/stack/example'} <your deployment root>")
+        _note("  cd <your deployment root>")
+        _note(f"  pixi run --manifest-path {repo / 'pixi.toml'} cloudpipe setup")
+        _note("Or re-run this with --root <your deployment root> to go straight on.")
+        return OK
+
+    # --manifest-path rather than a chdir into the clone. pixi sets INIT_CWD to the
+    # directory it was invoked from (and overwrites any value it inherits), and the
+    # wizard resolves a relative --root and its answers document against that. So
+    # pixi has to be invoked from where the deployer is, not from the clone.
+    command = ["pixi", "run", "--manifest-path", str(repo / "pixi.toml"), "cloudpipe", "setup"]
     if args.json:
         command.append("--json")
     if args.non_interactive:
@@ -488,7 +505,6 @@ def _hand_off(repo: Path, args: argparse.Namespace, forwarded: list[str]) -> int
         _note("error: pixi vanished between the check and the hand-off.")
         return CHECK_FAILED
 
-    os.chdir(repo)
     os.execvp(binary, command)  # noqa: S606 - a fixed command, resolved through which()
 
 

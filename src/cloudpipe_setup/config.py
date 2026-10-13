@@ -82,9 +82,12 @@ def load(path: str | Path | None) -> tuple[dict[str, Any], Path | None]:
 
 
 def resolve_path(path: str | Path | None) -> Path | None:
+    """The answers document, relative to where the command was run (see `roots.invocation_dir`)."""
+    from . import roots
+
     if path is not None:
-        return Path(path).expanduser()
-    return Path.cwd() / DEFAULT_ANSWERS_NAME
+        return roots.from_invocation(path)
+    return roots.invocation_dir() / DEFAULT_ANSWERS_NAME
 
 
 def reject_credentials(answers: dict[str, Any]) -> None:
