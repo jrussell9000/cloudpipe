@@ -47,6 +47,7 @@ CHECK_CONFIG_OBJECTS = "aws.config_objects"
 CHECK_AMIS = "aws.amis"
 CHECK_IMAGE_SCANNING = "aws.image_scanning"
 CHECK_CLOUDFLARE = "cloudflare.token"
+CHECK_CLOUDFLARE_ORGANIZATION = "cloudflare.organization"
 CHECK_FEDERATION_METADATA = "federation.metadata"
 CHECK_FEDERATION_EVIDENCE = "federation.mfa_evidence"
 CHECK_FEDERATION_SECRET = "federation.client_secret"
@@ -73,6 +74,7 @@ ORDER = (
     CHECK_AMIS,
     CHECK_IMAGE_SCANNING,
     CHECK_CLOUDFLARE,
+    CHECK_CLOUDFLARE_ORGANIZATION,
     CHECK_FEDERATION_METADATA,
     CHECK_FEDERATION_EVIDENCE,
     CHECK_FEDERATION_SECRET,
@@ -306,6 +308,7 @@ def run(
     repo = repo or Path(__file__).resolve().parents[2]
 
     identity_record, identity = _check_identity(world)
+    token_record = _check_cloudflare(world, answers)
     records = [
         identity_record,
         _check_account(identity, expected_account),
@@ -315,7 +318,8 @@ def run(
         _check_config_objects(world, root, repo, identity),
         _check_amis(world, root, repo, identity),
         _check_image_scanning(world, identity),
-        _check_cloudflare(world, answers),
+        token_record,
+        _check_cloudflare_organization(world, answers, token_record),
         _check_federation_metadata(world, answers),
         _check_federation_evidence(answers),
         _check_federation_secret(world, answers, identity),
@@ -990,6 +994,101 @@ def _check_cloudflare(world: World, answers: dict[str, Any]) -> Record:
         f"{len(cloudflare.PERMISSIONS)} permission groups the stack uses in account {account}. "
         "Read is what can be checked without changing anything; a token made from the link "
         "this tool prints has Write.",
+    )
+
+
+def _check_cloudflare_organization(
+    world: World, answers: dict[str, Any], token_record: Record
+) -> Record:
+    """Zero Trust is on in the account, and its team domain is the one in the answers.
+
+    Two failures this catches before the cluster exists rather than at phase 4.
+    Zero Trust not turned on: the provider's create is a PUT on the existing
+    organization and cannot make one, and the dashboard is the only way to make
+    one, because onboarding asks for a plan and payment details even on Free
+    (confirmed in the second-account rerun, 2026-10-13). And a team domain that
+    differs from the account's: the apply would send it as `auth_domain`, trying
+    to rename the domain every enrolled WARP client and the identity provider's
+    redirect URI use.
+
+    Runs only after `cloudflare.token` passed. Its probes include a read in the
+    same permission group as this one, so a refusal here is about the
+    organization and not the token, and a bad token is reported once, there.
+    """
+    title = "Zero Trust organization"
+    account = answers.get("cloudflare_account_id")
+    expected = str(answers.get("cloudflare_team_domain") or "").strip().rstrip(".").lower()
+    enable = Remedy(
+        "human",
+        "Turn Zero Trust on in this account: open Zero Trust from the account's sidebar in the "
+        "Cloudflare dashboard, choose a team name, then a plan and payment details (Free asks "
+        "for them and charges nothing). Set cloudflare_team_domain to "
+        "<team name>.cloudflareaccess.com. See docs/deployer-first-hour.md, \"The Cloudflare "
+        "account and its token\".",
+    )
+
+    if token_record.state != "pass":
+        return _skipped(
+            CHECK_CLOUDFLARE_ORGANIZATION,
+            title,
+            f"{CHECK_CLOUDFLARE} did not pass, so there is no token this can read the "
+            "organization with.",
+            token_record.remedy or Remedy("human", f"Resolve {CHECK_CLOUDFLARE} first."),
+        )
+
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        status, body = world.fetch_json(
+            f"{CLOUDFLARE_API}/accounts/{account}/access/organizations", headers=headers
+        )
+    except (urllib.error.URLError, OSError, ValueError) as err:
+        return _skipped(
+            CHECK_CLOUDFLARE_ORGANIZATION,
+            title,
+            f"the Cloudflare API could not be reached ({err}).",
+            Remedy("human", "Try again from a network that can reach api.cloudflare.com."),
+        )
+
+    succeeded = isinstance(body, dict) and body.get("success") is True
+    result = body.get("result") if succeeded else None
+    found = str((result if isinstance(result, dict) else {}).get("auth_domain") or "")
+    found = found.strip().rstrip(".").lower()
+    if status != 200 or not found:
+        reason = _cloudflare_errors(body)
+        return Record(
+            identifier=CHECK_CLOUDFLARE_ORGANIZATION,
+            title=title,
+            state="fail",
+            message=f"account {account} has no Zero Trust organization that this token can read "
+            f"(HTTP {status}{': ' + reason if reason else ''}). Zero Trust is most likely not "
+            "turned on yet. Terraform cannot turn it on: it updates the organization and "
+            "cannot create one.",
+            remedy=enable,
+        )
+
+    if found != expected:
+        return Record(
+            identifier=CHECK_CLOUDFLARE_ORGANIZATION,
+            title=title,
+            state="fail",
+            message=f"account {account}'s team domain is {found}, but cloudflare_team_domain is "
+            f"{expected or 'not set'}. The apply sends cloudflare_team_domain as the "
+            "organization's auth_domain, so it would try to rename the team domain that every "
+            "enrolled WARP client and the identity provider's redirect URI use.",
+            remedy=Remedy(
+                "command",
+                f"{_cli('setup')}   (and give {found} as the team domain; rename it in the "
+                "dashboard first only if you mean to)",
+            ),
+        )
+
+    return Record(
+        identifier=CHECK_CLOUDFLARE_ORGANIZATION,
+        title=title,
+        state="pass",
+        message=f"Zero Trust is on in account {account}, and its team domain is {found}, as "
+        "the answers say.",
     )
 
 
