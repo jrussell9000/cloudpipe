@@ -55,3 +55,19 @@ variable "create_data_bucket" {
   type        = bool
   default     = true
 }
+
+# The deployer's own FreeSurfer license, which every FreeSurfer and FastSurfer
+# step stages from config/fslicense. Licenses are issued per person, so no
+# published file carries one (openspec/changes/publish-images-for-deployers,
+# task 8.1). Null leaves the upload to the deployer; preflight's
+# aws.config_objects then says it is missing.
+variable "freesurfer_license_path" {
+  description = "Path to your FreeSurfer license file (license.txt, from https://surfer.nmr.mgh.harvard.edu/registration.html). Uploaded to config/fslicense in the data bucket. Terraform state records this path and the object's ETag, never the license's contents. Null: upload it yourself."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.freesurfer_license_path == null || fileexists(coalesce(var.freesurfer_license_path, "-"))
+    error_message = "freesurfer_license_path does not name a file that exists."
+  }
+}

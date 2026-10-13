@@ -272,3 +272,27 @@ resource "aws_s3_bucket_policy" "deny_insecure_transport" {
     aws_s3_bucket_public_access_block.data,
   ]
 }
+
+# ---------------------------------------------------------------------------
+# The deployer's FreeSurfer license, at config/fslicense in the data bucket
+# ---------------------------------------------------------------------------
+
+# Every FreeSurfer and FastSurfer step stages this object, and a new bucket does
+# not have it. `source`, not `content`: Terraform reads the file at apply and
+# uploads it, and state records the path and the object's ETag. The license's
+# text is never in state, in a plan, or in this repository. The S3 ETag of a
+# single-part upload is the file's MD5, so `etag` re-uploads when the file
+# changes and costs nothing an object listing does not already show.
+#
+# Not prevent_destroy: a license is replaceable, and a deployer who removes the
+# path should be able to delete the object with it.
+resource "aws_s3_object" "freesurfer_license" {
+  count = var.freesurfer_license_path == null ? 0 : 1
+
+  bucket = var.data_bucket
+  key    = "config/fslicense"
+  source = var.freesurfer_license_path
+  etag   = filemd5(var.freesurfer_license_path)
+
+  depends_on = [aws_s3_bucket.data, aws_s3_bucket_policy.deny_insecure_transport]
+}

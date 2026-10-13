@@ -148,6 +148,11 @@ def _ask(
             if default is _NULL:
                 return None
             if default in (None, "", []):
+                # An optional field that can be null (the FreeSurfer license path)
+                # takes Enter as "not set". Re-asking it would make an optional
+                # question mandatory.
+                if field.nullable and not field.required and field.required_when is None:
+                    return None
                 emitter.note(style.warn("  This one has no default — it has to be answered."))
                 continue
             return default
