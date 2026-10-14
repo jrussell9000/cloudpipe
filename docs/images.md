@@ -94,7 +94,7 @@ Builds `linux/arm64` on `ubuntu-24.04-arm`. After push, rewrites the SHA tag in 
 
 ### build-prefect-flow-runner.yaml
 
-Triggers on changes to `images/prefect-flow-runner/**`, `src/metrics/**` (`COPY`ed into the image), `prefect/flows/**`, or `prefect/prefect.yaml`. Uses `:latest` tag (not SHA). After push, warns in the GitHub Actions job summary if `prefect.yaml` changed and `pixi run -e ops prefect-deploy` is needed (never a bare `prefect deploy --all` — see operations.md). See operations.md for the full Prefect deployment procedure.
+Triggers on changes to `images/prefect-flow-runner/**`, `src/metrics/**` (`COPY`ed into the image), `prefect/flows/**`, or `prefect/prefect.yaml`. Uses `:latest` tag (not SHA). After push, warns in the GitHub Actions job summary if `prefect.yaml` changed and `pixi run prefect-deploy` is needed (never a bare `prefect deploy --all` — see operations.md). See operations.md for the full Prefect deployment procedure.
 
 ---
 

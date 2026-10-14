@@ -2,10 +2,11 @@
 # Register every deployment in prefect.yaml with the Prefect server, then read
 # each one back from the server to prove what it stored.
 #
-#   pixi run -e ops prefect-deploy
+#   pixi run prefect-deploy
 #
-# The ops environment exports PREFECT_API_URL and PREFECT_API_AUTH_STRING from
-# the cluster (scripts/cloudpipe-env.sh). Outside it, export both by hand.
+# PREFECT_API_URL and PREFECT_API_AUTH_STRING come from the cluster, through the
+# same scripts/cloudpipe-env.sh the ops environment sources, whenever either is
+# unset. So any pixi environment works, and a value you export yourself wins.
 #
 # Use this, never a bare `prefect deploy --all`. prefect.yaml names no bucket and
 # no registry: it reads them as `{{ $CLOUDPIPE_* }}` placeholders, and this script
@@ -28,10 +29,20 @@
 # ConfigMap lives.
 set -euo pipefail
 
-: "${PREFECT_API_URL:?set PREFECT_API_URL — run as 'pixi run -e ops prefect-deploy', which exports it and PREFECT_API_AUTH_STRING, or set it to the Prefect server API, e.g. https://prefect.example.org/api}"
+if [ -z "${PREFECT_API_URL:-}" ] || [ -z "${PREFECT_API_AUTH_STRING:-}" ]; then
+  # Sourced with -e and -u off: the env script is written for pixi activation,
+  # and its ingress lookups fail by design in port-forward mode. Under -e that
+  # failure would end this script before the guards below could explain it.
+  set +eu
+  # shellcheck source=SCRIPTDIR/../scripts/cloudpipe-env.sh
+  source "$(dirname "$0")/../scripts/cloudpipe-env.sh"
+  set -eu
+fi
+
+: "${PREFECT_API_URL:?could not read the Prefect API URL from the cluster — connect WARP, or export PREFECT_API_URL (e.g. https://prefect.example.org/api)}"
 # The API requires basic auth (#636). Checked here because a 401 from the middle
 # of `prefect deploy --all` would leave some deployments registered and some not.
-: "${PREFECT_API_AUTH_STRING:?set PREFECT_API_AUTH_STRING — run as 'pixi run -e ops prefect-deploy', or read it with: kubectl -n prefect get secret prefect-api-auth -o jsonpath='{.data.auth-string}' | base64 -d}"
+: "${PREFECT_API_AUTH_STRING:?could not read the prefect-api-auth Secret from the cluster — connect WARP, or export PREFECT_API_AUTH_STRING (kubectl -n prefect get secret prefect-api-auth -o jsonpath='{.data.auth-string}' | base64 -d)}"
 NAMESPACE="${CLOUDPIPE_CONFIG_NAMESPACE:-argo-workflows}"
 
 config() {

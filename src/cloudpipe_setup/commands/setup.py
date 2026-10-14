@@ -74,6 +74,8 @@ def setup(ctx: Context) -> ExitCode:
     config.save(answers, target)
     emitter.note(f"wrote {target}")
 
+    _require_declared(root, answers)
+
     written = [_render(root, render.TFVARS_NAME, render.tfvars(answers), ctx)]
     if with_backend:
         written.append(_render(root, render.BACKEND_NAME, render.backend_tf(answers), ctx))
@@ -198,6 +200,40 @@ def display_command(command: str) -> list[str]:
         lines.extend(f"  -var {flag} \\" for flag in flags[:-1])
         lines.append(f"  -var {flags[-1]}")
     return lines
+
+
+def _require_declared(root: Path, answers: dict) -> None:
+    """Refuse to render a value the root would silently drop.
+
+    After the answers are saved, so nothing typed is lost, and before either file
+    is written. A root copied from an older example declares fewer variables than
+    the wizard now renders, and Terraform only warns about the extra values and
+    ignores them (`roots.undeclared`).
+    """
+    rendered = [
+        field.terraform_variable
+        for field in schema.terraform_fields()
+        if field.identifier in answers and field.terraform_variable
+    ]
+    missing = roots.undeclared(root, rendered)
+    if not missing:
+        return
+    example = render.CLONE / "terraform/modules/stack/example/main.tf"
+    raise CliError(
+        "root.undeclared_variables",
+        f"{root} does not declare and pass {', '.join(missing)}, so Terraform would ignore "
+        f"{'its value' if len(missing) == 1 else 'their values'} with only a warning. The "
+        "root was most likely copied from an older example.",
+        exit_code=ExitCode.INVALID,
+        remedy=Remedy(
+            "human",
+            f"Copy the `variable` block for each of {', '.join(missing)} from {example} into "
+            f"{root / 'main.tf'}, and its line in the module \"stack\" call "
+            f"(`{missing[0]} = var.{missing[0]}`). Your answers are saved; run this again "
+            "afterwards.",
+        ),
+        detail={"root": str(root), "undeclared": missing},
+    )
 
 
 def _render(root: Path, name: str, content: str, ctx: Context) -> Path:

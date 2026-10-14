@@ -99,8 +99,19 @@ A missing `kubectl`, Helm or `jq` is reported but does not block you. You do not
 Copy the example root to a directory **outside the clone**, and keep it in your own version control:
 
 ```
-cp -r terraform/modules/stack/example ~/my-cloudpipe-deployment
+cp -r <your clone>/terraform/modules/stack/example ~/my-cloudpipe-deployment
 ```
+
+Then point the copy's module call at the stack module in your clone. The example's `source = "../"` is right only inside the clone: from your copy it names the directory above it, and the first plan rejects every input as an "Unsupported argument". In `~/my-cloudpipe-deployment/main.tf`, change the `source` line of `module "stack"` to the absolute path:
+
+```hcl
+module "stack" {
+  source = "<your clone>/terraform/modules/stack"
+```
+
+`cloudpipe setup` and `cloudpipe preflight` refuse a root whose `source` does not lead to the stack module.
+
+**When you pull a newer clone, compare your `main.tf` with the example's.** A new stack input arrives as a `variable` block and a line in the module call. A copy that lacks them makes Terraform ignore the value the wizard renders, with only a warning, so `cloudpipe setup` refuses to render until both are there and names them.
 
 Why outside: that directory will hold your `terraform.tfvars`, your backend configuration and your state. It is yours, it is deployment-specific, and it should not live in a checkout you will later pull upstream changes into. The example root's own `main.tf` explains the module call it makes; see [infrastructure.md](infrastructure.md) for what the module builds.
 

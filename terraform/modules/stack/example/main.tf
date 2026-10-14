@@ -239,6 +239,16 @@ variable "external_identity" {
   default   = null
 }
 
+# An institutional identity provider federated into the Cognito pool, written
+# into the answers document by hand and rendered by `cloudpipe setup`. Its shape
+# is the module's; `any` here so this root does not restate it. Until the wizard
+# began refusing roots that drop a rendered value, this root did not declare it,
+# and a federated provider was ignored with only a warning.
+variable "cognito_federation" {
+  type    = any
+  default = null
+}
+
 variable "operator_emails" {
   type = list(string)
 }
@@ -343,6 +353,7 @@ module "stack" {
   region                       = var.region
   domain                       = var.domain
   external_identity            = var.external_identity
+  cognito_federation           = var.cognito_federation
   operator_emails              = var.operator_emails
   github_user_url              = var.github_user_url
   github_repo                  = var.github_repo

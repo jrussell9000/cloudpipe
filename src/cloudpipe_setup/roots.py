@@ -113,6 +113,69 @@ def verify(candidate: Path) -> None:
             "rendered terraform.tfvars as setting undeclared variables",
         )
 
+    _verify_module_source(candidate, text)
+
+
+#: The `source` of a module call, when it is the call's first argument, as it is
+#: in the example root. A source after a nested block is not found, and then
+#: nothing is checked rather than something guessed.
+_MODULE_SOURCE = re.compile(r'^\s*module\s+"[^"]+"\s*\{[^}]*?^\s*source\s*=\s*"([^"]+)"', re.M)
+
+
+def _verify_module_source(candidate: Path, text: str) -> None:
+    """A local module `source` must resolve, from this root, to the stack module.
+
+    The example root says `source = "../"`, which is the stack module only while
+    the file sits in the clone. Copied out, as Step 2 says to, it names the
+    directory above the copy, and every input the call passes is then an
+    "Unsupported argument" at the first plan (second-account rerun, 2026-10-13).
+    Registry and git sources are not checked: they resolve only at `init`.
+    """
+    match = _MODULE_SOURCE.search(text)
+    if not match:
+        return
+    source = match.group(1)
+    if not source.startswith(("./", "../", "/")) and source not in (".", ".."):
+        return
+    target = (candidate / source).resolve()
+    variables = target / "variables.tf"
+    module_text = variables.read_text() if variables.is_file() else ""
+    if all(re.search(rf'^variable\s+"{name}"', module_text, re.M) for name in _FINGERPRINT):
+        return
+    from .render import CLONE
+
+    raise CliError(
+        "root.module_source",
+        f"{candidate} calls the stack module with source = \"{source}\", which from here is "
+        f"{target}, and that is not the stack module",
+        exit_code=ExitCode.INVALID,
+        remedy=Remedy(
+            "human",
+            f"In {candidate / 'main.tf'}, set the module's source to the stack module in your "
+            f'clone: source = "{CLONE / "terraform/modules/stack"}". The example root\'s "../" '
+            "is right only inside the clone.",
+        ),
+        detail={"root": str(candidate), "source": source, "resolved": str(target)},
+    )
+
+
+def undeclared(root: Path, variables: list[str]) -> list[str]:
+    """Which of `variables` the root does not both declare and pass to a module.
+
+    Terraform only warns about a value in terraform.tfvars for a variable the root
+    does not declare, and then ignores it. A root copied before the stack gained an
+    input therefore drops that input silently: a copy made before `bucket_suffix`
+    existed would name every bucket without the suffix, which is to say after
+    buckets another deployment owns (second-account rerun, 2026-10-13).
+    """
+    text = "\n\n".join(path.read_text() for path in sorted(root.glob("*.tf")))
+    declared = set(re.findall(r'^variable\s+"([^"]+)"\s*\{', text, re.M))
+    return [
+        name
+        for name in variables
+        if name not in declared or not re.search(rf"\bvar\.{name}\b", text)
+    ]
+
 
 def _refusal(candidate: Path, looked_for: str, because: str) -> CliError:
     return CliError(
