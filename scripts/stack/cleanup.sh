@@ -55,7 +55,7 @@ require_cluster_name
 # says where to look instead.
 SURVIVING_BUCKETS=()
 for _output in terraform_state_bucket data_bucket metrics_bucket; do
-  _bucket=$(terraform output -raw "$_output" 2>/dev/null || true)
+  _bucket=$(stack_output "$_output")
   [[ -n "$_bucket" && "$_bucket" != "null" ]] && SURVIVING_BUCKETS+=("$_bucket")
 done
 unset _output _bucket

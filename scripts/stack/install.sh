@@ -168,8 +168,8 @@ CF_ACCOUNT_ID=""
 CF_TUNNEL_ID=""
 require_cloudflare_ids() {
   [[ -n $CF_ACCOUNT_ID && -n $CF_TUNNEL_ID ]] && return 0
-  CF_ACCOUNT_ID=$(terraform output -raw cloudflare_account_id 2>/dev/null || true)
-  CF_TUNNEL_ID=$(terraform output -raw cloudflare_tunnel_id 2>/dev/null || true)
+  CF_ACCOUNT_ID=$(stack_output cloudflare_account_id)
+  CF_TUNNEL_ID=$(stack_output cloudflare_tunnel_id)
   if [[ -z $CF_ACCOUNT_ID || -z $CF_TUNNEL_ID ]]; then
     fail "$EXIT_CHECK_FAILED" \
       "ERROR: this deployment has no Cloudflare tunnel yet, so it cannot be proven." \
