@@ -58,15 +58,28 @@ LICENSE = Provider(
     "which uploads it to config/fslicense; or upload it yourself with "
     "`aws s3 cp <path to license.txt> s3://<your data bucket>/config/fslicense`.",
 )
+
+
+def _script(name: str) -> str:
+    """A clone script as it runs from the deployer's root: by `--manifest-path` and full path.
+
+    A bare `pixi run python scripts/...` fails there, because the root has no
+    pixi.toml (second-account rerun, 2026-10-13).
+    """
+    from .render import CLONE
+
+    return f"pixi run --manifest-path {CLONE / 'pixi.toml'} python {CLONE / 'scripts' / name}"
+
+
 REFERENCE = Provider(
     "public reference data",
-    "Run `pixi run python scripts/seed_reference_files.py --bucket <your data bucket>`. It "
+    f"Run `{_script('seed_reference_files.py')} --bucket <your data bucket>`. It "
     "downloads each file from its upstream source (TemplateFlow, HCPpipelines), checks it "
     "against a pinned checksum, and uploads it.",
 )
 NSS = Provider(
     "your NSS table",
-    "Run `pixi run python scripts/make_nss_volumes.py --mr-info <path>/mr_y_adm__info` on the "
+    f"Run `{_script('make_nss_volumes.py')} --mr-info <path>/mr_y_adm__info` on the "
     "ABCD table from your own data access, then upload the result to config/nss_volumes.csv. "
     "This deployment's table is keyed by subject ID and is never published.",
 )

@@ -87,6 +87,21 @@ PERMISSIONS = (
 
 TOKEN_NAME = "CloudPipe deployment"
 
+#: What Cloudflare answers an Access read with in an account where Zero Trust has
+#: not been turned on: HTTP 403, `access.api.error.not_enabled: Access is not
+#: enabled`. Seen in the second-account rerun, 2026-10-13. It is a 403 like a
+#: missing permission, so preflight reported a token that was fine as missing two
+#: groups; the account, not the token, needed fixing.
+ACCESS_NOT_ENABLED = "access.api.error.not_enabled"
+
+#: How to turn Zero Trust on, for every message that finds it off.
+ENABLE_ZERO_TRUST = (
+    "Turn Zero Trust on in this account: open Zero Trust from the account's sidebar in the "
+    "Cloudflare dashboard, choose a team name, then a plan and payment details (Free asks for "
+    "them and charges nothing). Set cloudflare_team_domain to <team name>.cloudflareaccess.com. "
+    'See docs/deployer-first-hour.md, "The Cloudflare account and its token".'
+)
+
 _TEMPLATE_BASE = "https://dash.cloudflare.com/profile/api-tokens"
 
 

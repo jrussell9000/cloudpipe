@@ -60,7 +60,7 @@ Common optional parameters:
 | `globus_dest_base_path` | `/mmps_mproc` | Destination path within GCS collection |
 | `ingress_mode` | `globus` | `presynced` skips Globus and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else fails the flow at start |
 
-`ingress_mode` (like `batch_label`) exists only once the deployment has been re-registered with `pixi run prefect-deploy`; until then `-p ingress_mode=…` fails with "parameters were specified but not found on the deployment".
+`ingress_mode` (like `batch_label`) exists only once the deployment has been re-registered with `pixi run -e ops prefect-deploy`; until then `-p ingress_mode=…` fails with "parameters were specified but not found on the deployment".
 
 `max_concurrent` is **not** a flow parameter — `prefect deployment run -p max_concurrent=N` has no effect. Concurrency is controlled live via the Prefect Variable `cloudpipe-max-concurrent` (code default `50`), checked on every poll cycle:
 
