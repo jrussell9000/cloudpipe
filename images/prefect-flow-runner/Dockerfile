@@ -9,10 +9,18 @@
 # our flow runner was built 2026-10-08T01:24Z, so this digest is the one the
 # running image came from.
 #
+# The TAG is part of the pin, not only the comment. Dependabot reads a bare
+# `image@sha256:` as tracking `latest`, and `prefecthq/prefect:latest` is the
+# legacy Prefect 1.x line. On 2026-10-10 that "bump" (#760) swapped this digest
+# for Prefect 1.4.1 on Python 3.7, from 2022, amd64-only. The only thing that
+# stopped it shipping was the arm64 build failing on `exec format error`. With
+# `:3-python3.12@sha256:` Dependabot follows the tag it should. Restored here:
+# the multi-arch index the deployed image was built from.
+#
 # Comment on its own line because Dockerfiles have no inline comments — see the
 # note in images/fastsurfer/Dockerfile.
 # tag: 3-python3.12 (upstream pushed 2026-10-06)
-FROM prefecthq/prefect@sha256:100044e13170771546fcf29d76d8edffa269baf3f452a1cc5fd2fffc176d02cc
+FROM prefecthq/prefect:3-python3.12@sha256:57e02b3f63d663e02b06d4127362ea48d92d4b361fbd96c8ba8f01e5702755f4
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). `upgrade`, not
 # `dist-upgrade`: it only moves already-installed packages to a newer revision of the
