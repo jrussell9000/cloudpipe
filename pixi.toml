@@ -67,7 +67,8 @@ globus = { cmd = "python -m globus_admin", env = { PYTHONPATH = "src" } }
 # first: it is standard-library-only, checks the prerequisites, and hands off here.
 cloudpipe = { cmd = "python -m cloudpipe_setup", env = { PYTHONPATH = "src" } }
 
-# Register the Prefect deployments: `PREFECT_API_URL=… pixi run prefect-deploy`.
+# Register the Prefect deployments: `pixi run -e ops prefect-deploy` (the ops env exports
+# PREFECT_API_URL and PREFECT_API_AUTH_STRING; the default env has neither).
 # Fills prefect.yaml's bucket and registry placeholders from the cloudpipe-config
 # ConfigMap, then reads every deployment back from the server. A bare
 # `prefect deploy --all` stores "" for each of them and still succeeds.
