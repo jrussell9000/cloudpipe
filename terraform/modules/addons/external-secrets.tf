@@ -176,11 +176,35 @@ resource "kubectl_manifest" "external_secrets_cert_controller_patch_binding" {
   depends_on = [kubectl_manifest.external_secrets_cert_controller_patch]
 }
 
+# The namespace the Role and RoleBinding below live in. ArgoCD creates it when it
+# syncs the external-secrets app (CreateNamespace=true), but ArgoCD comes up in
+# Phase 5 and this is applied in Phase 2, so on a fresh install the Role failed
+# with `namespaces "external-secrets" not found` (second-account rerun,
+# 2026-10-13). The reference cluster has had the namespace since its first sync.
+#
+# `kubectl_manifest` applies rather than creates, so it adopts the namespace
+# where ArgoCD made it first. `apply_only` because deleting it from Terraform
+# would delete everything ArgoCD runs in it; the teardown removes it with the
+# cluster.
+resource "kubectl_manifest" "external_secrets_namespace" {
+  apply_only    = true
+  ignore_fields = ["metadata.annotations", "metadata.labels"]
+
+  yaml_body = <<-YAML
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: external-secrets
+  YAML
+}
+
 # The namespaced half of the patch (#637): the webhook cert secret, this
 # controller's own events, and its leader-election lease. All three live in
 # external-secrets, so none of them needs a cluster-wide grant.
 resource "kubectl_manifest" "external_secrets_cert_controller_patch_role" {
   ignore_fields = ["metadata.annotations.argocd\\.argoproj\\.io/tracking-id"]
+
+  depends_on = [kubectl_manifest.external_secrets_namespace]
 
   yaml_body = <<-YAML
     apiVersion: rbac.authorization.k8s.io/v1

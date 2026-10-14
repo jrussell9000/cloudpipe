@@ -5,11 +5,12 @@ module "cert_manager_pod_identity" {
 
   name = "cert-manager"
 
-  attach_cert_manager_policy = true
+  # No policy without a domain. Its only purpose is the ACME DNS-01 solver, and
+  # the upstream module renders the zone list as a statement's resources, so an
+  # empty list is a statement with none, which IAM refuses: "MalformedPolicyDocument:
+  # Policy statement must contain resources" (second-account rerun, 2026-10-13).
+  attach_cert_manager_policy = var.route53_zone_arn != null
 
-  # Empty without a domain: the policy's only purpose is the ACME DNS-01 solver,
-  # and a list holding one null would render an unusable policy statement rather
-  # than no permission.
   cert_manager_hosted_zone_arns = var.route53_zone_arn == null ? [] : [var.route53_zone_arn]
 
   # Pod Identity Associations
