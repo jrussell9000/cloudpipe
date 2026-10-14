@@ -9,10 +9,14 @@
 # image would carry a CUDA runtime and a full FreeSurfer tree that no enabled
 # module touches. If the shape module is ever enabled, revisit — that one does
 # need a sourced FreeSurfer.
-FROM public.ecr.aws/docker/library/python:3.10-slim-bookworm
+FROM public.ecr.aws/docker/library/python:3.14-slim-bookworm
 
-# 3.10 matches the runtime of the other neuroimaging images in this repo. fsqc
-# requires >=3.10; the wheels below are all manylinux, so no compiler is needed.
+# 3.14, not the 3.10 the other neuroimaging images run: 3.10 reaches end of life
+# in October 2026, and this image has no FreeSurfer runtime tying it to the old
+# one. Not 3.15 either — the slim base has no compiler, so every package below
+# must ship a manylinux wheel for the interpreter, and scikit-image had no cp315
+# wheel when 3.15 came out (#818 failed building it from source). Check the
+# wheels exist before the next minor bump.
 
 ARG FSQC_VERSION=2.1.7
 
@@ -87,12 +91,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # derivatives via fs_derivatives.py, the same publish path that segfaulted in
 # #268, so it must pin the SAME versions as images/fastsurfer/Dockerfile and
 # images/freesurfer/Dockerfile — see the note in the former for why.
+#
+# scikit-image is capped below 0.28: fsqc 2.1.7's checkSNR.py calls
+# skimage.morphology.binary_erosion, which 0.26 deprecates and 0.28 removes. An
+# uncapped rebuild would not fail: the import sits inside checkSNR()'s body, so
+# the module-import smoke test below still passes, and at run time fsqcMain
+# catches the ImportError and writes NaN for all four *_snr_* fields on every
+# record. Lift the cap only with an fsqc that has moved off binary_erosion.
 RUN pip install --disable-pip-version-check --root-user-action=ignore --no-cache-dir \
         nibabel \
         numpy \
         pandas \
         scipy \
-        scikit-image \
+        'scikit-image<0.28' \
         matplotlib \
         transforms3d \
         pillow \

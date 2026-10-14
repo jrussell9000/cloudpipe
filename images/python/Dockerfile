@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/python:3.14.2-alpine3.23
+FROM public.ecr.aws/docker/library/python:3.15.0-alpine3.23
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). `apk upgrade` is
 # Alpine's equivalent of `apt-get upgrade`: with no repository pinned beyond the base
