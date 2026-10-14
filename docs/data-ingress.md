@@ -5,7 +5,8 @@ before any processing step runs. **Getting it there is a separate concern from
 processing it**, and this page defines the boundary between the two.
 
 The production deployment fills the bucket with Globus
-([globus.md](globus.md), [globus-setup.md](globus-setup.md)). That is one
+([globus.md](globus.md), [globus-setup.md](globus-setup.md)), either through its
+own endpoint or by reading the source collection over HTTPS. That is one
 implementation, not a requirement. If you already have the data — or can get it
 by other means — you can skip Globus entirely and still run the pipeline.
 
@@ -65,12 +66,19 @@ hangs off one gate:
 
 ```
 ingress-mode == globus:   start-globus-instance → globus-transfer
-ingress-mode != globus:   verify-staged-input
+ingress-mode == https:    https-transfer ─┐
+ingress-mode != globus:                   └→ verify-staged-input
                                                     ↓
-     inventory  ← depends: (transfer Succeeded || Skipped) && (verify Succeeded || Skipped)
+     inventory  ← depends: (globus-transfer Succeeded || Skipped)
+                        && (https-transfer  Succeeded || Skipped)
+                        && (verify          Succeeded || Skipped)
                                                     ↓
                                             (the rest of the pipeline)
 ```
+
+`verify-staged-input` depends on `https-transfer` (Succeeded or Skipped). In
+`presynced` mode the copy is Skipped, so the validator runs exactly as before; in
+`https` mode a failed copy leaves the validator, and inventory, Omitted.
 
 The `|| Skipped` arms are what make ingress replaceable: a task that never runs
 satisfies the dependency just as well as one that succeeds. Two properties of
@@ -84,8 +92,9 @@ this shape are easy to break and invisible to `argo lint`
   nothing. For the same reason the gate must **never** accept `.Omitted`: a
   failed `globus-transfer` leaves the gate unsatisfied, so inventory is Omitted,
   and accepting Omitted would let it run over a failed ingress.
-- **The two arms are exact complements** (`== "globus"` / `!= "globus"`), so a
-  misspelt mode runs the validator, which rejects it. The parameter's `enum` is
+- **The Globus arm and the validator are exact complements** (`== "globus"` /
+  `!= "globus"`), so a misspelt mode runs the validator, which accepts only
+  `presynced` and `https` and rejects anything else. The parameter's `enum` is
   only a UI dropdown — Argo does not enforce it on submission.
 
 `tests/argo/test_ingress_modes.py` asserts the resulting state for every mode and
@@ -96,15 +105,80 @@ workflow built from the template's own `when`/`depends` strings.
 
 ## Choosing an ingress path
 
-There are two, not three. The POSIX/EBS staging variant was removed in 2026-09
-(ADR 001's Update) — if you have
-a Globus endpoint without the S3 add-on, stage the data yourself and use
-`presynced` rather than a second GridFTP write path.
+There are three. (The POSIX/EBS staging variant was removed in 2026-09 — ADR
+001's Update. If you have a Globus endpoint without the S3 add-on, stage the data
+yourself and use `presynced` rather than a second GridFTP write path.)
 
 | Path | Use when | Needs Globus subscription? | Status |
 |---|---|---|---|
 | **Globus** (`ingress-mode: globus`, the default) | You are pulling from the NIH Brain Development Cohorts (NBDC) Data Hub collection and have cleared every gate in [globus-prerequisites.md](globus-prerequisites.md) | Yes — High Assurance tier | Production |
+| **HTTPS** (`ingress-mode: https`) | You can reach the NBDC Data Hub collection as a DUA-approved person, and want to skip running a Globus endpoint of your own | **No** — the source collection is High Assurance, not you | Built and probed 2026-10-13; production batches pending |
 | **Pre-staged S3** (`ingress-mode: presynced`) | You obtained the data another way (an NBDC Data Hub download, an institutional copy, a collaborator's bucket, or a Globus endpoint without the S3 add-on) and put it in the bucket yourself | No | Supported — see below |
+
+### Reading the source over HTTPS (`ingress-mode=https`)
+
+The NBDC Data Hub collection serves its files over HTTPS as well as over Globus
+Transfer. In this mode one Argo step, `https-transfer`, runs on the ingress node
+pool and does the whole ingest:
+
+1. **Checks the login.** It reads the recorded login time
+   (`/cloudpipe/globus/session-established-at`) and **refuses**, before any request,
+   a login older than **30 days**, a missing one, or an unparseable one. The
+   refusal exits 78, which is not retried, and names `pixi run globus login`. The
+   30 days is this deployment's own rule; the source itself allows a year.
+2. **Lists the subject** through the Globus Transfer API, with the same walk and
+   file filter `globus` mode uses, and prints the same `TRANSFER-SUMMARY` line.
+3. **Copies the files** with rclone from the collection's HTTPS server straight to
+   `s3://<bucket>{globus-dest-base-path}/{subj}/`, the prefix `globus` mode writes.
+4. **Checks every object's size** in S3 against the listing, and fails naming the
+   file and both sizes on any difference or missing object.
+
+Then `verify-staged-input` checks the tree against the ingress contract, as in
+`presynced` mode, and inventory runs. On success the exit handler deletes the input,
+as in `globus` mode: the pipeline fetched it, so it can fetch it again.
+
+**What it needs:**
+
+- **One login that grants the HTTPS scope.** `pixi run globus login` asks for the
+  source collection's `/https` scope as well as the transfer scope whenever the
+  answers document names a `source_collection_id`. Approve every scope on the
+  consent screen. The login stores the grant as `https-refresh-token`, and the
+  `globus-credentials` Secret carries it into the cluster.
+- **The ingress node pool.** The copy runs on `ingress-nodepool`: spot nodes with
+  public addresses, so the download pays no NAT charge. Inbound from the internet
+  is denied by both their security group and their subnets' network ACL, and
+  nothing but this step tolerates the pool's taint (ADR 021).
+- **No Globus endpoint and no High Assurance subscription of your own.** Nothing
+  starts the Globus host in this mode.
+
+Through Prefect:
+
+```bash
+prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
+  -p subjects_file=s3://<bucket>/subjects.csv \
+  -p ingress_mode=https
+```
+
+Before the first submission the queue manager refuses the batch if the login would
+pass 30 days within its safety margin (default 24 hours). It also lists the source
+base path and refreshes the HTTPS token once, so a revoked grant fails the batch
+instead of every workflow.
+
+Or for one subject, directly. The destination collection is not used, so pass it
+empty:
+
+```bash
+argo submit --from workflowtemplate/cloudpipe -n argo-workflows \
+  -p subjID=sub-XXXXXXXX \
+  -p ingress-mode=https \
+  -p globus-source-collection-id=<source collection id> \
+  -p globus-source-base-path=<source base path> \
+  -p globus-dest-collection-id= -p globus-dest-base-path=/mmps_mproc \
+  -p globus-scan-types='["T1w","T2w","rest","nback"]'
+```
+
+A hand `argo submit` skips the queue manager's check. The step's own 30-day check
+still applies.
 
 ### Pre-staging without Globus (`ingress-mode=presynced`)
 
@@ -143,8 +217,8 @@ In this mode the workflow:
    exists there it prints both names. Read those warnings: a near-miss T1w name
    is the one staging mistake that otherwise fails silently. The checks import
    `src/inventory.py` itself, so they cannot drift from what inventory reads.
-3. **Does not delete the input on success.** In `globus` mode the exit handler
-   removes `mmps_mproc/{subj}/` after a successful run; staged data the pipeline
+3. **Does not delete the input on success.** In `globus` and `https` modes the
+   exit handler removes `mmps_mproc/{subj}/` after a successful run; staged data the pipeline
    cannot re-fetch is left alone. Clean it up yourself when you are done.
 
 A subject with only anatomical data fails the validator (no BOLD run), even
@@ -177,18 +251,26 @@ aws s3 cp "s3://${BUCKET}/config/nss_volumes.csv" - | grep "${SUBJ}"
 
 A `head-object` that returns `404` is the failure mode to care about: it does
 not stop the workflow, it just quietly removes that session's anatomical work.
-In `presynced` mode the validator warns about it; in `globus` mode nothing does.
+In `presynced` and `https` modes the validator warns about it; in `globus` mode
+nothing does.
 
 ---
 
 ## Why the pipeline uses Globus at all
 
 Globus is not a convenience here. The ABCD minimally preprocessed data is
-distributed by the NBDC Data Hub through a Globus **High Assurance** collection, and
-Globus requires *both* sides of a transfer to be HA
-(ADR 010). For a deployment pulling
-directly from the NBDC Data Hub, there is no non-Globus alternative — the constraint comes
-from the data provider, not from CloudPipe.
+distributed by the NBDC Data Hub through a Globus **High Assurance** collection.
+Access to it is granted to DUA-approved people through Globus Auth, whichever way
+you read it.
+
+What changed in 2026-10 is how much of Globus you have to run. A Globus *transfer*
+requires *both* sides to be High Assurance (ADR 010), so `globus` mode needs an
+endpoint and subscription of your own. Reading the collection's own HTTPS server
+does not: `https` mode needs only a Globus login, by a DUA-approved person, that
+grants the collection's HTTPS scope (plan 018 measured it at about 1.6× the
+Globus rate on the same subject, with byte-identical files). There is still no
+alternative to Globus Auth: the constraint comes from the data provider, not from
+CloudPipe.
 
 What *is* CloudPipe's choice is writing straight to S3 through the GCS native S3
 storage gateway instead of staging to a POSIX volume first
