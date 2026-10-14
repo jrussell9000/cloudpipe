@@ -35,12 +35,27 @@ locals {
   ingress_subnet_role = "ingress"
 
   # Ports something on an ingress node listens on, on the node's own address.
-  # hostNetwork DaemonSets: aws-node (61678 metrics, 8162), eks-pod-identity-agent
-  # (2703), kube-proxy (10256 healthz). kubelet: 10250. Bottlerocket ships no sshd,
-  # but 22 costs nothing to deny. The network ACL denies each from the internet
-  # BEFORE it admits the return-traffic range, because that range has to include
-  # them (see the ACL below). A new hostNetwork listener must be added here.
-  ingress_node_listen_ports = [22, 2703, 6443, 8162, 10250, 10256, 61678]
+  # MEASURED, not recalled: task 9.3's acceptance probe
+  # (scripts/investigations/https-ingress-probe/acceptance.py) read a shipped node's
+  # /proc/net/tcp{,6} on 2026-10-13 and found, besides loopback and link-local:
+  #   80, 2705    eks-pod-identity-agent (80 is under 1024, so denied anyway)
+  #   8162, 8163  aws-node's network-policy agent: metrics, health probe
+  #   10249       kube-proxy metrics; 10256 kube-proxy healthz
+  #   10250       kubelet
+  #   61678       aws-node metrics
+  # 2705, 8163 and 10249 were missing from this list until then, so only the
+  # security group stood in front of them. 22, 2703 and 6443 are not listening
+  # today and stay denied as a margin. The network ACL denies each from the
+  # internet BEFORE it admits the return-traffic range, because that range has to
+  # include them (see the ACL below). Re-run the probe after any Bottlerocket,
+  # VPC CNI or add-on upgrade: a port it reports as "SG ONLY" belongs here.
+  #
+  # APPEND, never insert. Each rule's number is 110 + its index here, and a rule
+  # number cannot change in place: an insert renumbers every rule after it into a
+  # destroy-and-create, whose creates can collide with numbers not yet freed.
+  # Appending is a plan of adds only. The rule numbers stop below the return
+  # rule (200), which the drift guard checks.
+  ingress_node_listen_ports = [22, 2703, 6443, 8162, 10250, 10256, 61678, 2705, 8163, 10249]
 }
 
 resource "aws_subnet" "ingress" {
@@ -101,7 +116,7 @@ resource "aws_route_table_association" "ingress" {
 # necessarily part of the ephemeral port range set at the OS level", and NACLs
 # keyed to that range break. Denying the listening ports first keeps the ACL a
 # real second barrier for exactly the ports that matter. The cost is that the
-# rare connection whose SNAT port lands on one of those seven is dropped and
+# rare connection whose SNAT port lands on one of those ten is dropped and
 # retried.
 #
 # Outbound is allow-all. The security group and the pods' NetworkPolicies decide
