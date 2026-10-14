@@ -129,31 +129,47 @@ def _verify_module_source(candidate: Path, text: str) -> None:
     the file sits in the clone. Copied out, as Step 2 says to, it names the
     directory above the copy, and every input the call passes is then an
     "Unsupported argument" at the first plan (second-account rerun, 2026-10-13).
+
+    It must also be RELATIVE. Terraform treats an absolute path as a package of
+    its own, and the stack's own `../globus`-style calls then "escape" it: `init`
+    fails with "Local module path escapes module package". The first fix printed
+    an absolute path and hit exactly that.
+
     Registry and git sources are not checked: they resolve only at `init`.
     """
     match = _MODULE_SOURCE.search(text)
     if not match:
         return
     source = match.group(1)
-    if not source.startswith(("./", "../", "/")) and source not in (".", ".."):
+    absolute = source.startswith("/")
+    if not absolute and not source.startswith(("./", "../")) and source not in (".", ".."):
         return
     target = (candidate / source).resolve()
     variables = target / "variables.tf"
     module_text = variables.read_text() if variables.is_file() else ""
-    if all(re.search(rf'^variable\s+"{name}"', module_text, re.M) for name in _FINGERPRINT):
+    is_stack = all(re.search(rf'^variable\s+"{name}"', module_text, re.M) for name in _FINGERPRINT)
+    if is_stack and not absolute:
         return
     from .render import CLONE
 
+    wanted = os.path.relpath(CLONE / "terraform/modules/stack", candidate.resolve())
+    if not wanted.startswith("."):
+        wanted = f"./{wanted}"
+    because = (
+        "an absolute path, which Terraform treats as a separate package that the stack's own "
+        '"../" module calls escape'
+        if absolute
+        else f"from here {target}, which is not the stack module"
+    )
     raise CliError(
         "root.module_source",
-        f"{candidate} calls the stack module with source = \"{source}\", which from here is "
-        f"{target}, and that is not the stack module",
+        f'{candidate} calls the stack module with source = "{source}": {because}',
         exit_code=ExitCode.INVALID,
         remedy=Remedy(
             "human",
-            f"In {candidate / 'main.tf'}, set the module's source to the stack module in your "
-            f'clone: source = "{CLONE / "terraform/modules/stack"}". The example root\'s "../" '
-            "is right only inside the clone.",
+            f'In {candidate / "main.tf"}, set the module\'s source to the path from this root '
+            f'to the stack module in your clone: source = "{wanted}". It has to be relative; '
+            'the example root\'s "../" is right only inside the clone.',
         ),
         detail={"root": str(candidate), "source": source, "resolved": str(target)},
     )

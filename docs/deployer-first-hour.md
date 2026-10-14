@@ -102,14 +102,14 @@ Copy the example root to a directory **outside the clone**, and keep it in your 
 cp -r <your clone>/terraform/modules/stack/example ~/my-cloudpipe-deployment
 ```
 
-Then point the copy's module call at the stack module in your clone. The example's `source = "../"` is right only inside the clone: from your copy it names the directory above it, and the first plan rejects every input as an "Unsupported argument". In `~/my-cloudpipe-deployment/main.tf`, change the `source` line of `module "stack"` to the absolute path:
+Then point the copy's module call at the stack module in your clone. The example's `source = "../"` is right only inside the clone: from your copy it names the directory above it, and the first plan rejects every input as an "Unsupported argument". In `~/my-cloudpipe-deployment/main.tf`, change the `source` line of `module "stack"` to the **relative** path from your root to the clone's stack module. With the clone at `~/cloudpipe`:
 
 ```hcl
 module "stack" {
-  source = "<your clone>/terraform/modules/stack"
+  source = "../cloudpipe/terraform/modules/stack"
 ```
 
-`cloudpipe setup` and `cloudpipe preflight` refuse a root whose `source` does not lead to the stack module.
+It has to be relative. Terraform treats an absolute path as a separate package, and the stack's own `../` module calls then fail `init` with "Local module path escapes module package". `cloudpipe setup` and `cloudpipe preflight` refuse a root whose `source` is absolute or does not lead to the stack module, and print the exact line for your layout.
 
 **When you pull a newer clone, compare your `main.tf` with the example's.** A new stack input arrives as a `variable` block and a line in the module call. A copy that lacks them makes Terraform ignore the value the wizard renders, with only a warning, so `cloudpipe setup` refuses to render until both are there and names them.
 
