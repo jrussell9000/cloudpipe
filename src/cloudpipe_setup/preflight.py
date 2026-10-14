@@ -808,17 +808,21 @@ def _verify_cloudflare_token(
 
 def _probe_cloudflare_permissions(
     world: World, headers: dict[str, str], account: str
-) -> tuple[list[Any], list[Any], list[str]]:
-    """(granted, refused, unclear) across `cloudflare.PERMISSIONS`, one read each.
+) -> tuple[list[Any], list[Any], list[str], list[Any]]:
+    """(granted, refused, unclear, disabled) across `cloudflare.PERMISSIONS`, one read each.
 
     The status alone is not the answer. Every Cloudflare v4 response carries a
     `success` flag, and a 200 whose body says `success: false` is a refusal —
     judging by status alone would report that as a grant, which is the one
     outcome this check exists to rule out.
+
+    Nor is every refusal about the token. `disabled` holds the groups Cloudflare
+    answered with `access.api.error.not_enabled`: Zero Trust is off in the
+    account, and whether the token holds the group cannot be known until it is on.
     """
     from . import cloudflare
 
-    granted, refused, unclear = [], [], []
+    granted, refused, unclear, disabled = [], [], [], []
     for permission in cloudflare.PERMISSIONS:
         status, body = world.fetch_json(
             f"{CLOUDFLARE_API}/accounts/{account}{permission.probe}", headers=headers
@@ -828,12 +832,15 @@ def _probe_cloudflare_permissions(
             # Cloudflare's own reason travels with the refusal, so the deployer
             # sees why and not only that.
             reason = _cloudflare_errors(body)
+            if cloudflare.ACCESS_NOT_ENABLED in reason:
+                disabled.append(permission)
+                continue
             refused.append((permission, f"HTTP {status}{': ' + reason if reason else ''}"))
         elif status == 200 and succeeded is True:
             granted.append(permission)
         else:
             unclear.append(f"{permission.name} (HTTP {status})")
-    return granted, refused, unclear
+    return granted, refused, unclear, disabled
 
 
 def _check_cloudflare(world: World, answers: dict[str, Any]) -> Record:
@@ -939,7 +946,7 @@ def _check_cloudflare(world: World, answers: dict[str, Any]) -> Record:
         )
 
     try:
-        granted, refused, unclear = _probe_cloudflare_permissions(world, headers, account)
+        granted, refused, unclear, disabled = _probe_cloudflare_permissions(world, headers, account)
     except (urllib.error.URLError, OSError, ValueError) as err:
         return _skipped(
             CHECK_CLOUDFLARE,
@@ -986,6 +993,19 @@ def _check_cloudflare(world: World, answers: dict[str, Any]) -> Record:
             "refusal.",
             Remedy("human", "Check the Cloudflare API's status page and run this again."),
         )
+    if disabled:
+        # Not a fail: nothing is wrong with the token that is known. The fix is in
+        # the account, and `cloudflare.organization` reports it as a failure there.
+        names = ", ".join(p.name for p in disabled)
+        return _skipped(
+            CHECK_CLOUDFLARE,
+            title,
+            f"the token is valid and can read {len(granted)} of the {len(cloudflare.PERMISSIONS)} "
+            f"permission groups in account {account}. The other {len(disabled)} ({names}) cannot "
+            "be checked yet: Cloudflare answers them with \"Access is not enabled\", because Zero "
+            "Trust is not turned on in the account. Re-run this once it is.",
+            Remedy("human", cloudflare.ENABLE_ZERO_TRUST),
+        )
     return Record(
         identifier=CHECK_CLOUDFLARE,
         title=title,
@@ -1011,23 +1031,21 @@ def _check_cloudflare_organization(
     to rename the domain every enrolled WARP client and the identity provider's
     redirect URI use.
 
-    Runs only after `cloudflare.token` passed. Its probes include a read in the
-    same permission group as this one, so a refusal here is about the
-    organization and not the token, and a bad token is reported once, there.
+    Runs only after `cloudflare.token` passed, or skipped because Zero Trust is
+    off — the one case the token check cannot judge and this check exists for.
+    Its probes include a read in the same permission group as this one, so a
+    refusal here is about the organization and not the token, and a bad token is
+    reported once, there.
     """
+    from . import cloudflare
+
     title = "Zero Trust organization"
     account = answers.get("cloudflare_account_id")
     expected = str(answers.get("cloudflare_team_domain") or "").strip().rstrip(".").lower()
-    enable = Remedy(
-        "human",
-        "Turn Zero Trust on in this account: open Zero Trust from the account's sidebar in the "
-        "Cloudflare dashboard, choose a team name, then a plan and payment details (Free asks "
-        "for them and charges nothing). Set cloudflare_team_domain to "
-        "<team name>.cloudflareaccess.com. See docs/deployer-first-hour.md, \"The Cloudflare "
-        "account and its token\".",
-    )
+    enable = Remedy("human", cloudflare.ENABLE_ZERO_TRUST)
 
-    if token_record.state != "pass":
+    zero_trust_off = token_record.remedy is not None and token_record.remedy == enable
+    if token_record.state != "pass" and not zero_trust_off:
         return _skipped(
             CHECK_CLOUDFLARE_ORGANIZATION,
             title,
@@ -1056,6 +1074,16 @@ def _check_cloudflare_organization(
     found = found.strip().rstrip(".").lower()
     if status != 200 or not found:
         reason = _cloudflare_errors(body)
+        if cloudflare.ACCESS_NOT_ENABLED in reason:
+            return Record(
+                identifier=CHECK_CLOUDFLARE_ORGANIZATION,
+                title=title,
+                state="fail",
+                message=f"Zero Trust is not turned on in account {account}: Cloudflare answers "
+                f'"{reason}". Terraform cannot turn it on: it updates the organization and '
+                "cannot create one, and onboarding asks for a plan and payment details.",
+                remedy=enable,
+            )
         return Record(
             identifier=CHECK_CLOUDFLARE_ORGANIZATION,
             title=title,

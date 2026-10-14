@@ -28,7 +28,7 @@
 # ConfigMap lives.
 set -euo pipefail
 
-: "${PREFECT_API_URL:?set PREFECT_API_URL to the Prefect server API, e.g. https://prefect.example.org/api}"
+: "${PREFECT_API_URL:?set PREFECT_API_URL — run as 'pixi run -e ops prefect-deploy', which exports it and PREFECT_API_AUTH_STRING, or set it to the Prefect server API, e.g. https://prefect.example.org/api}"
 # The API requires basic auth (#636). Checked here because a 401 from the middle
 # of `prefect deploy --all` would leave some deployments registered and some not.
 : "${PREFECT_API_AUTH_STRING:?set PREFECT_API_AUTH_STRING — run as 'pixi run -e ops prefect-deploy', or read it with: kubectl -n prefect get secret prefect-api-auth -o jsonpath='{.data.auth-string}' | base64 -d}"
