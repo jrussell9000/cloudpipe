@@ -429,6 +429,10 @@ output "terraform_state_bucket" {
   value = module.stack.terraform_state_bucket
 }
 
+output "argocd_created_namespaces" {
+  value = module.stack.argocd_created_namespaces
+}
+
 output "region" {
   value = module.stack.region
 }

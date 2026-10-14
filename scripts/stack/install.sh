@@ -389,9 +389,35 @@ phase_3_kube_system_network_policies() {
 #
 # The token sync belongs to this phase, not the next: External Secrets must find
 # the current value on its first sync.
+# The namespaces ArgoCD creates that this apply writes into. ArgoCD is installed
+# in Phase 2 but syncs on its own clock, and on a fresh install Phase 4 reached
+# them first: `namespaces "prefect" not found`, `namespaces "grafana" not found`
+# (second-account rerun, 2026-10-13). The reference cluster has had them since its
+# first sync, which is why this wait did not exist. Ten minutes each, because a
+# first sync pulls every chart; a namespace still missing after that is a sync
+# failure, and the message says where to look.
+wait_for_argocd_namespaces() {
+  local namespaces ns
+  namespaces=$(stack_output argocd_created_namespaces)
+  if [[ -z $namespaces ]]; then
+    fail "$EXIT_INVALID" "ERROR: could not read the namespaces ArgoCD creates." \
+      "Neither \`terraform output -raw argocd_created_namespaces\` nor the stack module's own" \
+      "output gave a value."
+  fi
+  echo "==> Waiting for ArgoCD to create the namespaces this apply writes into..."
+  for ns in $namespaces; do
+    poll_until "namespace $ns" 600 kubectl get namespace "$ns" ||
+      fail "$EXIT_CHECK_FAILED" "ERROR: ArgoCD has not created namespace $ns after 10 minutes." \
+        "Check the ArgoCD applications: \`kubectl -n argocd get applications\`. A first sync" \
+        "that cannot clone gitops_repo_url, or whose app is Degraded on a missing image, never" \
+        "creates its namespace. Then continue with \`--from-phase 4\`."
+  done
+}
+
 phase_4_full_apply_and_tunnel_token() {
   require_cluster
   require_helm_ecr_login
+  wait_for_argocd_namespaces
   echo "==> Applying remaining resources (crds_available=false)..."
   terraform apply -var="endpoint_public_access=true" -auto-approve 2>&1 | tee /dev/tty
 
