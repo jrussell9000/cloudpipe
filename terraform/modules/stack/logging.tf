@@ -605,4 +605,11 @@ resource "aws_cloudtrail" "this" {
       equals = ["Management"]
     }
   }
+
+  # CreateTrail checks the bucket policy grants CloudTrail write, and nothing in
+  # the arguments above references the policy, so on a fresh install the two were
+  # created in parallel and the trail lost: InsufficientS3BucketPolicyException
+  # (second-account rerun, 2026-10-13). The reference bucket's policy predates
+  # its trail.
+  depends_on = [aws_s3_bucket_policy.logs]
 }

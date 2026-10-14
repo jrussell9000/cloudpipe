@@ -53,3 +53,15 @@ output "terraform_state_bucket" {
   description = "The bucket holding this deployment's Terraform state, resolved through its var.name fallback."
   value       = local.cloudtrail_state_bucket
 }
+
+# The namespaces ArgoCD creates (CreateNamespace=true) that the Phase 4 full
+# apply writes Secrets, Roles and NetworkPolicies into. ArgoCD comes up in Phase 2
+# but syncs on its own clock, so Phase 4 waits for these first: on a fresh
+# install it ran before the first sync and failed with `namespaces "prefect" not
+# found` (second-account rerun, 2026-10-13). Space-separated, so a script reads it
+# with -raw. Read through stack_output's module fallback, so roots need not
+# re-export it.
+output "argocd_created_namespaces" {
+  description = "Namespaces ArgoCD creates that the full apply writes into, space-separated. Read by install.sh Phase 4."
+  value       = join(" ", [var.argo_workflows_namespace, var.prefect_namespace, var.grafana_namespace])
+}
