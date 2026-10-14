@@ -58,7 +58,7 @@ Common optional parameters:
 | `globus_source_collection_id` | (from SSM) | Override source Globus collection UUID |
 | `globus_source_base_path` | (from SSM) | Override source base path |
 | `globus_dest_base_path` | `/mmps_mproc` | Destination path within GCS collection |
-| `ingress_mode` | `globus` | `presynced` skips Globus and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else fails the flow at start |
+| `ingress_mode` | `globus` | `https` reads the source collection over its HTTPS server on the ingress node pool, with no Globus endpoint — see [data-ingress.md](data-ingress.md#reading-the-source-over-https-ingress-modehttps). The batch is refused if the last `pixi run globus login` would pass 30 days within the safety margin. `presynced` skips Globus and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else fails the flow at start |
 
 `ingress_mode` (like `batch_label`) exists only once the deployment has been re-registered with `pixi run prefect-deploy`; until then `-p ingress_mode=…` fails with "parameters were specified but not found on the deployment".
 

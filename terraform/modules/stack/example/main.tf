@@ -189,6 +189,27 @@ variable "name" {
   default     = "cloudpipe"
 }
 
+# The three switches the phased installer (scripts/stack/install.sh) sets with
+# `-var` while it runs, and records in install-state.auto.tfvars once Phase 6 has
+# turned them on. Terraform refuses a `-var` for a variable the root does not
+# declare, so without these the installer stopped at its first apply
+# ("Value for undeclared variable"; second-account rerun, 2026-10-13). Leave them
+# at false here: the installer decides when each one flips.
+variable "endpoint_public_access" {
+  type    = bool
+  default = false
+}
+
+variable "crds_available" {
+  type    = bool
+  default = false
+}
+
+variable "vpc_cni_network_policy_enabled" {
+  type    = bool
+  default = false
+}
+
 # The random part of every default S3 bucket name, which `cloudpipe setup`
 # generates once. Bucket names are global, so without it `<name>-metrics` and its
 # siblings collide with any other deployment that kept the default name.
@@ -347,30 +368,33 @@ module "stack" {
     aws.billing   = aws.billing
   }
 
-  name                         = var.name
-  bucket_suffix                = var.bucket_suffix
-  terraform_state_bucket       = var.terraform_state_bucket
-  region                       = var.region
-  domain                       = var.domain
-  external_identity            = var.external_identity
-  cognito_federation           = var.cognito_federation
-  operator_emails              = var.operator_emails
-  github_user_url              = var.github_user_url
-  github_repo                  = var.github_repo
-  gitops_repo_url              = var.gitops_repo_url
-  github_oidc_allowed_subs     = var.github_oidc_allowed_subs
-  cloudflare_account_id        = var.cloudflare_account_id
-  cloudflare_team_domain       = var.cloudflare_team_domain
-  cloudflare_team_name         = var.cloudflare_team_name
-  globus_enabled               = var.globus_enabled
-  globus_s3_destination_bucket = var.globus_s3_destination_bucket
-  globus_source_collection_id  = var.globus_source_collection_id
-  globus_client_id             = var.globus_client_id
-  globus_admin_prefix_list_id  = var.globus_admin_prefix_list_id
-  globus_org_name              = var.globus_org_name
-  globus_contact_email         = var.globus_contact_email
-  globus_owner_email           = var.globus_owner_email
-  globus_identity_domain       = var.globus_identity_domain
+  name                           = var.name
+  endpoint_public_access         = var.endpoint_public_access
+  crds_available                 = var.crds_available
+  vpc_cni_network_policy_enabled = var.vpc_cni_network_policy_enabled
+  bucket_suffix                  = var.bucket_suffix
+  terraform_state_bucket         = var.terraform_state_bucket
+  region                         = var.region
+  domain                         = var.domain
+  external_identity              = var.external_identity
+  cognito_federation             = var.cognito_federation
+  operator_emails                = var.operator_emails
+  github_user_url                = var.github_user_url
+  github_repo                    = var.github_repo
+  gitops_repo_url                = var.gitops_repo_url
+  github_oidc_allowed_subs       = var.github_oidc_allowed_subs
+  cloudflare_account_id          = var.cloudflare_account_id
+  cloudflare_team_domain         = var.cloudflare_team_domain
+  cloudflare_team_name           = var.cloudflare_team_name
+  globus_enabled                 = var.globus_enabled
+  globus_s3_destination_bucket   = var.globus_s3_destination_bucket
+  globus_source_collection_id    = var.globus_source_collection_id
+  globus_client_id               = var.globus_client_id
+  globus_admin_prefix_list_id    = var.globus_admin_prefix_list_id
+  globus_org_name                = var.globus_org_name
+  globus_contact_email           = var.globus_contact_email
+  globus_owner_email             = var.globus_owner_email
+  globus_identity_domain         = var.globus_identity_domain
 }
 
 ################################################################################
