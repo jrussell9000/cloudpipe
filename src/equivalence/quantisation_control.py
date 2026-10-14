@@ -1,5 +1,13 @@
 """The quantisation positive control: bound cloudpipe's own storage floor.
 
+**Since 2026-10-14 the floor is zero for new derivatives.** Stage 3 writes the
+warp's float32 values unscaled, and Stage 5 keeps float32, so a current MNI BOLD
+is stored at full precision and `already_quantised` reports it as such. What
+follows describes the int16 writer that ran from 2026-10-06 to 2026-10-14. That
+writer produced the plan 017 pilot's 50 subjects, so this control still bounds
+those runs, and its lattice test still tells an int16-era file from a current
+one. `quantise_like_writer` mirrors that historical writer, not the live one.
+
 cloudpipe does not store its MNI BOLD at full precision, so tier-1 agreement has
 a ceiling that has nothing to do with registration. This control measures it, so
 a margin is never set tighter than the floor cloudpipe can meet against itself.

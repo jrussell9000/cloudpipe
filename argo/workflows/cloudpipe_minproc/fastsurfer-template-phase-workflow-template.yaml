@@ -203,7 +203,7 @@ spec:
 
     initContainers:
       - name: download-t1w-inputs
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:b01be697509b3855e21419819d12d8afc1dd41926102e2a73437783c593b1c12"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ec7fcc3731ba96fefd52c79a9691b880430d8117e4cb648f635196f14a3474e"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -248,7 +248,7 @@ spec:
       # slice-hours, and this one fetched a tree FastSurfer never opened.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:4d40a431ca50d9ea1b328b2b912ecbd02e34c0df042648ae05ee8ca61bc2bbfa"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:391244dd292ede02c182f86bf6b1f4d3cad4ff27d2ca66e8152052ae9c5f0ec2"
       imagePullPolicy: IfNotPresent
       volumeMounts:
       - name: work
@@ -453,7 +453,7 @@ spec:
     # See the fsaverage link in the args block below.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:4d40a431ca50d9ea1b328b2b912ecbd02e34c0df042648ae05ee8ca61bc2bbfa"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:391244dd292ede02c182f86bf6b1f4d3cad4ff27d2ca66e8152052ae9c5f0ec2"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

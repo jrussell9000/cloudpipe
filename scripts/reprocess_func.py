@@ -427,6 +427,54 @@ def workflow_subject(wf: dict) -> str | None:
     return None
 
 
+_EKS_ARN = re.compile(r"^arn:aws[\w-]*:eks:[a-z0-9-]+:(\d{12}):cluster/[\w.-]+$")
+
+
+def kubectl_cluster() -> str:
+    """kubectl's current-context cluster, as `kubectl config view --minify` names it."""
+    result = subprocess.run(
+        ["kubectl", "config", "view", "--minify", "-o", "jsonpath={.contexts[0].context.cluster}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def aws_account() -> str:
+    return boto3.client("sts").get_caller_identity()["Account"]
+
+
+def require_same_account() -> str:
+    """Refuse unless kubectl and the AWS credentials name the same account.
+
+    The flush runs in the account the AWS credentials name; Argo, and the Prefect
+    URL that cloudpipe-env.sh derives, follow kubectl's current context. On
+    2026-10-14 a second account's cluster was the current context more than once,
+    which would flush production and then submit (and run preflight) against a
+    cluster that cannot read production's bucket. Copied from
+    scripts/investigations/https-ingress-probe/_account_guard.py (#812), which is
+    not published. Point kubectl at the right cluster in this shell instead of
+    overriding this.
+    """
+    cluster = kubectl_cluster()
+    match = _EKS_ARN.match(cluster)
+    if not match:
+        raise SystemExit(
+            f"refusing: kubectl's current context is not an EKS cluster ARN ({cluster!r})"
+        )
+    kube, account = match.group(1), aws_account()
+    if kube != account:
+        raise SystemExit(
+            f"refusing: kubectl targets account {kube} ({cluster}) but the AWS credentials are "
+            f"for account {account}. Point kubectl at {account}'s cluster in this shell, e.g.\n"
+            f"  kubectl config view --raw --minify --context <that cluster's context> "
+            f"> ~/.kube/cloudpipe-{account}.config\n"
+            f"  export KUBECONFIG=~/.kube/cloudpipe-{account}.config"
+        )
+    print(f"account {account}, cluster {cluster}")
+    return account
+
+
 def check_prefect_target() -> str:
     """Refuse unless Prefect points at a real server, and the deployment resolves.
 
@@ -578,6 +626,7 @@ def launch(s3, args) -> int:
     audit_dir = Path(args.audit_dir)
     audit = Audit(audit_dir / f"{args.batch_label}_launch.jsonl")
     sha = file_sha256(args.subjects)
+    require_same_account()
 
     gate = launch_gate(audit.events(), sha, args.skip_flush)
     if gate == "submit":
@@ -716,6 +765,7 @@ def submit(s3, args, subjects, sha: str, audit: Audit) -> int:
         "subjects_file": uri,
         "batch_label": args.batch_label,
         "globus_scan_types": SCAN_TYPES,
+        "ingress_mode": args.ingress_mode,
     }
     try:
         check_prefect_target()
@@ -725,7 +775,8 @@ def submit(s3, args, subjects, sha: str, audit: Audit) -> int:
         recover = (
             f"pixi run -e ops python scripts/reprocess_func.py launch --subjects {args.subjects} "
             f'--data-bucket "{args.data_bucket}" --metrics-bucket "{args.metrics_bucket}" '
-            f"--batch-label {args.batch_label} --skip-flush --write"
+            f"--batch-label {args.batch_label} --ingress-mode {args.ingress_mode} "
+            "--skip-flush --write"
         )
         audit.write("submit_failed", error=f"{type(exc).__name__}: {exc}")
         print(
@@ -735,7 +786,13 @@ def submit(s3, args, subjects, sha: str, audit: Audit) -> int:
             file=sys.stderr,
         )
         return 1
-    audit.write("submitted", flow_run_id=str(flow_run.id), flow_run_name=flow_run.name, uri=uri)
+    audit.write(
+        "submitted",
+        flow_run_id=str(flow_run.id),
+        flow_run_name=flow_run.name,
+        uri=uri,
+        ingress_mode=args.ingress_mode,
+    )
     print(f"Submitted flow run {flow_run.name} ({flow_run.id}) for {uri}")
     return 0
 
@@ -955,6 +1012,7 @@ def gather_readback(s3, args, evidence: dict[str, Evidence]) -> None:
 
 def verify(s3, args) -> int:
     subjects = read_subject_csv(args.subjects)
+    require_same_account()
     audit_dir = Path(args.audit_dir)
     ledger = load_ledger(audit_dir / LEDGER_NAME)
     never = [s for s in subjects if not (ledger.get(s) or {}).get("flushed_at")]
@@ -1308,6 +1366,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("launch", help="flush one slice's func outputs and submit it")
     common(sp, subjects=True)
     sp.add_argument("--batch-label", required=True)
+    # Required, never defaulted: https is the fast path, globus the rollback, and a
+    # launch should say which it is rather than inherit the queue manager's default.
+    sp.add_argument("--ingress-mode", required=True, choices=("https", "globus"))
     sp.add_argument("--write", action="store_true", help="Delete and submit (default: dry run).")
     sp.add_argument("--yes", action="store_true", help="Skip the typed confirmation.")
     sp.add_argument(

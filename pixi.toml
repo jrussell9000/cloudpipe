@@ -211,6 +211,9 @@ pytest-cov = ">=6,<8"
 # aCompCor; without the real package the tests had to stub it out, which meant
 # compute_confounds could never run under test (#641).
 scikit-learn = ">=1.5.0,<2"
+# Same exact pin as images/afni/pixi.toml, so the tissue_masks.py HMRF and its
+# determinism tests run against the DIPY the image ships.
+dipy = "==1.12.1"
 requests = ">=2.34.2,<3"
 nibabel = ">=5.4.2,<6"
 scipy = ">=1.18.0,<2"
