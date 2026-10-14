@@ -315,6 +315,30 @@ assert_targets_declared() {
   fi
 }
 
+# One of the stack's outputs, by name, printed raw.
+#
+# `terraform output` reads the ROOT's outputs from state, and a `-target` apply
+# never records an output that depends on nothing it targeted. On a fresh
+# deployment every apply before Phase 4's is targeted, so `region` and
+# `cluster_name` are simply absent, and Phase 1 stopped right after the EKS
+# apply (second-account rerun, 2026-10-13). The reference deployment never hit
+# it: its state has carried every output since its first full apply.
+#
+# The fallback evaluates the stack module's own output with `terraform console`,
+# which reads configuration and state and changes neither. Its state lock is
+# held only for the one expression piped in. It needs STACK_MODULE_NAME, so it
+# applies once resolve_stack_module has run; before that, only the state is read.
+stack_output() {
+  local name=$1 value
+  value=$(terraform output -raw "$name" 2>/dev/null || true)
+  if [[ (-z $value || $value == "null") && -n ${STACK_MODULE_NAME:-} ]]; then
+    value=$(printf 'module.%s.%s\n' "$STACK_MODULE_NAME" "$name" | terraform console 2>/dev/null || true)
+    value=${value#\"}
+    value=${value%\"}
+  fi
+  printf '%s' "$value"
+}
+
 # The deployment's region, and every `aws` call steered at it.
 #
 # Read from the stack's own output rather than parsed out of the deployer's
@@ -337,12 +361,12 @@ require_deployment_region() {
   if [[ -n $_REGION_ARG ]]; then
     DEPLOYMENT_REGION=$_REGION_ARG
   else
-    DEPLOYMENT_REGION=$(terraform output -raw region 2>/dev/null || true)
+    DEPLOYMENT_REGION=$(stack_output region)
   fi
   if [[ -z $DEPLOYMENT_REGION || $DEPLOYMENT_REGION == "null" ]]; then
     fail "$EXIT_INVALID" "ERROR: could not read the deployment's region." \
-      "\`terraform output -raw region\` gave nothing — the state may not exist yet, or this" \
-      "root may not re-export the stack's \`region\` output. Pass --region <aws-region>." \
+      "Neither \`terraform output -raw region\` nor the stack module's own \`region\` output" \
+      "gave a value — the state may not exist yet. Pass --region <aws-region>." \
       "The caller's AWS profile is deliberately not used as a fallback: it describes the" \
       "workstation, not the deployment."
   fi
@@ -358,12 +382,12 @@ require_cluster_name() {
   if [[ -n $_NAME_ARG ]]; then
     CLUSTER_NAME=$_NAME_ARG
   else
-    CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || true)
+    CLUSTER_NAME=$(stack_output cluster_name)
   fi
   if [[ -z $CLUSTER_NAME || $CLUSTER_NAME == "null" ]]; then
     fail "$EXIT_INVALID" "ERROR: could not read the deployment's cluster name." \
-      "\`terraform output -raw cluster_name\` gave nothing — the state may not exist yet, or" \
-      "this root may not re-export the stack's \`cluster_name\` output. Pass --name <cluster>."
+      "Neither \`terraform output -raw cluster_name\` nor the stack module's own" \
+      "\`cluster_name\` output gave a value — the state may not exist yet. Pass --name <cluster>."
   fi
 }
 
