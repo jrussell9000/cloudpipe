@@ -329,20 +329,17 @@ def apply_transforms(
     all threads.  Each thread calls scipy.ndimage.map_coordinates for one frame;
     scipy's C extension releases the GIL so threads achieve real CPU parallelism.
 
-    The output is int16 with a per-run scl_slope (scl_inter 0), the NIfTI-1
-    mechanism for storing reals in 16 bits. NIfTI-1 has no float16 datatype:
-    this function used to write float16 bytes under datatype 512, which is
+    The output is float32 (DT_FLOAT32), unscaled, exactly the warp's own values.
+    This function used to write float16 bytes under datatype 512, which is
     DT_UINT16, so every reader (Stage 5's 3dcalc included) took the bit patterns
-    for the intensities. Do not reintroduce a hand-set datatype code here.
+    for the intensities; then, until 2026-10-14, scaled int16 quantised to
+    max|value| / 32767. The dtype is set through nibabel's header, never as a
+    hand-set datatype code.
 
-    The slope needs the whole run's range before the first voxel is quantised,
-    so the warp is two passes. Pass 1 writes each float32 frame into a disk
-    scratch file (np.memmap) and tracks max|value|; pass 2 quantises frame by
-    frame into the NIfTI. Nothing holds the full 4D array in anonymous memory —
-    the memmap's pages are file-backed and reclaimable — which keeps Stage 3
-    under the step's 6G limit without the float16 array the old writer needed.
-    Quantisation step is max|value| / 32767, about 4.5 significant digits at
-    the top of the range.
+    The warp is two passes. Pass 1 writes each float32 frame into a disk scratch
+    file (np.memmap); pass 2 copies the frames into the NIfTI in time order.
+    Nothing holds the full 4D array in anonymous memory — the memmap's pages are
+    file-backed and reclaimable — which keeps Stage 3 under the step's 6G limit.
 
     coords is returned to the caller so Stage 4 (warp_mask_to_mni) can reuse it
     without a second _build_warp_coords call (BOLD and brainmask share the same
@@ -413,11 +410,9 @@ def apply_transforms(
     bold_data = mean_acc = M2_acc = None
     del _std
 
-    # A NaN anywhere would make the slope NaN and every voxel garbage; stop here
-    # rather than ship that.
+    # A NaN or inf anywhere is a broken warp; stop here rather than ship it.
     if not np.isfinite(max_abs[0]):
         raise ValueError(f"warped BOLD contains non-finite values ({prefix})")
-    slope = max_abs[0] / 32767.0 if max_abs[0] > 0 else 1.0
 
     # Write NIfTI manually, one frame at a time, to avoid a full 4D transpose.
     # scratch is (n_frames, x, y, z) C-order; NIfTI expects each 3D volume
@@ -425,10 +420,11 @@ def apply_transforms(
     # the on-disk layout matches (x, y, z, t) Fortran order — identical to what
     # nibabel would write.
     out_hdr = mni_img.header.copy()
-    out_hdr.set_data_dtype(np.int16)
+    out_hdr.set_data_dtype(np.float32)
     out_hdr.set_data_shape((*mni_shape, n_frames))
     # Explicit, never inherited: the template's own scl_slope/scl_inter are NaN.
-    out_hdr.set_slope_inter(slope, 0.0)
+    # 1/0 states "no scaling" outright.
+    out_hdr.set_slope_inter(1.0, 0.0)
     out_hdr.set_data_offset(352)
     # pixdim[4] is the TR, and out_hdr is copied from the MNI *template* — a 3D
     # file whose pixdim[4] is a meaningless 1.0. Without this the output claims
@@ -437,23 +433,19 @@ def apply_transforms(
     # header (including the CIFTI -timestep, which is derived from this file).
     out_hdr.structarr['pixdim'][4] = float(bold_img.header.get_zooms()[3])
 
-    on_disk = np.dtype(np.int16).newbyteorder(out_hdr.endianness)
+    on_disk = np.dtype(np.float32).newbyteorder(out_hdr.endianness)
     out_nii = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-unmasked_bold.nii"
     with open(str(out_nii), 'wb') as _f:
         _f.write(bytes(np.array(out_hdr.structarr).tobytes()))  # 348-byte header
         _f.write(b'\x00' * 4)  # pad to vox_offset=352
         for t in range(n_frames):
-            q = np.rint(scratch[t] / np.float32(slope))
-            # The frame holding max|value| lands on ±32767 up to float32
-            # rounding, which can tip it to ±32768 and wrap. Clip only that.
-            np.clip(q, -32767, 32767, out=q)
             # order='F' is what makes the bytes x-fastest. tobytes() defaults
             # to 'C' whatever the array's memory layout, so the np.asfortranarray
             # this line used to wrap was a no-op: on the 97x115x97 grid, where
             # x and z have the same length, every reader saw the volume with x
             # and z swapped, and Stage 5 then masked it with a correctly
             # oriented mask.
-            _f.write(q.astype(on_disk).tobytes(order='F'))
+            _f.write(np.asarray(scratch[t]).astype(on_disk).tobytes(order='F'))
     scratch = None  # rebind, not `del` — closed over by _warp_frame (see above)
     scratch_path.unlink()
 
@@ -520,9 +512,9 @@ def apply_mni_mask(bold_mni: Path, mask_mni: Path, outdir: Path, prefix: str) ->
     Masking here rather than before the warp prevents LanczosWindowedSinc
     from ringing across the sharp native-space brain boundary.
 
-    -datum float pins the published dtype. Stage 3 writes scaled int16, and
-    3dcalc's default would be a short output re-quantised under a new scale
-    factor per sub-brick; float stores the slope-applied values exactly.
+    -datum float pins the published dtype, matching Stage 3's float32. Without
+    it 3dcalc may choose its output datum itself, and a short output would be
+    re-quantised under a scale factor per sub-brick.
     """
     out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz"
     run(
@@ -548,9 +540,9 @@ def apply_mni_mask(bold_mni: Path, mask_mni: Path, outdir: Path, prefix: str) ->
 # ---------------------------------------------------------------------------
 
 # Tolerance on the per-voxel temporal mean, as a fraction of the largest in-mask
-# mean. Quantisation alone moves a mean by at most half a step, max|value|/65534
-# (~1.5e-5 of the run's range); 1e-3 leaves a wide margin for that. The defects
-# this exists to catch moved values by their own magnitude or more.
+# mean. The file is the warp's own float32 values, so only float32 summation
+# order separates the two; 1e-3 is a wide margin. The defects this exists to
+# catch moved values by their own magnitude or more.
 READBACK_RTOL = 1e-3
 
 

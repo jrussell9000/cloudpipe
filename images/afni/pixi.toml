@@ -21,3 +21,7 @@ numpy = ">=1.26.0,<3"
 scikit-learn = ">=1.5.0,<2"
 scipy = ">=1.13.0,<2"
 pigz = ">=2.8,<3"
+# Exact, not a band: tissue_masks.py seeds the HMRF by patching
+# dipy.segment.tissue.add_noise, which is DIPY internals. Moving this pin means
+# re-running tests/images/afni/test_tissue_masks.py's determinism checks.
+dipy = "==1.12.1"

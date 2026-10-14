@@ -30,7 +30,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:b01be697509b3855e21419819d12d8afc1dd41926102e2a73437783c593b1c12"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ec7fcc3731ba96fefd52c79a9691b880430d8117e4cb648f635196f14a3474e"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -166,7 +166,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:3ecd9e648607aec552d911af4ce88ea9a74f9fca64671ceb4839eedf754312cf"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:5302cc03c70da3465968b296376c9d9005853155fc6cb4492a717e954ae5c5ab"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -273,7 +273,7 @@ spec:
     container:
       # The same image and digest as globus-transfer-template: the HTTPS step
       # imports transfer.py's listing, and the pin job rewrites both lines.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:3ecd9e648607aec552d911af4ce88ea9a74f9fca64671ceb4839eedf754312cf"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:5302cc03c70da3465968b296376c9d9005853155fc6cb4492a717e954ae5c5ab"
       imagePullPolicy: IfNotPresent
 
       # Plan 018 §7: one subject peaked at 1,118 MiB, about 8.4 CPU-s per GiB

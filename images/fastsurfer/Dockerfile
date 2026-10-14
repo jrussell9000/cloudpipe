@@ -20,7 +20,7 @@
 # no inline comments, so `FROM image@digest # tag` parses the comment as
 # arguments and fails with "FROM requires either one or three arguments".
 # tag: latest (upstream pushed 2026-06-02)
-FROM deepmi/fastsurfer@sha256:11d594ae6fea7b1dde5b66ba5124b6295c4eedf1f401e21c7319c22eefd55c50
+FROM deepmi/fastsurfer@sha256:f6da4315c344ee1afb496682b7b6328e3971eb712bafc39b47bb59bcfbe91742
 
 USER root
 

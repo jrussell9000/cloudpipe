@@ -33,8 +33,8 @@ FROM public.ecr.aws/docker/library/debian:bookworm-slim AS afni-dist
 # NIMH publishes no versioned artifact. `--build-arg AFNI_SHA256=` (empty) skips
 # the digest check for an emergency build; the version assertion still applies.
 ARG AFNI_URL=https://afni.nimh.nih.gov/pub/dist/tgz/linux_ubuntu_24_64.tgz
-ARG AFNI_SHA256=b2f834925818d1b8b38a4ae2a337af067bd8ad160d05d39c642ecc7661840d85
-ARG AFNI_VERSION=AFNI_26.3.02
+ARG AFNI_SHA256=81de5069380cc136f35af165b1a0b61e0ddb76038008669f024edb7a1f207be9
+ARG AFNI_VERSION=AFNI_26.3.04
 
 # Programs lifted out of the tarball. preproc.py shells out to exactly ONE AFNI
 # binary — 3dcalc, for Stage 5's MNI masking — so that is all that ships. Adding
@@ -147,7 +147,7 @@ RUN echo "#!/bin/bash" > /entrypoint.sh && \
     echo "exec \"\$@\"" >> /entrypoint.sh && \
     chmod +x /entrypoint.sh
 
-COPY images/afni/preproc.py images/afni/surf_geometry.py ./
+COPY images/afni/preproc.py images/afni/surf_geometry.py images/afni/tissue_masks.py ./
 
 # The IQMs and FuncQC record preproc.py imports. Shared with src/equivalence, which
 # recomputes the same record from another pipeline's outputs with this same code.

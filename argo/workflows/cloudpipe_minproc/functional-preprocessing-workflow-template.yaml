@@ -157,6 +157,10 @@ spec:
   #   derivatives/func/{subjID}/{session}/
   #     {subjID}_{session}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
   #     {subjID}_{session}_{task}_{run}_events.tsv   (n-back: ABCD's task timing, copied)
+  #     {subjID}_{session}_space-MNI152NLin2009cAsym_res-1_{dseg,label-GM/WM/CSF_mask}.nii.gz
+  #       + _dseg.tsv   (per session: FastSurfer tissue masks, 1 mm MNI)
+  #     {subjID}_{session}_space-MNI152NLin2009cAsym_res-1_label-GM/WM/CSF_probseg.nii.gz
+  #                     (per session: DIPY HMRF tissue probabilities, 1 mm MNI)
   #   derivatives/func_surf/{subjID}/{session}/components/
   #     {subjID}_{session}_{task}_{run}_desc-grayordcomponents_bold.tar.gz
   #
@@ -241,6 +245,16 @@ spec:
             region: "{{workflow.parameters.region}}"
             key: config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii
 
+        # The 1 mm template the t1w-to-MNI SyN warp is defined on: the grid the
+        # session's tissue masks are written to (tissue_masks.py).
+        - name: mni-template-1mm
+          path: /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: config/MNI152NLin2009cAsym_res-01_T1w_brain.nii
+
         # The session's registration outputs: t1w_to_mni/ (shared by every run)
         # and bold_to_t1w_{task}_{run}/ (per run). Pulled from S3 rather than a
         # PVC so this template still runs standalone when bold-to-t1w was
@@ -287,6 +301,19 @@ spec:
             bucket: "{{workflow.parameters.bucket}}"
             region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/aseg.auto.mgz'
+
+        # Skull-stripped, bias-corrected T1w: the input to the DIPY probseg maps
+        # (tissue_masks.py --brainmask). A single .mgz, so `archive: none` is
+        # required for the same reason as the aseg above (#274).
+        - name: fastsurfer-brainmask
+          path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/brainmask.mgz'
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/brainmask.mgz'
 
         - name: fastsurfer-surf
           path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/surf'
@@ -438,7 +465,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:9e323790beaf9b0d07d3c7371ba83a71f6e9ae003655ff203eb58b258ab092da"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:eece42e12fa46dd3e9821423c7c72676e22481af6e1c2132bab4f4656adcc5e2"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -497,7 +524,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:9e323790beaf9b0d07d3c7371ba83a71f6e9ae003655ff203eb58b258ab092da"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:eece42e12fa46dd3e9821423c7c72676e22481af6e1c2132bab4f4656adcc5e2"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather
@@ -738,6 +765,33 @@ spec:
                 # run for this session until the geometry exists.
                 print(f"[driver] WARNING: surface geometry export failed (exit {rc})")
                 for f in ANAT_OUT.iterdir():
+                    f.unlink()
+
+        def export_tissue_masks():
+            """The session's FastSurfer tissue masks in MNI, 1 mm, beside its tarballs.
+
+            Once per session, and only when this pod wrote at least one fresh MNI
+            BOLD tarball, so the masks always come from the same workflow as the
+            BOLD they sit beside. Non-fatal, like the surface geometry export: the
+            BOLD is valid without them, and a partial set is removed rather than
+            uploaded.
+            """
+            if not any(OUT_DIR.glob("*_space-MNI152NLin2009cAsym_bold.tar.gz")):
+                return
+            rc = subprocess.run([
+                "python", "/app/tissue_masks.py",
+                "--aseg", str(ASEG),
+                "--template", "/data/MNI152NLin2009cAsym_res-01_T1w_brain.nii",
+                "--t1w2mni-affine", str(T1W2MNI_AFFINE),
+                "--t1w2mni-warp", str(T1W2MNI_WARP),
+                "--brainmask", str(FS_ROOT / "mri" / "brainmask.mgz"),
+                "--outdir", str(OUT_DIR),
+                "--subj", SUBJ,
+                "--session", SES,
+            ]).returncode
+            if rc != 0:
+                print(f"[driver] WARNING: tissue mask export failed (exit {rc})")
+                for f in OUT_DIR.glob(f"{SUBJ}_{SES}_space-MNI152NLin2009cAsym_res-1_*"):
                     f.unlink()
 
         def recover_mni_bold(prefix, task, rid, work_dir):
@@ -995,6 +1049,7 @@ spec:
         try:
             with ThreadPoolExecutor(max_workers=JOBS) as pool:
                 results = list(pool.map(process, pending))
+            export_tissue_masks()
         finally:
             # Record every run's outcome directly (see ADR 016) instead of
             # emitting failed-run lists for a sibling DAG task to fan out

@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
+FROM public.ecr.aws/docker/library/python:3.15-slim-bookworm
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). `upgrade`, not
 # `dist-upgrade`: it only moves already-installed packages to a newer revision of the
