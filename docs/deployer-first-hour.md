@@ -113,6 +113,8 @@ It has to be relative. Terraform treats an absolute path as a separate package, 
 
 **When you pull a newer clone, compare your `main.tf` with the example's.** A new stack input arrives as a `variable` block and a line in the module call. A copy that lacks them makes Terraform ignore the value the wizard renders, with only a warning, so `cloudpipe setup` refuses to render until both are there and names them.
 
+**Keep the copied `.terraform.lock.hcl`, and refresh it only from the example.** It pins every provider to the build the stack is tested with, and the installer runs `terraform init` without `-upgrade` so that it holds. Running `terraform init -upgrade` yourself takes whatever was published last, which is how a provider release with a read bug once reached an install on its release day. When a pull bumps a provider, the installer's `init` fails naming it; copy the example's lock file over yours and run it again.
+
 Why outside: that directory will hold your `terraform.tfvars`, your backend configuration and your state. It is yours, it is deployment-specific, and it should not live in a checkout you will later pull upstream changes into. The example root's own `main.tf` explains the module call it makes; see [infrastructure.md](infrastructure.md) for what the module builds.
 
 The wizard verifies the directory you point it at before writing anything. A directory that declares no module call, or that does not declare the stack's variables, is refused with exit `4`. This check exists because the failure it prevents is silent: a `terraform.tfvars` written into a directory Terraform never reads produces no error at all, and you find out when `plan` prompts you for all eighteen values anyway.
