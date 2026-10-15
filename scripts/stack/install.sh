@@ -716,7 +716,16 @@ main() {
   # Initialize Terraform. Ahead of the target validation, not after it: `init`
   # writes the module manifest that says which module call is the stack and where
   # Terraform resolved it to. It creates nothing in any cloud account.
-  terraform init -upgrade
+  #
+  # Never `-upgrade`. That re-resolves every provider to the newest version the
+  # constraints allow and rewrites the root's lock file, so an install got
+  # whatever was published that morning rather than the build the lock file and
+  # CI tested. It got hashicorp/aws 6.69.0 on its release day, whose
+  # `aws_cognito_managed_login_branding` read fails with "bufio.Scanner: token too
+  # long" (hashicorp/terraform-provider-aws#50481; second-account rerun,
+  # 2026-10-14). A lock that cannot satisfy the configuration fails here, naming
+  # the provider; the fix is the example root's lock file, not -upgrade.
+  terraform init -input=false
 
   resolve_stack_module
   echo "==> Targeting module \"$STACK_MODULE_NAME\" ($STACK_DIR)"
