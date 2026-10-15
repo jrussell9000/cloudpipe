@@ -12,14 +12,43 @@ crash.log
 crash.*.log
 
 # Exclude all .tfvars files, which are likely to contain sensitive data, such as
-# password, private keys, and other secrets. These should not be part of version 
-# control as they are data points which are potentially sensitive and subject 
+# password, private keys, and other secrets. These should not be part of version
+# control as they are data points which are potentially sensitive and subject
 # to change depending on the environment.
 *.tfvars
 *.tfvars.json
 
-# Don't need terraform locks
-.terraform.lock.hcl
+# The operator's answers document (docs/globus-setup.md step 3.1). It holds no
+# secret — the client secret is a reference the schema enforces — but it is one
+# deployment's identifiers, and D15 keeps those out of the code.
+globus-answers.yaml
+globus-answers.*.yaml
+
+# The setup wizard's answers document (docs/deployer-first-hour.md). Same reason:
+# no secret — the wizard refuses a credential field outright — but it holds one
+# deployment's domain, issuer, Cloudflare account and bucket. The deployer guide
+# says to version it, and that means in the deployer's OWN deployment repository,
+# beside their Terraform root, never in this one. Ignored here because this
+# repository's root files are only report-only to the publish gate, so a
+# committed copy would not be blocked. `.json` too: `cloudpipe setup` writes JSON
+# when the --answers path ends in it.
+cloudpipe-answers.yaml
+cloudpipe-answers.yml
+cloudpipe-answers.*.yaml
+cloudpipe-answers.json
+
+# terraform/.terraform.lock.hcl IS committed, deliberately — it used to be
+# ignored here ("don't need terraform locks"), which meant every `terraform
+# init` re-resolved providers against the registry and re-fetched SHA256SUMS to
+# establish trust. That is a live network dependency on each provider's release
+# hosting, and it broke CI on 2026-08-12 when the checksum fetch for
+# gavinbunney/kubectl (hosted on GitHub Releases, not the HashiCorp CDN) timed
+# out. With the lock committed, init verifies against recorded hashes instead.
+#
+# Consequence: provider upgrades are now explicit. `terraform init` will no
+# longer drift you onto a newer patch release; run
+#   terraform init -upgrade && terraform providers lock -platform=...
+# and commit the result. See .github/workflows/ci.yaml (terraform_lint).
 
 # Ignore override files as they are usually used to override resources locally and so
 # are not checked in
@@ -31,8 +60,17 @@ override.tf.json
 # Include override files you do wish to add to version control using negated pattern
 # !example_override.tf
 
-# Include tfplan files to ignore the plan output of command: terraform plan -out=tfplan
-# example: *tfplan*
+# Saved plan files from `terraform plan -out=...`. The upstream template leaves
+# this commented out as an example; it is enabled here because three of them
+# (1.2-1.3 MB each) were committed by a `git add -A terraform/` on 2026-09-25.
+#
+# They carry no credential material — those three were `-target`ed plans and
+# held no ArgoCD or GitHub resources, checked before removing them — but a plan
+# embeds prior state for everything in its scope, and this repository's state is
+# recorded in the SSP as holding a GitHub PAT and an OIDC client secret (P3-2).
+# So the next one might. Ignored rather than remembered.
+*.tfplan
+*tfplan*
 
 # Ignore CLI configuration files
 .terraformrc
@@ -40,15 +78,20 @@ terraform.rc
 
 *.cfg
 
+# Written by the Packer manifest post-processor on every build. The AMI id it
+# records reaches git through the PR the build workflow opens, not this file.
+packer-manifest.json
+
 .vscode/
 
 keys/
 
 # VPN client config contains private keys — never commit
 *.ovpn
-# pixi environments
+# pixi environments (root and nested, e.g. images/workbench/.pixi)
 .pixi/*
 !.pixi/config.toml
+**/.pixi/
 # pixi.lock is intentionally committed — lock files pin dependency versions
 # for reproducible Docker image builds.
 
@@ -61,3 +104,48 @@ keys/
 # Python extras
 .pytest_cache
 .conda
+
+# AI Distiller
+.aid
+
+gits/
+
+# No Serena Configs
+.serena
+
+# No Claude
+.claude/*
+.claude
+.claude/settings.json
+
+# Python
+*.pyc
+__pycache__/
+
+# Ignore temporary runtime state from Spec Kit integrations and extensions
+.specify/integrations/*/state/
+.specify/extensions/*/.cache/
+.specify/extensions/*/tmp/
+
+.serena/
+
+.spec-workflow/
+.superpowers/
+
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+# `pixi run coverage` data files (one per xdist worker before combining).
+.coverage
+.coverage.*
+.agents
+
+# Disposable local CSV exports from scripts/export_batch_metrics.py
+metrics_exports/
+
+# MkDocs build output (`pixi run -e docs docs-build`)
+site/
+
+# Unshareable ABCD Data
+data/
+backfill-qc-rejected-20260911T142606Z.jsonl
