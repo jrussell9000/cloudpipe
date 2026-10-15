@@ -629,6 +629,15 @@ def launch_gate(prior: list[dict], sha: str, skip_flush: bool) -> str:
     return "flush"
 
 
+def no_func_problems(subjects, plan: FlushPlan, ledger) -> list[str]:
+    """Subjects with nothing to reprocess. A resumed partial flush legitimately
+    finds some already emptied; the ledger baseline proves they had func output."""
+    no_func = sorted(
+        s for s in subjects if not plan.bold_keys(s) and not (ledger.get(s) or {}).get("baseline")
+    )
+    return [f"{len(no_func)} subject(s) have no MNI BOLD, e.g. {no_func[0]}"] if no_func else []
+
+
 def launch(s3, args) -> int:
     subjects = read_subject_csv(args.subjects)
     if not args.batch_label.startswith(BATCH_LABEL_PREFIX):
@@ -655,13 +664,7 @@ def launch(s3, args) -> int:
     ledger = load_ledger(ledger_path)
     problems = preflight(s3, args, subjects)
     plan = plan_flush(s3, args.data_bucket, args.metrics_bucket, subjects, args.workers)
-    # A resumed partial flush legitimately finds some subjects already emptied;
-    # the ledger baseline is what proves they had func output.
-    no_func = sorted(
-        s for s in subjects if not plan.bold_keys(s) and not (ledger.get(s) or {}).get("baseline")
-    )
-    if no_func:
-        problems.append(f"{len(no_func)} subject(s) have no MNI BOLD, e.g. {no_func[0]}")
+    problems += no_func_problems(subjects, plan, ledger)
     if problems:
         for p in problems:
             print(f"REFUSED: {p}", file=sys.stderr)
@@ -691,6 +694,16 @@ def launch(s3, args) -> int:
     if not confirmed(args, len(plan.deriv_keys), len(subjects)):
         print("Aborted.")
         return 1
+    # Again, now: the prompt can sit unanswered for hours, and another launch of
+    # this label may have flushed and submitted meanwhile (2026-10-15: a 17-hour-old
+    # prompt was still open beside the live run). This plan is stale by then.
+    gate = launch_gate(audit.events(), sha, args.skip_flush)
+    if gate != "flush":
+        print(
+            f"ERROR: {args.batch_label}: {gate} while awaiting confirmation; nothing deleted.",
+            file=sys.stderr,
+        )
+        return 2
     if not flush(s3, args, subjects, plan, ledger, Audit(ledger_path), audit):
         return 1
     audit.write("flush_complete", csv_sha256=sha, subjects=len(subjects))
