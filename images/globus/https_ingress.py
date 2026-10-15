@@ -190,8 +190,16 @@ def rclone_command(
         "16M",
         "--s3-upload-concurrency",
         "4",
+        # Bounded, not 1 (2026-10-14): the source answers bursts of HTTP 500
+        # on stat and open while all 8 ingress pods run (22 of 50 pilot
+        # workflows, 20:38-20:55Z), and each failure used to cost the whole
+        # pod plus a 1-2 min Argo backoff. Three passes 30 s apart retry only
+        # the failed files, adding no load, and a refusal or throttle still
+        # fails the step within about a minute (design.md, "One source IP").
         "--retries",
-        "1",
+        "3",
+        "--retries-sleep",
+        "30s",
         "--low-level-retries",
         "10",
         "--stats",
