@@ -6,7 +6,7 @@ wrote in-pod. Until it does, a measured arm difference cannot be separated from 
 harness difference, and nothing downstream of it means anything.
 
 This is the real-data half and it does not run in CI: it needs the metrics store
-and the per-run output tarballs out of S3, and CI's test job carries no AWS
+and the per-run outputs out of S3, and CI's test job carries no AWS
 credentials. Run it in-region, against real runs, before the pilot:
 
     PYTHONPATH=src python -m equivalence.calibrate --bucket <bucket> --limit 20
@@ -32,8 +32,9 @@ from .confound_map import CLOUDPIPE
 from .recompute import CALIBRATED_FIELDS, FieldMismatch, RunInputs, calibration_mismatches
 from .recompute import recompute_func_qc as _recompute
 
-#: `derivatives/func/{subject}/{session}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz`,
-#: rooted at `{task}_{run}/` inside the archive (the driver's `arcname`).
+#: The legacy per-run archive, rooted at `{task}_{run}/` (the old driver's
+#: `arcname`). A session republished since the exploded layout (ADR 017) holds
+#: the three files below as separate objects in the session prefix instead.
 FUNC_TARBALL = "{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
 MNI_BOLD = "{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz"
 MNI_MASK = "{prefix}_space-MNI152NLin2009cAsym_brainmask.nii.gz"
@@ -60,15 +61,27 @@ def _prefix(record: dict) -> str:
 
 
 def _download_and_extract(s3, bucket: str, record: dict, dest: Path) -> Path:
-    """Fetch one run's volumetric tarball and extract it under `dest`.
+    """Fetch the three files the harness reads for one run into a directory under `dest`.
 
-    Returns the directory holding the three files the harness reads. The archive
-    is rooted at `{task}_{run}/`, so the members land one level down.
+    The exploded objects when the session has them; otherwise the legacy tarball,
+    extracted (it is rooted at `{task}_{run}/`, so the members land one level down).
     """
+    from botocore.exceptions import ClientError
+
     prefix = _prefix(record)
-    key = f"derivatives/func/{record['subject']}/{record['session']}/" + FUNC_TARBALL.format(
-        prefix=prefix
-    )
+    session_prefix = f"derivatives/func/{record['subject']}/{record['session']}/"
+    run_dir = dest / "exploded"
+    run_dir.mkdir()
+    try:
+        for name in (MNI_BOLD, MNI_MASK, CONFOUNDS):
+            name = name.format(prefix=prefix)
+            s3.download_file(bucket, session_prefix + name, str(run_dir / name))
+        return run_dir
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+            raise
+
+    key = session_prefix + FUNC_TARBALL.format(prefix=prefix)
     archive = dest / "run.tar.gz"
     s3.download_file(bucket, key, str(archive))
     with tarfile.open(archive) as tar:
@@ -89,7 +102,7 @@ def calibrate_run(s3, bucket: str, record: dict) -> RunResult:
     with tempfile.TemporaryDirectory(prefix="equivalence-calibrate-") as workdir:
         try:
             run_dir = _download_and_extract(s3, bucket, record, Path(workdir))
-        except Exception as exc:  # a missing or unreadable tarball is not a mismatch
+        except Exception as exc:  # a missing or unreadable output is not a mismatch
             return RunResult(prefix, (), f"{type(exc).__name__}: {exc}")
 
         inputs = RunInputs(

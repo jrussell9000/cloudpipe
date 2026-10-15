@@ -163,6 +163,10 @@ COPY images/shared/func_iqm.py /app/func_iqm.py
 # restore_links.py is standard-library only, so it runs under the pixi env's
 # python (3.14) with nothing installed. Its own test asserts that property.
 COPY images/shared/restore_links.py /app/restore_links.py
+# The exploded func publish: func_derivatives builds on fs_derivatives' transfer
+# helpers and marker reader (ADR 017).
+COPY images/shared/fs_derivatives.py /app/fs_derivatives.py
+COPY images/shared/func_derivatives.py /app/func_derivatives.py
 
 # The StepOutcome taxonomy and writer the func-preproc driver records with
 # (#646). Standard-library only, same as restore_links.py.

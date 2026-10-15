@@ -92,16 +92,45 @@ def list_bold_runs(s3, bucket: str, subj: str, ses: str) -> list[dict]:
     return runs
 
 
+def func_session_runs(s3, bucket: str, subj: str, ses: str) -> set[str]:
+    """
+    The run IDs (`{task}_{run}`) the session's func `_complete.json` lists.
+
+    Empty when there is no marker, or when the marker there is not a func-session
+    one. The marker is written by the func-preproc pod after every file it names
+    (images/shared/func_derivatives.py, ADR 017), so a run it lists is complete
+    and a run it does not list is not, however many of its objects are present.
+    """
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"derivatives/func/{subj}/{ses}/_complete.json")
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return set()
+        raise
+    marker = json.loads(obj["Body"].read())
+    if marker.get("kind") != "func-session":
+        return set()
+    return set(marker.get("runs") or {})
+
+
 def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict]) -> None:
     """
     Add b2t_exists, func_exists and surf_exists flags to each run dict (in-place).
 
     Completion markers (terminal output files — presence proves the step finished):
       b2t_exists:  _desc-bold2t1w_itk.txt      (bold-to-t1w)
-      func_exists: _space-MNI152NLin2009cAsym_bold.tar.gz  (functional preprocessing)
+      func_exists: the run is listed in the session's func _complete.json, or
+                   (legacy) its _space-MNI152NLin2009cAsym_bold.tar.gz exists
       components_exist: _desc-grayordcomponents_bold.tar.gz (grayordinate extraction)
       surf_target_exists: _space-fsLR32k_bold.dtseries.nii  (fsLR/CIFTI assembly)
       surf_exists: components_exist OR surf_target_exists   (see below)
+
+    func_exists reads the marker, never an object probe: the exploded layout has no
+    single object whose presence means "this run finished uploading" (ADR 017). The
+    legacy tarball is the exception that proves it — a tarball is one PUT, so its
+    key still means what it always did. It is kept as a fallback only for sessions
+    not yet republished in the exploded layout; a session's publish prunes the
+    tarballs of the runs it redoes, so the two cannot disagree about one run.
 
     func_exists and surf_exists gate independently: both derivatives come out of
     the same pod, but either can be missing on its own, and preproc.py takes the
@@ -125,6 +154,7 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
     resample would immediately delete again — paying cpu-heavy compute on every
     subsequent workflow to reclaim storage that was already reclaimed.
     """
+    published = func_session_runs(s3, bucket, subj, ses)
     for run in runs:
         task, run_id = run["task"], run["run"]
         prefix = f"{subj}_{ses}_{task}_{run_id}"
@@ -132,7 +162,9 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
             f"derivatives/registration/{subj}/{ses}/"
             f"bold_to_t1w_{task}_{run_id}/{prefix}_desc-bold2t1w_itk.txt"
         )
-        func_key = f"derivatives/func/{subj}/{ses}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
+        legacy_func_key = (
+            f"derivatives/func/{subj}/{ses}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
+        )
         surf_key = (
             f"derivatives/func_surf/{subj}/{ses}/components/"
             f"{prefix}_desc-grayordcomponents_bold.tar.gz"
@@ -140,12 +172,16 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
         surf_target_key = (
             f"derivatives/func_surf/{subj}/{ses}/fsLR32k/{prefix}_space-fsLR32k_bold.dtseries.nii"
         )
-        for field, s3_key in (
+        checks = [
             ("b2t_exists", b2t_key),
-            ("func_exists", func_key),
             ("components_exist", surf_key),
             ("surf_target_exists", surf_target_key),
-        ):
+        ]
+        if f"{task}_{run_id}" in published:
+            run["func_exists"] = True
+        else:
+            checks.insert(1, ("func_exists", legacy_func_key))
+        for field, s3_key in checks:
             try:
                 s3.head_object(Bucket=bucket, Key=s3_key)
                 run[field] = True

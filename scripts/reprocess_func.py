@@ -111,11 +111,17 @@ PRODUCER_SLACK = timedelta(minutes=2)
 # Subject IDs are matched as whole key segments, never substrings; refusing
 # anything outside this shape keeps a malformed ID from widening a match.
 SUBJECT_RE = re.compile(r"^sub-[A-Za-z0-9]+$")
-TARBALL_RE = re.compile(
+# A run's MNI BOLD, in either layout: the exploded `.nii.gz` the driver has
+# published since ADR 017 was extended to func, or the legacy tarball every run
+# held before. Both name exactly one object per run, so either marks the run.
+MNI_BOLD_RE = re.compile(
     r"^derivatives/func/(sub-[^/]+)/(ses-[^/]+)/\1_\2_(task-[^_]+)_(run-[^_]+)"
-    r"_space-MNI152NLin2009cAsym_bold\.tar\.gz$"
+    r"_space-MNI152NLin2009cAsym_bold\.(tar\.gz|nii\.gz)$"
 )
-# ABCD's task timing, copied beside each fresh n-back tarball by the func driver.
+# The session's completion marker (images/shared/func_derivatives.py). An
+# exploded run counts only once the marker lists it.
+FUNC_MARKER_RE = re.compile(r"^derivatives/func/(sub-[^/]+)/(ses-[^/]+)/_complete\.json$")
+# ABCD's task timing, copied beside each fresh n-back BOLD by the func driver.
 EVENTS_RE = re.compile(
     r"^derivatives/func/(sub-[^/]+)/(ses-[^/]+)/\1_\2_(task-[^_]+)_(run-[^_]+)_events\.tsv$"
 )
@@ -514,7 +520,11 @@ def create_flow_run(parameters: dict, idempotency_key: str):
 
 
 def load_ledger(path: Path) -> dict[str, dict]:
-    """{subject: {"baseline": [tarball keys] | None, "flushed_at": [iso, ...]}}."""
+    """{subject: {"baseline": [MNI BOLD keys] | None, "flushed_at": [iso, ...]}}.
+
+    The baseline event's field is still named `tarballs`, as in ledgers written
+    before the exploded layout; the keys in it may be either layout's.
+    """
     ledger: dict[str, dict] = defaultdict(lambda: {"baseline": None, "flushed_at": []})
     for ev in Audit(path).events():
         entry = ledger[ev["subject"]]
@@ -540,8 +550,8 @@ class FlushPlan:
     def deriv_keys(self) -> list[str]:
         return [o["Key"] for objs in self.deriv.values() for o in objs]
 
-    def tarballs(self, subject: str) -> list[str]:
-        return [o["Key"] for o in self.deriv[subject] if TARBALL_RE.match(o["Key"])]
+    def bold_keys(self, subject: str) -> list[str]:
+        return [o["Key"] for o in self.deriv[subject] if MNI_BOLD_RE.match(o["Key"])]
 
 
 def step_values(subjects) -> set[tuple[str, str]]:
@@ -648,18 +658,18 @@ def launch(s3, args) -> int:
     # A resumed partial flush legitimately finds some subjects already emptied;
     # the ledger baseline is what proves they had func output.
     no_func = sorted(
-        s for s in subjects if not plan.tarballs(s) and not (ledger.get(s) or {}).get("baseline")
+        s for s in subjects if not plan.bold_keys(s) and not (ledger.get(s) or {}).get("baseline")
     )
     if no_func:
-        problems.append(f"{len(no_func)} subject(s) have no func tarballs, e.g. {no_func[0]}")
+        problems.append(f"{len(no_func)} subject(s) have no MNI BOLD, e.g. {no_func[0]}")
     if problems:
         for p in problems:
             print(f"REFUSED: {p}", file=sys.stderr)
         return 2
 
     tag = "write" if args.write else "dry-run"
-    n_tar = sum(len(plan.tarballs(s)) for s in subjects)
-    print(f"  [{tag}] derivatives: {len(plan.deriv_keys)} objects ({n_tar} MNI tarballs)")
+    n_bold = sum(len(plan.bold_keys(s)) for s in subjects)
+    print(f"  [{tag}] derivatives: {len(plan.deriv_keys)} objects ({n_bold} MNI BOLD runs)")
     print(f"  [{tag}] raw per-scan QC: {len(plan.qc_raw)} objects")
     print(f"  [{tag}] raw step-outcomes {'/'.join(FUNC_STEPS)}: {len(plan.steps_raw)} objects")
     if not args.write:
@@ -669,7 +679,7 @@ def launch(s3, args) -> int:
             csv_sha256=sha,
             subjects=len(subjects),
             deriv=len(plan.deriv_keys),
-            tarballs=n_tar,
+            tarballs=n_bold,  # field name kept: older audits use it
             qc_raw=len(plan.qc_raw),
             steps_raw=len(plan.steps_raw),
             qc_compacted_rows=qc_rows,
@@ -730,7 +740,7 @@ def flush(s3, args, subjects, plan: FlushPlan, ledger, ledger_audit: Audit, audi
     for s in subjects:
         if not (ledger.get(s) or {}).get("baseline"):
             ledger_audit.write(
-                "baseline", subject=s, tarballs=plan.tarballs(s), batch_label=args.batch_label
+                "baseline", subject=s, tarballs=plan.bold_keys(s), batch_label=args.batch_label
             )
     try:
         d = delete_audited(s3, args.data_bucket, plan.deriv_keys, audit, "derivatives")
@@ -814,13 +824,19 @@ class Evidence:
     """Everything verify gathered for one subject, all of it written after its flush
     except `baseline` (the runs it held before the campaign).
 
-    `tarballs`/`dtseries` map unit -> LastModified; `qc_raw`/`surf_raw` map unit
+    `bold`/`dtseries` map unit -> LastModified; `qc_raw`/`surf_raw` map unit
     -> list of record dicts; the compacted counters count rows per unit.
+    `exploded` holds the units whose BOLD is in the exploded layout, `published`
+    the units a fresh session marker lists, and `tissue` the sessions whose fresh
+    marker carries tissue maps.
     """
 
     flushed_at: datetime
     baseline: set = field(default_factory=set)
-    tarballs: dict = field(default_factory=dict)
+    bold: dict = field(default_factory=dict)
+    exploded: set = field(default_factory=set)
+    published: set = field(default_factory=set)
+    tissue: set = field(default_factory=set)
     dtseries: dict = field(default_factory=dict)
     events: dict = field(default_factory=dict)
     qc_raw: dict = field(default_factory=lambda: defaultdict(list))
@@ -834,9 +850,9 @@ class Evidence:
     running: bool = False
 
 
-def unit_of_tarball(key: str):
-    m = TARBALL_RE.match(key)
-    return m.groups() if m else None
+def unit_of_bold(key: str):
+    m = MNI_BOLD_RE.match(key)
+    return m.groups()[:4] if m else None
 
 
 def unit_of_events(key: str):
@@ -866,10 +882,18 @@ def fresh_single(records: list[dict], after: datetime, schema_version: str | Non
 
 def raw_problems(ev: Evidence, units: set) -> list[str]:
     reasons = []
-    missing = sorted(ev.baseline - {u for u, lm in ev.tarballs.items() if lm > ev.flushed_at})
+    missing = sorted(ev.baseline - {u for u, lm in ev.bold.items() if lm > ev.flushed_at})
     if missing:
         reasons.append(
-            f"{len(missing)} run(s) have no new tarball, e.g. {'_'.join(missing[0][1:])}"
+            f"{len(missing)} run(s) have no new MNI BOLD, e.g. {'_'.join(missing[0][1:])}"
+        )
+    # An exploded run's objects exist before its marker does, so a run whose
+    # upload died reads as present by listing alone. Only the marker says done.
+    unlisted = sorted(u for u in units if u in ev.exploded and u not in ev.published)
+    if unlisted:
+        reasons.append(
+            f"{len(unlisted)} run(s) are not in a fresh session _complete.json, "
+            f"e.g. {'_'.join(unlisted[0][1:])}"
         )
     no_surf = [u for u in units if not (ev.dtseries.get(u) and ev.dtseries[u] > ev.flushed_at)]
     if no_surf:
@@ -895,7 +919,7 @@ def classify_subject(subject: str, ev: Evidence) -> SubjectResult:
         )
     if ev.running:
         return SubjectResult(subject, "PENDING", ["workflow still running"])
-    units = ev.baseline | {u for u, lm in ev.tarballs.items() if lm > ev.flushed_at}
+    units = ev.baseline | {u for u, lm in ev.bold.items() if lm > ev.flushed_at}
     reasons = raw_problems(ev, units)
     if ev.readback_errors:
         reasons.insert(
@@ -922,6 +946,11 @@ def classify_subject(subject: str, ev: Evidence) -> SubjectResult:
         if u[2] in EVENTS_TASKS and not (ev.events.get(u) and ev.events[u] > ev.flushed_at)
     ]
     notes = [f"note: {len(no_events)} n-back run(s) have no _events.tsv"] if no_events else []
+    # Also a note: the tissue maps are non-fatal by design (the BOLD is valid
+    # without them), and only an exploded session's marker can say they landed.
+    no_tissue = {u[:2] for u in units if u in ev.exploded} - ev.tissue
+    if no_tissue:
+        notes.append(f"note: {len(no_tissue)} session(s) have no tissue maps in their marker")
     return SubjectResult(subject, "PENDING" if pending else "OK", pending + notes)
 
 
@@ -933,15 +962,39 @@ def gather_derivatives(s3, args, evidence: dict[str, Evidence]) -> None:
             for o in list_objects(s3, args.data_bucket, t.format(subj=subj))
         ]
 
+    markers = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for objs in pool.map(deriv_of, evidence):
             for o in objs:
-                if u := unit_of_tarball(o["Key"]):
-                    evidence[u[0]].tarballs[u] = o["LastModified"]
+                if m := MNI_BOLD_RE.match(o["Key"]):
+                    u = m.groups()[:4]
+                    evidence[u[0]].bold[u] = o["LastModified"]
+                    if m.group(5) == "nii.gz":
+                        evidence[u[0]].exploded.add(u)
+                elif (m := FUNC_MARKER_RE.match(o["Key"])) and o["LastModified"] > (
+                    evidence[m.group(1)].flushed_at
+                ):
+                    markers.append((m.group(1), m.group(2), o["Key"]))
                 elif u := unit_of_events(o["Key"]):
                     evidence[u[0]].events[u] = o["LastModified"]
                 elif u := unit_of_dtseries(o["Key"]):
                     evidence[u[0]].dtseries[u] = o["LastModified"]
+
+        docs = list(pool.map(lambda m: get_json(s3, args.data_bucket, m[2]), markers))
+    for (subj, ses, _), doc in zip(markers, docs, strict=True):
+        record_marker(evidence[subj], subj, ses, doc)
+
+
+def record_marker(ev: Evidence, subj: str, ses: str, doc: dict | None) -> None:
+    """Fold one fresh session marker into the subject's evidence."""
+    if not doc or doc.get("kind") != "func-session":
+        return
+    # A run ID is `{task}_{run}`, and a task label has no `_`.
+    for rid in doc.get("runs") or {}:
+        task, run = rid.split("_", 1)
+        ev.published.add((subj, ses, task, run))
+    if doc.get("session_files"):
+        ev.tissue.add((subj, ses))
 
 
 def gather_raw_qc(s3, args, evidence: dict[str, Evidence]) -> None:
@@ -1026,7 +1079,7 @@ def verify(s3, args) -> int:
     evidence = {
         s: Evidence(
             flushed_at=max(parse_instant(t) for t in ledger[s]["flushed_at"]),
-            baseline={unit_of_tarball(k) for k in ledger[s]["baseline"] or []} - {None},
+            baseline={unit_of_bold(k) for k in ledger[s]["baseline"] or []} - {None},
             running=s in busy,
         )
         for s in subjects
@@ -1101,11 +1154,11 @@ def load_runs(s3, bucket: str, workers: int) -> list[Run]:
 
 
 def find_producers(
-    runs: list[Run], tarball_times: dict[str, list[datetime]]
+    runs: list[Run], bold_times: dict[str, list[datetime]]
 ) -> tuple[dict[str, set[tuple[str, str]]], set[str]]:
-    """Per subject, the workflows whose window contains a stored tarball's LastModified.
+    """Per subject, the workflows whose window contains a stored MNI BOLD's LastModified.
 
-    Returns (producers, unattributed subjects). A subject with a tarball no window
+    Returns (producers, unattributed subjects). A subject with a BOLD no window
     covers is unattributed, and callers leave its records alone rather than
     deleting the producer's by mistake.
     """
@@ -1115,7 +1168,7 @@ def find_producers(
             by_subject[r.subject].append(r)
     producers: dict[str, set[tuple[str, str]]] = defaultdict(set)
     unattributed = set()
-    for subj, times in tarball_times.items():
+    for subj, times in bold_times.items():
         for t in times:
             hits = [
                 r
@@ -1137,17 +1190,17 @@ def is_producer(producers, subject: str, name: str, uid: str) -> bool:
 
 
 def list_func_units(s3, data_bucket: str):
-    """(tarball units, dtseries units, subject -> tarball LastModifieds)."""
+    """(MNI BOLD units, dtseries units, subject -> MNI BOLD LastModifieds)."""
     func_units, surf_units = set(), set()
-    tarball_times: dict[str, list[datetime]] = defaultdict(list)
+    bold_times: dict[str, list[datetime]] = defaultdict(list)
     for o in list_objects(s3, data_bucket, "derivatives/func/"):
-        if u := unit_of_tarball(o["Key"]):
+        if u := unit_of_bold(o["Key"]):
             func_units.add(u)
-            tarball_times[u[0]].append(o["LastModified"])
+            bold_times[u[0]].append(o["LastModified"])
     for o in list_objects(s3, data_bucket, "derivatives/func_surf/"):
         if u := unit_of_dtseries(o["Key"]):
             surf_units.add(u)
-    return func_units, surf_units, tarball_times
+    return func_units, surf_units, bold_times
 
 
 @dataclass
@@ -1160,8 +1213,8 @@ class Attribution:
     idle: dict  # (name, uid) -> Run, the reprocess workflows that produced nothing
 
     @classmethod
-    def build(cls, runs: list[Run], tarball_times) -> Attribution:
-        producers, unattributed = find_producers(runs, tarball_times)
+    def build(cls, runs: list[Run], bold_times) -> Attribution:
+        producers, unattributed = find_producers(runs, bold_times)
         reprocess = {
             (r.name, r.uid): r for r in runs if r.batch_label.startswith(BATCH_LABEL_PREFIX)
         }
@@ -1296,16 +1349,16 @@ def reconcile(s3, args) -> int:
     tag = "write" if args.write else "dry-run"
 
     print("Listing derivatives and workflow runs ...")
-    func_units, surf_units, tarball_times = list_func_units(s3, args.data_bucket)
+    func_units, surf_units, bold_times = list_func_units(s3, args.data_bucket)
     runs = load_runs(s3, args.metrics_bucket, args.workers)
-    attr = Attribution.build(runs, tarball_times)
+    attr = Attribution.build(runs, bold_times)
     print(
         f"  {len(runs)} runs; {len(attr.reprocess)} from {BATCH_LABEL_PREFIX}*, "
         f"{len(attr.idle)} of those produced nothing"
     )
     if attr.unattributed:
         print(
-            f"  [hold] {len(attr.unattributed)} subject(s) have a tarball no workflow window "
+            f"  [hold] {len(attr.unattributed)} subject(s) have an MNI BOLD no workflow window "
             "covers; their func step rows and workflows are left alone"
         )
         audit.write("unattributed", subjects=sorted(attr.unattributed))

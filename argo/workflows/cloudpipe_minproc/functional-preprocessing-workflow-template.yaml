@@ -153,9 +153,11 @@ spec:
   #                                     short path, to recover an MNI BOLD
   #                                     rather than recompute the warp chain
   #
-  # Uploads to S3, one tarball per run (built by the driver — see the outputs):
+  # Publishes to S3, exploded (the driver itself, func_derivatives.py; ADR 017):
   #   derivatives/func/{subjID}/{session}/
-  #     {subjID}_{session}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
+  #     {subjID}_{session}_{task}_{run}_space-MNI152NLin2009cAsym_{bold,brainmask}.nii.gz
+  #     {subjID}_{session}_{task}_{run}_desc-{boldref.nii.gz,confounds_timeseries.tsv}
+  #     _complete.json   (written LAST; lists every run's files = func_exists)
   #     {subjID}_{session}_{task}_{run}_events.tsv   (n-back: ABCD's task timing, copied)
   #     {subjID}_{session}_space-MNI152NLin2009cAsym_res-1_{dseg,label-GM/WM/CSF_mask}.nii.gz
   #       + _dseg.tsv   (per session: FastSurfer tissue masks, 1 mm MNI)
@@ -347,8 +349,9 @@ spec:
 
         # Existing volumetric derivatives, for the grayordinate-only short
         # path: it skips the warp chain, so the CIFTI subcortical block needs
-        # the MNI BOLD recovered from the run's finished tarball rather than
-        # recomputed. optional + empty on a fresh session, where nothing here
+        # the run's published MNI BOLD (or, for a session not yet republished
+        # in the exploded layout, its legacy tarball) rather than recomputing
+        # it. optional + empty on a fresh session, where nothing here
         # exists yet and nothing needs recovering.
         - name: existing-func
           optional: true
@@ -385,22 +388,10 @@ spec:
             bucket: "{{workflow.parameters.metrics-bucket}}"
             region: "{{workflow.parameters.region}}"
             key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
-        # Per-run tarballs, built by the driver rather than by Argo's archiver:
-        # one static artifact declaration cannot emit N differently-named
-        # tarballs. The driver writes them with exactly the filename inventory
-        # treats as the func_exists completion marker, so this uploads to the
-        # same keys as the old per-run mni-bold artifact.
-        # optional: every run may have been skipped, leaving the dir empty.
-        - name: mni-bold
-          optional: true
-          path: /tmp/func_out
-          archive:
-            none: {}
-          s3:
-            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
-            bucket: "{{workflow.parameters.bucket}}"
-            region: "{{workflow.parameters.region}}"
-            key: 'derivatives/func/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/'
+        # No output artifact for derivatives/func/: the driver publishes the
+        # session's exploded files itself (images/shared/func_derivatives.py),
+        # because the completion marker must land after every other object and
+        # an Argo directory upload has no order to rely on (ADR 017).
 
         # Per-run QC JSONs, collected flat by the driver. Filenames are
         # unchanged; only the destination prefix gained a dt= partition segment.
@@ -540,6 +531,11 @@ spec:
         #
         # containerName must be `main` — that is what Argo names the user
         # container in a script template.
+        # Where the driver publishes derivatives/func/{subj}/{ses}/ (see the
+        # note where the mni-bold output artifact used to be).
+        - name: DATA_BUCKET
+          value: "{{workflow.parameters.bucket}}"
+
         - name: CPU_REQUEST
           valueFrom:
             resourceFieldRef:
@@ -768,15 +764,15 @@ spec:
                     f.unlink()
 
         def export_tissue_masks():
-            """The session's FastSurfer tissue masks in MNI, 1 mm, beside its tarballs.
+            """The session's FastSurfer tissue masks in MNI, 1 mm, beside its BOLD.
 
             Once per session, and only when this pod wrote at least one fresh MNI
-            BOLD tarball, so the masks always come from the same workflow as the
+            BOLD, so the masks always come from the same workflow as the
             BOLD they sit beside. Non-fatal, like the surface geometry export: the
             BOLD is valid without them, and a partial set is removed rather than
             uploaded.
             """
-            if not any(OUT_DIR.glob("*_space-MNI152NLin2009cAsym_bold.tar.gz")):
+            if not any(OUT_DIR.glob("*_space-MNI152NLin2009cAsym_bold.nii.gz")):
                 return
             rc = subprocess.run([
                 "python", "/app/tissue_masks.py",
@@ -794,14 +790,57 @@ spec:
                 for f in OUT_DIR.glob(f"{SUBJ}_{SES}_space-MNI152NLin2009cAsym_res-1_*"):
                     f.unlink()
 
+        # run_id -> the volumetric files this pod wrote for it, filled by
+        # _process and published by publish_outputs().
+        RUN_FILES = {}
+        # Exit code when the in-pod publish fails. 75 (EX_TEMPFAIL) is in this
+        # template's retry expression: a publish that died (a spot reclaim, an
+        # S3 error) leaves the session markerless, so a retry redoes it.
+        EXIT_PUBLISH_FAILED = 75
+
+        def publish_outputs():
+            """Publish OUT_DIR exploded, then the session marker last (ADR 017).
+
+            Returns "" on success or when there is nothing to publish, else the
+            error message, which the caller turns into failed func-preproc
+            records and EXIT_PUBLISH_FAILED.
+            """
+            if not RUN_FILES:
+                return ""
+            sys.path.insert(0, "/app")
+            import func_derivatives
+
+            session_files = sorted(
+                f.name for f in OUT_DIR.glob(f"{SUBJ}_{SES}_space-MNI152NLin2009cAsym_res-1_*")
+            )
+            try:
+                func_derivatives.publish_session(
+                    OUT_DIR,
+                    os.environ["DATA_BUCKET"],
+                    f"derivatives/func/{SUBJ}/{SES}",
+                    runs=RUN_FILES,
+                    session_files=session_files,
+                    owner=f"{SUBJ}_{SES}",
+                    source_step="func-preproc",
+                )
+            except Exception as exc:  # noqa: BLE001 -- recorded per run, then the pod exits 75
+                traceback.print_exc()
+                return f"publish failed: {type(exc).__name__}: {exc}"
+            return ""
+
         def recover_mni_bold(prefix, task, rid, work_dir):
-            """Unpack the MNI BOLD from this run's finished volumetric tarball.
+            """The MNI BOLD this run already published, staged from S3.
 
             The short path skips the warp chain, so the CIFTI subcortical block
-            has no freshly-warped MNI BOLD to read. Extracting the one already
-            in S3 is far cheaper than recomputing the composite warp and the 4D
-            warp just to rebuild a file that exists.
+            has no freshly-warped MNI BOLD to read. Reusing the published one is
+            far cheaper than recomputing the composite warp and the 4D warp just
+            to rebuild a file that exists. Since the exploded layout it is a
+            plain object in the session prefix; a session not yet republished
+            still holds the legacy tarball, which is unpacked instead.
             """
+            exploded = EXISTING_FUNC / f"{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz"
+            if exploded.exists():
+                return exploded
             src = EXISTING_FUNC / f"{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
             if not src.exists():
                 raise FileNotFoundError(
@@ -961,47 +1000,42 @@ spec:
                 shutil.rmtree(work_dir, ignore_errors=True)
                 return prefix, func_needed, surf_needed, False, f"preproc.py exited {rc}", ""
 
-            # Argo's archiver used to build these tarballs from the artifact
-            # path; one static declaration cannot emit N per-run tarballs, so
-            # build them here. arcname keeps each tar rooted at {task}_{run}/.
-            # The filenames are inventory's func_exists / surf_exists markers —
-            # changing either would make every rerun redo finished work.
+            # The volumetric derivative is published exploded (ADR 017): each
+            # file a separate object in the session prefix, uncompressed beyond
+            # NIfTI's own gzip, so a reader fetches the one file it needs. The
+            # run's files are recorded in RUN_FILES, which publish_outputs()
+            # turns into the session's _complete.json — inventory's func_exists.
             if func_needed:
-                tarball = OUT_DIR / f"{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
                 # On --emit both the work dir also holds the surface components,
-                # which the components tarball below already carries — tarring
-                # the whole dir would duplicate ~320 MB of GIFTIs/subcort into
-                # this volumetric tarball, whose real payload (MNI BOLD +
-                # confounds + boldref + brainmask) is ~125 MB. Exclude them by
-                # name, using the exact globs the components step uses below so
-                # the two can't drift. On --emit volumetric there are no surface
-                # files, so this set is empty and the filter is a no-op.
+                # which the components tarball below carries; they are not part
+                # of the volumetric derivative. Exclude them by name, using the
+                # exact globs the components step uses below so the two can't
+                # drift. On --emit volumetric this set is empty.
                 surf_names = {p.name for p in dict.fromkeys(
                     sorted(work_dir.glob(f"{prefix}_hemi-*_space-fsnative_bold.func.gii"))
                     + sorted(work_dir.glob(f"{prefix}_*desc-subcort*"))
                     + sorted(work_dir.glob(f"{prefix}_desc-subcort_labellist.txt")))}
-                # ti.name is arcname-prefixed ({task}_{rid}/<file>); match on the
-                # basename so the top-level dir entry is always kept.
-                def _vol_only(ti, _names=surf_names):
-                    return None if Path(ti.name).name in _names else ti
-                with tarfile.open(tarball, "w:gz") as tar:
-                    tar.add(str(work_dir), arcname=f"{task}_{rid}", filter=_vol_only)
-                print(f"[driver] wrote {tarball.name}")
+                vol = sorted(
+                    f for f in work_dir.iterdir() if f.is_file() and f.name not in surf_names
+                )
+                for f in vol:
+                    shutil.copy2(f, OUT_DIR / f.name)
+                RUN_FILES[f"{task}_{rid}"] = [f.name for f in vol]
+                print(f"[driver] staged {len(vol)} volumetric files for {prefix}")
 
                 # ABCD ships task timing as {prefix}_events.tsv beside the BOLD
                 # (n-back has one; rest has none). It is staged into FUNC_DIR
                 # with the other inputs, and staged input is deleted once the
                 # workflow succeeds, so without this copy the onsets are kept
-                # nowhere. A plain object beside the tarball, not inside it, so
-                # a first-level reader fetches 5 KB rather than unpacking
-                # ~125 MB. Onsets count from the first acquired frame, and the
+                # nowhere. Onsets count from the first acquired frame, and the
                 # MNI BOLD keeps every frame (non-steady-state frames are
                 # flagged in the confounds, never cut), so they apply unchanged.
-                # Copied only with a fresh tarball, so the two always come from
-                # the same run.
+                # Copied only with a fresh BOLD, so the two always come from the
+                # same run.
                 events = FUNC_DIR / f"{prefix}_events.tsv"
                 if events.exists():
                     shutil.copy2(events, OUT_DIR / events.name)
+                    RUN_FILES[f"{task}_{rid}"].append(events.name)
                     print(f"[driver] wrote {events.name}")
                 elif task == "task-nback":
                     # ABCD drops an n-back run with no valid E-Prime file before
@@ -1045,11 +1079,22 @@ spec:
             return prefix, False, surf_failed, produced, surf_message, ""
 
         results = []
+        publish_error = ""
         pending_prefixes = {f"{SUBJ}_{SES}_{r['task']}_{r['run']}" for r in pending}
         try:
             with ThreadPoolExecutor(max_workers=JOBS) as pool:
                 results = list(pool.map(process, pending))
             export_tissue_masks()
+            publish_error = publish_outputs()
+            if publish_error:
+                # Nothing this pod made is published: every run it produced
+                # volumetric output for is a func-preproc failure, not a success.
+                print(f"[driver] FAILED to publish: {publish_error}")
+                published = {f"{SUBJ}_{SES}_{rid}" for rid in RUN_FILES}
+                results = [
+                    (p, True, sf, False, publish_error, up) if p in published else (p, ff, sf, prod, msg, up)
+                    for p, ff, sf, prod, msg, up in results
+                ]
         finally:
             # Record every run's outcome directly (see ADR 016) instead of
             # emitting failed-run lists for a sibling DAG task to fan out
@@ -1161,6 +1206,8 @@ spec:
                 return 1
             return 0
 
+        if publish_error:
+            sys.exit(EXIT_PUBLISH_FAILED)
         exit_code = session_exit_code(results, RUNS)
         if exit_code:
             sys.exit(exit_code)

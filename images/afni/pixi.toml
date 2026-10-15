@@ -21,6 +21,15 @@ numpy = ">=1.26.0,<3"
 scikit-learn = ">=1.5.0,<2"
 scipy = ">=1.13.0,<2"
 pigz = ">=2.8,<3"
+# The func driver publishes its exploded session outputs itself
+# (images/shared/func_derivatives.py), so the marker can be written last; Argo's
+# directory artifact upload has no order to rely on (ADR 017). Exact, and the
+# same three pins as every other image that ships fs_derivatives.py (#268: a
+# publish segfault must reproduce identically in each). Bump all of them together;
+# tests/images/test_publish_pin_parity.py holds them in step.
+boto3 = "==1.43.72"
+botocore = "==1.43.72"
+urllib3 = "==2.7.0"
 # Exact, not a band: tissue_masks.py seeds the HMRF by patching
 # dipy.segment.tissue.add_noise, which is DIPY internals. Moving this pin means
 # re-running tests/images/afni/test_tissue_masks.py's determinism checks.

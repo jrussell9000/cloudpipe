@@ -128,19 +128,31 @@ def anatomy_complete(s3, bucket: str, subject: str, session: str) -> bool:
     return any(obj["Key"] == key for obj in response.get("Contents", []))
 
 
+def _listed(s3, bucket: str, object_key: str) -> bool:
+    response = s3.list_objects_v2(Bucket=bucket, Prefix=object_key, MaxKeys=1)
+    return any(obj["Key"] == object_key for obj in response.get("Contents", []))
+
+
 def cloudpipe_output_exists(s3, bucket: str, key: RunKey) -> bool:
     """Is cloudpipe's volumetric derivative present for this run?
 
-    The per-run tarball name is cloudpipe's own completion marker — the driver
-    writes it last, and `inventory.py` treats it as the existence test for a
-    finished run.
+    The same test `inventory.py` gates func-preproc on: the session's
+    `_complete.json` lists the run (ADR 017; the driver writes the marker after
+    every file it names), or, for a session not yet republished in the exploded
+    layout, the run's legacy tarball exists — a single PUT, so its key alone is
+    a whole run.
     """
-    object_key = (
-        f"derivatives/func/{key.subject}/{key.session}/"
-        f"{key.prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
+    session_prefix = f"derivatives/func/{key.subject}/{key.session}/"
+    marker_key = session_prefix + COMPLETE_MARKER
+    if _listed(s3, bucket, marker_key):
+        marker = json.loads(s3.get_object(Bucket=bucket, Key=marker_key)["Body"].read())
+        if marker.get("kind") == "func-session" and (
+            f"{key.task}_{key.run}" in (marker.get("runs") or {})
+        ):
+            return True
+    return _listed(
+        s3, bucket, f"{session_prefix}{key.prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
     )
-    response = s3.list_objects_v2(Bucket=bucket, Prefix=object_key, MaxKeys=1)
-    return any(obj["Key"] == object_key for obj in response.get("Contents", []))
 
 
 def sampling_frame(s3, bucket: str, candidates: list[RunKey]) -> Census:

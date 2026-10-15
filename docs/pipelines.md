@@ -11,7 +11,7 @@ which the commands on this page run).
 | `cloudpipe_minproc` | `cloudpipe` | `cloudpipe-queue-manager` Prefect flow | ABCD minimally preprocessed |
 | `cloudpipe_fullproc` | — (planned, not implemented) | — | Raw ABCD DICOMs |
 | `subregion-seg` | `subregion-seg` | `cloudpipe` DAG (or standalone) | FastSurfer longitudinal outputs |
-| `fmri-first-level-proc` | (separate repo) | `first-level-queue-manager` Prefect flow | cloudpipe_minproc outputs |
+| `fmri-first-level-proc` | (separate repo) | `first-level-queue-manager` Prefect flow | fMRIPrep archives (`derivatives/fmriprep/`), not cloudpipe outputs |
 
 ### What this pipeline does not do
 
@@ -178,7 +178,7 @@ The eight checks (executed in one pass):
 2. **List BOLD runs** — for each session, paginates `mmps_mproc/{subj}/{ses}/func/` for `.nii`/`.nii.gz` files, extracts `(task, run)` pairs filtered to `{rest, nback}`, deduplicates
 3. **Check run completion** — for each run, calls `head_object` on four S3 keys:
    - `b2t_exists`: `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_itk.txt`
-   - `func_exists`: `derivatives/func/{subj}/{ses}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz`
+   - `func_exists`: the run is listed in `derivatives/func/{subj}/{ses}/_complete.json` (or, for a session not yet republished in the exploded layout, its legacy `{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz` exists)
    - `components_exist`: `derivatives/func_surf/{subj}/{ses}/components/{prefix}_desc-grayordcomponents_bold.tar.gz`
    - `surf_target_exists`: `derivatives/func_surf/{subj}/{ses}/fsLR32k/{prefix}_space-fsLR32k_bold.dtseries.nii`
 
@@ -710,21 +710,29 @@ Three things about that order are deliberate and easy to get wrong:
 
 The tSNR map and the read-back reference are accumulated in float64 from the warp's own output.
 
-Resources: 4G memory request, 6G limit (TODO(perf): validate limit empirically against observed peak usage — intermediate ANTs warp operations may exceed 6G on longer runs; check `metrics/func-preproc` QC JSONs for `peak_memory_gb` before adjusting), 2 CPU, 20G ephemeral-storage request, 30G limit. CPU was cut 6 → 3 in #96 — mean `cpu_efficiency` across 26 pods was 0.347, ~2.1 of 6 cores — then 3 → 2 after a live re-measurement over 65 pods mid-batch at 200 concurrent (2026-08-11) showed median 1.15 CPU and p90 3.19, i.e. 38% of the request, the step being largely S3-I/O-bound. At 2 CPU three pods share a `c*.2xlarge` where only two fit at 3. The request must stay an integer: `resourceFieldRef` rounds a fractional CPU request up, which would decouple the thread count from the reservation. The driver derives `--threads` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` from the pod's own CPU request (downward API `resourceFieldRef`, env `CPU_REQUEST`) rather than a hardcoded constant, so the request is the single source of truth and cannot drift from the thread count. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`); ephemeral storage grew because the pod holds the session's whole `func/` and `registration/` prefixes plus the staged FastSurfer `mri/aseg.auto.mgz` and `surf/`. The driver deletes each run's working directory once it is tarred, so intermediates do not accumulate across runs.
+Resources: 4G memory request, 6G limit (TODO(perf): validate limit empirically against observed peak usage — intermediate ANTs warp operations may exceed 6G on longer runs; check `metrics/func-preproc` QC JSONs for `peak_memory_gb` before adjusting), 2 CPU, 20G ephemeral-storage request, 30G limit. CPU was cut 6 → 3 in #96 — mean `cpu_efficiency` across 26 pods was 0.347, ~2.1 of 6 cores — then 3 → 2 after a live re-measurement over 65 pods mid-batch at 200 concurrent (2026-08-11) showed median 1.15 CPU and p90 3.19, i.e. 38% of the request, the step being largely S3-I/O-bound. At 2 CPU three pods share a `c*.2xlarge` where only two fit at 3. The request must stay an integer: `resourceFieldRef` rounds a fractional CPU request up, which would decouple the thread count from the reservation. The driver derives `--threads` and `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` from the pod's own CPU request (downward API `resourceFieldRef`, env `CPU_REQUEST`) rather than a hardcoded constant, so the request is the single source of truth and cannot drift from the thread count. Memory is sized for a single run, since runs execute sequentially (`jobs: "1"`); ephemeral storage grew because the pod holds the session's whole `func/` and `registration/` prefixes plus the staged FastSurfer `mri/aseg.auto.mgz` and `surf/`. The driver deletes each run's working directory once its files are staged for upload, so intermediates do not accumulate across runs.
 
 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` is set by the driver per run (to `CPU_REQUEST // jobs`, floored at 1) rather than on the container, so raising `jobs` splits the CPU request across concurrent runs instead of letting each grab the whole request and over-subscribe the node. `jobs` is `1`, and with the CPU request now at 2, `jobs=2` already leaves one thread per run and anything above 2 floors at 1 while still multiplying peak memory.
 
 Retry limit: 8, as a per-template override of the same spec-level budget. This is the pipeline's bottleneck step and it runs on the spot-only `cpu-heavy-nodepool`, making it the most reclaim-exposed pod in the workflow — two back-to-back reclaims on one step were observed 2026-08-03 (#115). The policy is `Always` with an expression filtering to infrastructure causes; `OnFailure` only half-honoured that filter, since a node shutdown lands in phase `Failed` but a reclaimed pod lands in phase `Error`. A retry re-runs the whole session, so a reclaim costs a session's in-flight work rather than a single run's.
 
-S3 output — one tarball per run, built by the driver (`tar` rooted at `{task}_{run}/`) and uploaded via a single directory artifact keyed on `derivatives/func/{subj}/{ses}/`. The filename is inventory's `func_exists` marker, so it is unchanged:
+S3 output: every file is its own object, flat in the session prefix, with no archive around it (ADR 017, extended to func on 2026-10-14). A reader fetches only the file it needs. The NIfTIs keep their own `.nii.gz` compression. The driver uploads them itself with `images/shared/func_derivatives.py` rather than through an Argo output artifact, because the session's `_complete.json` must be written after every other object, and a directory artifact uploads in no fixed order:
 ```
-derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
+derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.nii.gz
+derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_brainmask.nii.gz
+derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv
+derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_*        # boldref, tSNR, and the run's other preproc.py outputs
 derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_events.tsv    # n-back only
 derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_dseg.nii.gz            # per session
 derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_dseg.tsv
 derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{GM,WM,CSF}_mask.nii.gz
 derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{GM,WM,CSF}_probseg.nii.gz
+derivatives/func/{subj}/{ses}/_complete.json                         # written last
 ```
+
+**`_complete.json` is the only existence test**, as for the FastSurfer trees. It lists every run's files (`runs`, keyed `{task}_{run}`) and the session's tissue maps (`session_files`). Inventory sets `func_exists` from it, and a run's objects without the marker do not count: a pod reclaimed mid-upload leaves exactly that state. A pod usually redoes only some of a session's runs, so the publish merges. Runs it did not redo keep their marker entries and objects. A redone run's stale objects are pruned, including its legacy tarball. The order is: delete the marker, upload, prune, write the merged marker. A crash at any point leaves the session markerless, so the whole session reads as absent and is redone. A failed publish records the pod's runs as func-preproc failures and exits 75, which the retry expression retries.
+
+Sessions processed before 2026-10-14 still hold one tarball per run (`{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz`, rooted at `{task}_{run}/`). Inventory, `recover_mni_bold`, and the reprocess and equivalence tools all read either layout. The func reprocess (plan 017) republishes every session in the exploded layout.
 
 The `res-1` files are the session's FastSurfer tissue masks in MNI. FastSurfer's `aseg.auto.mgz` is in the subject's conformed T1w space, so `tissue_masks.py` warps it to the 1 mm MNI152NLin2009cAsym template, the grid the t1w-to-MNI SyN warp is defined on. It uses that session's t1w-to-MNI transforms with nearest-neighbour interpolation, then assigns every brain label to one class: 1 = GM, 2 = WM, 3 = CSF. The `_dseg.tsv` is the lookup table, and the label lists are `TISSUE_LABELS` in the script. These are anatomical masks, not the aCompCor noise ROIs, which are narrower, eroded, and in native BOLD space. They are on the 1 mm grid, so resample one before applying it to the 2 mm BOLD. The `probseg` maps are a second, independent segmentation of the same session, and they are probabilistic. FastSurfer's `brainmask.mgz` (skull-stripped and bias-corrected, the input DIPY's example asks for) is warped to the same 1 mm grid with linear interpolation. DIPY 1.12.1's hidden-Markov-random-field classifier (`TissueClassifierHMRF`, `beta` 0.1) then fits three classes to it. This is the same model family as FSL FAST, which fMRIPrep's `probseg` comes from. Each voxel's three values sum to 1 inside the brain and are 0 outside it.
 
@@ -732,11 +740,11 @@ The `res-1` files are the session's FastSurfer tissue masks in MNI. FastSurfer's
 - **Thresholding.** Thresholding a `probseg` gives a hard mask, but one that differs from the FastSurfer mask by construction.
 - **Reproducibility.** DIPY draws fresh OS entropy for its background noise fill (`add_noise(rng=None)`). `tissue_masks.py` therefore patches in a generator seeded with `PROBSEG_SEED`, so the same input always gives bit-identical maps. DIPY is pinned exactly in both pixi environments because that patch reaches into its internals.
 
-The driver writes them once per session, only when it also wrote a fresh MNI BOLD tarball. A failure logs a `WARNING` and removes any partial set.
+The driver writes them once per session, only when it also wrote a fresh MNI BOLD. A failure logs a `WARNING` and removes any partial set.
 
 The published MNI BOLD is float32 end to end: the warp's own values, unquantised (see the Stage 3 note above).
 
-The `_events.tsv` is ABCD's own task timing (`onset`, `duration`, `response_time`, `trial_type`), copied unchanged from the staged `mmps_mproc/` input next to each fresh tarball. Staged input is deleted when a workflow succeeds, so this copy is the only one we keep. It is a separate object so a first-level reader can fetch it without unpacking the tarball. Onsets count from the first acquired frame. The MNI BOLD keeps every frame (non-steady-state frames are flagged in the confounds, not removed), so the onsets apply to it unchanged. Resting-state runs have no events file. An n-back run staged without one logs a `WARNING` and keeps its BOLD.
+The `_events.tsv` is ABCD's own task timing (`onset`, `duration`, `response_time`, `trial_type`), copied unchanged from the staged `mmps_mproc/` input next to each fresh MNI BOLD, and listed under its run in `_complete.json`. Staged input is deleted when a workflow succeeds, so this copy is the only one we keep. Onsets count from the first acquired frame. The MNI BOLD keeps every frame (non-steady-state frames are flagged in the confounds, not removed), so the onsets apply to it unchanged. Resting-state runs have no events file. An n-back run staged without one logs a `WARNING` and keeps its BOLD.
 
 #### Grayordinate extraction (Stage 5b)
 
@@ -756,7 +764,7 @@ derivatives/func_surf/{subj}/{ses}/components/{subj}_{ses}_{task}_{run}_desc-gra
 | `func_exists` | `surf_exists` | `--emit` | What runs |
 |---|---|---|---|
 | false | false | `both` | Stages 0–6 + extraction |
-| true | false | `grayordinate` | Stages 0–1 + extraction; **skips the composite warp and 4D warp**, recovering the MNI BOLD from the existing tarball |
+| true | false | `grayordinate` | Stages 0–1 + extraction; **skips the composite warp and 4D warp**, recovering the published MNI BOLD (or extracting it from a legacy tarball) |
 | false | true | `volumetric` | Stages 0–6, extraction skipped |
 | true | true | — | run skipped entirely |
 
@@ -923,14 +931,14 @@ Runs on `cpu-light-nodepool`, 128M memory, 100m CPU. Paginates and deletes all o
 
 ### Idempotency and partial reruns
 
-Inventory runs fresh on every submission. Prior step outputs are checked via `head_object` on S3 completion marker keys.
+Inventory runs fresh on every submission. Prior step outputs are checked via `head_object` on S3 completion marker keys, except `func_exists`, which reads the session's func `_complete.json`.
 
 | S3 completion marker | Gates |
 |---|---|
 | `derivatives/fastsurfer/{subj}/{ses}/` for **all sessions** | Entire anatomical phase |
 | `derivatives/registration/{subj}/{ses}/t1w_to_mni/{subj}_{ses}_desc-t1w2mni_affine.mat` | `t1w-to-mni` for that session |
 | `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{subj}_{ses}_{task}_{run}_desc-bold2t1w_itk.txt` | `bold-to-t1w` for that run |
-| `derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz` | `func-preproc` for that run |
+| `derivatives/func/{subj}/{ses}/_complete.json` listing `{task}_{run}` (legacy: that run's `_space-MNI152NLin2009cAsym_bold.tar.gz`) | `func-preproc` for that run |
 | `derivatives/func_surf/{subj}/{ses}/components/{subj}_{ses}_{task}_{run}_desc-grayordcomponents_bold.tar.gz` **or** the dtseries below | Grayordinate extraction (Stage 5b) for that run — the components are reclaimed after assembly, so either one proves it ran |
 | `derivatives/func_surf/{subj}/{ses}/fsLR32k/{subj}_{ses}_{task}_{run}_space-fsLR32k_bold.dtseries.nii` | `surface-resample` for that run |
 | `derivatives/subregions/{subj}/{region}/` for **all three** regions | Entire subregion-segmentation phase |
@@ -948,8 +956,10 @@ aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/registration/NDARINVXXXXXXXX/ses-0
 # Force re-run of bold-to-t1w for one run
 aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/registration/NDARINVXXXXXXXX/ses-00A/bold_to_t1w_task-rest_run-01/NDARINVXXXXXXXX_ses-00A_task-rest_run-01_desc-bold2t1w_itk.txt"
 
-# Force re-run of func-preproc for one run
-aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/func/NDARINVXXXXXXXX/ses-00A/NDARINVXXXXXXXX_ses-00A_task-rest_run-01_space-MNI152NLin2009cAsym_bold.tar.gz"
+# Force re-run of func-preproc for a session (the marker is per session; without
+# it every run of the session reads as absent, and the next publish prunes
+# whatever the redone runs no longer produce)
+aws s3 rm "s3://$CLOUDPIPE_BUCKET/derivatives/func/NDARINVXXXXXXXX/ses-00A/_complete.json"
 
 # Force re-run of surface-resample for one run (leaves the grayordinate
 # components in place, so only the fsLR32k assembly repeats)
@@ -1118,11 +1128,11 @@ Subregion labels are left in native T1w space: the subcortical structures are sm
 
 **Note:** This pipeline lives in a separate repository (`jrussell9000/fmri-first-level-proc`). There is no WorkflowTemplate for it in this repo. The submission is managed by the `first-level-queue-manager` Prefect flow in `ABCD_fmri_orchestrator_S3`.
 
-Runs after cloudpipe_minproc has finished processing a subject. Requires cloudpipe_minproc outputs in the data bucket and writes results back to it.
+It reads fMRIPrep output, not cloudpipe's: one archive per session, configured by `fmriprep_s3_prefix` in `images/fmri-first-level-proc/orch_config_final.yaml`. It does not read `derivatives/func/`.
 
 Reads from the data bucket:
 ```
-derivatives/func/{subjID}/{session}/{subjID}_{session}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz
+derivatives/fmriprep/sub-{ID}/ses-{session}A/sub-{ID}_ses-{session}A_fmriprep-output.tar.gz
 ```
 
 Writes to the data bucket:
@@ -1137,10 +1147,11 @@ derivatives/first_levels/{subjID}/...
 ### Checking processed subjects
 
 ```bash
-# Sessions with complete functional preprocessing outputs
-aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/func/" --recursive \
-  | grep 'space-MNI152NLin2009cAsym_bold.tar.gz' \
-  | awk '{print $4}' | cut -d/ -f3 | sort -u
+# Subjects with at least one completely published func session (the marker,
+# never a file listing; legacy tarball-only sessions are not counted here)
+aws s3api list-objects-v2 --bucket "$CLOUDPIPE_BUCKET" --prefix derivatives/func/ \
+  --query "Contents[?ends_with(Key, '/_complete.json')].Key" --output text \
+  | tr '\t' '\n' | cut -d/ -f3 | sort -u
 
 # Step outcomes (queryable via Athena)
 # s3://cloudpipe-metrics/metrics/step-outcomes/dt=YYYY-MM-DD/
