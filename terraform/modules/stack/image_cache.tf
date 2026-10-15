@@ -88,9 +88,15 @@ resource "aws_ecr_repository_creation_template" "image_cache" {
     }]
   })
 
-  resource_tags = {
-    Name = "${var.name}-image-cache"
-  }
+  # No `resource_tags`. ECR creates cached repositories as its
+  # AWSServiceRoleForECRTemplate service-linked role, which may create a
+  # repository but not tag one, so a template with tags failed EVERY first pull:
+  # "ECRPullThroughCacheWithTemplate is not authorized to perform:
+  # ecr:TagResource". The pod waited on the image until its deadline, and nothing
+  # was ever cached (second-account rerun, 2026-10-15; seen in CloudTrail). Tags
+  # would need a `custom_role_arn` able to tag; a Name tag is not worth owning one.
+  # The reference deployment pulls from its private registry and never reaches
+  # this path.
 }
 
 # What a node needs beyond AmazonEC2ContainerRegistryReadOnly / PullOnly to pull
