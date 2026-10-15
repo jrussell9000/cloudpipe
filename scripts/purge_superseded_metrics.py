@@ -99,6 +99,20 @@ def _registration_marker(scan: tuple) -> str | None:
 
 
 def _func_marker(scan: tuple) -> str:
+    """The run's exploded MNI BOLD (ADR 017).
+
+    Not the session's _complete.json, which inventory gates on: that is rewritten
+    whenever any run of the session is republished, so its LastModified would
+    trip the stale-final hold for every sibling. The BOLD is this run's own write
+    time. A run whose upload died before its marker is no hazard here: purging
+    then removes only records older than its final, and the run is redone.
+    """
+    subj, ses, task, run = scan
+    return f"derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.nii.gz"
+
+
+def _func_legacy_marker(scan: tuple) -> str:
+    """The run's tarball, for a session not yet republished in the exploded layout."""
     subj, ses, task, run = scan
     return f"derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz"
 
@@ -134,6 +148,8 @@ class TableSpec:
     # far below the days a flush-and-rebuild takes.
     stale_margin_min: float
     verdict: str | None = None  # a pass/fail column, if the table has one
+    # Asked only when `marker` is absent: the same output in an older layout.
+    legacy_marker: Callable[[tuple], str] | None = None
     type_column: str | None = None  # registration_type: one table, two scan kinds
     # A rejected scan withholds its marker. True for both registration types
     # (2026-09-17: 0 of 165 final bold_to_t1w fails had an _itk.txt).
@@ -161,6 +177,7 @@ TABLES = {
         compacted="func_preproc_compacted",
         scan=("subject", "session", "task", "run"),
         marker=_func_marker,
+        legacy_marker=_func_legacy_marker,
         stale_margin_min=120,
     ),
     # Scan key deliberately excludes `emit`: records of either emit mode describe
@@ -315,6 +332,8 @@ def check_derivatives(s3, data_bucket: str, spec: TableSpec, plans: list[ScanPla
         if p.hold or key is None:
             continue
         written = _last_modified(s3, data_bucket, key)
+        if written is None and spec.legacy_marker:
+            written = _last_modified(s3, data_bucket, spec.legacy_marker(p.scan))
         rejected = p.final_verdict == "fail"
         if written is None:
             if not rejected:

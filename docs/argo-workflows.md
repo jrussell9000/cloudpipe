@@ -134,7 +134,7 @@ The inventory step (`src/inventory.py`) drives which subsequent steps are skippe
 | `subregions_exists` | All three subregion output trees carry `_complete.json` | `subregion-segmentation-dagtask` |
 | `t1w_to_mni_exists` (per session) | `…_desc-t1w2mni_affine.mat` — terminal output of `fst1w_to_mni.py` | `t1w-to-mni-step` for that session |
 | `b2t_exists` (per run) | `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_itk.txt` | `bold-to-t1w-step` for that run |
-| `func_exists` (per run) | `derivatives/func/{subj}/{ses}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz` | `functional-preprocessing-dagtask` for that run |
+| `func_exists` (per run) | The run is listed in `derivatives/func/{subj}/{ses}/_complete.json`; a session not yet republished in the exploded layout falls back to the run's legacy `{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz` | `functional-preprocessing-dagtask` for that run |
 | `components_exist` (per run) | `derivatives/func_surf/{subj}/{ses}/components/{prefix}_desc-grayordcomponents_bold.tar.gz` | — (reclaimed intermediate; see below) |
 | `surf_target_exists` (per run) | `derivatives/func_surf/{subj}/{ses}/fsLR32k/{prefix}_space-fsLR32k_bold.dtseries.nii` | `surface-resample` for that run |
 | `surf_exists` (per run) | *derived*: `components_exist OR surf_target_exists` | Grayordinate extraction for that run |
@@ -274,11 +274,11 @@ argo submit --from workflowtemplate/functional-preprocessing \
   -p nss-frames=15
 ```
 
-**`functional-preprocessing-session-template`** — **One pod per session**, looping over the session's `(task, run)` pairs (previously one pod per `(session, task, run)`). Downloads from S3 as whole-prefix directory artifacts: the session's `func/` (BOLD + BIDS sidecars + motion params) and `registration/` (bold-to-t1w brain masks and ITK affines, plus the shared t1w-to-mni transforms), along with FastSurfer's `mri/aseg.auto.mgz` (for aCompCor), `surf/` and `_links.json` (for grayordinate extraction) and the MNI template — the last two once per session rather than once per run. Runs `preproc.py` (AFNI) per run and tars each run's output itself. The task is skipped when `func_exists == "true"` for every run; individual complete runs are skipped inside the pod.
+**`functional-preprocessing-session-template`** — **One pod per session**, looping over the session's `(task, run)` pairs (previously one pod per `(session, task, run)`). Downloads from S3 as whole-prefix directory artifacts: the session's `func/` (BOLD + BIDS sidecars + motion params) and `registration/` (bold-to-t1w brain masks and ITK affines, plus the shared t1w-to-mni transforms), along with FastSurfer's `mri/aseg.auto.mgz` (for aCompCor), `surf/` and `_links.json` (for grayordinate extraction) and the MNI template — the last two once per session rather than once per run. Runs `preproc.py` (AFNI) per run, then publishes the session's outputs itself as separate S3 objects, with `_complete.json` last (`images/shared/func_derivatives.py`). Only the grayordinate components are still tarred. The task is skipped when `func_exists == "true"` for every run; individual complete runs are skipped inside the pod.
 
 Resources: 4 GB RAM (6 GB limit), 2 CPU, 20 GB ephemeral storage (30 GB limit) requested. The CPU request was measured down 6 → 3 → 2 (median live pod uses ~1.15 cores; the step is mostly S3 I/O), and the driver derives its thread count from it, so it must stay an integer. Node pool: `cpu-heavy-nodepool`. Image: `afni`.
 
-Output: `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.tar.gz` → `derivatives/func/{subj}/{ses}/`.
+Output: each run's files (`{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.nii.gz`, its brainmask, confounds and the rest; `_events.tsv` for n-back), the session's `res-1` tissue maps, and `_complete.json`, flat in `derivatives/func/{subj}/{ses}/`. A failed publish exits 75 (retried). See [pipelines.md](pipelines.md) for the layout and the merge rules.
 
 Retry limit: 8 — the same as every other template. (An earlier revision set this to 6 and justified it as "higher than other templates"; the fleet-wide limit is now 8 and this template is not special.)
 

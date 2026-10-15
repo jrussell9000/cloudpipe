@@ -111,7 +111,7 @@ def resolve_run_status(
 
     This is skip-safe (the fan-out passes only status, no output reference) and
     subsumes the volumetric/surface split for free: func-preproc checks the
-    volumetric tarball, surface-sample checks the components tarball, so a run
+    MNI BOLD, surface-sample checks the components tarball, so a run
     downgraded to volumetric-only reads func=succeeded / surface=failed.
     """
     st = aggregate_status.lower()
@@ -142,8 +142,12 @@ def default_expected_keys(step: str, subject: str, session: str, task: str, run:
             f"derivatives/registration/{subject}/{session}/"
             f"bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_itk.txt",
         ],
+        # The run's exploded MNI BOLD (ADR 017). This is a size-floor backstop,
+        # not the completion test: that is the session's _complete.json listing
+        # the run, which inventory reads. The only live caller is the session-
+        # level fallback recorder (task=na), whose key never exists anyway.
         "func-preproc": [
-            f"derivatives/func/{subject}/{session}/{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz",
+            f"derivatives/func/{subject}/{session}/{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz",
         ],
         # Produced inside the func-preproc pod, but gated by its own marker so
         # that a run can have one derivative and not the other.
@@ -178,7 +182,8 @@ def default_expected_keys(step: str, subject: str, session: str, task: str, run:
 # costs nothing extra.
 #
 # Floors are set roughly an order of magnitude below the smallest real output
-# observed (components ~266 MB, func tarballs ~386 MB, dtseries ~138 MB) so that
+# observed (components ~266 MB, func tarballs ~386 MB, dtseries ~138 MB; the
+# exploded float32 MNI BOLD is most of a func tarball's bytes) so that
 # a genuinely short BOLD run never trips them. This catches gross truncation —
 # the realistic partial-upload mode — and nothing subtler; it is a backstop
 # behind the drivers' own tarball guards, not a substitute for them.
