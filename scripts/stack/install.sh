@@ -243,6 +243,9 @@ cognito_has_users() {
   echo "enroll an authenticator app:" >&2
   echo "  aws cognito-idp admin-create-user --user-pool-id $pool \\" >&2
   echo "    --username <email> --user-attributes Name=email,Value=<email> Name=email_verified,Value=true" >&2
+  echo "Then enroll WARP in this deployment's team and sign in once, while the endpoint is" >&2
+  echo "still open: docs/deployer-first-hour.md, \"Step 9 — connect WARP and sign in for the" >&2
+  echo "first time\". The first sign-in sets the password and enrolls the authenticator app." >&2
   return 1
 }
 
