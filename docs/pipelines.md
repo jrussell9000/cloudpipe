@@ -721,7 +721,7 @@ S3 output: every file is its own object, flat in the session prefix, with no arc
 derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.nii.gz
 derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_brainmask.nii.gz
 derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv
-derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_*        # boldref, tSNR, and the run's other preproc.py outputs
+derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_desc-boldref.nii.gz
 derivatives/func/{subj}/{ses}/{subj}_{ses}_{task}_{run}_events.tsv    # n-back only
 derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_dseg.nii.gz            # per session
 derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_dseg.tsv

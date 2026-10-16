@@ -366,7 +366,7 @@ The eight phases, what each does, and the three variables that change between th
 
 - **Phase 4's tunnel-token sync.** Terraform never reads the Cloudflare tunnel's connector token, so it has to be copied into Secrets Manager separately. Without it cloudflared never connects. The script pipes it from Cloudflare to Secrets Manager, comparing hashes, so the token never reaches your terminal, your shell history or any process argument list.
 - **Phase 7's tunnel check, before Phase 8 closes the public endpoint.** After Phase 8 the EKS API is private-only, reached through the Cloudflare tunnel (or the VPN as a fallback). Close it before the tunnel is proven healthy, and the tunnel is the one route you cannot fix from outside. Phase 8 re-proves the tunnel itself, every time it runs, and leaves the endpoint open if it cannot.
-- **Step 8 below, also before Phase 8.** The tunnel being healthy is not the same as somebody being able to log in to it. Phase 8 refuses to close the endpoint against an empty user pool and prints the command that fixes it.
+- **Steps 8 and 9 below, also before Phase 8.** The tunnel being healthy is not the same as somebody being able to log in to it. Phase 8 refuses to close the endpoint against an empty user pool and prints the command that fixes it. Step 9 is the sign-in itself, over WARP, which the installer cannot check for you.
 
 Phase 6 also writes `install-state.auto.tfvars` in your root, holding `crds_available` and `vpc_cni_network_policy_enabled`, both `true`. (A third flag, `vpc_cni_strict_mode`, stays at its default of `false` and is yours to turn on later if you want it — strict enforcement denies any pod no NetworkPolicy selects, and this repo only ships policies for four namespaces; see #746.) Those two start `false` because the first phases run against a cluster with no CRDs and no kube-system NetworkPolicies, and they have to stay `true` afterwards — so they are persisted to a file every later `terraform` run loads, rather than living only on the install commands. Keep the file; it is gitignored, so a fresh clone needs it recreated before any apply. Losing it destroys the ExternalSecrets and disables NetworkPolicy enforcement, both quietly (#635; [operations.md → Updating infrastructure](operations.md#updating-infrastructure-terraform)).
 
@@ -404,6 +404,42 @@ Three things worth knowing before you rely on this:
 - **The pool sends mail through Cognito's default sender**, which is rate-limited to a small number of messages per day. That is ample for a handful of operators and is not a path to build anything else on.
 
 Why this is a step rather than a footnote: after the endpoint closes, the cluster is reachable only over WARP, and WARP admits only identities the pool knows. An empty pool at that moment leaves the mTLS VPN as the only way in.
+
+## Step 9 — connect WARP and sign in for the first time
+
+Also before Phase 8. The installer only checks that the pool has a user. It cannot check that the user can actually sign in. Do that sign-in yourself while the public endpoint is still open, so a problem with it is one you can still fix from your laptop.
+
+**Install the client.** Cloudflare's WARP client is now called the Cloudflare One Client in its documentation. Install it from [Cloudflare's download page](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/) for your operating system. On Windows, the client on the host also carries traffic from WSL. A shell in WSL needs no client of its own: the second-account run reached the private endpoint that way.
+
+**Enroll it in your team.** Your team name is the part of `cloudflare_team_domain` before `.cloudflareaccess.com`.
+
+```bash
+warp-cli registration new <your-team-name>
+```
+
+The desktop client has the same action in its settings, under Account, as **Login to Cloudflare Zero Trust**. Either opens a browser to your team domain, which sends you to the Cognito pool's sign-in page.
+
+**Sign in, the first time.** Use the address from `operator_emails` and the temporary password Cognito emailed. The pool then asks for a new password and shows a QR code for an authenticator app. Scan it, and enter the six-digit code to finish. The browser hands the session back to the client. Then:
+
+```bash
+warp-cli connect
+warp-cli status        # expect: Connected
+```
+
+**Prove it, then run Phase 8.** With WARP connected:
+
+```bash
+bash <path-to-clone>/scripts/stack/install.sh --root <your root> --from-phase 8
+kubectl get nodes      # after Phase 8, this answers only over WARP
+```
+
+Five things that are easy to trip on:
+
+- **One team at a time.** A client is enrolled in one Zero Trust team. Enrolling it in this deployment's team logs it out of any other, such as a second deployment's or your institution's own. Switch back the same way: `warp-cli registration new <the other team>`.
+- **Your kubectl context follows the installer, not WARP.** The installer runs `aws eks update-kubeconfig`, which makes this cluster the current context. Switching WARP to another team does not switch kubectl, and a command meant for the other cluster then fails with `no route to host`, or worse, reaches this one. Check with `kubectl config current-context`.
+- **The session lasts 24 hours.** When it lapses, `kubectl` shows a TLS handshake timeout or EOF. Renew it with `warp-cli debug access-reauth`, which signs you in again, authenticator code included.
+- **A successful `registration new` is not proof.** Cloudflare's own documentation warns that the CLI can report success when the browser enrollment failed. `warp-cli status` saying Connected is the check.
+- **WARP routes only the cluster's network.** The split tunnel includes the VPC's address range and nothing else, so the rest of your traffic is unaffected.
 
 ## Signing in with your institution's identity provider
 
