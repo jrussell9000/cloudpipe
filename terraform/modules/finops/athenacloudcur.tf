@@ -117,6 +117,15 @@ resource "aws_athena_database" "athena_cur_database" {
 
 resource "aws_athena_workgroup" "cur_athena_workgroup" {
   name = var.athena_workgroup
+
+  # Without it a teardown fails: "WorkGroup cur_athena_workgroup is not empty",
+  # because Athena deletes a workgroup that holds named queries or prepared
+  # statements only with RecursiveDeleteOption, which this sets (second-account
+  # teardown, 2026-10-16). Query RESULTS live in the finops bucket and are not
+  # touched by it. Read from state at destroy, so it takes effect for a
+  # deployment only after one apply with it set.
+  force_destroy = true
+
   configuration {
     enforce_workgroup_configuration    = true
     publish_cloudwatch_metrics_enabled = true
