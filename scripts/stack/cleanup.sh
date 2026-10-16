@@ -7,6 +7,10 @@
 # failure paths below print the by-hand commands they could not complete.
 #
 # Usage: cleanup.sh [--root DIR] [--module NAME] [--region NAME] [--name NAME]
+#                   [--verbose]
+#
+# --verbose streams Terraform's output instead of one progress line per destroy;
+# it changes what is shown, never what is destroyed. See tf_step in targets.sh.
 set -euo pipefail
 
 # Takes a stack-relative address (`module.vpc`) — see targets.sh — and destroys
@@ -15,7 +19,7 @@ destroy_target() {
   local target
   target=$(stack_address "$1")
   echo "==> Destroying $target..."
-  if terraform destroy -target="$target" -auto-approve 2>&1 | tee /dev/tty; then
+  if tf_step "$1" terraform destroy -target="$target" -auto-approve; then
     echo "SUCCESS: $target"
   else
     echo "FAILED: $target"
@@ -34,6 +38,7 @@ if [[ ${#COMMON_ARGS_REST[@]} -gt 0 ]]; then
 fi
 
 resolve_root
+init_step_logs
 require_cloudflare_api_token
 
 # `init` before the target validation, as in install.sh: it writes the module
@@ -267,7 +272,7 @@ fi
 # records, ACM certificates, SSM parameters, EventBridge schedulers, etc.)
 # crds_available=false prevents errors from missing CRD types post-cluster.
 echo "==> Final full destroy for remaining resources..."
-terraform destroy -var="crds_available=false" -auto-approve 2>&1 | tee /dev/tty
+tf_step "remaining resources" terraform destroy -var="crds_available=false" -auto-approve
 
 # After the destroy, because Cognito refuses to delete a pool that still has a
 # domain. UpdateUserPool resets every setting it is not given to its default,
@@ -309,7 +314,8 @@ report_surviving_buckets() {
   echo "      aws s3 rb s3://<bucket> --force"
   echo ""
 
-  # Interactive only. `cleanup.sh` takes no flags by decision, and a teardown
+  # Interactive only. `cleanup.sh` takes no flag that changes what it does, by
+  # decision (`--verbose` changes only what it shows), and a teardown
   # driven from CI must not hang waiting for a terminal that is not there.
   if [[ -t 0 ]]; then
     read -r -p "    Press Enter once you have read the above. " _

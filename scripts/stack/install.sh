@@ -5,7 +5,7 @@
 # the root the caller names — see targets.sh.
 #
 # Usage: install.sh [--root DIR] [--module NAME] [--region NAME] [--name NAME]
-#                   [--phase N | --from-phase N]
+#                   [--phase N | --from-phase N] [--verbose]
 #        install.sh --list-phases [--json]
 #
 # With no phase flag every phase runs, in order. `--phase N` runs exactly one and
@@ -116,11 +116,13 @@ list_phases() {
 # Takes a stack-relative address (`module.vpc`) — see targets.sh — and applies
 # the root-level one Terraform needs (`module.stack.module.vpc`).
 apply_target() {
-  local target
+  # The progress line is labelled with the stack-relative address: it is
+  # shorter, and it is the part that tells one target from the next.
+  local target label=$1
   target=$(stack_address "$1")
   shift
   echo "==> Applying $target..."
-  if terraform apply -target="$target" "$@" -auto-approve 2>&1 | tee /dev/tty; then
+  if tf_step "$label" terraform apply -target="$target" "$@" -auto-approve; then
     echo "SUCCESS: $target"
   else
     echo "FAILED: $target"
@@ -422,7 +424,8 @@ phase_4_full_apply_and_tunnel_token() {
   require_helm_ecr_login
   wait_for_argocd_namespaces
   echo "==> Applying remaining resources (crds_available=false)..."
-  terraform apply -var="endpoint_public_access=true" -auto-approve 2>&1 | tee /dev/tty
+  tf_step "full apply (crds_available=false)" \
+    terraform apply -var="endpoint_public_access=true" -auto-approve
 
   require_cloudflare_ids
   sync_tunnel_token
@@ -454,11 +457,11 @@ phase_6_crd_dependent_resources() {
   # The -var flags are kept alongside the file: a -var wins over an auto.tfvars,
   # the two agree, and this apply then works even if the write failed.
   echo "==> Applying CRD-dependent resources (public endpoint still open)..."
-  terraform apply \
+  tf_step "CRD-dependent resources" terraform apply \
     -var="crds_available=true" \
     -var="vpc_cni_network_policy_enabled=true" \
     -var="endpoint_public_access=true" \
-    -auto-approve 2>&1 | tee /dev/tty
+    -auto-approve
 }
 
 # An *.auto.tfvars is loaded by every `terraform` invocation in this directory,
@@ -552,10 +555,10 @@ phase_8_close_the_public_endpoint() {
   fi
 
   echo "==> Final apply: disabling the public EKS endpoint..."
-  terraform apply \
+  tf_step "close the public endpoint" terraform apply \
     -var="crds_available=true" \
     -var="vpc_cni_network_policy_enabled=true" \
-    -auto-approve 2>&1 | tee /dev/tty
+    -auto-approve
 
   # Refresh kubeconfig so kubectl uses the private endpoint from here on.
   aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$DEPLOYMENT_REGION"
@@ -566,7 +569,7 @@ phase_8_close_the_public_endpoint() {
 # ---------------------------------------------------------------------------
 
 USAGE="Usage: install.sh [--root DIR] [--module NAME] [--region NAME] [--name NAME]
-                  [--phase N | --from-phase N]
+                  [--phase N | --from-phase N] [--verbose]
        install.sh --list-phases [--json]
 
 $COMMON_USAGE
@@ -649,6 +652,7 @@ parse_install_args() {
   [[ -n $_MODULE_ARG ]] && RESUME_ARGS+=(--module "$_MODULE_ARG")
   [[ -n $_REGION_ARG ]] && RESUME_ARGS+=(--region "$_REGION_ARG")
   [[ -n $_NAME_ARG ]] && RESUME_ARGS+=(--name "$_NAME_ARG")
+  [[ $_VERBOSE_ARG == true ]] && RESUME_ARGS+=(--verbose)
   return 0
 }
 
@@ -697,6 +701,7 @@ main() {
   # acts on this root, and nothing is read relative to this script.
   resolve_root
   echo "==> Installing from $DEPLOYMENT_ROOT"
+  init_step_logs
 
   # Checked before the first apply of a run that will reach Phase 4, which is
   # where it is first needed — failing there leaves a half-built cluster. A run
@@ -736,10 +741,14 @@ main() {
   echo "==> Validating -target addresses against the configuration..."
   assert_targets_declared "${ALL_TARGETS[@]}"
 
+  # [3/8] is the phase's place in the whole install, not in this invocation, so
+  # `--phase 6` alone still reads as six of eight.
+  local last_phase
+  last_phase=$(phase_ids | tail -n 1)
   trap resume_hint EXIT
   for id in "${selected[@]}"; do
     CURRENT_PHASE=$id
-    echo "==> Phase $id: $(phase_field "$id" title)"
+    echo "==> [$id/$last_phase] Phase $id: $(phase_field "$id" title)"
     "$(phase_field "$id" function)"
   done
   CURRENT_PHASE=""

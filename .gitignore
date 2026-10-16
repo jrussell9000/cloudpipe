@@ -72,6 +72,13 @@ override.tf.json
 *.tfplan
 *tfplan*
 
+# Per-step Terraform logs from scripts/stack/install.sh and cleanup.sh, under
+# the deployment root (tf_step in scripts/stack/targets.sh). Each holds a full
+# apply or destroy, plan included, and a plan embeds prior state — the same
+# reason as the plan files above. The directory also writes its own `*`
+# .gitignore, for a root that lives in a deployer's repository instead.
+.install-logs/
+
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
