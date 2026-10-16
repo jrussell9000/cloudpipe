@@ -226,7 +226,7 @@ The workflows stage five things from `config/` in the data bucket, and a new buc
 
 | Object | What it is | Where you get it |
 |---|---|---|
-| `config/fslicense` | Your FreeSurfer license | Register free at [surfer.nmr.mgh.harvard.edu/registration.html](https://surfer.nmr.mgh.harvard.edu/registration.html). Licenses are issued per person, so no published file carries one. Give its absolute path as **FreeSurfer license file** (`freesurfer_license_path`) in step 3. The bootstrap command above then uploads it; only the path and the object's ETag reach Terraform state. Or leave that unset and upload it yourself: `aws s3 cp license.txt s3://<data bucket>/config/fslicense` |
+| `config/fslicense` | Your FreeSurfer license | Register free at [surfer.nmr.mgh.harvard.edu/registration.html](https://surfer.nmr.mgh.harvard.edu/registration.html). Licenses are issued per person, so no published file carries one. Give its absolute path as **Your FreeSurfer license file** (`freesurfer_license_path`) in step 3. The bootstrap command above then uploads it; only the path and the object's ETag reach Terraform state. Or leave that unset and upload it yourself: `aws s3 cp license.txt s3://<data bucket>/config/fslicense` |
 | `config/MNI152NLin2009cAsym_res-01_T1w_brain.nii` and `config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii` | The MNI152NLin2009cAsym brain templates | Seeded from TemplateFlow (below) |
 | `config/fsLR/` | Six fsLR surface meshes | Seeded from HCPpipelines v6.0.0 (below) |
 | `config/nss_volumes.csv` | Non-steady-state frames per session | Built from your own ABCD data (below) |
@@ -359,6 +359,8 @@ export CLOUDFLARE_API_TOKEN=...          # never echoed, never a Terraform varia
 bash <path-to-clone>/scripts/stack/install.sh --list-phases   # what it will do, and in what order
 bash <path-to-clone>/scripts/stack/install.sh                 # all eight phases, in order
 ```
+
+Each Terraform apply shows as one line: a progress bar of resources finished against the plan's total on a terminal, a start line and a finish line otherwise. The installer's own `==>` lines carry the outline. A full apply prints thousands of lines, and with all of them on screen the one error that matters scrolls out of view. Terraform's complete output goes to `.install-logs/<run>/` in your root instead, one numbered file per apply, and the installer prints that directory when it starts. If a step fails, the installer prints Terraform's error messages and the path of that step's log. Pass `--verbose` (or set `CLOUDPIPE_INSTALL_VERBOSE=1`) to stream Terraform's output as it runs; the log is still written. The logs contain plan output, so never commit them. The directory ignores itself, and your root's own repository should ignore `.install-logs/` too.
 
 One phase at a time is equally valid, and is the better way to run a first install: `--phase 1`, then `--phase 2`, and so on. A phase that fails prints the `--from-phase N` command that continues from it. Nothing is carried between invocations — each phase re-reads the deployment and re-checks what it depends on, and says which phase to run first if something is missing.
 

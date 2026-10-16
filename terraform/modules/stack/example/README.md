@@ -57,6 +57,13 @@ applied with `-target` first, then the add-ons, then the rest. The sequence, and
 why each phase is load-bearing, is in
 [Bootstrap and install sequence](../../../../docs/infrastructure.md).
 
+`install.sh` and `cleanup.sh` write each Terraform step's full output to
+`.install-logs/<run>/` in this directory. Never commit it: a log holds the plan,
+and a plan carries values from state. The directory writes its own `.gitignore`,
+but if your copy of this root is in a repository, add `.install-logs/` to that
+repository's `.gitignore` as well, so the rule does not depend on a file inside
+the directory it protects.
+
 Prerequisites the stack expects to already exist:
 
 - a Route53 hosted zone for `domain`;

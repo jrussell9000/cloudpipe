@@ -27,7 +27,7 @@
       "pattern": "^[a-z]{2}(-gov)?-[a-z]+-[0-9]$",
       "x-error-message": "region must be an AWS region id: two letters, a dash, a word, a dash, a digit.",
       "title": "AWS region",
-      "description": "Where this deployment runs. Choose a region close to you, or to wherever your imaging data already sits — every transfer between the data bucket and the cluster stays inside one region, so the two should match. Region ids look like eu-west-1 or ap-southeast-2; the full list is at https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-regions.html. Check EKS and the GPU instance types you want are offered there before committing: not every region has both.",
+      "description": "The AWS region to run in, for example eu-west-1 (Ireland) or ap-southeast-2 (Sydney). Choose the region where your imaging data is stored, or the one closest to you.\n\nKeeping the data and the processing in one region avoids transfer charges and delays. Not every region offers the GPU machines the pipeline uses, so check that yours does before you choose. All regions are listed at https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-regions.html.",
       "x-section": "aws",
       "x-source": "deployer-choice",
       "x-terraform-variable": "region"
@@ -37,8 +37,8 @@
       "pattern": "^[a-z][a-z0-9-]{1,18}[a-z0-9]$",
       "x-error-message": "name must be 3 to 20 characters: lowercase letters, digits and hyphens, starting with a letter and not ending in a hyphen.",
       "default": "cloudpipe",
-      "title": "Deployment name",
-      "description": "The prefix of every resource this deployment creates, and the name of its EKS cluster. Names in your AWS account only have to be unique within it, so the default is fine unless one account holds two deployments.\n\nS3 bucket names are global across every AWS account, so the buckets also carry a random suffix the wizard generates (bucket_suffix): <name>-<suffix>-metrics, and so on.\n\nAvoid aws, amazon and cognito anywhere in it: the Cognito sign-in domain starts with this name, and Cognito refuses a domain that contains them.",
+      "title": "Short name for this deployment",
+      "description": "A short name that labels everything the install creates in your AWS account: 3 to 20 lowercase letters, digits and hyphens, starting with a letter. The default is fine unless one AWS account will hold more than one deployment.\n\nStorage bucket names also get a random six-character code after this name, generated for you, because bucket names must be unique across all of AWS.\n\nAvoid the words aws, amazon and cognito anywhere in it: the sign-in page's web address starts with this name, and AWS refuses addresses that contain them.",
       "x-section": "aws",
       "x-source": "deployer-choice",
       "x-terraform-variable": "name"
@@ -47,8 +47,8 @@
       "type": "string",
       "pattern": "^([a-z0-9]{6})?$",
       "x-error-message": "bucket_suffix must be empty or exactly 6 lowercase letters and digits.",
-      "title": "S3 bucket name suffix",
-      "description": "Six random lowercase letters and digits that go into every S3 bucket name, after the deployment name. Bucket names are global across all AWS accounts, so without it two deployments with the same name collide, and anyone can claim a predictable name before you do.\n\nGenerated once and kept in the answers document, so every re-run and every machine you resume on uses the same buckets. Change it only before the bootstrap apply: once the buckets exist, a different suffix names buckets that do not.",
+      "title": "Random code in storage bucket names",
+      "description": "A random six-character code added to every storage bucket name. It is generated once and kept, so there is nothing to do.\n\nBucket names are global across all AWS accounts. Without the code, two deployments with the same name would collide, and anyone could claim a predictable name before you. It is kept in the answers file, so every re-run and every computer you resume on uses the same buckets. Change it only before the buckets are created (Step 4 of the deployer guide); afterwards a new code names buckets that do not exist.",
       "x-section": "aws",
       "x-source": "derived",
       "x-terraform-variable": "bucket_suffix",
@@ -63,8 +63,8 @@
       "pattern": "^[a-z0-9.-]+\\.[a-z]{2,}$",
       "x-error-message": "domain must be null (port-forward mode) or a bare DNS name with a TLD, e.g. example.org — no scheme and no trailing dot.",
       "x-null-meaning": "port-forward mode: no published web UIs, and no domain or hosted zone needed",
-      "title": "Service domain",
-      "description": "Where the web UIs are published, as <ui>.<domain> over WARP, or none. With a domain, a Route53 hosted zone for it must already exist in the account you are deploying into — ACM validates its certificates against that zone, so a domain you do not own fails at apply rather than here. `cloudpipe preflight` checks for the zone before you get that far.\n\nWith none, nothing is published: no load balancer, certificate or DNS record. Each UI is reached on a fixed localhost port with `pixi run --manifest-path <your clone>/pixi.toml cloudpipe ui <name>`, which port-forwards over WARP.\n\nA bare DNS name: no scheme, no trailing dot.",
+      "title": "Web address for the dashboards (or none)",
+      "description": "Type none unless you own a domain name that is set up in this AWS account (Route 53) and want the web dashboards at addresses like grafana.<your domain>. With none, you open each dashboard from your own computer with one command instead, which is the simpler choice.\n\nWith a domain: a Route 53 hosted zone for exactly that name must already exist in the account you are deploying into, and the domain's registrar must point at it, because the install proves you own the domain through it to get web certificates. Type the bare name, for example lab.example.org, with no https:// and no trailing dot. `cloudpipe preflight` checks that the zone exists.\n\nWith none, nothing is published at any address. You open a dashboard with `pixi run --manifest-path <your clone>/pixi.toml cloudpipe ui <name>`, while connected to WARP.",
       "x-section": "identity",
       "x-source": "deployer-choice",
       "x-terraform-variable": "domain"
@@ -78,8 +78,8 @@
       },
       "minItems": 1,
       "x-error-message": "operator_emails must hold at least one address: with none, no one can administer the deployment.",
-      "title": "Operator email addresses",
-      "description": "The people who run this deployment, as email addresses, comma-separated. They may enroll a WARP device and reach the cluster, they hold the administrator role in every web UI, and their email domains are the only ones the web UIs' sign-in admits.\n\nThe stack creates an Amazon Cognito user pool for them, with an authenticator app required as a second factor. It does not create the users: after the apply, each address needs `aws cognito-idp admin-create-user` against the pool the `cognito_user_pool_id` output names.",
+      "title": "Email addresses of the people who will run it",
+      "description": "The email address of each person who will operate this deployment, separated by commas, for example ana@example.edu, ben@example.edu. These people can sign in, connect to the cluster and administer the web dashboards.\n\nEach person gets a sign-in account with a password and an authenticator app (such as Google Authenticator or 1Password) as a second step. The install creates the sign-in system but not the accounts themselves: when it gets there, the installer prints the command to run for each person, and Step 8 of docs/deployer-first-hour.md explains it. The dashboards admit only the email domains listed here.",
       "x-section": "identity",
       "x-source": "deployer-choice",
       "x-terraform-variable": "operator_emails"
@@ -89,8 +89,8 @@
         "object",
         "null"
       ],
-      "title": "Institutional identity provider (optional)",
-      "description": "Your institution's single sign-on, federated into the Cognito user pool. Leave it out unless you have one: the pool on its own is a complete, compliant way to sign in.\n\nThis is the one input the wizard does not ask for, because its shape is your institution's rather than this tool's — and because arranging it takes a conversation with their identity team, not a line at a terminal. Write it into the answers document by hand; `cloudpipe setup` renders it and `cloudpipe preflight` checks it. See docs/deployer-first-hour.md, \"Signing in with your institution's identity provider\".\n\n`type` is \"saml\" (with `metadata_url`) or \"oidc\" (with `oidc_issuer` and `client_secret_id`, the name of a Secrets Manager secret you create by hand holding {\"clientID\": ..., \"clientSecret\": ...}).\n\n`mfa_evidence` is required and takes exactly one form, because Cognito adds no second factor of its own for a federated user: either `claim` and `claim_value`, a per-login claim the Cloudflare Access policy will then require, or `attestation`, a reference to their written policy for a provider that cannot assert one.",
+      "title": "Your institution's single sign-on (optional)",
+      "description": "Lets operators sign in with your institution's own single sign-on instead of a separate password. Leave it out unless you need it: sign-in works fully without it.\n\nThis is the one setting the wizard does not ask for, because its details belong to your institution and arranging it takes a conversation with their identity team. Write it into the answers file by hand; `cloudpipe setup` uses it and `cloudpipe preflight` checks it. See docs/deployer-first-hour.md, \"Signing in with your institution's identity provider\".\n\n`type` is \"saml\" (with `metadata_url`) or \"oidc\" (with `oidc_issuer` and `client_secret_id`, the name of a Secrets Manager secret you create by hand holding {\"clientID\": ..., \"clientSecret\": ...}).\n\n`mfa_evidence` is required and takes exactly one form, because Cognito adds no second factor of its own for a federated user: either `claim` and `claim_value`, a per-login claim the Cloudflare Access policy will then require, or `attestation`, a reference to their written policy for a provider that cannot assert one.",
       "x-section": "identity",
       "x-source": "identity-provider",
       "x-terraform-variable": "cognito_federation",
@@ -164,8 +164,8 @@
       "type": "string",
       "pattern": "^[^/]+/[^/]+$",
       "x-error-message": "github_repo must be in owner/repo format, with no scheme and no .git suffix.",
-      "title": "CI repository (owner/repo)",
-      "description": "The repository whose GitHub Actions runs may assume the ECR push and Packer AMI build roles. In owner/repo form: no scheme, no .git suffix.\n\nNot necessarily the repository ArgoCD syncs — see gitops_repo_url. CI can run in one repository while the cluster follows another, and in the reference deployment it does.",
+      "title": "GitHub repository allowed to build images (owner/name)",
+      "description": "The GitHub repository allowed to build and upload container images for this deployment, written as owner/name, for example your-lab/cloudpipe. Give your own fork of CloudPipe, even if you never build images: the install needs a repository here, and nothing breaks if it never builds.\n\nGive a repository you control, not someone else's: GitHub Actions runs on its main branch can upload images into your AWS account. Type it without https:// and without .git.\n\nThis does not have to be the repository the cluster follows, which is the next question. They are usually the same.",
       "x-section": "source-control",
       "x-source": "source-control-host",
       "x-terraform-variable": "github_repo"
@@ -174,8 +174,8 @@
       "type": "string",
       "pattern": "^https://",
       "x-error-message": "gitops_repo_url must be an https clone URL — ArgoCD reads it without a credential here.",
-      "title": "GitOps repository clone URL",
-      "description": "The repository ArgoCD reads gitops/apps/ from, and that every generated Application tracks. An https clone URL: ArgoCD reads it without a credential, so an ssh URL does not work.\n\nDeliberately separate from github_repo, which scopes the GitHub Actions trust policy. These may name the same repository or different ones.",
+      "title": "Repository the cluster follows (its web address)",
+      "description": "The https address of the repository the cluster takes its configuration from, for example https://github.com/your-lab/cloudpipe. Usually your fork of CloudPipe. The cluster keeps itself in step with this repository, so changes merged there are applied automatically.\n\nIt must be an https address, not an ssh one (git@...). A public repository needs no password; for a private one, see docs/deployer-first-hour.md, \"If your GitOps repository is private\".",
       "x-section": "source-control",
       "x-source": "source-control-host",
       "x-terraform-variable": "gitops_repo_url"
@@ -184,8 +184,8 @@
       "type": "string",
       "pattern": "^https://",
       "x-error-message": "github_user_url must be an https URL.",
-      "title": "Repository owner URL",
-      "description": "The owner's https URL — the organization or user page above your repositories. Used to scope the ArgoCD repository credential so that one credential covers every repository beneath it rather than one per repository.",
+      "title": "GitHub account or organization that owns it",
+      "description": "The https address of the GitHub user or organization that owns the repository above, for example https://github.com/your-lab.\n\nUsed so that one access setting covers every repository under that owner, rather than one per repository.",
       "x-section": "source-control",
       "x-source": "source-control-host",
       "x-terraform-variable": "github_user_url"
@@ -197,8 +197,8 @@
       },
       "minItems": 1,
       "x-error-message": "github_oidc_allowed_subs must not be empty: an empty list trusts nothing and every build loses its credentials.",
-      "title": "GitHub Actions OIDC subject claims",
-      "description": "The exact `token.actions.githubusercontent.com:sub` claim values allowed to assume the GitHub Actions roles. Derived from github_repo as main-branch runs only, which covers every workflow that assumes those roles today.\n\nOverride it when you need one of three things, all of which the stack's own variable documents: a non-main branch, temporarily, to test a build workflow before merging it; a job that sets a GitHub `environment:`, which mints repo:<repo>:environment:<name> and would NOT match a ref-shaped entry; or a wildcard, since the trust policy uses StringLike and `*` is a wildcard in these values.\n\nAn entry that matches nothing is not an error anywhere: the job simply loses its credentials. That is why this is derived rather than typed.",
+      "title": "Which GitHub Actions runs may build images",
+      "description": "Which GitHub Actions runs may use the image-building permissions: runs on the main branch of the repository you gave. Worked out for you, so there is nothing to do.\n\nThese are the exact `token.actions.githubusercontent.com:sub` claim values allowed to assume the GitHub Actions roles. Override it when you need one of three things, all of which the stack's own variable documents: a non-main branch, temporarily, to test a build workflow before merging it; a job that sets a GitHub `environment:`, which mints repo:<repo>:environment:<name> and would NOT match a ref-shaped entry; or a wildcard, since the trust policy uses StringLike and `*` is a wildcard in these values.\n\nAn entry that matches nothing is not an error anywhere: the job simply loses its credentials. That is why this is worked out rather than typed.",
       "x-section": "source-control",
       "x-source": "derived",
       "x-terraform-variable": "github_oidc_allowed_subs",
@@ -213,7 +213,7 @@
       "pattern": "^[0-9a-f]{32}$",
       "x-error-message": "cloudflare_account_id must be the 32-character hex account id from the Cloudflare dashboard.",
       "title": "Cloudflare account ID",
-      "description": "The account this deployment builds in: 32 lowercase hex characters, not your login email. Quickest way to get it: in the Cloudflare dashboard press Cmd/Ctrl+K, type 'Copy account ID', and select the result — it copies to your clipboard. It is also under Workers & Pages > Account Details, with a copy button. If you already have the API token exported, `curl -s https://api.cloudflare.com/client/v4/accounts -H \"Authorization: Bearer $CLOUDFLARE_API_TOKEN\"` lists every account the token can see, which also confirms the token is scoped to the one you mean.",
+      "description": "The 32-character ID of the Cloudflare account to use (digits and the letters a to f), not your login email. In the Cloudflare dashboard, press Cmd/Ctrl+K, type 'Copy account ID' and choose it: the ID is copied to your clipboard.\n\nUse a Cloudflare account for this deployment alone. Several of its settings exist once per account, so two deployments sharing one would overwrite each other. The ID is also shown under Workers & Pages > Account Details. If your API token is already exported, `curl -s https://api.cloudflare.com/client/v4/accounts -H \"Authorization: Bearer $CLOUDFLARE_API_TOKEN\"` lists the accounts it can reach, which also confirms it is the right one.",
       "x-section": "cloudflare",
       "x-source": "cloudflare-dashboard",
       "x-terraform-variable": "cloudflare_account_id"
@@ -222,8 +222,8 @@
       "type": "string",
       "pattern": "\\.cloudflareaccess\\.com$",
       "x-error-message": "cloudflare_team_domain must end in .cloudflareaccess.com.",
-      "title": "Zero Trust team domain",
-      "description": "The host your operators sign in at: <team name>.cloudflareaccess.com.\n\nZero Trust has to be turned on in this Cloudflare account before the install, and only the dashboard can do that: Terraform updates the Zero Trust organization but cannot create one. If it is not on yet, open Zero Trust from the account's sidebar. Cloudflare asks you to choose a team name and a plan (Free asks for payment details and charges nothing). Your answer here is that team name followed by .cloudflareaccess.com. If Zero Trust is already on, give the team domain the account already has; the Zero Trust dashboard shows it under Settings.\n\nIt becomes the organization's auth_domain, so it appears in every URL WARP and the browser send people to. docs/deployer-first-hour.md, \"The Cloudflare account and its token\", covers the same step.",
+      "title": "Cloudflare Zero Trust team address",
+      "description": "Your Zero Trust team name followed by .cloudflareaccess.com, for example my-lab.cloudflareaccess.com. You chose the team name when you turned on Zero Trust in the Cloudflare dashboard; it is shown under Zero Trust > Settings.\n\nIf Zero Trust is not on yet: open Zero Trust from the account's sidebar, choose a team name, then the Free plan. Cloudflare asks for payment details even for Free, and charges nothing. Only the dashboard can do this step; the install cannot do it for you.\n\nEveryone's sign-in goes through this address, so it appears in every link WARP and the browser use. docs/deployer-first-hour.md, \"The Cloudflare account and its token\", covers the same step.",
       "x-section": "cloudflare",
       "x-source": "cloudflare-dashboard",
       "x-terraform-variable": "cloudflare_team_domain"
@@ -231,8 +231,8 @@
     "cloudflare_team_name": {
       "type": "string",
       "minLength": 1,
-      "title": "Zero Trust organization name",
-      "description": "A label for the Zero Trust organization — choose one, there is nothing to look up. The deployment's own name is a good answer.\n\nTerraform sets this on the organization, so whatever you give replaces the placeholder Cloudflare generated when Zero Trust was first enabled. That placeholder often looks like a domain, which is not the team domain above — the two are separate fields. No pattern is checked because any readable string is valid.",
+      "title": "A display name for your Zero Trust team",
+      "description": "Any readable label, for example your lab's name. There is nothing to look up.\n\nThe install sets it on your Zero Trust organization, replacing the placeholder name Cloudflare created when Zero Trust was turned on. That placeholder can look like a web address, but it is not the team address of the previous question.",
       "x-section": "cloudflare",
       "x-source": "cloudflare-dashboard",
       "x-terraform-variable": "cloudflare_team_name"
@@ -241,8 +241,8 @@
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
       "x-error-message": "state_bucket must be a valid S3 bucket name.",
-      "title": "Terraform state bucket",
-      "description": "The S3 bucket holding this deployment's Terraform state, derived as <name>-<bucket_suffix>-terraform-state. It must exist before the first `terraform init`, and nothing here creates an AWS resource: the closing output prints the bootstrap command that creates it, versioned and with public access blocked.\n\nThe stack's CloudTrail data events watch the bucket by its derived name. Override this only to use a state bucket you already have, and then set terraform_state_bucket to the same name in a `.auto.tfvars` file, or the trail watches a bucket that does not exist. Use a bucket dedicated to state, not the data bucket. `cloudpipe setup --no-backend` skips the backend file entirely if you manage state another way.",
+      "title": "Storage bucket for the install's records",
+      "description": "The storage bucket where the install keeps its record of what it has built (Terraform's \"state\"). It is named for you, <name>-<code>-terraform-state, so there is nothing to do. The bucket itself is created in Step 4 of the deployer guide.\n\nOverride it only to use a state bucket you already have, and then also set terraform_state_bucket to the same name in a `.auto.tfvars` file, or the audit trail watches a bucket that does not exist. Use a bucket kept for this purpose alone, not the data bucket. `cloudpipe setup --no-backend` skips this entirely if you keep the record another way.",
       "x-section": "terraform-state",
       "x-source": "derived",
       "x-terraform-variable": null,
@@ -257,8 +257,8 @@
       "type": "string",
       "minLength": 1,
       "default": "cloudpipe/terraform.tfstate",
-      "title": "Terraform state key",
-      "description": "The object key the state is written to inside the bucket. The default is fine unless the bucket holds state for more than one deployment, in which case give each its own key — two roots sharing one key overwrite each other's state.",
+      "title": "Name of the record inside that bucket",
+      "description": "Press Enter to keep the default. Change it only if one bucket will hold the records of more than one deployment.\n\nTwo deployments using the same name here would overwrite each other's record.",
       "x-section": "terraform-state",
       "x-source": "deployer-choice",
       "x-terraform-variable": null
@@ -268,8 +268,8 @@
         "string",
         "null"
       ],
-      "title": "FreeSurfer license file",
-      "description": "The absolute path to your FreeSurfer license file, the license.txt FreeSurfer emails you after free registration at https://surfer.nmr.mgh.harvard.edu/registration.html. Every FreeSurfer and FastSurfer step needs it, and licenses are issued per person, so no published file carries one.\n\nOnly the path is recorded. The wizard checks the file locally (it exists and is shaped like a license) and never reads its contents into the answers document or prints them. The bootstrap command passes the path to the bootstrap root, which uploads the file to config/fslicense in the data bucket; Terraform state keeps the path and the object's ETag, not the license.",
+      "title": "Your FreeSurfer license file",
+      "description": "The full path to the license.txt file FreeSurfer emailed you, for example /home/you/license.txt. Registration is free at https://surfer.nmr.mgh.harvard.edu/registration.html. Press Enter to skip it and upload the file yourself later.\n\nThe brain-segmentation steps need it, and licenses are issued per person, so CloudPipe cannot ship one. The wizard checks that the file exists and looks like a license, but never copies its contents into your answers or prints them. The bootstrap step (Step 4 of the deployer guide) uploads it to your data bucket.",
       "x-section": "reference-data",
       "x-source": "deployer-choice",
       "x-terraform-variable": null,
@@ -282,27 +282,27 @@
       "x-order": [
         {
           "identifier": "aws",
-          "title": "AWS"
+          "title": "Your AWS account"
         },
         {
           "identifier": "identity",
-          "title": "Identity"
+          "title": "Sign-in and the web dashboards"
         },
         {
           "identifier": "source-control",
-          "title": "Source control"
+          "title": "Your code repository"
         },
         {
           "identifier": "cloudflare",
-          "title": "Cloudflare Zero Trust"
+          "title": "Cloudflare (secure remote access)"
         },
         {
           "identifier": "terraform-state",
-          "title": "Terraform state"
+          "title": "Where the install keeps its records"
         },
         {
           "identifier": "reference-data",
-          "title": "Reference data"
+          "title": "FreeSurfer license"
         }
       ]
     },

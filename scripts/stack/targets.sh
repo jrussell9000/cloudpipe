@@ -45,6 +45,9 @@ _ROOT_ARG=""
 _MODULE_ARG=""
 _REGION_ARG=""
 _NAME_ARG=""
+# Whether --verbose was on the command line, rather than in the environment, so
+# install.sh's resume line can repeat it.
+_VERBOSE_ARG=false
 
 # Arguments parse_common_args did not recognise, for the caller to handle.
 COMMON_ARGS_REST=()
@@ -55,7 +58,10 @@ COMMON_USAGE="  --root DIR     The Terraform root to act on (default: the curren
   --region NAME  The deployment's AWS region, when \`terraform output -raw region\`
                  cannot supply it yet.
   --name NAME    The EKS cluster's name, when \`terraform output -raw cluster_name\`
-                 cannot supply it yet."
+                 cannot supply it yet.
+  --verbose      Stream Terraform's full output instead of one progress line per
+                 apply or destroy (also CLOUDPIPE_INSTALL_VERBOSE=1). Either way
+                 the full output is logged under <root>/.install-logs/."
 
 # Fail with one of the codes above. The message goes to stderr, because stdout
 # carries the Terraform output a caller may be piping.
@@ -89,6 +95,11 @@ parse_common_args() {
           --region) _REGION_ARG=$value ;;
           --name) _NAME_ARG=$value ;;
         esac
+        shift
+        ;;
+      --verbose)
+        CLOUDPIPE_INSTALL_VERBOSE=1
+        _VERBOSE_ARG=true
         shift
         ;;
       *)
@@ -426,4 +437,323 @@ reversed() {
   for ((i = $#; i > 0; i--)); do
     printf '%s\n' "${!i}"
   done
+}
+
+# ---------------------------------------------------------------------------
+# How Terraform's output is shown
+# ---------------------------------------------------------------------------
+#
+# Every `terraform apply` and `terraform destroy` in both scripts runs through
+# `tf_step`. A first install is about twenty of them, and streamed in full they
+# are thousands of lines per phase: the scripts' own `==>` lines, which are the
+# outline someone actually follows, scroll away, and the one `Error:` that
+# matters is somewhere above. So by default each step is ONE line — a progress
+# bar on a terminal, a start and a finish line otherwise — and the complete
+# output goes to a log file per step under <root>/.install-logs/<run>/. A failed
+# step prints Terraform's own error blocks and the log's path.
+#
+# `--verbose`, or CLOUDPIPE_INSTALL_VERBOSE=1, streams Terraform's output as
+# before, and still writes the log. The stream used to go through
+# `| tee /dev/tty`, which printed every line twice on a terminal (once to the
+# tty, once to stdout) and, with no controlling terminal at all, made tee exit
+# non-zero — so under pipefail every apply "failed". It now goes to stdout once.
+#
+# tests/test_installer_tf_step.py drives this against a fake `terraform`, and
+# holds every apply and destroy in scripts/stack/ to going through it.
+
+# Set by `--verbose` (parse_common_args) or exported by the caller.
+CLOUDPIPE_INSTALL_VERBOSE=${CLOUDPIPE_INSTALL_VERBOSE:-}
+
+# The per-run log directory, created by init_step_logs, and how many steps have
+# written into it — which numbers the files in the order they ran.
+STEP_LOG_DIR=""
+STEP_COUNT=0
+
+step_verbose() {
+  [[ -n $CLOUDPIPE_INSTALL_VERBOSE && $CLOUDPIPE_INSTALL_VERBOSE != 0 ]]
+}
+
+# Create this run's log directory and say where it is, once.
+#
+# Under the deployment root because that is where an operator already is, and
+# where the state the logs describe belongs. The logs hold plan output, which
+# carries attribute values from state, so the directory is private to the user
+# and carries its own `.gitignore` of `*`: a deployer's root lives in their own
+# repository, whose ignore rules this repository's .gitignore cannot reach.
+init_step_logs() {
+  [[ -n $STEP_LOG_DIR ]] && return 0
+  local base="${DEPLOYMENT_ROOT:-$PWD}/.install-logs" run dir i=1
+  run=$(date -u +%Y%m%dT%H%M%SZ)
+  (umask 077 && mkdir -p "$base") ||
+    fail "$EXIT_ERROR" "ERROR: could not create the log directory $base."
+  [[ -f $base/.gitignore ]] || printf '# Written by scripts/stack/targets.sh. Never commit these logs.\n*\n' \
+    >"$base/.gitignore"
+  # Two runs in the same second get a suffix rather than one log directory.
+  dir="$base/$run"
+  until (umask 077 && mkdir "$dir" 2>/dev/null); do
+    [[ $i -le 20 ]] || fail "$EXIT_ERROR" "ERROR: could not create a log directory under $base."
+    dir="$base/$run-$i"
+    i=$((i + 1))
+  done
+  STEP_LOG_DIR=$dir
+  echo "==> Full Terraform output for this run is logged under $STEP_LOG_DIR"
+}
+
+# Run one Terraform command as a step: tf_step "<label>" terraform apply ...
+#
+# Returns the command's own exit status, unchanged, so a caller's `if` and the
+# scripts' `set -e` see exactly what they saw before. Callers rely on that: an
+# apply_target failure prints FAILED, and an unguarded one ends the run and
+# prints install.sh's `--from-phase N` line.
+tf_step() {
+  local label=$1
+  shift
+  init_step_logs
+  STEP_COUNT=$((STEP_COUNT + 1))
+
+  # The subcommand (apply, destroy) goes in the file name, so a directory
+  # listing reads as what ran.
+  local verb="" arg
+  for arg in "${@:2}"; do
+    if [[ $arg != -* ]]; then
+      verb=$arg
+      break
+    fi
+  done
+  local log
+  printf -v log '%s/%02d-%s.log' "$STEP_LOG_DIR" "$STEP_COUNT" "$(_step_slug "${verb:+$verb }$label")"
+
+  local start=$SECONDS rc=0
+  if step_verbose; then
+    # The `if` keeps a failure from tripping `set -e` here, and PIPESTATUS[0] is
+    # the command's status: a tee that could not write the log must not turn a
+    # good apply into a failed one, nor a failed one into a good one.
+    if "$@" 2>&1 | tee "$log"; then rc=0; else rc=${PIPESTATUS[0]}; fi
+    return "$rc"
+  fi
+
+  local spinner_pid="" running="" cols
+  : >"$log"
+  if [[ -t 1 ]]; then
+    cols=$(_term_cols)
+    running=$(mktemp "${TMPDIR:-/tmp}/tf_step.XXXXXX")
+    _step_progress "$label" "$log" "$running" "$start" "$cols" "$BASHPID" &
+    spinner_pid=$!
+  else
+    printf '  → %s\n' "$label"
+  fi
+
+  # Terraform runs in the foreground, so Ctrl-C reaches it and it can release
+  # the state lock; only the progress line runs in the background. TF_INPUT=0
+  # because a prompt would be written to the log, where nobody can see it, and
+  # the step would wait for an answer forever — this makes it an error, which
+  # the summary below shows, instead.
+  if TF_INPUT=0 "$@" >"$log" 2>&1; then rc=0; else rc=$?; fi
+
+  if [[ -n $spinner_pid ]]; then
+    rm -f "$running"
+    wait "$spinner_pid" 2>/dev/null || true
+    printf '\r\033[K'
+  fi
+
+  local done_n total nochange elapsed counts
+  read -r done_n total nochange < <(_step_counts "$log")
+  elapsed=$(_fmt_elapsed $((SECONDS - start)))
+  if [[ $total -ge 0 ]]; then
+    counts="$done_n/$total changed"
+  else
+    counts="$done_n changed"
+  fi
+  if [[ $rc -eq 0 ]]; then
+    if [[ $nochange -eq 1 && $done_n -eq 0 ]] || [[ $total -eq 0 && $done_n -eq 0 ]]; then
+      counts="no changes"
+    fi
+    printf '  ✓ %s  %s  %s\n' "$label" "$counts" "$elapsed"
+    _step_warnings "$log"
+  else
+    if [[ $done_n -gt 0 || $total -gt 0 ]]; then
+      printf '  ✗ %s  failed after %s  (%s)\n' "$label" "$elapsed" "$counts"
+    else
+      printf '  ✗ %s  failed after %s\n' "$label" "$elapsed"
+    fi
+    _step_errors "$log"
+    printf '    Full log: %s\n' "$log"
+  fi
+  return "$rc"
+}
+
+# A file-name-safe form of a label: `apply module.vpc` -> `apply-module-vpc`.
+_step_slug() {
+  local s=${1,,}
+  s=$(printf '%s' "$s" | tr -cs 'a-z0-9' '-')
+  s=${s#-}
+  s=${s:0:60}
+  s=${s%-}
+  printf '%s' "${s:-step}"
+}
+
+# 45s, 4m12s, 1h03m.
+_fmt_elapsed() {
+  local s=$1
+  if [[ $s -lt 60 ]]; then
+    printf '%ds' "$s"
+  elif [[ $s -lt 3600 ]]; then
+    printf '%dm%02ds' $((s / 60)) $((s % 60))
+  else
+    printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+  fi
+}
+
+_term_cols() {
+  local c=${COLUMNS:-}
+  [[ $c =~ ^[0-9]+$ ]] || c=$(tput cols 2>/dev/null || true)
+  [[ $c =~ ^[0-9]+$ && $c -ge 40 ]] || c=80
+  printf '%s' "$c"
+}
+
+# Three numbers from a step's log, as far as it has been written:
+#   - resources finished: Terraform's `<addr>: Creation|Modifications|
+#     Destruction complete after ...` lines. A replacement is two of them, and
+#     two in the plan's total too (one to add, one to destroy);
+#   - the plan's total, X+Y+Z of `Plan: X to add, Y to change, Z to destroy.`,
+#     or -1 before that line has appeared (still refreshing and planning).
+#     Imports and forgets are left out: they print no "complete after" line;
+#   - 1 if Terraform said `No changes.`.
+# Terraform colours its output even into a file, so escapes are stripped first.
+_step_counts() {
+  awk '
+    function n(s, what) {
+      if (match(s, "[0-9]+ to " what)) return substr(s, RSTART, RLENGTH) + 0
+      return 0
+    }
+    BEGIN { esc = sprintf("%c", 27); ansi = esc "\\[[0-9;]*[A-Za-z]"; total = -1 }
+    { gsub(ansi, "") }
+    /: (Creation|Modifications|Destruction) complete after / { done++ }
+    total < 0 && /^Plan: [0-9]+ to / { total = n($0, "add") + n($0, "change") + n($0, "destroy") }
+    /^No changes\./ { nochange = 1 }
+    END { printf "%d %d %d\n", done, total, nochange }
+  ' "$1" 2>/dev/null || echo "0 -1 0"
+}
+
+# Terraform's `Error:` diagnostics from a step's log: each box from its
+# `│ Error:` line through the closing `╵`, once each — the same diagnostic is
+# often printed more than once — and at most three, then how many more there
+# were. When there is no such block (a crash, or a failure before Terraform
+# could say why), the last lines of the log instead, so a failure is never
+# reported with nothing to go on.
+_step_errors() {
+  local log=$1 found
+  found=$(awk -v max=3 '
+    BEGIN { esc = sprintf("%c", 27); ansi = esc "\\[[0-9;]*[A-Za-z]" }
+    function flush() {
+      if (inblk && !(blk in seen)) { seen[blk] = 1; kept++; if (kept <= max) out[kept] = blk }
+      blk = ""; inblk = 0; lines = 0
+    }
+    { gsub(ansi, "") }
+    /^(│ )?Error: / { flush(); inblk = 1; blk = $0 "\n"; lines = 1; next }
+    inblk && /^╵/ { blk = blk $0 "\n"; flush(); next }
+    inblk && /^(│ )?Warning: / { flush(); next }
+    inblk && lines < 40 { blk = blk $0 "\n"; lines++ }
+    END {
+      flush()
+      for (i = 1; i <= kept && i <= max; i++) printf "%s", out[i]
+      if (kept > max) printf "… %d more errors\n", kept - max
+    }
+  ' "$log" 2>/dev/null || true)
+  if [[ -n $found ]]; then
+    printf '%s\n' "$found" | sed 's/^/    /'
+  else
+    echo "    Terraform printed no Error: block. The last lines of its output:"
+    tail -n 15 "$log" | sed 's/^/    /'
+  fi
+}
+
+# One line per distinct Terraform `Warning:` title, e.g. "Check block assertion
+# failed". A warning does not fail a step, which is exactly why it is easy to
+# miss when the rest of the output is in a file.
+#
+# Except the two Terraform prints on EVERY `-target` apply, "Resource targeting
+# is in effect" and "Applied changes may be incomplete": the phases target on
+# purpose, so those say nothing about this step, and printed after each of
+# twenty-odd steps they would bury the warning that does. Matched on the whole
+# title, so a different warning is never hidden. They stay in the log, and
+# --verbose shows everything.
+_step_warnings() {
+  awk '
+    BEGIN {
+      esc = sprintf("%c", 27); ansi = esc "\\[[0-9;]*[A-Za-z]"
+      seen["Resource targeting is in effect"] = 1
+      seen["Applied changes may be incomplete"] = 1
+    }
+    { gsub(ansi, "") }
+    /^(│ )?Warning: / {
+      t = $0; sub(/^(│ )?Warning: */, "", t); sub(/[ \t]+$/, "", t)
+      if (!(t in seen)) { seen[t] = 1; printf "    ! Warning: %s\n", t }
+    }
+  ' "$1" 2>/dev/null || true
+}
+
+# The live line, redrawn in place until the step's marker file is removed (or
+# the script that started it is gone). Before Terraform prints its plan there is
+# nothing to measure against, so it says "planning…"; after, a bar of resources
+# finished against the plan's total. The bar is clamped at full because a
+# replacement can finish more "complete" lines than a careless total expects;
+# the numbers beside it stay raw.
+#
+# Always run in the background, so `set -e` is dropped: a failed read here must
+# cost a frame, not the progress line.
+_step_progress() {
+  set +e
+  local label=$1 log=$2 running=$3 start=$4 cols=$5 parent=$6
+  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 done_n total nochange el line
+  while [[ -e $running ]] && kill -0 "$parent" 2>/dev/null; do
+    read -r done_n total nochange < <(_step_counts "$log")
+    el=$(_fmt_elapsed $((SECONDS - start)))
+    line=$(_step_line "${frames[i % ${#frames[@]}]}" "$label" "$done_n" "$total" "$el" "$cols")
+    printf '\r\033[K%s' "$line"
+    i=$((i + 1))
+    sleep 0.2
+  done
+}
+
+# One frame of the live line, fitted to `cols` columns: the label is shortened
+# from the left with an ellipsis (the end of an address is the part that tells
+# one target from the next), and the bar narrows only if that is not enough.
+_step_line() {
+  local frame=$1 label=$2 done_n=$3 total=$4 el=$5 cols=$6
+  local bw=20 counts tail fixed lw filled bar_full bar_empty
+  if [[ $total -lt 0 ]]; then
+    tail="planning…"
+    fixed=$((4 + 2 + 9 + 2 + ${#el}))
+    lw=$((cols - 1 - fixed))
+    printf '  %s %s  %s  %s' "$frame" "$(_fit_label "$label" "$lw")" "$tail" "$el"
+    return 0
+  fi
+  counts="$done_n/$total"
+  fixed=$((4 + 2 + 2 + 2 + ${#counts} + 2 + ${#el}))
+  lw=$((cols - 1 - fixed - bw))
+  if [[ $lw -lt 16 ]]; then
+    bw=$((bw - (16 - lw)))
+    [[ $bw -ge 5 ]] || bw=5
+    lw=$((cols - 1 - fixed - bw))
+  fi
+  if [[ $total -le 0 || $done_n -ge $total ]]; then
+    filled=$bw
+  else
+    filled=$((done_n * bw / total))
+  fi
+  printf -v bar_full '%*s' "$filled" ''
+  printf -v bar_empty '%*s' $((bw - filled)) ''
+  printf '  %s %s  [%s%s]  %s  %s' "$frame" "$(_fit_label "$label" "$lw")" \
+    "${bar_full// /█}" "${bar_empty// /░}" "$counts" "$el"
+}
+
+_fit_label() {
+  local label=$1 width=$2
+  [[ $width -ge 4 ]] || width=4
+  if [[ ${#label} -le $width ]]; then
+    printf '%s' "$label"
+  else
+    printf '…%s' "${label: -$((width - 1))}"
+  fi
 }

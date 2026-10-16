@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -161,6 +162,20 @@ def https_access_token(auth_client: Any, refresh_token: str, collection_id: str)
     return str(tokens["access_token"])
 
 
+# What the source's operators see in their logs. Named, so the traffic is never an
+# anonymous AWS address; the contact is the deployment's (cloudpipe-config
+# `ingress_contact`), and is left off when unset or not a plain address.
+USER_AGENT_PRODUCT = "cloudpipe-https-ingress/1"
+_CONTACT_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$")
+
+
+def user_agent(contact: str | None) -> str:
+    contact = (contact or "").strip()
+    if contact and _CONTACT_RE.match(contact):
+        return f"{USER_AGENT_PRODUCT} (contact: {contact})"
+    return USER_AGENT_PRODUCT
+
+
 def rclone_command(
     *,
     https_server: str,
@@ -169,6 +184,7 @@ def rclone_command(
     bucket: str,
     dest_prefix: str,
     region: str,
+    contact: str | None = None,
 ) -> list[str]:
     """The copy, with no secret in it: the token goes in rclone_env()."""
     dest = f":s3,env_auth,provider=AWS,region={region},no_check_bucket:{bucket}/{dest_prefix}/"
@@ -205,6 +221,8 @@ def rclone_command(
         "--stats",
         "30s",
         "--stats-one-line",
+        "--user-agent",
+        user_agent(contact),
         "-v",
     ]
 
@@ -318,6 +336,7 @@ def run(
             bucket=args.dest_bucket,
             dest_prefix=dest_prefix,
             region=env["AWS_DEFAULT_REGION"],
+            contact=env.get("INGRESS_CONTACT"),
         )
         log(f"Copying {len(sizes)} file(s), {sum(sizes.values()) / 2**30:.2f} GiB, over HTTPS.")
         result = runner(command, env=rclone_env(token, env), check=False)
