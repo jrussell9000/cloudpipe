@@ -92,6 +92,12 @@ variable "ecr_registry" {
   type        = string
 }
 
+variable "ingress_contact" {
+  description = "Contact address the HTTPS ingress puts in its User-Agent (cloudpipe-config `ingress_contact`), so the source collection's operators can reach this deployment. Empty leaves the key unset and the User-Agent without an address."
+  type        = string
+  default     = ""
+}
+
 ################################################################################
 # Argo Workflows — service account names
 ################################################################################

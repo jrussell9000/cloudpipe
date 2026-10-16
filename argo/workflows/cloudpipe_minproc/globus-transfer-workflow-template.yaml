@@ -166,7 +166,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:39d3318b50bd627ced3d1f380daa1eff44f9879e3b70104b1866d3b1c2a3c05b"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:afbba392ba404ba0ce9be794a9bf792a3c97c7dbb3d57abe10bf6de7062f6ba9"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -273,7 +273,7 @@ spec:
     container:
       # The same image and digest as globus-transfer-template: the HTTPS step
       # imports transfer.py's listing, and the pin job rewrites both lines.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:39d3318b50bd627ced3d1f380daa1eff44f9879e3b70104b1866d3b1c2a3c05b"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:afbba392ba404ba0ce9be794a9bf792a3c97c7dbb3d57abe10bf6de7062f6ba9"
       imagePullPolicy: IfNotPresent
 
       # Plan 018 §7: one subject peaked at 1,118 MiB, about 8.4 CPU-s per GiB
@@ -294,6 +294,15 @@ spec:
             configMapKeyRef:
               name: cloudpipe-config
               key: region
+        # The contact in rclone's User-Agent, so the source's operators can
+        # reach us about this traffic. Optional: without it the User-Agent
+        # still names cloudpipe, just with no address.
+        - name: INGRESS_CONTACT
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: ingress_contact
+              optional: true
         - name: GLOBUS_NATIVE_APP_CLIENT_ID
           valueFrom:
             secretKeyRef:

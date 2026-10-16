@@ -243,14 +243,18 @@ def _help(emitter: Emitter, style: _Style, field: schema.Field, *, full: bool = 
 
 
 def _preamble(emitter: Emitter, style: _Style, *, total: int) -> None:
-    emitter.note(style.bold(f"Collecting {total} values for a CloudPipe deployment."))
+    emitter.note(style.bold(f"{total} questions to set up your CloudPipe deployment."))
     emitter.note(
-        f"  Press Enter to accept a value in brackets. Type {HELP_TOKEN} for more help on a "
-        f"field, or {SKIP_TOKEN} to stop and come back."
+        f"  Press Enter to keep the value shown in brackets. Type {HELP_TOKEN} after a question "
+        f"for more about it, or {SKIP_TOKEN} to stop and come back later; your answers are saved "
+        "as you go."
     )
-    emitter.note("  Nothing is created in any cloud account, and no credential is asked for.")
     emitter.note(
-        "  The Globus values are not here: `globus init` owns them and renders them separately."
+        "  Answering creates nothing in AWS or Cloudflare, and no password or key is asked for."
+    )
+    emitter.note(
+        "  Settings for the optional Globus data transfer are not asked here; a separate tool, "
+        "`globus init`, covers them."
     )
 
 
@@ -310,13 +314,13 @@ def _skipped(field: schema.Field) -> CliError:
 #: the schema's own enum, so a new source value fails loudly here rather than
 #: being shown as a bare identifier.
 _SOURCE_LABELS = {
-    "aws-console": "Look this up in the AWS console.",
-    "cloudflare-dashboard": "Look this up in the Cloudflare dashboard.",
-    "identity-provider": "Your identity provider's administrator knows this.",
-    "source-control-host": "This comes from your source-control host.",
-    "institution": "This comes from your institution.",
-    "deployer-choice": "This one is yours to decide.",
-    "derived": "Computed from another answer.",
+    "aws-console": "You can find this in the AWS console.",
+    "cloudflare-dashboard": "You can find this in the Cloudflare dashboard.",
+    "identity-provider": "Your institution's sign-in (identity) team can tell you this.",
+    "source-control-host": "This comes from GitHub, or wherever your code is hosted.",
+    "institution": "Your institution can tell you this.",
+    "deployer-choice": "Your choice.",
+    "derived": "Worked out for you.",
 }
 
 

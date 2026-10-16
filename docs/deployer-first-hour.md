@@ -226,7 +226,7 @@ The workflows stage five things from `config/` in the data bucket, and a new buc
 
 | Object | What it is | Where you get it |
 |---|---|---|
-| `config/fslicense` | Your FreeSurfer license | Register free at [surfer.nmr.mgh.harvard.edu/registration.html](https://surfer.nmr.mgh.harvard.edu/registration.html). Licenses are issued per person, so no published file carries one. Give its absolute path as **FreeSurfer license file** (`freesurfer_license_path`) in step 3. The bootstrap command above then uploads it; only the path and the object's ETag reach Terraform state. Or leave that unset and upload it yourself: `aws s3 cp license.txt s3://<data bucket>/config/fslicense` |
+| `config/fslicense` | Your FreeSurfer license | Register free at [surfer.nmr.mgh.harvard.edu/registration.html](https://surfer.nmr.mgh.harvard.edu/registration.html). Licenses are issued per person, so no published file carries one. Give its absolute path as **Your FreeSurfer license file** (`freesurfer_license_path`) in step 3. The bootstrap command above then uploads it; only the path and the object's ETag reach Terraform state. Or leave that unset and upload it yourself: `aws s3 cp license.txt s3://<data bucket>/config/fslicense` |
 | `config/MNI152NLin2009cAsym_res-01_T1w_brain.nii` and `config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii` | The MNI152NLin2009cAsym brain templates | Seeded from TemplateFlow (below) |
 | `config/fsLR/` | Six fsLR surface meshes | Seeded from HCPpipelines v6.0.0 (below) |
 | `config/nss_volumes.csv` | Non-steady-state frames per session | Built from your own ABCD data (below) |
