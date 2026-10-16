@@ -178,15 +178,19 @@ resource "kubernetes_config_map_v1" "cloudpipe_config" {
     }
   }
 
-  data = {
-    bucket = var.bucket
-    # Read by the `metrics-bucket` workflow parameter. Kept distinct from
-    # `bucket` so a template cannot write a metric to the data bucket (or a
-    # derivative to the metrics bucket) by defaulting the wrong one.
-    metrics_bucket = var.metrics_bucket
-    ecr_registry   = var.ecr_registry
-    region         = var.region
-  }
+  data = merge(
+    {
+      bucket = var.bucket
+      # Read by the `metrics-bucket` workflow parameter. Kept distinct from
+      # `bucket` so a template cannot write a metric to the data bucket (or a
+      # derivative to the metrics bucket) by defaulting the wrong one.
+      metrics_bucket = var.metrics_bucket
+      ecr_registry   = var.ecr_registry
+      region         = var.region
+    },
+    # Read by the HTTPS ingress pod as an optional env var (User-Agent contact).
+    var.ingress_contact == "" ? {} : { ingress_contact = var.ingress_contact },
+  )
 
   depends_on = [data.kubernetes_namespace_v1.this]
 }

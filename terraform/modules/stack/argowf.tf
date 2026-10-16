@@ -168,6 +168,8 @@ module "argo_workflows" {
   # images; var.image_registry decides, see image_cache.tf. Either way layer blobs
   # are served from S3 via the gateway endpoint, not across the NAT gateway.
   ecr_registry = local.ecr_registry
+  # The address the HTTPS ingress names in its User-Agent, for the source's operators.
+  ingress_contact = var.globus_contact_email
 
   # Database
   db_name       = var.argo_workflows_db_name
