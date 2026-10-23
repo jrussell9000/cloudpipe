@@ -193,6 +193,162 @@ release_rds_deletion_protection() {
   done < <(rds_addresses)
 }
 
+# The deployment's audit trail (logging.tf): the CloudTrail and flow-log bucket,
+# the key that encrypts it, and the ALB and S3 access-log bucket. A plain
+# `terraform destroy` handled these the worst way possible. It deleted the
+# bucket policy that protects the trail, the trail itself and the key (7-day
+# window), then failed to delete the buckets because they are not empty
+# (second-account teardown, 2026-10-23): the logs stayed, and became unreadable
+# a week later.
+#
+# So the teardown asks, before anything is destroyed. Keep (the default): all of
+# these leave state before the final destroy and stay as they are, protected
+# and readable, and their lifecycle rules expire the logs over time. Delete: they
+# leave state the same way, and are emptied and deleted after the final destroy,
+# once CloudTrail has stopped writing to them.
+audit_log_addresses() {
+  local resource
+  for resource in \
+    aws_s3_bucket.logs \
+    aws_s3_bucket_policy.logs \
+    aws_s3_bucket_versioning.logs \
+    aws_s3_bucket_lifecycle_configuration.logs \
+    aws_s3_bucket_server_side_encryption_configuration.logs \
+    aws_s3_bucket_public_access_block.logs \
+    aws_s3_bucket_logging.logs \
+    aws_kms_key.logs \
+    aws_kms_alias.logs \
+    aws_s3_bucket.access_logs \
+    aws_s3_bucket_policy.access_logs \
+    aws_s3_bucket_lifecycle_configuration.access_logs \
+    aws_s3_bucket_server_side_encryption_configuration.access_logs \
+    aws_s3_bucket_public_access_block.access_logs \
+    aws_s3_bucket_ownership_controls.access_logs; do
+    stack_address "$resource"
+  done
+}
+
+# Read from state before the confirmation, since they leave it before the
+# final destroy.
+AUDIT_LOG_BUCKETS=()
+AUDIT_LOG_KEY_ID=""
+AUDIT_LOG_KEY_WINDOW=""
+AUDIT_LOG_ALIAS=""
+KEEP_AUDIT_LOGS=true
+ask_about_audit_logs() {
+  local resource bucket answer
+  for resource in aws_s3_bucket.logs aws_s3_bucket.access_logs; do
+    bucket=$(state_attr "$(stack_address "$resource")" bucket)
+    if [[ -n $bucket ]]; then AUDIT_LOG_BUCKETS+=("$bucket"); fi
+  done
+  AUDIT_LOG_KEY_ID=$(state_attr "$(stack_address aws_kms_key.logs)" id)
+  AUDIT_LOG_KEY_WINDOW=$(state_attr "$(stack_address aws_kms_key.logs)" deletion_window_in_days)
+  AUDIT_LOG_ALIAS=$(state_attr "$(stack_address aws_kms_alias.logs)" name)
+  [[ ${#AUDIT_LOG_BUCKETS[@]} -eq 0 ]] && return 0
+
+  echo ""
+  echo "==> This deployment's audit logs (CloudTrail, VPC flow logs, ALB and S3 access logs) are in:"
+  printf '      s3://%s\n' "${AUDIT_LOG_BUCKETS[@]}"
+  echo "    Keep them: the buckets, and the key that encrypts the CloudTrail record, stay"
+  echo "    in this account, protected and readable; their lifecycle rules expire the"
+  echo "    logs over time. Delete them: every object version is deleted, then the"
+  echo "    buckets, and the key is scheduled for deletion. Deleting cannot be undone."
+  read -rp "    Keep the audit logs? [Y/n] " answer
+  case $answer in
+    n | N | no | No | NO) KEEP_AUDIT_LOGS=false ;;
+    *) KEEP_AUDIT_LOGS=true ;;
+  esac
+}
+
+# Every audit-log resource leaves state, whichever was chosen: kept, the final
+# destroy must not touch them; deleted, they are deleted below in the one order
+# that works. The by-hand commands are printed first, because a re-run cannot
+# read the names once they have left state.
+release_audit_logs() {
+  local address addresses=()
+  while read -r address; do
+    if terraform state list "$address" 2>/dev/null | grep -q .; then addresses+=("$address"); fi
+  done < <(audit_log_addresses)
+  [[ ${#addresses[@]} -eq 0 ]] && return 0
+  if [[ $KEEP_AUDIT_LOGS == true ]]; then
+    echo "==> Releasing the audit logs from state, to keep them..."
+  else
+    echo "==> Releasing the audit logs from state, to delete them after the final destroy..."
+    echo "    If this script stops before the end, delete them by hand, for each bucket:"
+    echo "      aws s3api delete-bucket-policy --bucket <bucket>"
+    echo "      # then delete every object version, and:"
+    echo "      aws s3api delete-bucket --bucket <bucket>"
+    printf '    Buckets: %s\n' "${AUDIT_LOG_BUCKETS[*]}"
+    if [[ -n $AUDIT_LOG_KEY_ID ]]; then
+      echo "      aws kms schedule-key-deletion --region $DEPLOYMENT_REGION --key-id $AUDIT_LOG_KEY_ID --pending-window-in-days ${AUDIT_LOG_KEY_WINDOW:-7}"
+    fi
+  fi
+  terraform state rm "${addresses[@]}"
+}
+
+# Deletes every object version and delete marker, 1000 at a time (the
+# DeleteObjects limit). Listing again from the start each time, so nothing is
+# skipped as pages disappear.
+empty_bucket() {
+  local bucket=$1 batch
+  batch=$(mktemp "${TMPDIR:-/tmp}/cleanup-versions.XXXXXX")
+  while :; do
+    # shellcheck disable=SC2016 # `true` is a JMESPath literal, not a command substitution
+    aws s3api list-object-versions --bucket "$bucket" --max-items 1000 --output json \
+      --query '{Objects: [Versions, DeleteMarkers][][].{Key: Key, VersionId: VersionId}, Quiet: `true`}' \
+      >"$batch"
+    grep -q '"Key"' "$batch" || break
+    aws s3api delete-objects --bucket "$bucket" --delete "file://$batch" >/dev/null
+  done
+  rm -f "$batch"
+}
+
+# After the final destroy, which removed the trail and every bucket's logging
+# configuration, so nothing new is written. S3 server access logs are delivered
+# up to hours late, though, so a bucket that is not empty when deleted is
+# emptied again a few times before giving up.
+delete_audit_logs() {
+  [[ $KEEP_AUDIT_LOGS == true ]] && return 0
+  local bucket attempt
+  for bucket in "${AUDIT_LOG_BUCKETS[@]}"; do
+    echo "==> Deleting audit-log bucket $bucket..."
+    # The policy denies DeleteObjectVersion to everyone but the account root (AU-9).
+    aws s3api delete-bucket-policy --bucket "$bucket" 2>/dev/null || true
+    for attempt in 1 2 3 4 5; do
+      empty_bucket "$bucket"
+      aws s3api delete-bucket --bucket "$bucket" 2>/dev/null && break
+      if [[ $attempt -eq 5 ]]; then
+        echo "FAILED: s3://$bucket is still not empty; delete it by hand once deliveries stop:" >&2
+        echo "  aws s3 rb s3://$bucket --force   # after deleting every object version" >&2
+        exit "$EXIT_ERROR"
+      fi
+      sleep 30
+    done
+  done
+  if [[ -n $AUDIT_LOG_ALIAS ]]; then
+    aws kms delete-alias --region "$DEPLOYMENT_REGION" --alias-name "$AUDIT_LOG_ALIAS" 2>/dev/null || true
+  fi
+  if [[ -n $AUDIT_LOG_KEY_ID ]]; then
+    echo "==> Scheduling deletion of the audit-log key $AUDIT_LOG_KEY_ID in ${AUDIT_LOG_KEY_WINDOW:-7} days..."
+    aws kms schedule-key-deletion --region "$DEPLOYMENT_REGION" --key-id "$AUDIT_LOG_KEY_ID" \
+      --pending-window-in-days "${AUDIT_LOG_KEY_WINDOW:-7}" >/dev/null
+  fi
+}
+
+# The ECR registry's scanning configuration (ecr.tf) is account-wide, not this
+# deployment's. Destroying it means turning enhanced scanning off, which an
+# AWS Organizations member account is not allowed to do when the organization
+# manages Inspector ("Member account ... is not authorized to disable itself",
+# second-account teardown, 2026-10-23). It leaves state and stays as it is; with
+# this deployment's repositories gone it has nothing to scan.
+release_registry_scanning_configuration() {
+  local address
+  address=$(stack_address aws_ecr_registry_scanning_configuration.this)
+  terraform state list "$address" 2>/dev/null | grep -q . || return 0
+  echo "==> Releasing the account's ECR scanning configuration from state (left as it is)..."
+  terraform state rm "$address"
+}
+
 # Deployment resolution, target lists and assert_targets_declared() are shared
 # with install.sh.
 # shellcheck source=SCRIPTDIR/targets.sh
@@ -239,6 +395,7 @@ echo "==> Checking that the cluster's API can be reached..."
 require_reachable_cluster
 echo "==> Checking that the databases' final snapshot names are free..."
 require_free_final_snapshot_names
+ask_about_audit_logs
 
 echo "==> WARNING: This will permanently destroy this deployment's infrastructure."
 echo "    Root:    $DEPLOYMENT_ROOT"
@@ -471,6 +628,9 @@ if terraform state list "$EKS_KEY_ADDRESS" 2>/dev/null | grep -q .; then
     --pending-window-in-days "$EKS_KEY_WINDOW" >/dev/null
 fi
 
+release_audit_logs
+release_registry_scanning_configuration
+
 # Phase 3: Full destroy to catch any remaining resources (IAM, ECR, Route53
 # records, ACM certificates, SSM parameters, EventBridge schedulers, etc.)
 # crds_available=false prevents errors from missing CRD types post-cluster.
@@ -485,6 +645,8 @@ if [[ -n "$COGNITO_POOL_ID" ]]; then
   aws cognito-idp update-user-pool --user-pool-id "$COGNITO_POOL_ID" --deletion-protection INACTIVE
   aws cognito-idp delete-user-pool --user-pool-id "$COGNITO_POOL_ID"
 fi
+
+delete_audit_logs
 
 # The buckets this teardown deliberately did not touch.
 #
@@ -512,6 +674,18 @@ report_final_snapshots() {
   echo "    of a deployment named $CLUSTER_NAME in this account will stop until they are"
   echo "    gone. Only if you are finished with them:"
   printf '      aws rds delete-db-snapshot --db-snapshot-identifier %s\n' "${FINAL_SNAPSHOTS[@]}"
+}
+
+report_kept_audit_logs() {
+  [[ $KEEP_AUDIT_LOGS == true && ${#AUDIT_LOG_BUCKETS[@]} -gt 0 ]] || return 0
+  echo ""
+  echo "==> The audit logs were kept, as asked:"
+  printf '      s3://%s\n' "${AUDIT_LOG_BUCKETS[@]}"
+  if [[ -n $AUDIT_LOG_KEY_ID ]]; then
+    echo "    encrypted with KMS key $AUDIT_LOG_KEY_ID, which was kept too."
+  fi
+  echo "    Terraform no longer manages them. A re-install in this account fails on"
+  echo "    these bucket names until they are deleted or imported."
 }
 
 report_surviving_buckets() {
@@ -543,6 +717,7 @@ report_surviving_buckets() {
 }
 
 report_final_snapshots
+report_kept_audit_logs
 report_surviving_buckets
 
 echo "==> Cleanup complete."
