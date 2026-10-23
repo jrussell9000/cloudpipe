@@ -38,10 +38,12 @@ destroy_target() {
 # No cluster is fine: there is nothing for kubectl to reach, and the teardown is
 # cleaning up what a failed install left. Also writes the kubeconfig entry the
 # Helm and Kubernetes providers use during the destroy.
+CLUSTER_EXISTS=false
 require_reachable_cluster() {
   if ! aws eks describe-cluster --name "$CLUSTER_NAME" >/dev/null 2>&1; then
     return 0
   fi
+  CLUSTER_EXISTS=true
   aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$DEPLOYMENT_REGION" >/dev/null
   if ! kubectl get --raw=/readyz --request-timeout=20s >/dev/null 2>&1; then
     fail "$EXIT_BLOCKED" \
@@ -50,6 +52,54 @@ require_reachable_cluster() {
       "Zero Trust team (or the VPN), check that \`kubectl get nodes\` works, then run this" \
       "again. Nothing has been destroyed."
   fi
+}
+
+# Every Kubernetes object Terraform manages, by resource type: kubernetes_*,
+# kubectl_* and helm_release. They are spread over the stack itself and modules
+# the teardown never names (Prefect's, among others), so a list of modules
+# cannot cover them. Data sources are not objects and are left out.
+in_cluster_addresses() {
+  { terraform state list 2>/dev/null || true; } |
+    grep -E '(^|\.)(kubernetes_[a-z0-9_]+|kubectl_[a-z0-9_]+|helm_release)\.' |
+    grep -vE '(^|\.)data\.' || true
+}
+
+# Destroy them while the cluster can still be reached, before the cluster goes.
+# Left in state past that point, each one fails every later destroy that
+# touches it, because its provider can no longer reach an API server: the VPC
+# destroy stopped on prefect/prefect-db-credentials after the cluster was gone
+# (second-account acceptance run, 2026-10-23).
+destroy_in_cluster_resources() {
+  local addresses=() targets=() state_address
+  mapfile -t addresses < <(in_cluster_addresses)
+  [[ ${#addresses[@]} -eq 0 ]] && return 0
+  # Read back from `terraform state list`, so already root-level: they need no
+  # stack_address conversion, unlike the stack-relative names in targets.sh.
+  for state_address in "${addresses[@]}"; do
+    targets+=(-target="$state_address")
+  done
+  echo "==> Destroying the ${#addresses[@]} Kubernetes objects still in state, while the cluster can be reached..."
+  if tf_step "Kubernetes objects" terraform destroy "${targets[@]}" -auto-approve; then
+    echo "SUCCESS: the Kubernetes objects"
+  else
+    echo "FAILED: the Kubernetes objects"
+    exit "$EXIT_ERROR"
+  fi
+}
+
+# A re-run after the cluster is already gone: its objects went with it, and
+# nothing can delete them through an API that no longer exists. They leave state
+# instead, named, so the destroys that follow do not try to reach it. After the
+# confirmation, because it changes state.
+forget_in_cluster_resources() {
+  [[ $CLUSTER_EXISTS == true ]] && return 0
+  local addresses=()
+  mapfile -t addresses < <(in_cluster_addresses)
+  [[ ${#addresses[@]} -eq 0 ]] && return 0
+  echo "==> The cluster is gone, and its ${#addresses[@]} Kubernetes objects went with it."
+  echo "    Removing them from state, so nothing below tries to reach it:"
+  printf '      %s\n' "${addresses[@]}"
+  terraform state rm "${addresses[@]}" >/dev/null
 }
 
 # The two RDS databases, Argo's and Prefect's. Each defaults to
@@ -173,6 +223,7 @@ if [[ "$CONFIRM" != "destroy" ]]; then
 fi
 
 release_rds_deletion_protection
+forget_in_cluster_resources
 
 # Phase 1: Tear down application-layer resources first (Helm releases, Kubernetes
 # objects, CRD-dependent manifests) before removing the cluster itself.
@@ -314,6 +365,8 @@ done
 # EKS respects PDBs during drain and will stall indefinitely if there is nowhere to
 # reschedule (e.g. single-node group). --disable-eviction bypasses PDBs entirely,
 # which is safe here since the whole cluster is being torn down.
+destroy_in_cluster_resources
+
 echo "==> Draining backend node group..."
 for node in $(kubectl get nodes -l eks.amazonaws.com/nodegroup=backend -o name 2>/dev/null); do
   kubectl drain "$node" \
