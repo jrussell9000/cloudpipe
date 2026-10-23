@@ -31,10 +31,54 @@
 # already in the environment is kept,
 # so `CLOUDPIPE_BUCKET=… pixi run -e ops …` still overrides.
 #
+# Before reading anything, it checks that kubectl and the AWS credentials name the
+# SAME cluster: the context's account must be the credentials' account, and the
+# server kubectl connects to must be the endpoint `aws eks describe-cluster`
+# reports for that context's ARN. A context's name is not where kubectl connects:
+# on 2026-10-23 a kubeconfig whose context named production held another
+# cluster's server URL. On any mismatch nothing is exported. On success it prints
+# one line to stderr naming the cluster it bound to.
+#
+# Set KUBECONFIG (and AWS_PROFILE) BEFORE `pixi shell -e ops`: this runs once, at
+# activation, so a KUBECONFIG exported inside the shell is not seen. To rebind an
+# open shell, unset the variables above and `source scripts/cloudpipe-env.sh`.
+#
 # Sourced, not executed: no `set -e`, no `exit`.
+
+_cloudpipe_target_ok() {
+  local arn server region account name creds endpoint
+  arn="$(kubectl config view --minify -o 'jsonpath={.contexts[0].context.cluster}' 2>/dev/null)"
+  server="$(kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}' 2>/dev/null)"
+  if [[ ! "$arn" =~ ^arn:aws[a-z-]*:eks:([a-z0-9-]+):([0-9]{12}):cluster/([A-Za-z0-9._-]+)$ ]]; then
+    echo "cloudpipe-env: kubectl's context is not an EKS cluster ARN (${arn:-none}); CLOUDPIPE_* not set" >&2
+    return 1
+  fi
+  region="${BASH_REMATCH[1]}" account="${BASH_REMATCH[2]}" name="${BASH_REMATCH[3]}"
+  if ! creds="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)"; then
+    echo "cloudpipe-env: no AWS credentials (SSO expired? run aws sso login); CLOUDPIPE_* not set" >&2
+    return 1
+  fi
+  if [ "$creds" != "$account" ]; then
+    echo "cloudpipe-env: kubectl targets account $account but AWS_PROFILE=${AWS_PROFILE:-default} is account $creds; CLOUDPIPE_* not set" >&2
+    return 1
+  fi
+  if ! endpoint="$(aws eks describe-cluster --region "$region" --name "$name" \
+    --query cluster.endpoint --output text 2>/dev/null)"; then
+    echo "cloudpipe-env: cannot read $arn's endpoint to check kubectl's server; CLOUDPIPE_* not set" >&2
+    return 1
+  fi
+  if [ "${server%/}" != "${endpoint%/}" ]; then
+    echo "cloudpipe-env: kubectl's context is named $arn but connects to ${server:-nothing}, not its endpoint $endpoint; CLOUDPIPE_* not set." >&2
+    echo "  aws eks update-kubeconfig --region $region --name $name --kubeconfig \"\${KUBECONFIG:-\$HOME/.kube/config}\"" >&2
+    return 1
+  fi
+  echo "cloudpipe-env: bound to account $account, cluster $name ($server)" >&2
+}
 
 _cloudpipe_env() {
   local ns="${CLOUDPIPE_CONFIG_NAMESPACE:-argo-workflows}" cfg bucket metrics_bucket registry host
+
+  _cloudpipe_target_ok || return 0
 
   if ! cfg="$(kubectl -n "$ns" get configmap cloudpipe-config \
     -o 'jsonpath={.data.bucket} {.data.metrics_bucket} {.data.ecr_registry}' 2>/dev/null)"; then
@@ -78,4 +122,4 @@ _cloudpipe_env() {
 }
 
 _cloudpipe_env
-unset -f _cloudpipe_env
+unset -f _cloudpipe_env _cloudpipe_target_ok

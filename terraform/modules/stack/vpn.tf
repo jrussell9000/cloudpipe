@@ -179,9 +179,11 @@ resource "aws_ec2_client_vpn_endpoint" "vpn" {
 
 }
 
-# Associating subnets and adding authorization rules
+# Associating subnets and adding authorization rules. The three per-subnet
+# resources below expand only while the VPC exists (local.vpc_exists, data.tf):
+# with it destroyed their subnet-ID keys are unknown and no plan can be made.
 resource "aws_ec2_client_vpn_network_association" "vpn_subnet" {
-  for_each               = toset(module.vpc.private_subnets)
+  for_each               = toset(local.vpc_exists ? module.vpc.private_subnets : [])
   client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.vpn.id
   subnet_id              = each.value
 }
@@ -198,7 +200,7 @@ resource "aws_ec2_client_vpn_authorization_rule" "vpn" {
 # makes reachability depend on which subnet a client happens to land on.
 resource "aws_ec2_client_vpn_route" "secondary_cidrs" {
   for_each = {
-    for pair in setproduct(var.secondary_cidr_blocks, module.vpc.private_subnets) :
+    for pair in setproduct(var.secondary_cidr_blocks, local.vpc_exists ? module.vpc.private_subnets : []) :
     "${pair[0]}-${pair[1]}" => { cidr = pair[0], subnet = pair[1] }
   }
   client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.vpn.id
@@ -229,7 +231,7 @@ resource "aws_ec2_client_vpn_authorization_rule" "internet" {
 # associations that was a 2-in-3 chance of "VPN connects but no internet",
 # previously misdiagnosed as a client-side route race. One route per subnet.
 resource "aws_ec2_client_vpn_route" "internet" {
-  for_each               = toset(module.vpc.private_subnets)
+  for_each               = toset(local.vpc_exists ? module.vpc.private_subnets : [])
   client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.vpn.id
   destination_cidr_block = "0.0.0.0/0"
   target_vpc_subnet_id   = each.value

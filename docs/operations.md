@@ -27,6 +27,16 @@ deployment's values from the cluster and exports them: `CLOUDPIPE_BUCKET`,
 `PREFECT_API_AUTH_STRING` and `KUBECOST_BASE_URL` (`scripts/cloudpipe-env.sh`). The `aws` CLI
 takes the region from your AWS profile.
 
+**It binds to one cluster, once, at activation.** It first checks that kubectl's context is in
+the AWS credentials' account and that the server kubectl connects to is that cluster's real
+endpoint (`aws eks describe-cluster`). It prints `cloudpipe-env: bound to account …, cluster …`,
+or exports nothing and says why. So set `KUBECONFIG` and `AWS_PROFILE` **before** `pixi shell -e
+ops`. A `KUBECONFIG` exported inside the shell is not seen; to rebind an open shell, unset the
+variables above and `source scripts/cloudpipe-env.sh`. If you run more than one deployment, give
+each its own kubeconfig file rather than switching contexts in `~/.kube/config`. That file, and
+its current context, is shared by every terminal, so `kubectl config use-context` or an installer's
+`aws eks update-kubeconfig` in one tab repoints all the others.
+
 **The Prefect API requires basic auth** (#636): every `prefect` CLI call and Prefect client
 needs `PREFECT_API_AUTH_STRING`, read from Secret `prefect-api-auth` in `prefect`. `pixi
 shell -e ops` / `pixi run -e ops …` export it; outside that environment export it yourself
