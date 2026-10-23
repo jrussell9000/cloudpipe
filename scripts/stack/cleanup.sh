@@ -442,6 +442,35 @@ if terraform state list "$COGNITO_POOL_ADDRESS" 2>/dev/null | grep -q .; then
   terraform state rm "$COGNITO_POOL_ADDRESS"
 fi
 
+# The cluster's Secrets-encryption key (eks.tf) carries `prevent_destroy` for
+# the same reason: scheduling its deletion makes every Secret in a live cluster
+# unreadable once the window ends. With the cluster destroyed above there is
+# nothing left for it to decrypt, so it leaves state too and its deletion is
+# scheduled here, with the window it was created with. The second-account
+# teardown's final destroy failed on it ("Instance cannot be destroyed",
+# 2026-10-23). The cluster is checked again first: this must never run against
+# a cluster that still exists.
+EKS_KEY_ADDRESS=$(stack_address aws_kms_key.eks_secrets)
+if terraform state list "$EKS_KEY_ADDRESS" 2>/dev/null | grep -q .; then
+  if aws eks describe-cluster --region "$DEPLOYMENT_REGION" --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+    echo "FAILED: cluster $CLUSTER_NAME still exists; not scheduling deletion of its Secrets key." >&2
+    exit "$EXIT_ERROR"
+  fi
+  EKS_KEY_ID=$(state_attr "$EKS_KEY_ADDRESS" id)
+  EKS_KEY_WINDOW=$(state_attr "$EKS_KEY_ADDRESS" deletion_window_in_days)
+  if [[ -z "$EKS_KEY_ID" || -z "$EKS_KEY_WINDOW" ]]; then
+    echo "FAILED: could not read the cluster's Secrets key from state ($EKS_KEY_ADDRESS)." >&2
+    exit "$EXIT_ERROR"
+  fi
+  echo "==> Releasing the cluster's Secrets key $EKS_KEY_ID from state..."
+  echo "    If this script stops before the end, schedule its deletion by hand:"
+  echo "      aws kms schedule-key-deletion --region $DEPLOYMENT_REGION --key-id $EKS_KEY_ID --pending-window-in-days $EKS_KEY_WINDOW"
+  terraform state rm "$EKS_KEY_ADDRESS"
+  echo "==> Scheduling deletion of key $EKS_KEY_ID in $EKS_KEY_WINDOW days..."
+  aws kms schedule-key-deletion --region "$DEPLOYMENT_REGION" --key-id "$EKS_KEY_ID" \
+    --pending-window-in-days "$EKS_KEY_WINDOW" >/dev/null
+fi
+
 # Phase 3: Full destroy to catch any remaining resources (IAM, ECR, Route53
 # records, ACM certificates, SSM parameters, EventBridge schedulers, etc.)
 # crds_available=false prevents errors from missing CRD types post-cluster.
