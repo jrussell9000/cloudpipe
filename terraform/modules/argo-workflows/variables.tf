@@ -173,9 +173,9 @@ variable "db_deletion_protection" {
 }
 
 variable "db_skip_final_snapshot" {
-  description = "Skip the final snapshot on RDS destroy/replace. Leave false so a destroy or a replace_triggered_by replacement is recoverable."
+  description = "Skip the final snapshot on RDS destroy/replace. True by default: a teardown should leave nothing behind, and an accidental delete or replacement is already refused by deletion protection. Set false to keep a final snapshot."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "db_table_name" {
