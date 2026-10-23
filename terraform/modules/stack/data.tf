@@ -33,6 +33,23 @@ locals {
   cluster_exists = contains(data.aws_eks_clusters.all.names, var.name)
 }
 
+# Whether this deployment's VPC exists right now, found by the Name tag
+# module.vpc gives it. The Client VPN's per-subnet resources in vpn.tf are keyed
+# by subnet ID, and once module.vpc is destroyed those IDs are unknown, so every
+# plan failed "Invalid for_each argument" — a teardown's final destroy included,
+# since cleanup.sh destroys the VPC before it (second-account acceptance run,
+# 2026-10-23). They expand only when this is true; with no VPC there are no
+# subnets to associate.
+data "aws_vpcs" "this" {
+  tags = {
+    Name = var.name
+  }
+}
+
+locals {
+  vpc_exists = length(data.aws_vpcs.this.ids) > 0
+}
+
 data "aws_availability_zones" "available" {
   # Exclude Local Zones (e.g. <region>-bos-1a) — not supported by all instance types.
   filter {

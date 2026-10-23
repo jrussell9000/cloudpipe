@@ -442,25 +442,45 @@ def workflow_subject(wf: dict) -> str | None:
     return None
 
 
-_EKS_ARN = re.compile(r"^arn:aws[\w-]*:eks:[a-z0-9-]+:(\d{12}):cluster/[\w.-]+$")
+_EKS_ARN = re.compile(r"^arn:aws[\w-]*:eks:([a-z0-9-]+):(\d{12}):cluster/([\w.-]+)$")
 
 
-def kubectl_cluster() -> str:
-    """kubectl's current-context cluster, as `kubectl config view --minify` names it."""
+def _kubectl_view(jsonpath: str) -> str:
     result = subprocess.run(
-        ["kubectl", "config", "view", "--minify", "-o", "jsonpath={.contexts[0].context.cluster}"],
+        ["kubectl", "config", "view", "--minify", "-o", f"jsonpath={jsonpath}"],
         capture_output=True,
         text=True,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def kubectl_cluster() -> str:
+    """kubectl's current-context cluster, as `kubectl config view --minify` names it."""
+    return _kubectl_view("{.contexts[0].context.cluster}")
+
+
+def kubectl_server() -> str:
+    """The API server URL kubectl's current context actually connects to."""
+    return _kubectl_view("{.clusters[0].cluster.server}")
+
+
 def aws_account() -> str:
     return boto3.client("sts").get_caller_identity()["Account"]
 
 
+def eks_endpoint(region: str, name: str) -> str:
+    """The cluster's real API endpoint, as the AWS credentials' account reports it."""
+    return boto3.client("eks", region_name=region).describe_cluster(name=name)["cluster"][
+        "endpoint"
+    ]
+
+
+def _same_url(a: str, b: str) -> bool:
+    return a.rstrip("/").lower() == b.rstrip("/").lower()
+
+
 def require_same_account() -> str:
-    """Refuse unless kubectl and the AWS credentials name the same account.
+    """Refuse unless kubectl and the AWS credentials name the same cluster.
 
     The flush runs in the account the AWS credentials name; Argo, and the Prefect
     URL that cloudpipe-env.sh derives, follow kubectl's current context. On
@@ -470,6 +490,11 @@ def require_same_account() -> str:
     scripts/investigations/https-ingress-probe/_account_guard.py (#812), which is
     not published. Point kubectl at the right cluster in this shell instead of
     overriding this.
+
+    Two checks, because the context's NAME is not where kubectl connects. On
+    2026-10-23 a kubeconfig whose context named production's ARN held another
+    cluster's server URL, and an ARN-only check passed it. So the server URL must
+    also equal the endpoint that `eks describe-cluster` reports for that ARN.
     """
     cluster = kubectl_cluster()
     match = _EKS_ARN.match(cluster)
@@ -477,16 +502,33 @@ def require_same_account() -> str:
         raise SystemExit(
             f"refusing: kubectl's current context is not an EKS cluster ARN ({cluster!r})"
         )
-    kube, account = match.group(1), aws_account()
+    region, kube, name = match.groups()
+    account = aws_account()
     if kube != account:
         raise SystemExit(
             f"refusing: kubectl targets account {kube} ({cluster}) but the AWS credentials are "
             f"for account {account}. Point kubectl at {account}'s cluster in this shell, e.g.\n"
-            f"  kubectl config view --raw --minify --context <that cluster's context> "
-            f"> ~/.kube/cloudpipe-{account}.config\n"
+            f"  aws eks update-kubeconfig --region {region} --name {name} "
+            f"--kubeconfig ~/.kube/cloudpipe-{account}.config\n"
             f"  export KUBECONFIG=~/.kube/cloudpipe-{account}.config"
         )
-    print(f"account {account}, cluster {cluster}")
+    server = kubectl_server()
+    try:
+        endpoint = eks_endpoint(region, name)
+    except Exception as exc:  # fail closed: an unverifiable target is not a verified one
+        raise SystemExit(
+            f"refusing: could not read {cluster}'s endpoint to check kubectl's server "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+    if not _same_url(server, endpoint):
+        raise SystemExit(
+            f"refusing: kubectl's context is named {cluster}, but it connects to {server!r}, "
+            f"and that cluster's endpoint is {endpoint}. The kubeconfig points at another "
+            f"cluster under this name. Regenerate it:\n"
+            f"  aws eks update-kubeconfig --region {region} --name {name} "
+            f'--kubeconfig "${{KUBECONFIG:-$HOME/.kube/config}}"'
+        )
+    print(f"account {account}, cluster {cluster}, server {server}")
     return account
 
 
