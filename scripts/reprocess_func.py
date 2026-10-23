@@ -85,6 +85,11 @@ ANATOMY_STEPS = (
     "fastsurfer-long-seg",
     "fastsurfer-long-parc",
 )
+# Anatomy statuses that mean the step did NOT run. `omitted` is Argo's word for a
+# DAG task never reached because an upstream task failed: wave 1's seven failed
+# ingress workflows recorded `anatomical-phase=omitted` and read as ANATOMY,
+# hiding them from the retry list (2026-10-22).
+ANATOMY_NOT_RUN = ("skipped", "omitted")
 # Every label this tool submits starts with this, so reconcile can find the
 # workflows it created by WorkflowRun.batch_label.
 BATCH_LABEL_PREFIX = "func-reprocess"
@@ -100,8 +105,12 @@ LOG_PREFIX = "logs/"
 FUNC_POD_MARKER = "functional-preprocessing-session-template"
 READBACK_OK = "read-back OK"
 READBACK_ERROR = "MNIBoldReadbackError"
-# FuncQC.schema_version since #643 (CompCor NSS exclusion); 1.1 is the old image.
-FUNC_QC_SCHEMA = "1.2"
+# The record versions a fresh run must carry, equal to the schemas.py defaults
+# (tests/test_reprocess_func.py holds them together). FuncQC 1.3 / SurfaceSampleQC
+# 1.1 since #859 (summaries exclude the NSS frames); a 1.2 / 1.0 record was
+# written by an image from before it, so the run is redone, not accepted.
+FUNC_QC_SCHEMA = "1.3"
+SURFACE_QC_SCHEMA = "1.1"
 
 # Producer window slack, the same rule data/census/cost_cleanup.py attributes
 # terminal outputs by: an output belongs to the workflow whose
@@ -911,10 +920,10 @@ def raw_problems(ev: Evidence, units: set) -> list[str]:
     no_surf = [u for u in units if not (ev.dtseries.get(u) and ev.dtseries[u] > ev.flushed_at)]
     if no_surf:
         reasons.append(f"{len(no_surf)} run(s) have no new fsLR32k dtseries")
-    # FuncQC is 1.2 since #643; a 1.1 record here was written by the old image.
+    # A record below the current version was written by an image from before #859.
     for name, raw, version in (
         ("func_preproc", ev.qc_raw, FUNC_QC_SCHEMA),
-        ("surface_sample", ev.surf_raw, None),
+        ("surface_sample", ev.surf_raw, SURFACE_QC_SCHEMA),
     ):
         bad = [u for u in units if not fresh_single(raw.get(u, []), ev.flushed_at, version)]
         if bad:
@@ -1052,7 +1061,7 @@ def gather_steps(s3, args, evidence: dict[str, Evidence], earliest: datetime) ->
     for subj, k in anatomy_keys:
         doc = get_json(s3, args.metrics_bucket, k) or {}
         at = parse_instant(doc.get("recorded_at"))
-        if at and at > evidence[subj].flushed_at and doc.get("status") != "skipped":
+        if at and at > evidence[subj].flushed_at and doc.get("status") not in ANATOMY_NOT_RUN:
             evidence[subj].anatomy.append(f"{doc.get('step')}={doc.get('status')}")
 
 

@@ -236,7 +236,9 @@ def write(path: Path, content: str, *, force: bool) -> Path:
             + (", rendered by an earlier `cloudpipe setup` run" if ours else ""),
             exit_code=ExitCode.INVALID,
             remedy=Remedy("command", text),
-            detail={"path": str(path)},
+            # `rendered_by_setup` so a front end can word its own remedy without
+            # parsing the message: the two cases need different advice.
+            detail={"path": str(path), "rendered_by_setup": ours},
         )
     path.write_text(content)
     return path

@@ -469,6 +469,10 @@ output "github_actions_packer_role_arn" {
   value = module.stack.github_actions_packer_role_arn
 }
 
+output "github_actions_pr_pull_role_arn" {
+  value = module.stack.github_actions_pr_pull_role_arn
+}
+
 output "globus_collection_id_ssm_parameter" {
   value = module.stack.globus_collection_id_ssm_parameter
 }

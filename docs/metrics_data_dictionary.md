@@ -60,7 +60,7 @@ S3 key: `metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json`
 |---|---|---|
 | `subject`, `session`, `task`, `run` | str | Run identity |
 | `n_frames` | int | Total frames in the BOLD volume |
-| `n_nss_frames` | int | Non-steady-state frames dropped |
+| `n_nss_frames` | int | Non-steady-state frames at the start of the run (5, 8 or 16 by scanner software, from `tools/nss_volumes.csv`). They stay in the BOLD and confounds, flagged by `non_steady_state_outlier_*`; from schema 1.3 every summary below excludes them |
 | `tr_seconds` | float | Repetition time (s) |
 | `mean_fd`, `median_fd`, `max_fd` | float | Framewise displacement stats (mm) |
 | `n_fd_above_0p2`, `n_fd_above_0p5` | int | Frame counts above FD thresholds |
@@ -79,7 +79,7 @@ S3 key: `metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json`
 | `peak_memory_gb` | float | Peak RSS for **this run only** (`RUSAGE_SELF`/`RUSAGE_CHILDREN` max) — resets per run |
 | `container_peak_memory_gb` | float | Peak RSS over the **container's lifetime** — climbs across a multi-run session even when runs are identically sized; size pod memory limits against this one, not `peak_memory_gb` |
 | `pipeline`, `image_tag` | str | Provenance: pipeline name and image SHA |
-| `schema_version` | str | `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that #119 showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
+| `schema_version` | str | `"1.3"`: every summary is over the steady-state frames (#859, see below). `"1.2"` (#643) changed only the confounds, whose CompCor excludes the NSS frames. `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that #119 showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
 
 **`gcor`/`aor`/`aqi` are computed in-process in `preproc.py`, at the same definitions as AFNI's
 `@compute_gcor`, `3dToutcount -fraction` and `3dTqual`** — the tools MRIQC wraps for the same
@@ -92,6 +92,15 @@ by choice — the in-process versions are kept on their own merits. `tests/image
 test_bold_iqms.py` pins all three against values the real AFNI binaries produced; agreement is
 exact for `gcor`/`aor` and within ~1e-5 for `aqi`, where AFNI's own sequential float32
 accumulation is the limiting error.
+
+**From schema 1.3 every summary excludes the non-steady-state frames** (#859): `gcor`, `aor`,
+`aqi`, `tsnr_median`, `mean_global_signal`, and `mean_dvars`/`dvars_std` and the FD fields, which
+also skip the first difference inside the window. ABCD discards the same frames before every
+analysis (Hagler et al. 2019, footnote 4). On GE DV26 and later and on Siemens VE11 those frames
+carry a T1-saturation transient (frame 0 ~+56% and ~+26% above steady state), and over the full
+series it dominated the metrics: on one GE DV26 run, `gcor` 0.546 against 0.058 and `tsnr_median`
+24.8 against 49.0. **1.2 and earlier values of these fields are therefore not comparable across
+scanner software**; on GE DV25, Philips and Siemens XA30 the difference is small.
 
 Recorded but not gated — no thresholds are calibrated yet for any of these four fields. **`0.0`
 means "not computed", not "computed as zero"**: these three are descriptive metrics derived after
@@ -107,7 +116,7 @@ requested for that run) — merged in via `qc.update(surf_metrics)` in `preproc.
 | `surf_L_n_vertices`, `surf_R_n_vertices` | int | Vertex count per hemisphere's surface mesh |
 | `surf_L_coverage_frac`, `surf_R_coverage_frac` | float | Fraction of vertices whose timeseries is not identically zero — vertices sampling outside the BOLD field of view read as constant zero, so this is the direct measure of how much cortex the acquisition covered |
 | `surf_L_nan_frac`, `surf_R_nan_frac` | float | Fraction of NaN samples in the surface timeseries |
-| `surf_L_tsnr_median`, `surf_R_tsnr_median` | float | Median tSNR over *covered* vertices only |
+| `surf_L_tsnr_median`, `surf_R_tsnr_median` | float | Median tSNR over *covered* vertices only, over the steady-state frames from FuncQC 1.3 / SurfaceSampleQC 1.1 |
 | `subcort_n_voxels` | int | Voxel count across all sampled subcortical structures |
 | `subcort_n_structures` | int | Distinct subcortical structure labels sampled |
 | `subcort_space` | str | Always `"MNI152NLin2009cAsym"` today |
@@ -163,7 +172,7 @@ produced surfaces appear at all.
 | `surf_L_n_vertices`, `surf_R_n_vertices` | int | Vertex count per hemisphere's surface mesh |
 | `surf_L_coverage_frac`, `surf_R_coverage_frac` | float | Fraction of vertices whose timeseries is not identically zero — the direct measure of how much cortex the acquisition covered |
 | `surf_L_nan_frac`, `surf_R_nan_frac` | float | Fraction of NaN samples in the surface timeseries |
-| `surf_L_tsnr_median`, `surf_R_tsnr_median` | float | Median tSNR over *covered* vertices only |
+| `surf_L_tsnr_median`, `surf_R_tsnr_median` | float | Median tSNR over *covered* vertices only, over the steady-state frames from schema 1.1 (#859). Coverage and NaN fraction still look at every frame |
 | `subcort_n_voxels` | int | Voxel count across all sampled subcortical structures |
 | `subcort_n_structures` | int | Distinct subcortical structure labels sampled |
 | `subcort_space` | str | Always `"MNI152NLin2009cAsym"` today |
@@ -176,7 +185,8 @@ therefore defaults these to `None`.
 **Nothing on this table is gated.** No threshold is calibrated for any surface field yet; the
 `surface-sample` step's pass/fail comes from `outputs_verified`, not from these numbers.
 
-**`schema_version` is `"1.0"`, and records written before 2026-08-11 have none at all.** Until #241
+**`schema_version` is `"1.1"`** since #859 (steady-state `surf_*_tsnr_median`; `"1.0"` values
+include the non-steady-state frames), **and records written before 2026-08-11 have none at all.** Until #241
 the artifact key had no `dt=` component and the emitter stamped neither `schema_version` nor
 `completed_at`. Both were fixed together, because the compactor maps a missing `schema_version` to
 the literal `"unknown"` and that value is a *projected partition key* on

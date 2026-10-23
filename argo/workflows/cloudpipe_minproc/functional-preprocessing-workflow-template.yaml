@@ -456,7 +456,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:819abab89ef9b11f91c31bd39043d7f85cd054be50e32cff9c1ffa1efd39eb17"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:ed88b3edebb26732d79c395a56b354906e49a90098c34fde00097483a04823a2"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -515,7 +515,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:819abab89ef9b11f91c31bd39043d7f85cd054be50e32cff9c1ffa1efd39eb17"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:ed88b3edebb26732d79c395a56b354906e49a90098c34fde00097483a04823a2"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather
@@ -798,6 +798,27 @@ spec:
         # S3 error) leaves the session markerless, so a retry redoes it.
         EXIT_PUBLISH_FAILED = 75
 
+        # Seconds per driver phase, printed as one `[driver] TIMINGS {...}` line
+        # before the outcome records. preproc.py times its own stages (its QC
+        # JSON's stage_timings_s); this covers what it does not: in wave 1 a
+        # session pod spent ~13 of its ~32.5 min outside preproc.py (2026-10-22).
+        TIMINGS = {}
+
+        class Timed:
+            """`with Timed(key):` adds the block's wall time to TIMINGS[key]."""
+
+            def __init__(self, key):
+                self.key = key
+
+            def __enter__(self):
+                import time
+                self.start = time.monotonic()
+
+            def __exit__(self, *exc):
+                import time
+                TIMINGS[self.key] = round(
+                    TIMINGS.get(self.key, 0.0) + time.monotonic() - self.start, 1)
+
         def publish_outputs():
             """Publish OUT_DIR exploded, then the session marker last (ADR 017).
 
@@ -965,7 +986,8 @@ spec:
                 shutil.rmtree(work_dir, ignore_errors=True)
                 return prefix, False, True, False, f"{type(exc).__name__}: {exc}", ""
 
-            rc = subprocess.run(cmd, env=env).returncode
+            with Timed(f"{task}_{rid}:preproc"):
+                rc = subprocess.run(cmd, env=env).returncode
 
             # preproc.py writes QC to flat /tmp paths — collect before handling
             # rc so a failed run still reports. The short path writes _surf_qc;
@@ -1018,8 +1040,9 @@ spec:
                 vol = sorted(
                     f for f in work_dir.iterdir() if f.is_file() and f.name not in surf_names
                 )
-                for f in vol:
-                    shutil.copy2(f, OUT_DIR / f.name)
+                with Timed(f"{task}_{rid}:stage_out"):
+                    for f in vol:
+                        shutil.copy2(f, OUT_DIR / f.name)
                 RUN_FILES[f"{task}_{rid}"] = [f.name for f in vol]
                 print(f"[driver] staged {len(vol)} volumetric files for {prefix}")
 
@@ -1063,7 +1086,13 @@ spec:
                     surf_message = ("grayordinate components missing after preproc.py "
                                      "exit 0 (Stage 5b downgrade to volumetric-only)")
                 else:
-                    with tarfile.open(surf_tarball(prefix), "w:gz") as tar:
+                    # compresslevel 1, not tarfile's default 9: the members are
+                    # mostly compressed already (GIFTI as gzip-base64, .nii.gz),
+                    # the tarball is transient (surface-resample deletes it), and
+                    # level 9 spends minutes of the session's one busy core on
+                    # ~2 GiB for little gain. surface-resample reads either.
+                    with Timed(f"{task}_{rid}:components_tar"), \
+                            tarfile.open(surf_tarball(prefix), "w:gz", compresslevel=1) as tar:
                         for f in dict.fromkeys(gray):   # de-dup overlapping globs
                             tar.add(str(f), arcname=f"{task}_{rid}/{f.name}")
                     print(f"[driver] wrote {surf_tarball(prefix).name}")
@@ -1084,8 +1113,10 @@ spec:
         try:
             with ThreadPoolExecutor(max_workers=JOBS) as pool:
                 results = list(pool.map(process, pending))
-            export_tissue_masks()
-            publish_error = publish_outputs()
+            with Timed("tissue_masks"):
+                export_tissue_masks()
+            with Timed("publish"):
+                publish_error = publish_outputs()
             if publish_error:
                 # Nothing this pod made is published: every run it produced
                 # volumetric output for is a func-preproc failure, not a success.
@@ -1096,6 +1127,7 @@ spec:
                     for p, ff, sf, prod, msg, up in results
                 ]
         finally:
+            print(f"[driver] TIMINGS {json.dumps(TIMINGS, sort_keys=True)}", flush=True)
             # Record every run's outcome directly (see ADR 016) instead of
             # emitting failed-run lists for a sibling DAG task to fan out
             # over. Two independent statuses per run — func-preproc and

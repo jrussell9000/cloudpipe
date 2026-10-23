@@ -134,7 +134,9 @@ resource "aws_glue_catalog_table" "func_preproc_compacted" {
     # enum is not a projected partition, so those rows return ZERO ROWS with a
     # SUCCEEDED query status — see #241 and the note at the top of this file.
     # 1.0 and 1.1 stay until no pre-reprocess partitions remain.
-    "projection.schema_version.values" = "1.0,1.1,1.2"
+    # 1.3 added for #859 (every summary excludes the non-steady-state frames),
+    # under the same rule: applied BEFORE any afni image emits it.
+    "projection.schema_version.values" = "1.0,1.1,1.2,1.3"
   })
 
   partition_keys {
@@ -354,8 +356,9 @@ resource "aws_glue_catalog_table" "surface_sample_compacted" {
     # under the literal "unknown" — declared here so the pre-fix batch stays
     # readable rather than landing outside the enum and returning zero rows
     # with a successful query status (#241). Do not drop "unknown" until
-    # those partitions are gone.
-    "projection.schema_version.values" = "unknown,1.0"
+    # those partitions are gone. 1.1 (#859): steady-state surf_*_tsnr_median;
+    # it must be applied BEFORE any afni image emits it.
+    "projection.schema_version.values" = "unknown,1.0,1.1"
   })
 
   partition_keys {

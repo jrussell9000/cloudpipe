@@ -166,6 +166,24 @@ zensical = ">=0.0.67,<0.1"
 docs-build = "zensical build --strict"
 docs-serve = "zensical serve"
 
+# --- Setup wizard in a browser (prototype) ---
+# `pixi run -e gui cloudpipe-gui --root <your root>` serves the same questions as
+# `cloudpipe setup` on http://127.0.0.1:8765 (src/cloudpipe_setup/gui/). Its own
+# environment, and NOT in the default solve group, so adding NiceGUI cannot move
+# a version the default environment, CI or the images resolve.
+[feature.gui.dependencies]
+nicegui = ">=3.17.1,<4"
+# NiceGUI's simulated browser (`nicegui.testing`) runs its pages under pytest-asyncio.
+pytest-asyncio = ">=1.4.0,<2"
+
+[feature.gui.tasks]
+cloudpipe-gui = { cmd = "python -m cloudpipe_setup.gui", env = { PYTHONPATH = "src" } }
+# The page tests, which pytest.ini's addopts hides from the default env for the
+# same reason as tests/images/fireants: NiceGUI is not installed there, and an
+# importorskip would fail CI's --allowed-skips-only. The page's logic is tested in
+# the default env by tests/test_setup_wizard_gui.py.
+test-gui = "pytest -o addopts= tests/gui"
+
 # --- Operator workstation (needs WARP) ---
 # `pixi run -e ops <tool>` exports this deployment's buckets and UI URLs from the
 # cluster (scripts/cloudpipe-env.sh), so src/ tools such as validate_test_batch.py
@@ -179,6 +197,7 @@ lint = { features = ["lint"], solve-group = "default" }
 imaging = { features = ["imaging"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
 ops = { features = ["ops"], solve-group = "default" }
+gui = { features = ["gui"] }
 
 [dependencies]
 numpy = ">=2.5.1,<3"

@@ -9,7 +9,7 @@ Two things to know before you start, because they set expectations for everythin
 
 ## What you need to have in hand
 
-The wizard will ask you for twelve values. Most you can read off a dashboard in a few minutes; two things you have to own first, and a third only if you want hostnames. Every bucket this deployment needs is created for you in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack).
+The wizard will ask you for eleven values, and fills in two of them from earlier answers. Most you can read off a dashboard in a few minutes; two things you have to own first, and a third only if you want hostnames. Every bucket this deployment needs is created for you in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack).
 
 | You must already own | Why | Where it is checked |
 |---|---|---|
@@ -71,13 +71,22 @@ Everything else — the cluster, the pipeline, Globus ingress, the metrics store
 
 Take the default unless you already run an identity provider and want the UIs pointed straight at it. An institutional provider does not need that input: it attaches to the Cognito pool as a federated provider instead, which keeps every institution-specific value in one place. See [Signing in with your institution's identity provider](#signing-in-with-your-institutions-identity-provider).
 
-## Step 1 — clone, and run the bootstrapper
+## Step 1 — fork, clone, and run the bootstrapper
+
+First, fork this repository on GitHub: open it on GitHub and choose **Fork**. A fork is your own copy on GitHub, for example `your-lab/cloudpipe`, which only you can change. Then clone your fork, not this repository:
 
 ```
-git clone <this repository> cloudpipe
+git clone https://github.com/your-lab/cloudpipe.git cloudpipe
 cd cloudpipe
 python3 scripts/cloudpipe-setup
 ```
+
+The fork matters because your cluster follows a repository on GitHub, not the copy on your computer, and applies whatever is merged there. With your fork, updates reach your cluster only when you choose to take them: GitHub's **Sync fork** button brings this repository's changes into it. The wizard also uses the fork as the one repository allowed to build images for your account.
+
+You can deploy without a fork, but you then have to make both choices yourself:
+
+- **The repository your cluster follows** can be this one. Your cluster then applies every change merged here, as soon as it is merged, including changes to the pipeline itself. To control when that happens, set `gitops_revision` in your root's `terraform.tfvars` to a specific commit, and change it when you want to upgrade.
+- **The repository allowed to build images** has to be one you own; an empty one is fine, since by default you never build images. Never give this repository: that would let its GitHub Actions runs upload images into your AWS account.
 
 The rest of this page calls that directory `<your clone>`. Use its real path wherever you see it, for example `~/cloudpipe` if you cloned into your home directory.
 

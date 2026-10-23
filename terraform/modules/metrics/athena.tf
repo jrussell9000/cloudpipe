@@ -16,6 +16,12 @@
 resource "aws_athena_workgroup" "cloudpipe_metrics" {
   name = "cloudpipe_metrics_workgroup"
 
+  # As for the CUR workgroup (modules/finops/athenacloudcur.tf): a workgroup that
+  # holds named queries or prepared statements is deleted only recursively, and
+  # a teardown otherwise stops on "WorkGroup ... is not empty". Results in S3 are
+  # not affected.
+  force_destroy = true
+
   configuration {
     enforce_workgroup_configuration    = true
     publish_cloudwatch_metrics_enabled = false

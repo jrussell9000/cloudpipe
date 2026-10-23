@@ -174,6 +174,27 @@ def refresh_derived(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
     return updated
 
 
+def refresh_suggested(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Re-suggest fields still holding the suggestion their sources made in `before`.
+
+    The browser form's counterpart of `refresh_derived`, for a field that is asked
+    but pre-filled: change the repository and the clone URL follows it, unless the
+    deployer typed a clone URL of their own. The terminal prompt needs none of
+    this, because it offers the suggestion at the moment it asks.
+    """
+    updated = dict(after)
+    for field in schema.fields():
+        if not field.is_suggested:
+            continue
+        stored = updated.get(field.identifier)
+        if stored not in (None, "", []) and stored != field.suggest(before):
+            continue  # the deployer's own value
+        suggested = field.suggest(updated)
+        if suggested is not None:
+            updated[field.identifier] = suggested
+    return updated
+
+
 def validate(answers: dict[str, Any], *, with_backend: bool = True) -> list[Record]:
     """Every problem with these answers, as one record per offending field.
 
@@ -199,6 +220,30 @@ def validate(answers: dict[str, Any], *, with_backend: bool = True) -> list[Reco
         problems.extend(_check(field, answers, with_backend=with_backend))
 
     return problems
+
+
+def is_asked(field: schema.Field, *, with_backend: bool) -> bool:
+    """Whether this field becomes a question.
+
+    Derived fields are shown and overridable but never asked — both halves are
+    required by the spec. A field that is required only when the backend is being
+    rendered is not asked when it is not: a question with no effect reads as a
+    setting that was ignored.
+
+    Here rather than in `prompt.py` because every front end asks the same set: the
+    terminal prompt and the browser form must not disagree about which fields are
+    questions.
+    """
+    if field.is_derived:
+        return False
+    # A field whose shape belongs to someone else — an institution's federated
+    # provider — is written into the answers document rather than typed at a
+    # prompt. It is still validated and still rendered; `x-not-asked` says why.
+    if field.not_asked:
+        return False
+    if field.required:
+        return True
+    return field.required_when is None or with_backend
 
 
 def is_answered(field: schema.Field, answers: dict[str, Any]) -> bool:

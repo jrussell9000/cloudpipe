@@ -432,8 +432,12 @@ def _collect_directory(
     """Add one directory's matching files to `result`; return how many matched.
 
     A file counts toward every scan type whose pattern it contains. A `.tsv` in
-    `func/` travels even when it names no requested task (events files for the
-    requested runs do name them; this keeps any that do not).
+    `func/` that names no task at all still travels (events files for the
+    requested runs name their task; this keeps any that do not). One that names
+    another task does not: every subject carries motion and events files for
+    `task-mid` and `task-sst`, which nothing here processes, and each is a request
+    on the source (28 of 113 files for a typical subject; 2026-10-22, when the
+    source was rejecting requests under load).
     """
     matched = 0
     for entry in entries:
@@ -441,7 +445,8 @@ def _collect_directory(
             continue
         name = entry["name"]
         types_here = [scan_type for scan_type, pattern in patterns if pattern in name]
-        if not types_here and not (bids_dir == FUNCTIONAL_DIR and name.endswith(".tsv")):
+        taskless_tsv = bids_dir == FUNCTIONAL_DIR and name.endswith(".tsv") and "_task-" not in name
+        if not types_here and not taskless_tsv:
             continue
         for scan_type in types_here:
             result.files_by_scan_type[scan_type] += 1

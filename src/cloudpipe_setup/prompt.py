@@ -68,7 +68,9 @@ def collect(
     would be ignored and the prompt would block on a terminal that is not there.
     """
     current = config.derive(dict(answers))
-    pending = [field for field in schema.fields() if _is_asked(field, with_backend=with_backend)]
+    pending = [
+        field for field in schema.fields() if config.is_asked(field, with_backend=with_backend)
+    ]
     style = _Style(emitter)
 
     _preamble(emitter, style, total=len(pending))
@@ -94,26 +96,6 @@ def collect(
                 current.pop(field.identifier, None)
     _show_derived(emitter, style, current)
     return current
-
-
-def _is_asked(field: schema.Field, *, with_backend: bool) -> bool:
-    """Whether this field becomes a question.
-
-    Derived fields are shown and overridable but never asked — both halves are
-    required by the spec. A field that is required only when the backend is being
-    rendered is not asked when it is not: a question with no effect reads as a
-    setting that was ignored.
-    """
-    if field.is_derived:
-        return False
-    # A field whose shape belongs to someone else — an institution's federated
-    # provider — is written into the answers document rather than typed at a
-    # prompt. It is still validated and still rendered; `x-not-asked` says why.
-    if field.not_asked:
-        return False
-    if field.required:
-        return True
-    return field.required_when is None or with_backend
 
 
 def _ask(
@@ -175,12 +157,17 @@ def _ask(
 
 
 def _stored_default(field: schema.Field, answers: dict[str, Any]) -> Any:
-    """What Enter accepts: the stored answer, `_NULL` for a stored null, or the schema's."""
+    """What Enter accepts: the stored answer, `_NULL` for a stored null, a suggestion, or the schema's.
+
+    The suggestion is computed here, at the moment of asking, rather than when the
+    run starts: on a first run its source is answered only a few questions earlier.
+    """
     stored = answers.get(field.identifier)
     if field.nullable and field.identifier in answers and stored is None:
         return _NULL
     if stored in (None, "", []):
-        return field.default
+        suggested = field.suggest(answers)
+        return suggested if suggested is not None else field.default
     return stored
 
 
@@ -233,7 +220,7 @@ def _help(emitter: Emitter, style: _Style, field: schema.Field, *, full: bool = 
     is only shown when there is more to see.
     """
     paragraphs = field.description.split("\n\n")
-    emitter.note(f"  {style.dim(_SOURCE_LABELS[field.source])}")
+    emitter.note(f"  {style.dim(SOURCE_LABELS[field.source])}")
     for paragraph in paragraphs if full else paragraphs[:1]:
         emitter.note(f"  {paragraph}")
     if not full and len(paragraphs) > 1:
@@ -312,8 +299,9 @@ def _skipped(field: schema.Field) -> CliError:
 
 #: What `x-source` means to a person standing in front of the question. Keyed by
 #: the schema's own enum, so a new source value fails loudly here rather than
-#: being shown as a bare identifier.
-_SOURCE_LABELS = {
+#: being shown as a bare identifier. Public because the browser form shows the
+#: same words beside the same question.
+SOURCE_LABELS = {
     "aws-console": "You can find this in the AWS console.",
     "cloudflare-dashboard": "You can find this in the Cloudflare dashboard.",
     "identity-provider": "Your institution's sign-in (identity) team can tell you this.",
