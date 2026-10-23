@@ -191,7 +191,7 @@ resource "kubernetes_role_v1" "worker_jobs" {
     verbs      = ["get", "list", "watch"]
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 resource "kubernetes_role_binding_v1" "worker_jobs" {

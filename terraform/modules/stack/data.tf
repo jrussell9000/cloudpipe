@@ -20,6 +20,19 @@ data "aws_iam_session_context" "current" {
   arn = data.aws_caller_identity.current.arn
 }
 
+# Whether this deployment's cluster exists right now, asked of AWS rather than of
+# the cluster. The namespace checks in grafana.tf and the argo-workflows and
+# prefect modules read from the cluster, so with the cluster gone they failed
+# every plan, a teardown's destroy included ("Failed to read Namespace
+# argo-workflows: ... dial tcp 127.0.0.1:80", second-account acceptance run,
+# 2026-10-23). They are read only when this is true. With no cluster there are
+# no namespaces to check, so skipping them is right.
+data "aws_eks_clusters" "all" {}
+
+locals {
+  cluster_exists = contains(data.aws_eks_clusters.all.names, var.name)
+}
+
 data "aws_availability_zones" "available" {
   # Exclude Local Zones (e.g. <region>-bos-1a) — not supported by all instance types.
   filter {

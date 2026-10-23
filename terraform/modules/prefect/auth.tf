@@ -36,5 +36,5 @@ resource "kubernetes_secret_v1" "api_auth" {
     "auth-string" = "cloudpipe:${random_password.api_auth.result}"
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }

@@ -12,7 +12,13 @@
 # resources apply in the second bootstrap phase, after ArgoCD has synced.
 ################################################################################
 
-data "kubernetes_namespace_v1" "grafana" {
+# Read only while the cluster exists (local.cluster_exists, in data.tf): with the cluster gone
+# there is no namespace to check, and reading it failed every plan, a teardown's
+# destroy included. Named `grafana_ready`, not `grafana` with a count added, which would be
+# an implicit move in every existing state and break -target plans.
+data "kubernetes_namespace_v1" "grafana_ready" {
+  count = local.cluster_exists ? 1 : 0
+
   metadata {
     name = var.grafana_namespace
   }
@@ -27,7 +33,7 @@ resource "kubernetes_secret_v1" "grafana_sso" {
     clientID     = local.ui_oidc_client_ids["grafana"]
     clientSecret = local.ui_oidc_client_secrets["grafana"]
   }
-  depends_on = [data.kubernetes_namespace_v1.grafana]
+  depends_on = [data.kubernetes_namespace_v1.grafana_ready]
 }
 
 # Grafana's local admin account.
@@ -61,7 +67,7 @@ resource "kubernetes_secret_v1" "grafana_admin" {
     admin-user     = "admin"
     admin-password = random_password.grafana_admin.result
   }
-  depends_on = [data.kubernetes_namespace_v1.grafana]
+  depends_on = [data.kubernetes_namespace_v1.grafana_ready]
 }
 
 # Shared token between Grafana and its image renderer (gitops/apps/grafana).
@@ -89,7 +95,7 @@ resource "kubernetes_secret_v1" "grafana_renderer_token" {
   data = {
     token = random_password.grafana_renderer_token.result
   }
-  depends_on = [data.kubernetes_namespace_v1.grafana]
+  depends_on = [data.kubernetes_namespace_v1.grafana_ready]
 }
 
 # The grafana-oidc-config ConfigMap that carried the domain and the admin

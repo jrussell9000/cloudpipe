@@ -13,7 +13,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     policy_types = ["Ingress", "Egress"]
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow intra-namespace traffic so server and worker can communicate directly.
@@ -48,7 +48,7 @@ resource "kubernetes_network_policy_v1" "intra_namespace" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # DNS
@@ -77,7 +77,7 @@ resource "kubernetes_network_policy_v1" "egress_dns" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # HTTPS egress — Kubernetes API server, AWS APIs (S3, SQS, Secrets Manager), GitHub
@@ -102,7 +102,7 @@ resource "kubernetes_network_policy_v1" "egress_https" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # PostgreSQL egress to Prefect DB
@@ -127,7 +127,7 @@ resource "kubernetes_network_policy_v1" "egress_rds" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow egress to the EKS Pod Identity Agent (169.254.170.23:80).
@@ -160,7 +160,7 @@ resource "kubernetes_network_policy_v1" "egress_pod_identity" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow ingress to Prefect server (port 4200) from oauth2-proxy only.
@@ -193,7 +193,7 @@ resource "kubernetes_network_policy_v1" "ingress_server" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # There is deliberately no prefect-server probe rule. One was added on the
@@ -245,5 +245,5 @@ resource "kubernetes_network_policy_v1" "ingress_oauth2_proxy" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }

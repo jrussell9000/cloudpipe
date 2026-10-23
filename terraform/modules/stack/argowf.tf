@@ -146,6 +146,7 @@ module "argo_workflows" {
 
   # Cluster / network
   cluster_name    = var.name
+  cluster_exists  = local.cluster_exists
   vpc_id          = module.vpc.vpc_id
   vpc_cidr        = var.vpc_cidr
   service_cidr    = module.eks.cluster_service_cidr

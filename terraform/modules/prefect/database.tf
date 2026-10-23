@@ -105,6 +105,6 @@ resource "kubectl_manifest" "db_external_secret" {
 
   depends_on = [
     aws_db_instance.this,
-    data.kubernetes_namespace_v1.this,
+    data.kubernetes_namespace_v1.ready,
   ]
 }

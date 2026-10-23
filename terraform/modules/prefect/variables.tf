@@ -7,6 +7,12 @@ variable "cluster_name" {
   type        = string
 }
 
+variable "cluster_exists" {
+  description = "Whether the cluster exists. The namespace check below reads from the cluster, so with no cluster it is skipped rather than failing every plan, a teardown's destroy included. Set by the stack from AWS."
+  type        = bool
+  default     = true
+}
+
 variable "vpc_id" {
   description = "ID of the VPC where the cluster and database reside."
   type        = string
