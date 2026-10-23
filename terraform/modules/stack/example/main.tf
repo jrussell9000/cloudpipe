@@ -108,15 +108,29 @@ provider "cloudflare" {}
 # the module: a provider may not be configured from a module's outputs, so the
 # cluster has to be looked up here, in the root, by name.
 #
-# Consequence worth knowing before the first apply: this lookup fails while the
-# cluster does not exist yet. A fresh deployment is phased (`-target` the VPC and
-# the cluster first) rather than one apply — see "Bootstrap and install sequence"
-# in ../../../../docs/infrastructure.md. Do not run a bare `terraform apply`
-# against an empty account and conclude the example is broken.
+# The cluster is read only when it exists. Before the first install, and after a
+# teardown has destroyed it, there is no cluster to read, and an unconditional
+# lookup failed every plan, a destroy included: a teardown re-run after the
+# cluster was gone stopped on "reading EKS Cluster (cloudpipe): couldn't find
+# resource" (second-account acceptance run, 2026-10-23). With no cluster the
+# Kubernetes-family providers get no host, which is right: nothing they manage
+# can exist without one.
+#
+# A fresh deployment is still phased (`-target` the VPC and the cluster first)
+# rather than one apply — see "Bootstrap and install sequence" in
+# ../../../../docs/infrastructure.md.
 ################################################################################
 
+data "aws_eks_clusters" "all" {}
+
 data "aws_eks_cluster" "upstream" {
-  name = var.name
+  count = contains(data.aws_eks_clusters.all.names, var.name) ? 1 : 0
+  name  = var.name
+}
+
+locals {
+  cluster_endpoint = try(data.aws_eks_cluster.upstream[0].endpoint, null)
+  cluster_ca       = try(base64decode(data.aws_eks_cluster.upstream[0].certificate_authority[0].data), null)
 }
 
 data "aws_ecrpublic_authorization_token" "token" {
@@ -136,8 +150,8 @@ provider "helm" {
     }
   ]
   kubernetes = {
-    host                   = data.aws_eks_cluster.upstream.endpoint
-    cluster_ca_certificate = base64decode(data.aws_eks_cluster.upstream.certificate_authority[0].data)
+    host                   = local.cluster_endpoint
+    cluster_ca_certificate = local.cluster_ca
     exec = {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
@@ -147,8 +161,8 @@ provider "helm" {
 }
 
 provider "kubernetes" {
-  host                   = data.aws_eks_cluster.upstream.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.upstream.certificate_authority[0].data)
+  host                   = local.cluster_endpoint
+  cluster_ca_certificate = local.cluster_ca
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"
@@ -158,8 +172,8 @@ provider "kubernetes" {
 
 # gavinbunney/kubectl, for raw manifests the kubernetes provider cannot express.
 provider "kubectl" {
-  host                   = data.aws_eks_cluster.upstream.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.upstream.certificate_authority[0].data)
+  host                   = local.cluster_endpoint
+  cluster_ca_certificate = local.cluster_ca
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"

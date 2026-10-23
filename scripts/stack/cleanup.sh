@@ -123,11 +123,14 @@ state_attr() {
     awk -v key="$2" '$1 == key { gsub(/"/, "", $3); print $3; exit }'
 }
 
-# Each destroy takes a final snapshot (db_skip_final_snapshot defaults to false),
-# named <cluster>-argo-final and <cluster>-prefect-final. A snapshot by that name
-# left by an earlier teardown in this account makes DeleteDBInstance fail with
-# DBSnapshotAlreadyExists, after everything before it has been destroyed. Checked
-# before the confirmation, so it stops with nothing destroyed.
+# No final snapshot is taken by default (db_skip_final_snapshot is true). One is
+# taken when a deployment sets it false, and by any deployment whose state still
+# records the old default until its next apply: named <cluster>-argo-final and
+# <cluster>-prefect-final. A snapshot by that name left by an earlier teardown in
+# this account makes DeleteDBInstance fail with DBSnapshotAlreadyExists, after
+# everything before it has been destroyed. Checked before the confirmation, so
+# it stops with nothing destroyed. Read from state, so it checks exactly the
+# snapshots this teardown would take, and none when it takes none.
 require_free_final_snapshot_names() {
   local address snapshot taken=()
   while read -r address; do
@@ -147,8 +150,8 @@ require_free_final_snapshot_names() {
 }
 
 # Turn deletion protection off on each database still in state. After the
-# confirmation, so it only happens in a teardown someone has agreed to. The
-# final snapshot each destroy takes is what keeps this recoverable.
+# confirmation, so it only happens in a teardown someone has agreed to. Notes any
+# final snapshot the destroy will take, for the closing report.
 FINAL_SNAPSHOTS=()
 release_rds_deletion_protection() {
   local address instance snapshot
@@ -439,13 +442,15 @@ fi
 # whether they are finished. Printed rather than deleted, and there is no flag
 # that deletes them: that flag's misuse is the one that cannot be undone.
 
-# The databases' final snapshots, kept for the same reason and reported the
-# same way. They also cost money, and a later teardown of a deployment with the
-# same cluster name in this account stops until they are renamed or deleted.
+# The databases' final snapshots, when there are any: none by default, since
+# db_skip_final_snapshot is true. Reported like the buckets because they cost
+# money, and a later teardown of a deployment with the same cluster name in this
+# account stops until they are renamed or deleted.
 report_final_snapshots() {
   [[ ${#FINAL_SNAPSHOTS[@]} -eq 0 ]] && return 0
   echo ""
-  echo "==> These database snapshots were taken and KEPT, on purpose:"
+  echo "==> These database snapshots were taken and kept (db_skip_final_snapshot is false"
+  echo "    in this deployment's state):"
   printf '      %s\n' "${FINAL_SNAPSHOTS[@]}"
   echo "    They are the last copy of the Argo and Prefect databases. A later teardown"
   echo "    of a deployment named $CLUSTER_NAME in this account will stop until they are"

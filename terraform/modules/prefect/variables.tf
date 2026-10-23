@@ -164,9 +164,9 @@ variable "db_deletion_protection" {
 }
 
 variable "db_skip_final_snapshot" {
-  description = "Skip the final snapshot on RDS destroy. Leave false so a destroy is recoverable."
+  description = "Skip the final snapshot on RDS destroy. True by default: a teardown should leave nothing behind, and an accidental delete is already refused by deletion protection. Set false to keep a final snapshot."
   type        = bool
-  default     = false
+  default     = true
 }
 
 ################################################################################

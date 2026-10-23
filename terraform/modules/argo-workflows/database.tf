@@ -64,8 +64,9 @@ resource "aws_db_instance" "this" {
   # separate apply, which is the point — deletion takes two deliberate steps.
   deletion_protection = var.db_deletion_protection
 
-  # A replacement (see replace_triggered_by below) still destroys the instance, so the
-  # final snapshot is what makes that recoverable.
+  # A replacement (see replace_triggered_by below) would destroy the instance, but
+  # deletion protection above makes AWS refuse that delete, so nothing is lost by
+  # skipping the final snapshot, which only a deliberate teardown would ever take.
   skip_final_snapshot       = var.db_skip_final_snapshot
   final_snapshot_identifier = var.db_skip_final_snapshot ? null : "${var.cluster_name}-argo-final"
 
