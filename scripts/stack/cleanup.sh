@@ -27,6 +27,31 @@ destroy_target() {
   fi
 }
 
+# The cluster's API has to be reachable from this shell before anything is
+# destroyed. After the install's last phase it is private, reachable only over
+# WARP (or the VPN). Every kubectl call below ends in `|| true`, because a
+# resource that is already gone is not an error — so an unreachable API reads as
+# "nothing to delete": the deletion-protected web-UI ALB is left behind, and the
+# VPC destroy then fails on its network interfaces, halfway through the teardown
+# (found preparing the second-account acceptance run, 2026-10-22).
+#
+# No cluster is fine: there is nothing for kubectl to reach, and the teardown is
+# cleaning up what a failed install left. Also writes the kubeconfig entry the
+# Helm and Kubernetes providers use during the destroy.
+require_reachable_cluster() {
+  if ! aws eks describe-cluster --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+    return 0
+  fi
+  aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$DEPLOYMENT_REGION" >/dev/null
+  if ! kubectl get --raw=/readyz --request-timeout=20s >/dev/null 2>&1; then
+    fail "$EXIT_BLOCKED" \
+      "ERROR: the cluster $CLUSTER_NAME exists, but its API cannot be reached from this shell." \
+      "After the install's last phase the API is private: connect WARP to this deployment's" \
+      "Zero Trust team (or the VPN), check that \`kubectl get nodes\` works, then run this" \
+      "again. Nothing has been destroyed."
+  fi
+}
+
 # Deployment resolution, target lists and assert_targets_declared() are shared
 # with install.sh.
 # shellcheck source=SCRIPTDIR/targets.sh
@@ -67,6 +92,11 @@ for _output in terraform_state_bucket data_bucket metrics_bucket; do
 done
 unset _output _bucket
 
+# Before the confirmation, so an unreachable cluster stops the run with nothing
+# destroyed and nobody has typed "destroy" for a teardown that cannot finish.
+echo "==> Checking that the cluster's API can be reached..."
+require_reachable_cluster
+
 echo "==> WARNING: This will permanently destroy this deployment's infrastructure."
 echo "    Root:    $DEPLOYMENT_ROOT"
 echo "    Module:  module.$STACK_MODULE_NAME"
@@ -78,10 +108,6 @@ if [[ "$CONFIRM" != "destroy" ]]; then
   echo "Aborted."
   exit "$EXIT_BLOCKED"
 fi
-
-# Kubeconfig must be current for Helm/Kubernetes provider calls during destroy.
-# Fails gracefully if the cluster is already gone.
-aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$DEPLOYMENT_REGION" 2>/dev/null || true
 
 # Phase 1: Tear down application-layer resources first (Helm releases, Kubernetes
 # objects, CRD-dependent manifests) before removing the cluster itself.

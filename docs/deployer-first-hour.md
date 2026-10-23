@@ -551,6 +551,14 @@ It needs kubectl configured for the cluster and a connected WARP session. If the
 
 `bash <your-clone>/scripts/stack/cleanup.sh --root <your-root>` destroys the cluster and everything the stack owns. It leaves the three buckets from [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) standing, and ends by naming them with the command that deletes each.
 
+Run it from a shell set up the way the install's was:
+
+- signed in to the AWS account this deployment is in (`aws sts get-caller-identity` names it);
+- with `CLOUDFLARE_API_TOKEN` exported, for the same Cloudflare account;
+- with WARP connected to this deployment's Zero Trust team, because after the install's last phase the cluster can be reached only through WARP. Check with `kubectl get nodes`.
+
+It checks the last one before asking you to type `destroy`, and stops with nothing destroyed if the cluster cannot be reached. Without that, the teardown would leave the web dashboards' load balancer behind and then fail partway through.
+
 That is deliberate in three independent ways, because deleting a cohort by accident is not a recoverable mistake: those buckets live in a Terraform state the teardown never touches, each carries `prevent_destroy`, and none sets `force_destroy` — so S3 refuses to delete a non-empty one even if the other two safeguards were gone.
 
 **Installing again into the same account reuses them.** The second install adopts the buckets rather than failing on names that already exist, which is the main reason not to clear them out reflexively between attempts. When you are genuinely finished:
