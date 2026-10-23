@@ -142,7 +142,13 @@ class FuncQC:
     # replaces it; the bump is what makes a run the reprocess MISSED visible
     # afterwards, instead of indistinguishable from a corrected one. The
     # longitudinal reprocess can partially skip, so that is a real case.
-    schema_version: str = "1.2"
+    # 1.2 -> 1.3 at #859: no field added, but every summary (gcor, aor, aqi,
+    # tsnr_median, the DVARS/global-signal means, the FD summaries, and the
+    # surf_*_tsnr_median block) is now taken over the steady-state frames,
+    # n_nss_frames onward. Over the full series the T1-saturation transient on
+    # GE DV26+ and Siemens VE11 dominated them, so 1.2 values of these fields
+    # are not comparable across scanner software.
+    schema_version: str = "1.3"
     completed_at: str = field(default_factory=_now_utc)
 
     # Grayordinate QC, present only on runs that also emit surfaces (--emit
@@ -239,7 +245,8 @@ class SurfaceSampleQC:
     peak_memory_gb: float = 0.0  # this run only (rusage, resets per run)
     container_peak_memory_gb: float = 0.0  # container lifetime; size limits.memory on this
 
-    schema_version: str = "1.0"
+    # 1.1 (#859): surf_*_tsnr_median is over the steady-state frames only.
+    schema_version: str = "1.1"
     completed_at: str = field(default_factory=_now_utc)
 
     # Surface metrics. None, not 0.0, is "not computed" — 0.0 is a legitimate

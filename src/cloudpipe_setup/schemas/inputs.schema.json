@@ -3,7 +3,7 @@
   "$id": "https://cloudpipe.invalid/schemas/inputs.schema.json",
   "title": "CloudPipe deployment inputs",
   "x-schema-version": "2.0",
-  "description": "Every cluster-wide value a human supplies to stand up a CloudPipe deployment, and nothing else. `pixi run cloudpipe setup` reads this file rather than hard-coding its questions, and renders `terraform.tfvars` and `backend.tf` into a target Terraform root from the answers.\n\nThis is the integration contract for any front end. A caller reads it and renders a complete input form without opening another file: `title` is the prompt, `description` is the help text, `pattern` is the rule, `x-section` is the grouping, and `x-source` says where a human obtains the value. Fields marked `x-derived` are computed and overridable — a form generator must display the computed value and accept a change, but must NOT present them as questions.\n\nThe eight Globus variables are deliberately absent. `pixi run globus init` owns them and renders them into a separate `globus.auto.tfvars`; see `src/globus_admin/schemas/answers.schema.json`. The two sets are disjoint and a test holds them so, because two tools writing one variable is two tools disagreeing about it.\n\nThere is deliberately NO AWS credential, key, or profile field, and no Cloudflare API token field. AWS credentials come from the deployer's environment through an AWS CLI v2 SSO profile; the Cloudflare token comes from CLOUDFLARE_API_TOKEN. Neither is ever prompted for, stored, or printed.\n\nEvery `pattern` here is the mechanical equivalent of a `validation` block in `terraform/modules/stack/variables.tf`, and `tests/test_setup_wizard_schema.py` derives both sides from that file and asserts they agree. A field whose variable Terraform does not constrain carries no pattern: one invented here would reject values Terraform accepts, which is the single failure a deployer cannot work around. `x-error-message` is Terraform's own `error_message`, verbatim, so the two can never word the same rule differently.\n\nNo value in this file identifies any deployment. Where a shape needs illustrating, the description uses a placeholder or a reserved example name.",
+  "description": "Every cluster-wide value a human supplies to stand up a CloudPipe deployment, and nothing else. `pixi run cloudpipe setup` reads this file rather than hard-coding its questions, and renders `terraform.tfvars` and `backend.tf` into a target Terraform root from the answers.\n\nThis is the integration contract for any front end. A caller reads it and renders a complete input form without opening another file: `title` is the prompt, `description` is the help text, `pattern` is the rule, `x-section` is the grouping, and `x-source` says where a human obtains the value. Fields marked `x-derived` are computed and overridable — a form generator must display the computed value and accept a change, but must NOT present them as questions. A derivation is `x-derived-template` filled from the answers named in `x-derived-from`; with `x-derived-pattern`, a regex with named groups is matched against the one source first, and the template may use its groups. Fields carrying `x-suggested-from` and `x-suggested-template` (and optionally `x-suggested-pattern`, read the same way) ARE questions: a form generator offers the computed value as the answer's default, and keeps offering the recomputed one while the answer has not been changed from it.\n\nThe eight Globus variables are deliberately absent. `pixi run globus init` owns them and renders them into a separate `globus.auto.tfvars`; see `src/globus_admin/schemas/answers.schema.json`. The two sets are disjoint and a test holds them so, because two tools writing one variable is two tools disagreeing about it.\n\nThere is deliberately NO AWS credential, key, or profile field, and no Cloudflare API token field. AWS credentials come from the deployer's environment through an AWS CLI v2 SSO profile; the Cloudflare token comes from CLOUDFLARE_API_TOKEN. Neither is ever prompted for, stored, or printed.\n\nEvery `pattern` here is the mechanical equivalent of a `validation` block in `terraform/modules/stack/variables.tf`, and `tests/test_setup_wizard_schema.py` derives both sides from that file and asserts they agree. A field whose variable Terraform does not constrain carries no pattern: one invented here would reject values Terraform accepts, which is the single failure a deployer cannot work around. `x-error-message` is Terraform's own `error_message`, verbatim, so the two can never word the same rule differently.\n\nNo value in this file identifies any deployment. Where a shape needs illustrating, the description uses a placeholder or a reserved example name.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -62,9 +62,9 @@
       ],
       "pattern": "^[a-z0-9.-]+\\.[a-z]{2,}$",
       "x-error-message": "domain must be null (port-forward mode) or a bare DNS name with a TLD, e.g. example.org — no scheme and no trailing dot.",
-      "x-null-meaning": "port-forward mode: no published web UIs, and no domain or hosted zone needed",
+      "x-null-meaning": "no web address (you open the dashboards from your own computer instead)",
       "title": "Web address for the dashboards (or none)",
-      "description": "Type none unless you own a domain name that is set up in this AWS account (Route 53) and want the web dashboards at addresses like grafana.<your domain>. With none, you open each dashboard from your own computer with one command instead, which is the simpler choice.\n\nWith a domain: a Route 53 hosted zone for exactly that name must already exist in the account you are deploying into, and the domain's registrar must point at it, because the install proves you own the domain through it to get web certificates. Type the bare name, for example lab.example.org, with no https:// and no trailing dot. `cloudpipe preflight` checks that the zone exists.\n\nWith none, nothing is published at any address. You open a dashboard with `pixi run --manifest-path <your clone>/pixi.toml cloudpipe ui <name>`, while connected to WARP.",
+      "description": "Choose none unless you own a domain name that is set up in this AWS account (Route 53) and want the web dashboards at addresses like grafana.<your domain>. With none, you open each dashboard from your own computer with one command instead, which is the simpler choice.\n\nWith a domain: a Route 53 hosted zone for exactly that name must already exist in the account you are deploying into, and the domain's registrar must point at it, because the install proves you own the domain through it to get web certificates. Type the bare name, for example lab.example.org, with no https:// and no trailing dot. `cloudpipe preflight` checks that the zone exists.\n\nWith none, nothing is published at any address. You open a dashboard with `pixi run --manifest-path <your clone>/pixi.toml cloudpipe ui <name>`, while connected to WARP.",
       "x-section": "identity",
       "x-source": "deployer-choice",
       "x-terraform-variable": "domain"
@@ -165,7 +165,7 @@
       "pattern": "^[^/]+/[^/]+$",
       "x-error-message": "github_repo must be in owner/repo format, with no scheme and no .git suffix.",
       "title": "GitHub repository allowed to build images (owner/name)",
-      "description": "The GitHub repository allowed to build and upload container images for this deployment, written as owner/name, for example your-lab/cloudpipe. Give your own fork of CloudPipe, even if you never build images: the install needs a repository here, and nothing breaks if it never builds.\n\nGive a repository you control, not someone else's: GitHub Actions runs on its main branch can upload images into your AWS account. Type it without https:// and without .git.\n\nThis does not have to be the repository the cluster follows, which is the next question. They are usually the same.",
+      "description": "The GitHub repository allowed to build and upload container images for this deployment, written as owner/name, for example your-lab/cloudpipe. Give a repository you own, which is usually your fork of CloudPipe. The install needs one here even if you never build images, and nothing breaks if it never builds.\n\nNever give the public CloudPipe repository or anyone else's: GitHub Actions runs on its main branch can upload images into your AWS account. Without a fork, any repository you own will do, even an empty one. Type it without https:// and without .git.\n\nThis does not have to be the repository the cluster follows, which is the next question. They are usually the same, so the next question is filled in from this answer.",
       "x-section": "source-control",
       "x-source": "source-control-host",
       "x-terraform-variable": "github_repo"
@@ -175,20 +175,30 @@
       "pattern": "^https://",
       "x-error-message": "gitops_repo_url must be an https clone URL — ArgoCD reads it without a credential here.",
       "title": "Repository the cluster follows (its web address)",
-      "description": "The https address of the repository the cluster takes its configuration from, for example https://github.com/your-lab/cloudpipe. Usually your fork of CloudPipe. The cluster keeps itself in step with this repository, so changes merged there are applied automatically.\n\nIt must be an https address, not an ssh one (git@...). A public repository needs no password; for a private one, see docs/deployer-first-hour.md, \"If your GitOps repository is private\".",
+      "description": "The https address of the repository the cluster takes its configuration from, for example https://github.com/your-lab/cloudpipe. It is filled in from the repository you gave in the previous question, because the two are usually the same: your fork of CloudPipe. Keep it unless the cluster should follow a different repository. If you have no fork and gave a repository of your own that does not hold CloudPipe, replace it with the repository the cluster should follow. The cluster keeps itself in step with this repository, so changes merged there are applied automatically.\n\nIt must be an https address, not an ssh one (git@...). A public repository needs no password; for a private one, see docs/deployer-first-hour.md, \"If your GitOps repository is private\".",
       "x-section": "source-control",
       "x-source": "source-control-host",
-      "x-terraform-variable": "gitops_repo_url"
+      "x-terraform-variable": "gitops_repo_url",
+      "x-suggested-from": [
+        "github_repo"
+      ],
+      "x-suggested-template": "https://github.com/{github_repo}"
     },
     "github_user_url": {
       "type": "string",
       "pattern": "^https://",
       "x-error-message": "github_user_url must be an https URL.",
-      "title": "GitHub account or organization that owns it",
-      "description": "The https address of the GitHub user or organization that owns the repository above, for example https://github.com/your-lab.\n\nUsed so that one access setting covers every repository under that owner, rather than one per repository.",
+      "title": "Address of the account that owns that repository",
+      "description": "The address of the repository the cluster follows, without the repository's own name: https://github.com/your-lab for https://github.com/your-lab/cloudpipe. Worked out for you, so there is nothing to do.\n\nIt is used only when that repository is private. The cluster then signs in to every repository whose address starts with this one, which covers the repository and any private ones it pulls in. With a public repository nothing reads it.",
       "x-section": "source-control",
-      "x-source": "source-control-host",
-      "x-terraform-variable": "github_user_url"
+      "x-source": "derived",
+      "x-terraform-variable": "github_user_url",
+      "x-derived": true,
+      "x-derived-from": [
+        "gitops_repo_url"
+      ],
+      "x-derived-pattern": "^(?P<owner_url>https://.+)/[^/]+?/?$",
+      "x-derived-template": "{owner_url}"
     },
     "github_oidc_allowed_subs": {
       "type": "array",
@@ -232,10 +242,15 @@
       "type": "string",
       "minLength": 1,
       "title": "A display name for your Zero Trust team",
-      "description": "Any readable label, for example your lab's name. There is nothing to look up.\n\nThe install sets it on your Zero Trust organization, replacing the placeholder name Cloudflare created when Zero Trust was turned on. That placeholder can look like a web address, but it is not the team address of the previous question.",
+      "description": "Any readable label, for example your lab's name. It is filled in with the team name from your team address (my-lab for my-lab.cloudflareaccess.com), which is fine to keep. There is nothing to look up.\n\nThe install sets it on your Zero Trust organization, replacing the placeholder name Cloudflare created when Zero Trust was turned on. That placeholder can look like a web address, but it is not the team address of the previous question.",
       "x-section": "cloudflare",
       "x-source": "cloudflare-dashboard",
-      "x-terraform-variable": "cloudflare_team_name"
+      "x-terraform-variable": "cloudflare_team_name",
+      "x-suggested-from": [
+        "cloudflare_team_domain"
+      ],
+      "x-suggested-pattern": "^(?P<team>[^.]+)\\.cloudflareaccess\\.com$",
+      "x-suggested-template": "{team}"
     },
     "state_bucket": {
       "type": "string",
@@ -258,7 +273,7 @@
       "minLength": 1,
       "default": "cloudpipe/terraform.tfstate",
       "title": "Name of the record inside that bucket",
-      "description": "Press Enter to keep the default. Change it only if one bucket will hold the records of more than one deployment.\n\nTwo deployments using the same name here would overwrite each other's record.",
+      "description": "Keep the default unless one bucket will hold the records of more than one deployment.\n\nTwo deployments using the same name here would overwrite each other's record.",
       "x-section": "terraform-state",
       "x-source": "deployer-choice",
       "x-terraform-variable": null
@@ -269,11 +284,11 @@
         "null"
       ],
       "title": "Your FreeSurfer license file",
-      "description": "The full path to the license.txt file FreeSurfer emailed you, for example /home/you/license.txt. Registration is free at https://surfer.nmr.mgh.harvard.edu/registration.html. Press Enter to skip it and upload the file yourself later.\n\nThe brain-segmentation steps need it, and licenses are issued per person, so CloudPipe cannot ship one. The wizard checks that the file exists and looks like a license, but never copies its contents into your answers or prints them. The bootstrap step (Step 4 of the deployer guide) uploads it to your data bucket.",
+      "description": "The full path to the license.txt file FreeSurfer emailed you, for example /home/you/license.txt. Registration is free at https://surfer.nmr.mgh.harvard.edu/registration.html. Leave it empty to skip it and upload the file yourself later.\n\nThe brain-segmentation steps need it, and licenses are issued per person, so CloudPipe cannot ship one. The wizard checks that the file exists and looks like a license, but never copies its contents into your answers or prints them. The bootstrap step (Step 4 of the deployer guide) uploads it to your data bucket. If you skip it, upload it yourself to config/fslicense in the data bucket; `cloudpipe preflight` reports whether it is there.",
       "x-section": "reference-data",
       "x-source": "deployer-choice",
       "x-terraform-variable": null,
-      "x-null-meaning": "you upload the license yourself, to config/fslicense in the data bucket; preflight's aws.config_objects says whether it is there"
+      "x-null-meaning": "uploading the license yourself later"
     }
   },
   "$defs": {

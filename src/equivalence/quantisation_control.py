@@ -170,8 +170,13 @@ class QuantisationFloor:
         )
 
 
-def quantisation_floor(bold, mask, source: str = "") -> tuple[QuantisationFloor, Tier1Result]:
+def quantisation_floor(
+    bold, mask, source: str = "", *, n_nss_frames: int
+) -> tuple[QuantisationFloor, Tier1Result]:
     """Tier-1 agreement between a full-precision BOLD and its quantised self.
+
+    `n_nss_frames` is passed to `tier1` so the floor is measured over the same
+    frames as the endpoint it bounds.
 
     `bold` must be the warp's float32 output, before the writer touched it — a
     published derivative is already quantised, and running this on one measures a
@@ -203,6 +208,7 @@ def quantisation_floor(bold, mask, source: str = "") -> tuple[QuantisationFloor,
         mask_image,
         nib.Nifti1Image(quantised_data, image.affine, image.header),
         mask_image,
+        n_nss_frames=n_nss_frames,
     )
 
     max_abs_overall = float(np.abs(data).max())
@@ -235,10 +241,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bold", type=Path, help="the warp's float32 MNI BOLD, pre-writer")
     parser.add_argument("mask", type=Path, help="its MNI brain mask")
+    parser.add_argument(
+        "--nss-frames",
+        type=int,
+        required=True,
+        help="the run's non-steady-state frame count (tools/nss_volumes.csv); excluded "
+        "from every time statistic, as in the endpoints this floor bounds",
+    )
     parser.add_argument("--json", type=Path, default=None, help="write the figures here as well")
     args = parser.parse_args(argv)
 
-    floor, _ = quantisation_floor(args.bold, args.mask, source=str(args.bold))
+    floor, _ = quantisation_floor(
+        args.bold, args.mask, source=str(args.bold), n_nss_frames=args.nss_frames
+    )
     print(floor)
     if not floor.extreme_is_in_mask:
         print(

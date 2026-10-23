@@ -45,7 +45,7 @@ def setup(ctx: Context) -> ExitCode:
     if answers_path is not None:
         emitter.note(f"answers: {answers_path}")
 
-    answers = _apply_defaults(answers)
+    answers = apply_defaults(answers)
     target = config.resolve_path(ctx.args.answers)
 
     if ctx.non_interactive:
@@ -240,18 +240,28 @@ def _render(root: Path, name: str, content: str, ctx: Context) -> Path:
     return render.write(root / name, content, force=ctx.args.force)
 
 
-def _apply_defaults(answers: dict) -> dict:
+def apply_defaults(answers: dict) -> dict:
     """Fill schema defaults for fields the deployer has not set.
 
-    Only `state_key` has one today. Applied here rather than in `config.load` so
-    that the answers document a deployer carries between machines records the
-    value that was actually used, not an empty slot that a future default change
-    would silently fill differently.
+    `name` and `state_key` have one today. Applied here rather than in
+    `config.load` so that the answers document a deployer carries between
+    machines records the value that was actually used, not an empty slot that a
+    future default change would silently fill differently. Public because the
+    browser form applies them on load too: without `name`, nothing derived from
+    it (the state bucket) can be shown.
+
+    A suggestion counts as a default once its sources are answered, which is what
+    lets `--non-interactive` accept a document that leaves `gitops_repo_url` to
+    follow `github_repo`. Filled in schema order, so a suggestion may read a
+    field filled earlier in the same pass.
     """
     filled = dict(answers)
     for field in schema.fields():
-        if field.default is not None and filled.get(field.identifier) in (None, ""):
-            filled[field.identifier] = field.default
+        if filled.get(field.identifier) not in (None, ""):
+            continue
+        value = field.default if field.default is not None else field.suggest(filled)
+        if value is not None:
+            filled[field.identifier] = value
     return filled
 
 

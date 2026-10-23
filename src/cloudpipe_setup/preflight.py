@@ -429,6 +429,10 @@ def _check_account(identity: dict[str, Any] | None, expected: str | None) -> Rec
         )
     resolved = str(identity.get("Account", ""))
     if not expected:
+        # Through cli_command, like every other printed command: a bare
+        # `cloudpipe preflight` is not a command that exists in the deployer's root.
+        from .render import cli_command
+
         return _skipped(
             CHECK_ACCOUNT,
             "Intended account",
@@ -436,7 +440,7 @@ def _check_account(identity: dict[str, Any] | None, expected: str | None) -> Rec
             "check it against.",
             Remedy(
                 "command",
-                f"cloudpipe preflight --account {resolved} (if that is the one you "
+                f"{cli_command('preflight')} --account {resolved}   (if that is the one you "
                 "mean to deploy into)",
             ),
         )

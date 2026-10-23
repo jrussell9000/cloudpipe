@@ -128,22 +128,25 @@ def _gcor(ts: np.ndarray) -> float:
 # src/metrics/schemas.py; tests/metrics/test_funcqc_schema_version_sync.py holds
 # them together. It sat at "1.1" here after #643 moved schemas.py to "1.2", so
 # every record computed with the #643 CompCor was still labelled 1.1.
-FUNC_QC_SCHEMA_VERSION = "1.2"
+# 1.3 (#859): every summary excludes the non-steady-state frames.
+FUNC_QC_SCHEMA_VERSION = "1.3"
 
 
-def tsnr_map_from_file(mni_bold: Path) -> np.ndarray:
-    """Voxelwise temporal SNR (mean / population std over time), 0 where std is 0.
+def _tsnr(ts: np.ndarray) -> np.ndarray:
+    """Per-row temporal SNR (mean / population std over the last axis), 0 where std is 0."""
+    sd = ts.std(axis=-1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(sd > 0, ts.mean(axis=-1) / sd, 0.0)
 
-    Population std (ddof=0), matching the Welford accumulator preproc.py's
-    apply_transforms uses to compute the same map without a second read.
+
+def tsnr_map_from_file(mni_bold: Path, n_nss_frames: int = 0) -> np.ndarray:
+    """Voxelwise temporal SNR over the steady-state frames, 0 where std is 0.
+
+    Population std (ddof=0). Frames before `n_nss_frames` are excluded, for the
+    reason given in func_qc_measures.
     """
     bold_data = nib.load(mni_bold).get_fdata(dtype=np.float32)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(
-            bold_data.std(axis=-1) > 0,
-            bold_data.mean(axis=-1) / bold_data.std(axis=-1),
-            0.0,
-        )
+    return _tsnr(bold_data[..., n_nss_frames:])
 
 
 def func_qc_measures(
@@ -153,16 +156,30 @@ def func_qc_measures(
     n_nss_frames: int,
     mni_bold: Path,
     mask_mni: Path,
-    tsnr_map: np.ndarray | None = None,
 ) -> dict:
     """The measured fields of a FuncQC record, in schema order.
 
     Reads only the outputs: the confounds table, the MNI BOLD and its brain mask.
-    `tsnr_map` lets preproc.py pass the map it already accumulated during the
-    warp; when None it is computed from `mni_bold`.
+
+    Every summary is taken over the steady-state frames, `n_nss_frames` onward
+    (schema 1.3, #859). The non-steady-state frames stay in the BOLD and the
+    confounds, flagged by the non_steady_state_outlier_* columns, but no analysis
+    uses them: ABCD discards the same count before every task and rest analysis
+    (Hagler et al. 2019, NeuroImage 202:116091, footnote 4). On GE DV26 and later
+    and on Siemens VE11 those frames carry a T1-saturation transient (frame 0 is
+    ~+56% and ~+26% above steady state), and over the full series it dominated
+    the metrics: on a GE DV26 run, gcor 0.546 against 0.058 steady-state and tSNR
+    24.8 against 49.0. Included, they describe the scanner software, not the data.
     """
-    fd = confounds["framewise_displacement"].dropna().values
-    dvars = confounds["dvars"].dropna().values
+    nss = max(0, int(n_nss_frames))
+    steady_conf = confounds.iloc[nss:]
+    # FD and DVARS are frame-to-frame differences, so row `nss` measures the step
+    # from the last excluded frame into the window. Start one row later: within
+    # the window the first difference is undefined, exactly as row 0 is n/a in
+    # the TSV. (At nss == 0 this drops only that n/a row.)
+    step_conf = confounds.iloc[nss + 1 :]
+    fd = step_conf["framewise_displacement"].dropna().values
+    dvars = step_conf["dvars"].dropna().values
 
     # --- Artifact/outlier metrics (AFNI-equivalent, mirroring MRIQC's aor/aqi/gcor) ---
     # Degraded, never fatal: these are descriptive metrics computed after the run's
@@ -171,12 +188,18 @@ def func_qc_measures(
     # discarding a completed MNI BOLD).  On failure the three fields carry their
     # schema default of 0.0 — which is why 0.0 is not a meaningful value for any of
     # them and the log line below is the only way to tell it apart.
+    tsnr_median: float | None = None
     try:
-        iqm_ts = _load_masked_timeseries(mni_bold, mask_mni)
-        aor = float(np.mean(_outlier_fraction(iqm_ts)))
-        aqi = float(np.mean(_quality_index(iqm_ts)))
-        gcor = _gcor(iqm_ts)
-        del iqm_ts
+        # A view, not a copy: the metrics below each allocate their own working
+        # array, so slicing costs nothing extra on the ~0.4 GB in-mask matrix.
+        steady_ts = _load_masked_timeseries(mni_bold, mask_mni)[:, nss:]
+        aor = float(np.mean(_outlier_fraction(steady_ts)))
+        aqi = float(np.mean(_quality_index(steady_ts)))
+        gcor = _gcor(steady_ts)
+        # Temporal SNR: median over brain voxels of (mean / std across time),
+        # from the matrix already in memory rather than a second read.
+        tsnr_median = float(np.median(_tsnr(steady_ts))) if steady_ts.shape[0] else 0.0
+        del steady_ts
     except Exception as exc:
         traceback.print_exc()
         print(
@@ -186,13 +209,12 @@ def func_qc_measures(
         )
         aor = aqi = gcor = 0.0
 
-    # Temporal SNR: median over brain voxels of (mean / std across time).
-    # preproc.py pre-computes tsnr_map in apply_transforms to avoid reloading the
-    # full 4D MNI BOLD (~12 GB) after it has already been freed from memory.
-    mask_data = nib.load(mask_mni).get_fdata() > 0
-    if tsnr_map is None:
-        tsnr_map = tsnr_map_from_file(mni_bold)
-    tsnr_median = float(np.median(tsnr_map[mask_data])) if mask_data.any() else 0.0
+    if tsnr_median is None:
+        # tSNR has no "not computed" default, so it is retried from the file the
+        # way it was always computed, and a failure here still propagates.
+        mask_data = nib.load(mask_mni).get_fdata() > 0
+        tsnr_map = tsnr_map_from_file(mni_bold, nss)
+        tsnr_median = float(np.median(tsnr_map[mask_data])) if mask_data.any() else 0.0
 
     # Count confound regressor columns by prefix
     cols = list(confounds.columns)
@@ -206,7 +228,7 @@ def func_qc_measures(
 
     mean_dvars_val = float(dvars.mean()) if dvars.size else 0.0
     mean_global_signal_val = (
-        float(confounds["global_signal"].mean()) if "global_signal" in confounds else 0.0
+        float(steady_conf["global_signal"].mean()) if "global_signal" in confounds else 0.0
     )
     # Percent-signal-change standardization of DVARS (Power et al. 2012), reusing
     # the mean global signal already computed above rather than a second pass.
@@ -247,7 +269,6 @@ def compute_func_qc_summary(
     total_runtime_s: float,
     peak_memory_gb: float,
     args: argparse.Namespace,
-    tsnr_map: np.ndarray | None = None,
     container_peak_memory_gb: float = 0.0,
 ) -> dict:
     """Compute a per-run QC summary dict from pipeline outputs.
@@ -264,7 +285,6 @@ def compute_func_qc_summary(
         n_nss_frames=args.nss_frames,
         mni_bold=mni_bold,
         mask_mni=mask_mni,
-        tsnr_map=tsnr_map,
     )
     return {
         "schema_version": FUNC_QC_SCHEMA_VERSION,

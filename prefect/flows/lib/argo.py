@@ -41,6 +41,14 @@ READ_RETRY_MAX_SECONDS = 60.0
 # Failures a retry cannot fix: a malformed selector, missing RBAC, a wrong namespace.
 # Retrying these would burn the entire backoff budget before surfacing the real
 # problem, so they propagate on the first attempt.
+#
+# `Unauthorized` is not always permanent. From Argo v4.1.4, argo-server in
+# `--auth-mode=client` runs a SelfSubjectReview on every request (cached 1 min per
+# token) and returns 401 for ANY failure of that review, a timeout or an
+# `etcdserver: throttle` included. It stays here because the two callers already
+# absorb it one layer up: `wait_for_slot` holds on any count error for
+# COUNT_FAILURE_BUDGET_SECONDS, and the submit tasks carry Prefect `retries=2`,
+# which is safe for this error since the review rejects before the create runs.
 PERMANENT_ERRORS = (
     BadRequest,
     Unauthorized,

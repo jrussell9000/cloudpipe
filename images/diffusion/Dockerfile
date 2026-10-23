@@ -1,7 +1,7 @@
 # Dockerfile for FSL and MRtrix3 on Ubuntu 24.04
 
 # Set up pixi: from https://pixi.prefix.dev/latest/deployment/container/#example-usage
-FROM ghcr.io/prefix-dev/pixi:0.41.4 AS build
+FROM ghcr.io/prefix-dev/pixi:0.82.0 AS build
 
 # copy source code, pixi.toml and pixi.lock to the container
 WORKDIR /app
