@@ -27,6 +27,32 @@ destroy_target() {
   fi
 }
 
+# kubectl in this script acts on this deployment's cluster and on nothing else.
+#
+# It used to follow the shell's current kubectl context. With this deployment's
+# cluster already gone no kubeconfig entry was written for it, so a re-run's
+# kubectl calls went to whatever cluster the shell pointed at — PRODUCTION, on
+# 2026-10-23: they scaled its ArgoCD controllers to 0 and deleted its five
+# web-UI ingresses, and only the production ALB's deletion protection stopped
+# the rest. Two guards, either of which alone would have prevented it:
+#
+# - a private kubeconfig for the whole run, holding only the entry
+#   require_reachable_cluster writes for this cluster, so no other cluster is
+#   visible to kubectl at all;
+# - a kubectl function that refuses to run while this cluster does not exist,
+#   so there is nothing for a call to reach even by accident.
+#
+# The Terraform Kubernetes-family providers never read a kubeconfig: they are
+# configured from the cluster's own endpoint in the root.
+CLEANUP_KUBECONFIG=$(mktemp "${TMPDIR:-/tmp}/cleanup-kubeconfig.XXXXXX")
+export KUBECONFIG=$CLEANUP_KUBECONFIG
+trap 'rm -f "$CLEANUP_KUBECONFIG"' EXIT
+
+kubectl() {
+  [[ $CLUSTER_EXISTS == true ]] || return 1
+  command kubectl "$@"
+}
+
 # The cluster's API has to be reachable from this shell before anything is
 # destroyed. After the install's last phase it is private, reachable only over
 # WARP (or the VPN). Every kubectl call below ends in `|| true`, because a
@@ -44,7 +70,8 @@ require_reachable_cluster() {
     return 0
   fi
   CLUSTER_EXISTS=true
-  aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$DEPLOYMENT_REGION" >/dev/null
+  aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$DEPLOYMENT_REGION" \
+    --kubeconfig "$KUBECONFIG" >/dev/null
   if ! kubectl get --raw=/readyz --request-timeout=20s >/dev/null 2>&1; then
     fail "$EXIT_BLOCKED" \
       "ERROR: the cluster $CLUSTER_NAME exists, but its API cannot be reached from this shell." \

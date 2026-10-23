@@ -179,7 +179,7 @@ resource "kubectl_manifest" "db_external_secret" {
   depends_on = [
     kubectl_manifest.cluster_secretstore,
     aws_db_instance.this,
-    data.kubernetes_namespace_v1.this,
+    data.kubernetes_namespace_v1.ready,
   ]
 }
 
@@ -202,7 +202,7 @@ resource "kubernetes_service_v1" "rds" {
     external_name = aws_db_instance.this.address
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # ExternalSecret for pgbouncer userlist — formats username+password from the
@@ -234,6 +234,6 @@ resource "kubectl_manifest" "pgbouncer_userlist_external_secret" {
   depends_on = [
     kubectl_manifest.cluster_secretstore,
     aws_db_instance.this,
-    data.kubernetes_namespace_v1.this,
+    data.kubernetes_namespace_v1.ready,
   ]
 }

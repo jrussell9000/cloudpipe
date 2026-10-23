@@ -28,7 +28,7 @@ resource "kubernetes_service_v1" "controller_metrics" {
     cluster_ip = "None"
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # count = 0 until ArgoCD installs the prometheus-operator CRDs; set crds_available=true after first ArgoCD sync
