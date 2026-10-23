@@ -3,10 +3,10 @@ name: argo-workflows
 description: A Helm chart for Argo Workflows
 type: application
 version: 0.1.0
-appVersion: "v4.1.3"
+appVersion: "v4.1.5"
 dependencies:
   - name: argo-workflows
-    version: 2.0.6
+    version: 2.0.12
     repository: https://argoproj.github.io/argo-helm
   - name: pgbouncer
     version: 4.1.9

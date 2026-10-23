@@ -49,15 +49,20 @@ ESTABLISHED_CRDS=(
 #
 # Titles are printed as JSON strings by hand, so they must stay free of double
 # quotes and backslashes; tests/test_installer_phases.py asserts that.
+#
+# Titles are written for the deployer, who meets them in --list-phases, in the
+# progress line each phase prints, and on the setup page's Run buttons. The
+# Terraform detail (targets, flags, CRD names) belongs to the "What happens"
+# column of the table in docs/infrastructure.md, not here.
 PHASES=(
-  "1|phase_1_network_and_cluster|true|Network and cluster, with the public endpoint open for bootstrapping"
-  "2|phase_2_cluster_addons|true|Add-on modules, Pod Identity associations and the ArgoCD bootstrap"
-  "3|phase_3_kube_system_network_policies|true|The kube-system NetworkPolicies, before strict VPC CNI mode"
-  "4|phase_4_full_apply_and_tunnel_token|true|Full apply with crds_available false, then sync the tunnel token"
-  "5|phase_5_wait_for_crds|true|Wait for ArgoCD to install the CRDs and report them established"
-  "6|phase_6_crd_dependent_resources|true|Record the post-install flags, then apply the CRD-dependent resources"
-  "7|phase_7_prove_the_tunnel|true|Prove the Cloudflare tunnel while the cluster is still reachable"
-  "8|phase_8_close_the_public_endpoint|false|Close the public EKS endpoint"
+  "1|phase_1_network_and_cluster|true|Create the network and the Kubernetes cluster"
+  "2|phase_2_cluster_addons|true|Install the cluster add-ons and start ArgoCD"
+  "3|phase_3_kube_system_network_policies|true|Add the network rules for the cluster's system services"
+  "4|phase_4_full_apply_and_tunnel_token|true|Create the remaining resources, including the Cloudflare tunnel, and store its token"
+  "5|phase_5_wait_for_crds|true|Wait for ArgoCD to install the resource types later phases need"
+  "6|phase_6_crd_dependent_resources|true|Save the install settings, then connect the cluster to its stored secrets"
+  "7|phase_7_prove_the_tunnel|true|Check that the Cloudflare tunnel works, while the cluster can still be reached"
+  "8|phase_8_close_the_public_endpoint|false|Close the cluster's public endpoint, leaving WARP as the only way in"
 )
 
 # One field of one phase, or non-zero for an id this installer does not have —

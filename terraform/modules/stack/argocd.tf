@@ -9,8 +9,8 @@ resource "helm_release" "argocd" {
   namespace        = "argocd"
   create_namespace = true
   # It is generally recommended to pin to a specific version for stability
-  version       = "9.5.17" # ArgoCD v3.4.3
-  timeout       = 600      # 10 min — init jobs need time on first cluster bootstrap
+  version       = "10.10.5" # ArgoCD v3.5.5
+  timeout       = 600       # 10 min — init jobs need time on first cluster bootstrap
   wait          = true
   wait_for_jobs = true # wait for argocd-redis-secret-init Job to complete
 
@@ -34,6 +34,13 @@ resource "helm_release" "argocd" {
       - key: "argoproj.io/backend"
         value: "true"
         effect: "NoSchedule"
+      # Chart 10.0.0 turned this on by default. The kubernetes_network_policy_v1
+      # resources at the bottom of this file own this namespace's policies, and
+      # policies only ever add up: the chart's set would open argocd-server to
+      # ingress from anywhere on every port, and the metrics ports to every
+      # namespace, on top of ours.
+      networkPolicy:
+        create: false
 
     server:
       extraArgs:
@@ -43,6 +50,13 @@ resource "helm_release" "argocd" {
         reposerver.enable.git.submodule: "false"
       cm:
         url: "${local.ui_base_urls["argocd"]}"
+        # SSO through Dex is the only way in; operators get role:admin from the
+        # RBAC policy below, keyed on their email. The local admin account was a
+        # password login nobody used, and the only target for the login
+        # rate-limit bypass (GHSA-4439-h7jw-5cjj). Break-glass when SSO is down
+        # is cluster access: set this back to "true" in argocd-cm, or use
+        # `argocd admin` commands, which run on the kubeconfig.
+        admin.enabled: "false"
         dex.config: |
           connectors:
             - type: oidc

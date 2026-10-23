@@ -80,6 +80,17 @@ class Field:
     #: For a field derived from nothing but randomness, `bucket_suffix`: how many
     #: characters to generate. Generated once, when the field is absent, and kept.
     derived_random: int | None = None
+    #: A regex with named groups, matched against the field's one source, whose
+    #: groups the template may use. For a value that is PART of another answer:
+    #: the owner's URL out of a repository's.
+    derived_pattern: str | None = None
+    #: A suggestion: a field that is still asked, with the computed value offered
+    #: as its default. Same three parts as a derivation. For a value most deployers
+    #: accept but some legitimately change, where "derived" would hide the
+    #: question in the answers document.
+    suggested_from: tuple[str, ...] = ()
+    suggested_template: str | None = None
+    suggested_pattern: str | None = None
 
     @property
     def property_schemas(self) -> dict[str, Any]:
@@ -92,6 +103,22 @@ class Field:
     @property
     def is_derived(self) -> bool:
         return bool(self.derived_template) or bool(self.derived_random)
+
+    @property
+    def is_suggested(self) -> bool:
+        return bool(self.suggested_template)
+
+    def suggest(self, answers: dict[str, Any]) -> Any:
+        """The value to offer as this field's default, or None when there is none yet."""
+        if not self.suggested_template:
+            return None
+        return _fill(
+            self.suggested_template,
+            self.suggested_from,
+            self.suggested_pattern,
+            answers,
+            is_list=self.is_list,
+        )
 
     @property
     def is_list(self) -> bool:
@@ -121,14 +148,40 @@ class Field:
             return "".join(secrets.choice(alphabet) for _ in range(self.derived_random))
         if not self.derived_template:
             return None
-        if any(
-            source not in answers or answers[source] in (None, "") for source in self.derived_from
-        ):
-            return None
-        rendered = self.derived_template.format(
-            **{source: answers[source] for source in self.derived_from}
+        return _fill(
+            self.derived_template,
+            self.derived_from,
+            self.derived_pattern,
+            answers,
+            is_list=self.is_list,
         )
-        return [rendered] if self.is_list else rendered
+
+
+def _fill(
+    template: str,
+    sources: tuple[str, ...],
+    pattern: str | None,
+    answers: dict[str, Any],
+    *,
+    is_list: bool,
+) -> Any:
+    """A template filled from other answers, or None when a source is missing or does not match.
+
+    None rather than a guess in both cases. A source that does not match the
+    pattern is a value the deployer typed in some other shape, and the right
+    response to that is no suggestion, not a malformed one.
+    """
+    if any(source not in answers or answers[source] in (None, "") for source in sources):
+        return None
+    values = {source: answers[source] for source in sources}
+    if pattern:
+        (source,) = sources  # a pattern reads exactly one answer; the schema test holds it
+        match = re.search(pattern, str(values[source]))
+        if match is None:
+            return None
+        values.update(match.groupdict())
+    rendered = template.format(**values)
+    return [rendered] if is_list else rendered
 
 
 @dataclass(frozen=True)
@@ -221,6 +274,10 @@ def fields() -> tuple[Field, ...]:
             derived_from=tuple(body.get("x-derived-from", ())),
             derived_template=body.get("x-derived-template"),
             derived_random=body.get("x-derived-random"),
+            derived_pattern=body.get("x-derived-pattern"),
+            suggested_from=tuple(body.get("x-suggested-from", ())),
+            suggested_template=body.get("x-suggested-template"),
+            suggested_pattern=body.get("x-suggested-pattern"),
             required_when=required_when.get(identifier),
         )
         by_section[field.section].append(field)

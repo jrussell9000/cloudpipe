@@ -313,12 +313,14 @@ def precompute_composite_warp(
 
 def apply_transforms(
     bold: Path, mni_template: Path, composite_warp: Path, outdir: Path, prefix: str, threads: int
-) -> tuple[Path, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[Path, np.ndarray, np.ndarray]:
     """Warp the unmasked 4D BOLD to MNI space using the precomputed composite
     displacement field.
 
-    Returns (unmasked MNI BOLD path, tSNR map, warp coords, temporal-mean map).
-    The two maps come from the float32 warp output in memory, never the file.
+    Returns (unmasked MNI BOLD path, warp coords, temporal-mean map). The mean
+    map comes from the float32 warp output in memory, never the file. This used
+    to return an all-frame tSNR map for FuncQC too; tSNR is now a steady-state
+    measure computed in func_iqm (#859).
 
     The BOLD is intentionally left unmasked at this stage so that interpolation
     does not encounter the steep native-space brain boundary, which would produce
@@ -346,7 +348,7 @@ def apply_transforms(
     native-space affine).
 
     Peak RAM: bold_data (native float32) + coords (3 x N_mni float64) + the
-    Welford accumulators (2 x N_mni float64). The scratch file costs disk
+    running-mean accumulator (N_mni float64). The scratch file costs disk
     (4 bytes x N_mni x n_frames), not RAM.
     """
     mni_img = nib.load(mni_template)
@@ -370,9 +372,11 @@ def apply_transforms(
     scratch_path = outdir / f"{prefix}_desc-warpscratch_bold.f32"
     scratch = np.memmap(scratch_path, dtype=np.float32, mode='w+', shape=(n_frames, *mni_shape))
 
-    # tSNR via Welford's online algorithm (avoids a second pass for mean/std).
+    # Running temporal mean of the warped frames, for verify_mni_bold_readback.
+    # It spans every frame, NSS included, because the read-back compares it with
+    # the whole published file. It no longer feeds tSNR: that is a steady-state
+    # measure now (#859), taken in func_iqm from the masked series.
     mean_acc = np.zeros(mni_shape, dtype=np.float64)
-    M2_acc = np.zeros(mni_shape, dtype=np.float64)
     wf_count = [0]
     max_abs = [0.0]
     wf_lock = threading.Lock()
@@ -390,25 +394,19 @@ def apply_transforms(
         with wf_lock:
             max_abs[0] = max(max_abs[0], frame_max)
             wf_count[0] += 1
-            delta = frame_f32 - mean_acc
-            mean_acc[:] += delta / wf_count[0]
-            M2_acc[:] += delta * (frame_f32 - mean_acc)
+            mean_acc[:] += (frame_f32 - mean_acc) / wf_count[0]
 
     with ThreadPoolExecutor(max_workers=threads) as pool:
         list(pool.map(_warp_frame, range(n_frames)))
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        _std = np.sqrt(M2_acc / n_frames).astype(np.float32)
-        tsnr_map = np.where(_std > 0, mean_acc.astype(np.float32) / _std, 0.0).astype(np.float32)
     # Kept for verify_mni_bold_readback: the one view of the warp's output that
     # never passes through the writer, so the file can be checked against it.
     mean_map = mean_acc.astype(np.float32)
-    # Released by rebinding rather than `del`: these three are captured by the
+    # Released by rebinding rather than `del`: these two are captured by the
     # _warp_frame closure above, and `del`ing a closed-over name makes pyflakes
     # (F821) treat every use inside the closure as unbound. Rebinding drops the
     # same reference at the same point, so the arrays are freed identically.
-    bold_data = mean_acc = M2_acc = None
-    del _std
+    bold_data = mean_acc = None
 
     # A NaN or inf anywhere is a broken warp; stop here rather than ship it.
     if not np.isfinite(max_abs[0]):
@@ -461,7 +459,7 @@ def apply_transforms(
             shutil.copyfileobj(_src, _dst)
         out_nii.unlink()
 
-    return out, tsnr_map, coords, mean_map
+    return out, coords, mean_map
 
 
 # ---------------------------------------------------------------------------
@@ -1174,9 +1172,16 @@ def compute_confounds(
 # ---------------------------------------------------------------------------
 
 
+# SurfaceSampleQC.schema_version as this module writes it; it must equal the
+# default in src/metrics/schemas.py (tests/metrics/test_surface_sample_schema_sync.py).
+# 1.1 (#859): surf_*_tsnr_median excludes the non-steady-state frames.
+SURFACE_QC_SCHEMA_VERSION = "1.1"
+
+
 def _surface_qc(
     surf_paths: dict[str, Path],
     subcort: "tuple[Path, Path, Path] | None",
+    nss_frames: int,
 ) -> dict:
     """QC for the grayordinate components.
 
@@ -1184,6 +1189,11 @@ def _surface_qc(
     identically zero — a vertex sampling outside the BOLD field of view reads
     as constant zero, so this is the direct measure of how much cortex the
     acquisition actually covered.
+
+    tSNR is over the steady-state frames only, `nss_frames` onward, for the same
+    reason as FuncQC's (func_iqm.func_qc_measures; SurfaceSampleQC 1.1, #859).
+    Coverage and NaN fraction still look at every frame: they describe what was
+    sampled, not the analysed window.
     """
     qc: dict = {}
     for hemi, path in surf_paths.items():
@@ -1191,8 +1201,10 @@ def _surface_qc(
         ts = np.stack([d.data for d in gii.darrays], axis=1)  # (n_vert, T)
         n_vert = ts.shape[0]
         covered = np.any(ts != 0, axis=1)
-        with np.errstate(invalid="ignore"):
-            tsnr = np.where(ts.std(axis=1) > 0, ts.mean(axis=1) / ts.std(axis=1), 0.0)
+        steady = ts[:, max(0, nss_frames) :]
+        sd = steady.std(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tsnr = np.where(sd > 0, steady.mean(axis=1) / sd, 0.0)
         qc[f"surf_{hemi}_n_vertices"] = int(n_vert)
         qc[f"surf_{hemi}_coverage_frac"] = round(float(covered.mean()), 4)
         qc[f"surf_{hemi}_nan_frac"] = round(float(np.isnan(ts).mean()), 6)
@@ -1246,7 +1258,7 @@ def _surface_qc_envelope(
         "total_runtime_s": round(total_runtime_s, 2),
         "peak_memory_gb": round(peak_memory_gb, 3),
         "container_peak_memory_gb": round(container_peak_memory_gb, 2),
-        "schema_version": "1.0",
+        "schema_version": SURFACE_QC_SCHEMA_VERSION,
         "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -1270,7 +1282,7 @@ def _finish_grayordinate_only(
 
     qc = {
         **_surface_qc_envelope(args, timings, total, peak_gb, _container_peak_memory_gb()),
-        **_surface_qc(surf_paths, subcort),
+        **_surface_qc(surf_paths, subcort, args.nss_frames),
     }
     qc_path = Path(f"/tmp/{prefix}_surf_qc.json")
     qc_path.write_text(json.dumps(qc))
@@ -1494,7 +1506,6 @@ def main() -> None:
         print(f"  reusing MNI BOLD: {args.mni_bold_in}", flush=True)
         mni_bold = args.mni_bold_in
         mask_mni = None
-        tsnr_map = None
     else:
         print("\n--- Stage 2: Precompute composite warp (bold→T1w→MNI) ---", flush=True)
         with timed_stage("composite_warp", _timings):
@@ -1509,7 +1520,7 @@ def main() -> None:
 
         print("\n--- Stage 3: Warp unmasked BOLD → MNI (cubic B-spline) ---", flush=True)
         with timed_stage("4d_warp", _timings):
-            bold_mni_unmasked, tsnr_map, warp_coords, mean_map = apply_transforms(
+            bold_mni_unmasked, warp_coords, mean_map = apply_transforms(
                 bold=args.bold,
                 mni_template=args.mni_template,
                 composite_warp=composite_warp,
@@ -1665,7 +1676,6 @@ def main() -> None:
             total_runtime_s=total,
             peak_memory_gb=peak_gb,
             args=args,
-            tsnr_map=tsnr_map,
             container_peak_memory_gb=container_gb,
         )
         # The volumetric record goes out FIRST, before any surface work. The
@@ -1684,7 +1694,7 @@ def main() -> None:
             # single per-run view, and written to metrics/surface-sample/ so that
             # prefix never carries a stale record from an earlier short-path run.
             try:
-                surf_metrics = _surface_qc(surf_paths, subcort)
+                surf_metrics = _surface_qc(surf_paths, subcort, args.nss_frames)
                 qc.update(surf_metrics)
                 qc_path.write_text(json.dumps(qc))  # re-write with surf folded in
                 Path(f"/tmp/{prefix}_surf_qc.json").write_text(

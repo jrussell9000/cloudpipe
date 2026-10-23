@@ -17,6 +17,14 @@ be made to look better than it is:
   fixed grid derived from `MNI152NLin6Asym` and cloudpipe's are on
   `MNI152NLin2009cAsym` by design; no `--output-spaces` value reconciles them, so
   a whole-brain grayordinate figure is refused rather than reported.
+- **Every time statistic is over the steady-state frames, and both arms drop the
+  same count.** Each arm keeps its non-steady-state frames in the series, flagged in
+  its confounds, and on GE DV26+ and Siemens VE11 those frames carry a
+  T1-saturation transient shared by every voxel (#859). Left in, it inflates every
+  temporal correlation between the arms, because both arms reproduce the same
+  start-of-run swing, and it halves tSNR. So `n_nss_frames` is a required argument
+  with no default: the run's protocol count from `tools/nss_volumes.csv`, never
+  each arm's own estimate (fMRIPrep detects its own unless given `--dummy-scans`).
 """
 
 from __future__ import annotations
@@ -152,6 +160,16 @@ def tsnr_map(bold: np.ndarray) -> np.ndarray:
         return np.where(std > 0, data.mean(axis=-1) / std, 0.0)
 
 
+def _steady_state(data: np.ndarray, n_nss_frames: int, what: str) -> np.ndarray:
+    """Frames `n_nss_frames` onward, refusing a count that leaves fewer than two."""
+    if n_nss_frames < 0 or data.shape[-1] - n_nss_frames < 2:
+        raise RefusedEndpoint(
+            f"{what}: n_nss_frames={n_nss_frames} leaves {data.shape[-1] - n_nss_frames} "
+            f"of {data.shape[-1]} frames; a time statistic needs at least two"
+        )
+    return data[..., n_nss_frames:]
+
+
 def tier1(
     bold_a,
     mask_a,
@@ -159,11 +177,15 @@ def tier1(
     mask_b,
     tsnr_median_a: float | None = None,
     tsnr_median_b: float | None = None,
+    *,
+    n_nss_frames: int,
 ) -> Tier1Result:
     """Tier-1 spatial endpoints for one run, over the two masks' intersection.
 
     Arguments are paths or loaded images; nothing here knows which arm is which,
-    beyond the order of the pair.
+    beyond the order of the pair. The mean image and tSNR map are over frames
+    `n_nss_frames` onward (see the module docstring); a supplied
+    `tsnr_median_*` must be measured the same way, as FuncQC 1.3 is.
     """
     image_a = bold_a if hasattr(bold_a, "get_fdata") else nib.load(bold_a)
     image_b = bold_b if hasattr(bold_b, "get_fdata") else nib.load(bold_b)
@@ -183,8 +205,8 @@ def tier1(
             f"compare on (Dice {mask_dice:.4f})"
         )
 
-    data_a = np.asanyarray(image_a.dataobj)
-    data_b = np.asanyarray(image_b.dataobj)
+    data_a = _steady_state(np.asanyarray(image_a.dataobj), n_nss_frames, "MNI BOLD")
+    data_b = _steady_state(np.asanyarray(image_b.dataobj), n_nss_frames, "MNI BOLD")
 
     mean_comparison = MaskedComparison(
         name="mean image voxelwise correlation",
@@ -239,13 +261,21 @@ class GrayordinateResult:
 
 
 def cortical_grayordinates(
-    dtseries_a, dtseries_b, n_cortical: int = CORTICAL_GRAYORDINATES
+    dtseries_a,
+    dtseries_b,
+    n_cortical: int = CORTICAL_GRAYORDINATES,
+    *,
+    n_nss_frames: int,
 ) -> GrayordinateResult:
     """Per-grayordinate temporal correlation over the cortical block only.
 
     Both arms' CIFTI carries the standard fsLR cortical block first, so the first
     `n_cortical` rows are comparable positionally. Anything past them is not: see
     `refuse_subcortical_comparison`.
+
+    Over frames `n_nss_frames` onward. This endpoint is the one the transient
+    distorts most: a start-of-run swing both arms share correlates them whatever
+    else they did, which lifts exactly the lower tail being tested.
 
     The declared endpoint is the tail percentile, not the median: a median near 1
     can sit above a tail of grayordinates where the two arms disagree completely,
@@ -267,8 +297,8 @@ def cortical_grayordinates(
             "temporal correlation is not defined across different time bases"
         )
 
-    cortex_a = a[:n_cortical]
-    cortex_b = b[:n_cortical]
+    cortex_a = _steady_state(a[:n_cortical], n_nss_frames, "dtseries")
+    cortex_b = _steady_state(b[:n_cortical], n_nss_frames, "dtseries")
     correlations = np.array(
         [_pearson(cortex_a[i], cortex_b[i]) for i in range(n_cortical)], dtype=np.float64
     )

@@ -412,9 +412,10 @@ data "aws_iam_policy_document" "github_actions_assume" {
       # and `:environment:<name>`. The repository was pinned; the ref was not.
       #
       # That was latent rather than exploitable — no workflow that assumes these
-      # roles triggers on pull_request, and the two PR-triggered workflows
-      # (ci.yaml, pr-image-build.yaml) request no OIDC token at all, the latter
-      # documenting that as deliberate. But this document is the assume-role
+      # roles triggers on pull_request. ci.yaml requests no OIDC token at all;
+      # pr-image-build.yaml requests one only for github_actions_pr_pull, whose
+      # trust is its own document below and names only the pull_request subject.
+      # Never add that subject here. This document is the assume-role
       # policy for BOTH github_actions_ecr and github_actions_packer, and the
       # Packer role can RunInstances and manage packer-* IAM roles. Adding
       # `id-token: write` to one PR workflow would have handed that to
@@ -532,6 +533,76 @@ resource "aws_iam_role_policy" "github_actions_ecr" {
 output "github_actions_ecr_role_arn" {
   description = "IAM role ARN to set as GHA secret AWS_ROLE_ARN"
   value       = aws_iam_role.github_actions_ecr.arn
+}
+
+################################################################################
+# GitHub Actions OIDC — pull-only auth for pull_request image builds
+################################################################################
+# pr-image-build.yaml builds every changed image on a PR, and its base images
+# come from public.ecr.aws. Anonymous pulls are metered per source IP and
+# GitHub-hosted runners share their IPs, so those builds kept failing with
+# `429 Too Many Requests` (PRs #835 and #844, 2026-10-16 and 10-21) until re-run.
+# build-images.yaml solved the same thing with ECRPublicPullAuth on the push
+# role, but a PR job must never hold that role (see github_actions_assume).
+#
+# So PR builds get a role of their own, separate in BOTH halves:
+# - Trust: only the exact `pull_request` subject of this repository. It does not
+#   share github_actions_assume, so the push and Packer roles stay unreachable
+#   from a PR. GitHub issues no OIDC token to a pull_request run from a fork, so
+#   fork-authored code never reaches even this role.
+# - Permissions: the two account-level calls an authenticated PULL needs, and
+#   nothing else. The ECR Public token only identifies the caller; every push
+#   API is authorized per call against this role, which has none, so a push with
+#   it is denied. There is no private ECR, S3 or anything else here.
+data "aws_iam_policy_document" "github_actions_pr_pull_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:${var.github_repo}:pull_request"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions_pr_pull" {
+  name                 = "${var.name}-github-actions-pr-pull"
+  assume_role_policy   = data.aws_iam_policy_document.github_actions_pr_pull_assume.json
+  description          = "Assumed by pull_request image builds to authenticate ECR Public base-image pulls; no push or other access"
+  max_session_duration = 3600
+}
+
+data "aws_iam_policy_document" "github_actions_pr_pull" {
+  statement {
+    sid    = "ECRPublicPullAuth"
+    effect = "Allow"
+    actions = [
+      "ecr-public:GetAuthorizationToken",
+      "sts:GetServiceBearerToken",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "github_actions_pr_pull" {
+  name   = "ecr-public-pull-auth"
+  role   = aws_iam_role.github_actions_pr_pull.name
+  policy = data.aws_iam_policy_document.github_actions_pr_pull.json
+}
+
+output "github_actions_pr_pull_role_arn" {
+  description = "IAM role ARN to set as GHA secret AWS_PR_PULL_ROLE_ARN (pull_request image builds; ECR Public pull auth only)"
+  value       = aws_iam_role.github_actions_pr_pull.arn
 }
 
 ################################################################################

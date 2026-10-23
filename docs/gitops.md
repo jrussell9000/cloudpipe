@@ -140,7 +140,7 @@ The same `selfHeal: true` + `prune: true` policy applies. Deleting a WorkflowTem
 
 ### argo-workflows
 
-Umbrella chart with two dependencies: `argoproj/argo-workflows` v2.0.6 (app v4.1.3) and `icoretech/pgbouncer` v4.1.9. PgBouncer was migrated from hand-written manifests in `templates/` to the subchart; `templates/pgbouncer.yaml` is now just a pointer comment.
+Umbrella chart with two dependencies: `argoproj/argo-workflows` v2.0.12 (app v4.1.5) and `icoretech/pgbouncer` v4.1.9. PgBouncer was migrated from hand-written manifests in `templates/` to the subchart; `templates/pgbouncer.yaml` is now just a pointer comment.
 
 Key overrides in `values.yaml`:
 
