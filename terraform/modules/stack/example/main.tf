@@ -116,6 +116,13 @@ provider "cloudflare" {}
 # Kubernetes-family providers get no host, which is right: nothing they manage
 # can exist without one.
 #
+# The lookup is named `this`. It was `upstream` without a count, and Terraform
+# keeps data sources in state: adding count under the old name records an
+# implicit move to `upstream[0]`, after which every -targeted plan (all of
+# install.sh and cleanup.sh) fails "Moved resource instances excluded by
+# targeting". Under a new name the old entry is an orphan, which Terraform
+# simply drops. Probed both ways against a hand-written state, 2026-10-23.
+#
 # A fresh deployment is still phased (`-target` the VPC and the cluster first)
 # rather than one apply — see "Bootstrap and install sequence" in
 # ../../../../docs/infrastructure.md.
@@ -123,14 +130,14 @@ provider "cloudflare" {}
 
 data "aws_eks_clusters" "all" {}
 
-data "aws_eks_cluster" "upstream" {
+data "aws_eks_cluster" "this" {
   count = contains(data.aws_eks_clusters.all.names, var.name) ? 1 : 0
   name  = var.name
 }
 
 locals {
-  cluster_endpoint = try(data.aws_eks_cluster.upstream[0].endpoint, null)
-  cluster_ca       = try(base64decode(data.aws_eks_cluster.upstream[0].certificate_authority[0].data), null)
+  cluster_endpoint = try(data.aws_eks_cluster.this[0].endpoint, null)
+  cluster_ca       = try(base64decode(data.aws_eks_cluster.this[0].certificate_authority[0].data), null)
 }
 
 data "aws_ecrpublic_authorization_token" "token" {
