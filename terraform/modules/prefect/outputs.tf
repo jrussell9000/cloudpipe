@@ -1,6 +1,6 @@
 output "namespace" {
   description = "Kubernetes namespace where Prefect is deployed."
-  value       = data.kubernetes_namespace_v1.this.metadata[0].name
+  value       = var.namespace
 }
 
 output "db_address" {

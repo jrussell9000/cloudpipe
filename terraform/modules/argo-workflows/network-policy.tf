@@ -23,7 +23,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_default_deny" {
     policy_types = ["Ingress", "Egress"]
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow egress on UDP and TCP 53 for DNS.
@@ -57,7 +57,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_egress_dns" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow HTTPS egress (443) to both VPC-internal targets (kube-apiserver, RDS via
@@ -88,7 +88,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_egress_https" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow egress on port 5432 to both CIDRs that the database path crosses:
@@ -129,7 +129,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_egress_rds" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow ingress to PgBouncer from Argo components and workflow pods in the same
@@ -176,7 +176,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_ingress_pgbouncer" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # There is deliberately no pgbouncer probe rule. One was added with the port and
@@ -225,7 +225,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_egress_pod_identity" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow ingress to the Argo Workflows server on port 2746.
@@ -257,7 +257,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_ingress_server" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow ingress to the workflow-controller Prometheus metrics endpoint (9090).
@@ -287,7 +287,7 @@ resource "kubernetes_network_policy_v1" "argo_workflows_ingress_metrics" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
 
 # Allow kubelet liveness probe to workflow-controller on port 6060.
@@ -323,5 +323,5 @@ resource "kubernetes_network_policy_v1" "argo_workflows_ingress_controller_probe
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }

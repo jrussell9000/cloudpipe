@@ -3,7 +3,13 @@
 # referenced here so dependent resources have an explicit handle.
 ################################################################################
 
-data "kubernetes_namespace_v1" "this" {
+# Read only while the cluster exists (var.cluster_exists): with the cluster gone
+# there is no namespace to check, and reading it failed every plan, a teardown's
+# destroy included. Named `ready`, not `this` with a count added, which would be
+# an implicit move in every existing state and break -target plans.
+data "kubernetes_namespace_v1" "ready" {
+  count = var.cluster_exists ? 1 : 0
+
   metadata {
     name = var.namespace
   }
@@ -58,5 +64,5 @@ resource "kubernetes_ingress_v1" "this" {
     }
   }
 
-  depends_on = [data.kubernetes_namespace_v1.this]
+  depends_on = [data.kubernetes_namespace_v1.ready]
 }
