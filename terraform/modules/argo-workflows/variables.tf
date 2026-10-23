@@ -167,7 +167,7 @@ variable "db_backup_retention_days" {
 }
 
 variable "db_deletion_protection" {
-  description = "Enable RDS deletion protection. AWS refuses DeleteDBInstance while true; set to false in a separate apply before an intentional teardown."
+  description = "Enable RDS deletion protection. AWS refuses DeleteDBInstance while true; scripts/stack/cleanup.sh turns it off, after its confirmation, before an intentional teardown."
   type        = bool
   default     = true
 }

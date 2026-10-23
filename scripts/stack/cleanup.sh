@@ -52,6 +52,67 @@ require_reachable_cluster() {
   fi
 }
 
+# The two RDS databases, Argo's and Prefect's. Each defaults to
+# deletion_protection = true, which AWS enforces by refusing DeleteDBInstance,
+# and the stack offers no variable to turn it off: a teardown used to stop at the
+# Argo module with "Cannot delete protected DB Instance" (second-account
+# acceptance run, 2026-10-22). Read from state, not rebuilt from a naming rule,
+# so a deployment that names them differently is still handled.
+rds_addresses() {
+  printf '%s\n' \
+    "$(stack_address module.argo_workflows).aws_db_instance.this" \
+    "$(stack_address module.prefect).aws_db_instance.this"
+}
+
+# One attribute of a resource in state, or nothing if the resource is not there.
+# `|| true` because `state show` exits non-zero for an address that has left
+# state, which under pipefail would end the script — and that is exactly the
+# re-run after a partial teardown.
+state_attr() {
+  { terraform state show -no-color "$1" 2>/dev/null || true; } |
+    awk -v key="$2" '$1 == key { gsub(/"/, "", $3); print $3; exit }'
+}
+
+# Each destroy takes a final snapshot (db_skip_final_snapshot defaults to false),
+# named <cluster>-argo-final and <cluster>-prefect-final. A snapshot by that name
+# left by an earlier teardown in this account makes DeleteDBInstance fail with
+# DBSnapshotAlreadyExists, after everything before it has been destroyed. Checked
+# before the confirmation, so it stops with nothing destroyed.
+require_free_final_snapshot_names() {
+  local address snapshot taken=()
+  while read -r address; do
+    snapshot=$(state_attr "$address" final_snapshot_identifier)
+    [[ -z $snapshot || $snapshot == null ]] && continue
+    if aws rds describe-db-snapshots --db-snapshot-identifier "$snapshot" >/dev/null 2>&1; then
+      taken+=("$snapshot")
+    fi
+  done < <(rds_addresses)
+  [[ ${#taken[@]} -eq 0 ]] && return 0
+  fail "$EXIT_BLOCKED" \
+    "ERROR: a database snapshot already has the name this teardown gives its final" \
+    "snapshot: ${taken[*]}. It is left from an earlier teardown in this account, and" \
+    "AWS would refuse to delete the database partway through. Keep it under another" \
+    "name, or delete it, then run this again. Nothing has been destroyed." \
+    "$(printf '  aws rds delete-db-snapshot --db-snapshot-identifier %s\n' "${taken[@]}")"
+}
+
+# Turn deletion protection off on each database still in state. After the
+# confirmation, so it only happens in a teardown someone has agreed to. The
+# final snapshot each destroy takes is what keeps this recoverable.
+FINAL_SNAPSHOTS=()
+release_rds_deletion_protection() {
+  local address instance snapshot
+  while read -r address; do
+    instance=$(state_attr "$address" identifier)
+    [[ -z $instance ]] && continue
+    snapshot=$(state_attr "$address" final_snapshot_identifier)
+    [[ -n $snapshot && $snapshot != null ]] && FINAL_SNAPSHOTS+=("$snapshot")
+    echo "==> Turning off deletion protection on database $instance..."
+    aws rds modify-db-instance --db-instance-identifier "$instance" \
+      --no-deletion-protection --apply-immediately >/dev/null
+  done < <(rds_addresses)
+}
+
 # Deployment resolution, target lists and assert_targets_declared() are shared
 # with install.sh.
 # shellcheck source=SCRIPTDIR/targets.sh
@@ -96,6 +157,8 @@ unset _output _bucket
 # destroyed and nobody has typed "destroy" for a teardown that cannot finish.
 echo "==> Checking that the cluster's API can be reached..."
 require_reachable_cluster
+echo "==> Checking that the databases' final snapshot names are free..."
+require_free_final_snapshot_names
 
 echo "==> WARNING: This will permanently destroy this deployment's infrastructure."
 echo "    Root:    $DEPLOYMENT_ROOT"
@@ -108,6 +171,8 @@ if [[ "$CONFIRM" != "destroy" ]]; then
   echo "Aborted."
   exit "$EXIT_BLOCKED"
 fi
+
+release_rds_deletion_protection
 
 # Phase 1: Tear down application-layer resources first (Helm releases, Kubernetes
 # objects, CRD-dependent manifests) before removing the cluster itself.
@@ -320,6 +385,21 @@ fi
 # Named at the END, after the destroy, because that is when someone is deciding
 # whether they are finished. Printed rather than deleted, and there is no flag
 # that deletes them: that flag's misuse is the one that cannot be undone.
+
+# The databases' final snapshots, kept for the same reason and reported the
+# same way. They also cost money, and a later teardown of a deployment with the
+# same cluster name in this account stops until they are renamed or deleted.
+report_final_snapshots() {
+  [[ ${#FINAL_SNAPSHOTS[@]} -eq 0 ]] && return 0
+  echo ""
+  echo "==> These database snapshots were taken and KEPT, on purpose:"
+  printf '      %s\n' "${FINAL_SNAPSHOTS[@]}"
+  echo "    They are the last copy of the Argo and Prefect databases. A later teardown"
+  echo "    of a deployment named $CLUSTER_NAME in this account will stop until they are"
+  echo "    gone. Only if you are finished with them:"
+  printf '      aws rds delete-db-snapshot --db-snapshot-identifier %s\n' "${FINAL_SNAPSHOTS[@]}"
+}
+
 report_surviving_buckets() {
   echo ""
   echo "==> These buckets were NOT deleted, on purpose:"
@@ -348,6 +428,7 @@ report_surviving_buckets() {
   fi
 }
 
+report_final_snapshots
 report_surviving_buckets
 
 echo "==> Cleanup complete."
