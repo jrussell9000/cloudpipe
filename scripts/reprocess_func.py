@@ -40,12 +40,13 @@ import re
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import boto3
+from botocore.client import BaseClient
 
 REPO = Path(__file__).resolve().parent.parent
 # src/metrics/ modules import each other flatly, so the package directory itself
@@ -252,6 +253,64 @@ def list_objects(s3, bucket: str, prefix: str) -> list[dict]:
             {"Key": o["Key"], "LastModified": o["LastModified"]} for o in page.get("Contents", [])
         )
     return out
+
+
+_PROCESS_S3 = None  # one boto3 client per listing worker process
+
+
+def _process_init(region: str | None) -> None:
+    global _PROCESS_S3
+    _PROCESS_S3 = boto3.client("s3", region_name=region)
+
+
+def _process_list(job: tuple[str, str, str]) -> tuple[str, list[str]]:
+    bucket, prefix, part = job
+    return prefix, list_keys(_PROCESS_S3, bucket, part)
+
+
+def list_keys_parallel(s3, bucket: str, prefixes: list[str], workers: int) -> dict[str, list[str]]:
+    """Every key under each prefix, as `list_keys` returns it, listed in parallel.
+
+    One delimited listing per prefix finds its partitions (`dt=YYYY-MM-DD/`) and
+    any key directly under it; each partition is then listed whole, all prefixes'
+    partitions in one pool. The keys are the same set as a serial `list_keys`, so
+    what a flush or verify sees is unchanged. Only the wall time changes: serially,
+    func-preproc (180k keys), surface-sample (180k) and step-outcomes (893k) took
+    123 + 122 + 370 s, ten minutes of every launch whatever the slice size.
+
+    The partitions are listed in PROCESSES for a real boto3 client. The work is
+    parsing ListObjectsV2's XML, which holds the GIL: 32 threads took 435 s of
+    that 615 (2026-10-24), at 100% of one core. Any other client (the tests'
+    in-memory fake) is listed with threads in this process.
+    """
+
+    def top(prefix: str) -> tuple[str, list[str], list[str]]:
+        direct: list[str] = []
+        parts: list[str] = []
+        pages = s3.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=prefix, Delimiter="/"
+        )
+        for page in pages:
+            direct += [o["Key"] for o in page.get("Contents", [])]
+            parts += [p["Prefix"] for p in page.get("CommonPrefixes", [])]
+        return prefix, direct, parts
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        tops = list(pool.map(top, prefixes))
+    out = {prefix: list(direct) for prefix, direct, _ in tops}
+    jobs = [(bucket, prefix, part) for prefix, _, parts in tops for part in parts]
+    if isinstance(s3, BaseClient) and jobs:
+        procs = max(1, min(workers, os.cpu_count() or 1, len(jobs)))
+        with ProcessPoolExecutor(
+            max_workers=procs, initializer=_process_init, initargs=(s3.meta.region_name,)
+        ) as pool:
+            listed = list(pool.map(_process_list, jobs))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            listed = list(pool.map(lambda j: (j[1], list_keys(s3, j[0], j[2])), jobs))
+    for prefix, keys in listed:
+        out[prefix] += keys
+    return {prefix: sorted(keys) for prefix, keys in out.items()}
 
 
 def get_json(s3, bucket: str, key: str) -> dict | None:
@@ -624,16 +683,19 @@ def plan_flush(s3, data_bucket, metrics_bucket, subjects, workers) -> FlushPlan:
     with ThreadPoolExecutor(max_workers=workers) as pool:
         deriv = dict(pool.map(deriv_of, subjects))
 
+    listed = list_keys_parallel(
+        s3, metrics_bucket, [*FUNC_QC_PREFIXES, STEP_OUTCOME_PREFIX], workers
+    )
     # The basename's first `_` field is the whole subject ID (IDs contain no `_`),
     # so this is an exact match — sub-AB never catches sub-ABC's records.
     qc_raw = [
         k
         for prefix in FUNC_QC_PREFIXES
-        for k in list_keys(s3, metrics_bucket, prefix)
+        for k in listed[prefix]
         if k.rsplit("/", 1)[-1].split("_", 1)[0] in subject_set
     ]
     steps_raw = []
-    for k in list_keys(s3, metrics_bucket, STEP_OUTCOME_PREFIX):
+    for k in listed[STEP_OUTCOME_PREFIX]:
         parsed = parse_step_outcome_key(k)
         if parsed and parsed.step in FUNC_STEPS and parsed.subject in subject_set:
             steps_raw.append(k)
@@ -1064,12 +1126,9 @@ def record_marker(ev: Evidence, subj: str, ses: str, doc: dict | None) -> None:
 
 
 def gather_raw_qc(s3, args, evidence: dict[str, Evidence]) -> None:
+    listed = list_keys_parallel(s3, args.metrics_bucket, FUNC_QC_PREFIXES, args.workers)
     for prefix, attr in zip(FUNC_QC_PREFIXES, ("qc_raw", "surf_raw"), strict=True):
-        keys = [
-            k
-            for k in list_keys(s3, args.metrics_bucket, prefix)
-            if (u := qc_unit(k)) and u[0] in evidence
-        ]
+        keys = [k for k in listed[prefix] if (u := qc_unit(k)) and u[0] in evidence]
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             docs = list(pool.map(lambda k: get_json(s3, args.metrics_bucket, k), keys))
         for k, doc in zip(keys, docs, strict=True):
