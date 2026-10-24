@@ -90,6 +90,8 @@ ANATOMY_STEPS = (
 # ingress workflows recorded `anatomical-phase=omitted` and read as ANATOMY,
 # hiding them from the retry list (2026-10-22).
 ANATOMY_NOT_RUN = ("skipped", "omitted")
+# verify's ANATOMY threshold (plan 017 amendment 20): below it, list and continue.
+ANATOMY_STOP_FRACTION = 0.01
 # Every label this tool submits starts with this, so reconcile can find the
 # workflows it created by WorkflowRun.batch_label.
 BATCH_LABEL_PREFIX = "func-reprocess"
@@ -1169,8 +1171,20 @@ def verify(s3, args) -> int:
     if any(ev.readback_errors for ev in evidence.values()):
         print(f"\nSTOP: {READBACK_ERROR} seen. Halt all launches.", file=sys.stderr)
     if counts["ANATOMY"]:
+        # Plan 017 amendment 20: a few such subjects per wave are expected (a
+        # session with a source T1w but no FastSurfer tree re-runs the whole
+        # longitudinal phase). They go to the full-reprocess list; only a rate
+        # above ANATOMY_STOP_FRACTION points at a systematic cause.
+        anatomy = sorted(r.subject for r in results if r.status == "ANATOMY")
+        share = len(anatomy) / len(results)
+        verdict = (
+            "STOP: halt the campaign and find the cause"
+            if share > ANATOMY_STOP_FRACTION
+            else "add them to func_reprocess_anatomy.csv and keep them out of every retry slice"
+        )
         print(
-            "\nSTOP: an anatomical step ran. Halt the campaign (plan 017 STOP conditions).",
+            f"\nANATOMY: {len(anatomy)} subject(s), {share:.1%} of this slice "
+            f"(stop above {ANATOMY_STOP_FRACTION:.0%}): {verdict}. {' '.join(anatomy)}",
             file=sys.stderr,
         )
     return 1 if counts["RETRY"] or counts["ANATOMY"] else 0

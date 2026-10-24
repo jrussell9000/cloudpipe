@@ -56,6 +56,15 @@ variable "create_data_bucket" {
   default     = true
 }
 
+# For buckets this root made before and has since lost the state of — not for a
+# bucket someone else made, which is `create_data_bucket = false` above. The
+# import blocks in main.tf read it (acceptance install, 2026-10-23).
+variable "adopt_existing_buckets" {
+  description = "Import the buckets this root made before, when its local state is gone. Set it when an apply fails BucketAlreadyOwnedByYou; every bucket named must then exist."
+  type        = bool
+  default     = false
+}
+
 # The deployer's own FreeSurfer license, which every FreeSurfer and FastSurfer
 # step stages from config/fslicense. Licenses are issued per person, so no
 # published file carries one (openspec/changes/publish-images-for-deployers,
