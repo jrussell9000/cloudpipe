@@ -45,6 +45,34 @@ moved {
   to   = aws_s3_bucket_policy.deny_insecure_transport["state"]
 }
 
+# Re-adopting buckets this root made before, after its local state was lost: a
+# deployment rebuilt into the same account, or a laptop that went with the state
+# file. Without these the apply fails `BucketAlreadyOwnedByYou` on all three, and
+# the only remedy was three hand-written `terraform import` commands, each
+# repeating every `-var` (acceptance install, 2026-10-23). Off by default,
+# because importing a bucket that does not exist is an error.
+#
+# Only the buckets are imported. Their versioning, encryption, public-access and
+# policy resources are then planned as creates, and each of those is a PUT that
+# sets the bucket to exactly this root's configuration, whatever it held before.
+import {
+  for_each = var.adopt_existing_buckets ? toset([var.state_bucket]) : toset([])
+  to       = aws_s3_bucket.terraform_state
+  id       = each.value
+}
+
+import {
+  for_each = var.adopt_existing_buckets ? toset([var.metrics_bucket]) : toset([])
+  to       = aws_s3_bucket.metrics
+  id       = each.value
+}
+
+import {
+  for_each = var.adopt_existing_buckets && var.create_data_bucket ? toset([var.data_bucket]) : toset([])
+  to       = aws_s3_bucket.data[0]
+  id       = each.value
+}
+
 # ---------------------------------------------------------------------------
 # Terraform state
 # ---------------------------------------------------------------------------

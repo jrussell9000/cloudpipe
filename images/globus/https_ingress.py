@@ -38,7 +38,9 @@ the whole copy, which re-stats every listed file: a pass that lost 3 files sent
 113 HEADs into the struggling server and, in a bad minute, failed them all. So
 rclone makes one pass, and this step makes up to four, each against a file list
 rebuilt from what S3 actually holds. A pod retried by Argo starts the same way,
-so it never re-requests a file an earlier attempt staged. After a pass that
+so it never re-requests a file an earlier attempt staged. A file staged at the
+wrong size is deleted before the pass, because rclone, which cannot know sizes
+under `--http-no-head`, would otherwise skip it as present. After a pass that
 fails, one file still missing is probed directly (HEAD, then a 1-byte GET) and
 the source's status, timing, safe headers and JSON error body are logged: the
 body carries the request ID the source's operators need, which rclone discards.
@@ -344,7 +346,8 @@ def copy_missing(
     with tempfile.TemporaryDirectory() as scratch:
         file_list = Path(scratch) / "files.txt"
         for attempt in range(len(PASS_SLEEPS_SECS) + 1):
-            todo = still_missing(sizes, staged_sizes(s3, bucket, dest_prefix))
+            staged = staged_sizes(s3, bucket, dest_prefix)
+            todo = still_missing(sizes, staged)
             if not todo:
                 if attempt:
                     log(f"Pass {attempt} left nothing missing.")
@@ -355,6 +358,19 @@ def copy_missing(
                 sleeper(wait)
             elif len(todo) < len(sizes):
                 log(f"{len(sizes) - len(todo)} of {len(sizes)} file(s) already staged.")
+            # A file staged at the wrong size is a stream the source cut short. With
+            # --http-no-head rclone never learns a file's size (it streams, "Rcat"),
+            # so it cannot see a short read, and on the next pass it skips the file
+            # as already present: "There was nothing to transfer", on every pass and
+            # every Argo attempt (wave 2, 2026-10-24: 3 subjects). Deleting the short
+            # copy makes it missing again, so the pass fetches it whole.
+            short = [rel for rel in todo if rel in staged]
+            if short:
+                log(
+                    f"{len(short)} file(s) staged short; deleting them before the copy: "
+                    + ", ".join(f"{rel} ({staged[rel]} of {sizes[rel]} bytes)" for rel in short)
+                )
+                delete_staged(s3, bucket, dest_prefix, short)
             file_list.write_text("".join(f"{rel}\n" for rel in todo))
             log(
                 f"Pass {attempt + 1}: copying {len(todo)} file(s), "
@@ -387,6 +403,23 @@ def staged_sizes(s3: Any, bucket: str, prefix: str) -> dict[str, int]:
 def still_missing(sizes: dict[str, int], staged: dict[str, int]) -> list[str]:
     """Listed files not yet in S3 at their listed size, in listing order."""
     return [rel for rel, size in sizes.items() if staged.get(rel) != size]
+
+
+def delete_staged(s3: Any, bucket: str, prefix: str, rels: list[str]) -> None:
+    """Delete these listed files' staged copies, at most 1,000 keys per request."""
+    keys = [f"{prefix}/{rel}" for rel in rels]
+    for start in range(0, len(keys), 1000):
+        response = s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in keys[start : start + 1000]], "Quiet": True},
+        )
+        errors = response.get("Errors") or []
+        if errors:
+            first = errors[0]
+            raise RuntimeError(
+                f"could not delete {len(errors)} short object(s), e.g. {first.get('Key')}: "
+                f"{first.get('Code')} {first.get('Message')}"
+            )
 
 
 def verify_sizes(s3: Any, bucket: str, prefix: str, sizes: dict[str, int]) -> None:

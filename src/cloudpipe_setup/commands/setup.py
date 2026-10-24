@@ -15,7 +15,7 @@ from __future__ import annotations
 import shlex
 from typing import TYPE_CHECKING
 
-from .. import cloudflare, config, render, roots, schema
+from .. import cloudflare, config, config_objects, render, roots, schema
 from ..cli import register
 from ..exits import CliError, ExitCode, Remedy
 
@@ -159,9 +159,11 @@ def _report(
 STEP_ORDER = {
     "state.bucket": 0,
     "globus.inputs": 1,
-    "install.cloudflare_token": 2,
-    "install.phased": 3,
-    "install.operator_accounts": 4,
+    "config.objects": 2,
+    "install.cloudflare_token": 3,
+    "preflight": 4,
+    "install.phased": 5,
+    "install.operator_accounts": 6,
 }
 
 
@@ -326,7 +328,10 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
     steps.append(
         {
             "identifier": "globus.inputs",
-            "title": "Globus Terraform inputs",
+            # With the ingress off, the one input wanted is the data bucket's name,
+            # and a title naming Globus sent deployers who are not running it to
+            # skip the step (acceptance install, 2026-10-23).
+            "title": "The data bucket's name" if one else "Globus Terraform inputs",
             "state": "pass" if done else "blocked",
             "message": (
                 f"{'the one' if one else f'all {len(expected)}'} set, in "
@@ -350,10 +355,63 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
                 "apply and survive its teardown: the imaging data bucket and the metrics bucket.",
                 "remedy": {
                     "kind": "command",
-                    "text": render.bootstrap_command(answers, root),
+                    # This tool makes no AWS call, so it cannot know whether the
+                    # buckets are there already; the aside names the one error that
+                    # says so, and the flag that answers it.
+                    "text": render.bootstrap_command(answers, root)
+                    + "   (if the apply fails BucketAlreadyOwnedByYou, an earlier install made "
+                    "these buckets: run the apply again with -var adopt_existing_buckets=true)",
                 },
             }
         )
+
+    # Nothing the install builds puts these objects in the bucket, and the install
+    # succeeds without them; the first workflow then fails at its first step. The
+    # remedies are config_objects' own, the ones preflight's `aws.config_objects`
+    # prints, so the two cannot drift. This tool makes no AWS call, so the step is
+    # always outstanding here and preflight is what checks it.
+    license_done = bool(answers.get(config.LICENSE_FIELD))
+    steps.append(
+        {
+            "identifier": "config.objects",
+            "title": "Reference files in the data bucket",
+            "state": "blocked",
+            "message": "the workflows stage these from config/ in the data bucket, and a new "
+            "bucket holds none of them. The install succeeds without them, and every workflow "
+            "then fails at its first step.",
+            "remedy": {
+                "kind": "human",
+                "text": "Once the data bucket exists, put these in it. "
+                f"{config_objects.REFERENCE.remedy} "
+                f"{config_objects.NSS.remedy} "
+                + (
+                    "Your FreeSurfer license is uploaded by the bootstrap apply above."
+                    if license_done
+                    else config_objects.LICENSE.remedy
+                ),
+            },
+        }
+    )
+
+    # Preflight is the step that turns these answers into checked facts — the
+    # account, the token's permission groups, the team domain, the data bucket and
+    # its config/ objects — and it used to appear only as an aside in the token
+    # step, without `--account` (acceptance install, 2026-10-23).
+    steps.append(
+        {
+            "identifier": "preflight",
+            "title": "Preflight",
+            "state": "blocked",
+            "message": "it checks, read-only, what these answers assert about your AWS and "
+            "Cloudflare accounts. A failure here costs a re-run; the same failure during the "
+            "install costs a half-built cluster.",
+            "remedy": {
+                "kind": "command",
+                "text": f"{render.cli_command('preflight')} --account <your-aws-account-id>   "
+                "(from this root; every check should read ok, skip or WAIT)",
+            },
+        }
+    )
 
     # The phased install is a published script, not a procedure to work by hand:
     # scripts/stack/install.sh is in the tree the deployer cloned, and the reference
@@ -411,9 +469,14 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
             "WARP admits only identities the pool knows.",
             "remedy": {
                 "kind": "human",
+                # The sign-in itself, not only the account: the installer checks that
+                # the pool has a user, and cannot check that the user can get in
+                # (deployer-first-hour.md step 9; acceptance install, 2026-10-23).
                 "text": "Once the pool exists, create one account per operator_emails entry — "
-                "the installer prints the command, and docs/deployer-first-hour.md covers what "
-                "each operator does at their first sign-in.",
+                "the installer prints the command. Then, still before the phase that closes "
+                "the endpoint, connect WARP to your team and sign in as that operator: the "
+                "installer checks only that the pool has a user, not that the user can sign "
+                "in. docs/deployer-first-hour.md steps 8 and 9 cover both.",
             },
         }
     )

@@ -166,7 +166,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:86e871e78f45d0cf67e009a2ba9980e0d134bc5f1c1327b5517ce83f08949f2e"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:f7e0b78856c096c64147308f7ffcbbf5e3fd1f3dd913ed8a63b2ab242cba4d3d"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -273,7 +273,7 @@ spec:
     container:
       # The same image and digest as globus-transfer-template: the HTTPS step
       # imports transfer.py's listing, and the pin job rewrites both lines.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:86e871e78f45d0cf67e009a2ba9980e0d134bc5f1c1327b5517ce83f08949f2e"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:f7e0b78856c096c64147308f7ffcbbf5e3fd1f3dd913ed8a63b2ab242cba4d3d"
       imagePullPolicy: IfNotPresent
 
       # Plan 018 §7: one subject peaked at 1,118 MiB, about 8.4 CPU-s per GiB
