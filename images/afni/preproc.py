@@ -86,6 +86,7 @@ Exit codes:
 """
 
 import argparse
+import atexit
 import contextlib
 import gzip
 import json
@@ -122,9 +123,33 @@ from sklearn.decomposition import PCA
 # ---------------------------------------------------------------------------
 
 
+# Seconds spent in each step finer than the stage timers, accumulated across the
+# run and printed as one `[preproc] SUBSTAGES {...}` line at exit (log only: the
+# QC JSON keeps its seven stage_timings_s, so no schema change). Keys are
+# `<stage>.<step>`, plus `cmd:<program>` for every subprocess run() starts. In
+# wave 1's re-run (2026-10-23) a run's stage timers summed to 254 s of a 314 s
+# subprocess; these say where inside each stage the time goes.
+SUBSTAGES: dict[str, float] = {}
+
+
+@contextlib.contextmanager
+def substage(name: str):
+    """Add the block's wall time to SUBSTAGES[name] (accumulating)."""
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        SUBSTAGES[name] = round(SUBSTAGES.get(name, 0.0) + time.monotonic() - t0, 2)
+
+
+def print_substages() -> None:
+    print(f"[preproc] SUBSTAGES {json.dumps(SUBSTAGES, sort_keys=True)}", flush=True)
+
+
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
     print(f"\n>>> {' '.join(str(c) for c in cmd)}", flush=True)
-    return subprocess.run([str(c) for c in cmd], check=check)
+    with substage(f"cmd:{Path(str(cmd[0])).name}"):
+        return subprocess.run([str(c) for c in cmd], check=check)
 
 
 def _mem_gb() -> float:
@@ -351,12 +376,14 @@ def apply_transforms(
     running-mean accumulator (N_mni float64). The scratch file costs disk
     (4 bytes x N_mni x n_frames), not RAM.
     """
-    mni_img = nib.load(mni_template)
-    bold_img = nib.load(bold)
-    n_frames = bold_img.shape[3]
-    bold_data = np.asarray(bold_img.dataobj, dtype=np.float32)
+    with substage("4d_warp.load_bold"):
+        mni_img = nib.load(mni_template)
+        bold_img = nib.load(bold)
+        n_frames = bold_img.shape[3]
+        bold_data = np.asarray(bold_img.dataobj, dtype=np.float32)
 
-    coords = _build_warp_coords(composite_warp, bold_img.affine, mni_img)
+    with substage("4d_warp.build_coords"):
+        coords = _build_warp_coords(composite_warp, bold_img.affine, mni_img)
 
     mni_shape = mni_img.shape[:3]
     print(
@@ -396,7 +423,7 @@ def apply_transforms(
             wf_count[0] += 1
             mean_acc[:] += (frame_f32 - mean_acc) / wf_count[0]
 
-    with ThreadPoolExecutor(max_workers=threads) as pool:
+    with substage("4d_warp.warp_frames"), ThreadPoolExecutor(max_workers=threads) as pool:
         list(pool.map(_warp_frame, range(n_frames)))
 
     # Kept for verify_mni_bold_readback: the one view of the warp's output that
@@ -433,7 +460,7 @@ def apply_transforms(
 
     on_disk = np.dtype(np.float32).newbyteorder(out_hdr.endianness)
     out_nii = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-unmasked_bold.nii"
-    with open(str(out_nii), 'wb') as _f:
+    with substage("4d_warp.write_nii"), open(str(out_nii), 'wb') as _f:
         _f.write(bytes(np.array(out_hdr.structarr).tobytes()))  # 348-byte header
         _f.write(b'\x00' * 4)  # pad to vox_offset=352
         for t in range(n_frames):
@@ -455,7 +482,11 @@ def apply_transforms(
         run(['pigz', '-p', str(threads), '-1', str(out_nii)])
         # pigz writes {out_nii}.gz in-place and removes the original
     else:
-        with open(str(out_nii), 'rb') as _src, gzip.open(str(out), 'wb', compresslevel=1) as _dst:
+        with (
+            substage("4d_warp.compress"),
+            open(str(out_nii), 'rb') as _src,
+            gzip.open(str(out), 'wb', compresslevel=1) as _dst,
+        ):
             shutil.copyfileobj(_src, _dst)
         out_nii.unlink()
 
@@ -747,7 +778,8 @@ def sample_cortical_ribbon(
     # The cost is 0.69 GB resident for a 383-frame run. Should indexed_gzip
     # ever land in the image, revisit this — random access would then be cheap
     # and streaming would bound memory for free.
-    bold_data = np.asarray(bold_img.dataobj, dtype=np.float32)
+    with substage("grayordinates.load_native_bold"):
+        bold_data = np.asarray(bold_img.dataobj, dtype=np.float32)
 
     # With the data resident there is no file handle to contend over, so frames
     # parallelise cleanly — map_coordinates releases the GIL, the same property
@@ -759,7 +791,7 @@ def sample_cortical_ribbon(
             s = map_coordinates(vol, crd, order=1, mode="constant", cval=0.0)
             acc[hemi][:, t] = s.reshape(n_depths, n_vert[hemi]).mean(axis=0)
 
-    with ThreadPoolExecutor(max_workers=threads) as pool:
+    with substage("grayordinates.sample_ribbon"), ThreadPoolExecutor(max_workers=threads) as pool:
         list(pool.map(_sample_frame, range(n_frames)))
     # Rebind, not `del` — both are closed over by _sample_frame (F821); see the
     # note in apply_transforms. Same reference drop, same point in the function.
@@ -784,7 +816,8 @@ def sample_cortical_ribbon(
             ],
         )
         path = outdir / f"{prefix}_hemi-{hemi}_space-fsnative_bold.func.gii"
-        nib.save(gii, path)
+        with substage("grayordinates.write_gifti"):
+            nib.save(gii, path)
         out[hemi] = path
         print(f"  wrote {path.name}", flush=True)
     return out
@@ -852,10 +885,12 @@ def extract_subcortical(
     if n_vox == 0:
         raise ValueError("no subcortical voxels survived the aseg warp")
 
-    data = bold_img.get_fdata(dtype=np.float32)
+    with substage("grayordinates.load_mni_bold"):
+        data = bold_img.get_fdata(dtype=np.float32)
     data[~mask] = 0.0
     bold_out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-subcort_bold.nii.gz"
-    nib.save(nib.Nifti1Image(data, bold_img.affine, bold_img.header), bold_out)
+    with substage("grayordinates.write_subcort"):
+        nib.save(nib.Nifti1Image(data, bold_img.affine, bold_img.header), bold_out)
     del data
 
     label_out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-subcort_dseg.nii.gz"
@@ -1025,7 +1060,8 @@ def compute_confounds(
     # --- Load BOLD, extract all ROIs, free immediately (~1.28 GB) ---
     # All boolean masks are ready; boolean indexing produces copies, so
     # bold_data can be released as soon as extraction is complete.
-    bold_data = bold_img.get_fdata(dtype=np.float32)  # (X, Y, Z, T)
+    with substage("confounds.load_native_bold"):
+        bold_data = bold_img.get_fdata(dtype=np.float32)  # (X, Y, Z, T)
     brain_ts = bold_data[mask_data].T  # (T, n_brain)
     wm_ts = bold_data[warped_wm].T if warped_wm.any() else None
     csf_ts = bold_data[warped_csf].T if warped_csf.any() else None
@@ -1052,9 +1088,10 @@ def compute_confounds(
     n_tcc = min(5, high_var_ts.shape[1], n_keep)
     t_comp_cor_cols: dict = {}
     if n_tcc > 0:
-        t_comps = _pad_nss(
-            PCA(n_components=n_tcc).fit_transform(high_var_ts), nss_frames
-        )  # (T, n_tcc)
+        with substage("confounds.pca"):
+            t_comps = _pad_nss(
+                PCA(n_components=n_tcc).fit_transform(high_var_ts), nss_frames
+            )  # (T, n_tcc)
         for i in range(n_tcc):
             t_comp_cor_cols[f't_comp_cor_{i:02d}'] = t_comps[:, i]
 
@@ -1108,7 +1145,8 @@ def compute_confounds(
         # Fit up to 5 components, then trim to whichever is fewer: 5 or the
         # minimum number of components needed to explain ≥50% of variance.
         max_comp = min(5, n_vox, n_keep)
-        pca = PCA(n_components=max_comp).fit(roi_ts)
+        with substage("confounds.pca"):
+            pca = PCA(n_components=max_comp).fit(roi_ts)
         cumvar = np.cumsum(pca.explained_variance_ratio_)
         n_comp = min(int(np.searchsorted(cumvar, 0.50)) + 1, max_comp)
         comps = _pad_nss(pca.transform(roi_ts)[:, :n_comp], nss_frames)  # (T, n_comp)
@@ -1488,6 +1526,9 @@ def main() -> None:
 
     refuse_if_inputs_missing(args, prefix)
 
+    # At exit, however the run ends (including sys.exit on a failure), so a
+    # failed run still says where its time went.
+    atexit.register(print_substages)
     pipeline_start = time.monotonic()
     _timings: dict = {}
 
@@ -1554,7 +1595,8 @@ def main() -> None:
         with timed_stage("masking", _timings):
             mni_bold = apply_mni_mask(bold_mni_unmasked, mask_mni, args.outdir, prefix)
             bold_mni_unmasked.unlink()
-            verify_mni_bold_readback(mni_bold, mask_mni, mean_map)
+            with substage("masking.readback"):
+                verify_mni_bold_readback(mni_bold, mask_mni, mean_map)
         del mean_map
 
     surf_paths: dict[str, Path] = {}
@@ -1667,17 +1709,20 @@ def main() -> None:
     # cost the MNI BOLD, the confounds and the surfaces (#119).
     try:
         confounds_df = pd.read_csv(confounds_tsv, sep='\t', na_values='n/a')
-        qc = compute_func_qc_summary(
-            confounds=confounds_df,
-            bold_img=nib.load(args.bold),
-            mni_bold=mni_bold,
-            mask_mni=mask_mni,
-            stage_timings=_timings,
-            total_runtime_s=total,
-            peak_memory_gb=peak_gb,
-            args=args,
-            container_peak_memory_gb=container_gb,
-        )
+        # func_qc covers the IQMs and the BOLD loads they need (func_iqm reads
+        # the MNI BOLD itself); nib.load here is header-only, so it is inside.
+        with substage("qc_summary.func_qc"):
+            qc = compute_func_qc_summary(
+                confounds=confounds_df,
+                bold_img=nib.load(args.bold),
+                mni_bold=mni_bold,
+                mask_mni=mask_mni,
+                stage_timings=_timings,
+                total_runtime_s=total,
+                peak_memory_gb=peak_gb,
+                args=args,
+                container_peak_memory_gb=container_gb,
+            )
         # The volumetric record goes out FIRST, before any surface work. The
         # note above reasons that a missing metrics record costs one row in
         # Athena — but with the surface block ordered first, a failure in
@@ -1694,7 +1739,8 @@ def main() -> None:
             # single per-run view, and written to metrics/surface-sample/ so that
             # prefix never carries a stale record from an earlier short-path run.
             try:
-                surf_metrics = _surface_qc(surf_paths, subcort, args.nss_frames)
+                with substage("qc_summary.surface_qc"):
+                    surf_metrics = _surface_qc(surf_paths, subcort, args.nss_frames)
                 qc.update(surf_metrics)
                 qc_path.write_text(json.dumps(qc))  # re-write with surf folded in
                 Path(f"/tmp/{prefix}_surf_qc.json").write_text(
