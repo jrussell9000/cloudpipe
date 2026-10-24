@@ -223,11 +223,25 @@ What each bucket is, and why its settings differ:
 
 All three block public access, encrypt at rest, and carry a policy refusing requests that are not over TLS.
 
-**This root keeps its state in a local file, on purpose.** It creates the bucket the stack's backend lives in, so it cannot use that backend itself. Keep that state file; losing it costs one `terraform import` per bucket, which is a far smaller problem than the one the state bucket exists to prevent.
+**This root keeps its state in a local file, on purpose.** It creates the bucket the stack's backend lives in, so it cannot use that backend itself. Keep that state file. Losing it is a far smaller problem than the one the state bucket exists to prevent, and [If the buckets already exist](#if-the-buckets-already-exist) is how you recover from it.
 
 **Nothing can delete these buckets by accident.** They are in a state the stack's teardown cannot reach, each carries `prevent_destroy`, and none sets `force_destroy` — so Terraform refuses even when asked. `cleanup.sh` ends by naming them and the `aws s3 rb --force` that removes them, for the case where you are finished with the data too.
 
-If a bucket already exists — a cohort someone else staged, or a deployment you are rebuilding — name it and pass `-var create_data_bucket=false`. The stack configures the data bucket by name either way, so nothing downstream can tell which happened.
+### If the buckets already exist
+
+Two cases, and they take different flags.
+
+**This root made them before, and its state file is gone.** You are rebuilding into the same account, or the bootstrap directory went with an old laptop. The apply then fails on all three buckets:
+
+```
+Error: creating S3 Bucket (<name>-<suffix>-terraform-state): ... BucketAlreadyOwnedByYou
+```
+
+Nothing was changed. Run the same apply again with one more flag, `-var adopt_existing_buckets=true`. The plan then reads `3 to import` and `0 to destroy`. It imports the three buckets into this state and sets their versioning, encryption, public-access block and TLS policy to the settings above, whatever they held before. The flag needs every bucket you name to exist; if one does not, the plan stops at `Cannot import non-existent remote object` with nothing changed. Leave the flag on any later apply from the same state, or drop it: either way it imports nothing more.
+
+The buckets carry your `bucket_suffix`. A new `cloudpipe setup` without your old `cloudpipe-answers.yaml` generates a new suffix, which names buckets that do not exist, and the apply then simply creates three more. Before step 3, set `bucket_suffix` in the answers document to the six characters in your existing bucket names, for example `bucket_suffix: k7q2xp` for `cloudpipe-k7q2xp-data`.
+
+**Someone else made the data bucket** — a cohort staged by another project. Name it as the data bucket and pass `-var create_data_bucket=false`. This root then leaves that bucket out of its state and its policies, because its owner may already hold the bucket's one policy. The stack configures the data bucket by name either way, so nothing downstream can tell which happened.
 
 ### Put the reference files in the data bucket
 
@@ -561,7 +575,7 @@ It checks the last one before asking you to type `destroy`, and stops with nothi
 
 That is deliberate in three independent ways, because deleting a cohort by accident is not a recoverable mistake: those buckets live in a Terraform state the teardown never touches, each carries `prevent_destroy`, and none sets `force_destroy` — so S3 refuses to delete a non-empty one even if the other two safeguards were gone.
 
-**Installing again into the same account reuses them.** The second install adopts the buckets rather than failing on names that already exist, which is the main reason not to clear them out reflexively between attempts. When you are genuinely finished:
+**Installing again into the same account reuses them.** That is the main reason not to clear them out reflexively between attempts. Keep the `bootstrap/` directory and your `cloudpipe-answers.yaml`, and the second install's bootstrap apply finds nothing to do. If either is gone, [If the buckets already exist](#if-the-buckets-already-exist) is the recovery. When you are genuinely finished:
 
 ```bash
 aws s3 rb s3://<bucket> --force   # for each bucket the teardown named
