@@ -74,7 +74,7 @@ Inputs (via CLI args):
   --motion-file      ABCD 3dvolreg motion parameter TSV
 
 Outputs written to --outdir:
-  <prefix>_desc-boldref.nii.gz                          mean NSS reference volume
+  <prefix>_desc-boldref.nii.gz                          steady-state mean reference volume
   <prefix>_space-MNI152NLin2009cAsym_brainmask.nii.gz  MNI-space brain mask
   <prefix>_space-MNI152NLin2009cAsym_bold.nii.gz       final masked MNI BOLD
   <prefix>_desc-confounds_timeseries.tsv                confound regressors
@@ -175,35 +175,57 @@ def timed_stage(name: str, _timings: dict | None = None):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Extract 3D BOLD reference (first frame)
+# Stage 1: Extract 3D BOLD reference (steady-state temporal mean)
 # ---------------------------------------------------------------------------
+
+# Frames read per slice of the proxy. The mean covers every steady-state frame,
+# and a pod can run several runs at once against a 6G limit, so it is
+# accumulated in blocks rather than from one full-length float array.
+_BOLD_REF_BLOCK = 32
 
 
 def extract_bold_ref(bold: Path, outdir: Path, prefix: str, nss_frames: int) -> Path:
-    """Compute the mean of the non-steady-state frames as a 3D BOLD reference.
+    """Compute the temporal mean of the steady-state frames as a 3D BOLD reference.
 
-    NSS frames have elevated T1 contrast (magnetisation not yet at steady
-    state), which improves boundary sharpness for the composite warp geometry
-    input and for tissue-mask warping in confound estimation.
+    This is the same image bold_to_t1w.py registers to (`build_reference`, the
+    mean of frames `nss_frames` onward), so each run has one reference. It used
+    to be the mean of the first `nss_frames` frames, on the premise that those
+    carry extra T1 contrast. That holds only on some scanner software: on GE
+    DV26+ and Siemens VE11 the NSS mean is T1-enhanced, while on GE DV25,
+    Philips and Siemens XA30 the saved frames are already near steady state, so
+    the same file was a different kind of image depending on the scanner (#858).
 
-    Used as the -i geometry input when precomputing the composite warp and
-    reused in confound estimation for tissue-mask warping.
+    Inside this script only the geometry is used: it is the -i input when
+    precomputing the composite warp (a displacement field, so the intensities
+    never reach it), and its affine and shape place the tissue masks in
+    confound estimation and the ribbon sampling. The intensities matter only
+    to downstream users of the published `desc-boldref`.
     """
-    # nss_frames < 1 would make the slice below empty, and mean() over an empty
-    # axis returns all-NaN with only a RuntimeWarning. That reference is the
-    # geometry input for the composite warp and the tissue-mask warping in
-    # confound estimation, so the NaNs would propagate into derivatives rather
-    # than stop anything. Nothing reaches this today (nss_volumes.csv holds only
-    # 5, 8 and 16, and an empty --nss-frames fails in argparse), which is
-    # exactly why it needs a guard rather than a comment.
+    # nss_frames < 1 would include the transient the reference exists to skip,
+    # and is not a value nss_volumes.csv holds (only 5, 8 and 16; an empty
+    # --nss-frames fails in argparse). Refused rather than averaged, so a bad
+    # table row stops here instead of shifting the published reference.
     if nss_frames < 1:
         raise ValueError(
             f'nss_frames={nss_frames} gives no frames to average for the BOLD '
             'reference; expected at least 1'
         )
     img = nib.load(bold)
-    data = np.asarray(img.dataobj[..., :nss_frames], dtype=np.float32)
-    ref_data = data.mean(axis=-1)
+    n_vols = img.shape[3] if len(img.shape) == 4 else 1
+    # A run with no steady-state frame would make the mean all-NaN with only a
+    # RuntimeWarning, and that reference is the geometry input for the
+    # composite warp and the tissue-mask warping, so the NaNs would propagate
+    # into derivatives rather than stop anything.
+    if n_vols <= nss_frames:
+        raise ValueError(
+            f'nss_frames={nss_frames} leaves no steady-state frames to average for '
+            f'the BOLD reference in a {n_vols}-volume run'
+        )
+    total = np.zeros(img.shape[:3], dtype=np.float64)
+    for start in range(nss_frames, n_vols, _BOLD_REF_BLOCK):
+        block = np.asarray(img.dataobj[..., start : start + _BOLD_REF_BLOCK], dtype=np.float64)
+        total += block.sum(axis=-1)
+    ref_data = (total / (n_vols - nss_frames)).astype(np.float32)
     ref_path = outdir / f"{prefix}_desc-boldref.nii.gz"
     nib.save(nib.Nifti1Image(ref_data, img.affine, img.header), str(ref_path))
     return ref_path
@@ -1608,7 +1630,7 @@ def main() -> None:
     args.bold = decompress_native_bold(args.bold, args.outdir, args.threads)
 
     print(
-        f"\n--- Stage 1: Extract BOLD reference (mean of {args.nss_frames} NSS frames) ---",
+        f"\n--- Stage 1: Extract BOLD reference (mean of frames {args.nss_frames} onward) ---",
         flush=True,
     )
     with timed_stage("boldref", _timings):
