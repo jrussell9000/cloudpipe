@@ -230,7 +230,8 @@ stack_address() {
 # The two target lists are consumed only by the scripts that source this file,
 # which is invisible when shellcheck checks this file on its own.
 
-# Phase 2 modules, in apply order. cleanup.sh destroys these in reverse.
+# Phase 2 modules: -targets of one apply in install.sh and of one destroy in
+# cleanup.sh. Terraform orders them by the graph, not by this list.
 # shellcheck disable=SC2034
 # `module.globus` stays in this list even though `globus_enabled` defaults to
 # false. A `-target` that resolves to a module call with zero instances is a
@@ -430,14 +431,6 @@ EOF
   fi
 }
 
-# Print the given arguments in reverse order, one per line. Used by cleanup.sh to
-# tear down in the opposite order to install, without a second hand-kept list.
-reversed() {
-  local i
-  for ((i = $#; i > 0; i--)); do
-    printf '%s\n' "${!i}"
-  done
-}
 
 # ---------------------------------------------------------------------------
 # How Terraform's output is shown

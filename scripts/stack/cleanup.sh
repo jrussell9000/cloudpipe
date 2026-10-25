@@ -27,6 +27,25 @@ destroy_target() {
   fi
 }
 
+# Several stack-relative addresses as -targets of ONE destroy:
+#   destroy_targets "<label>" <address>...
+# For the same reason install.sh's apply_targets exists: each targeted destroy
+# pays about 30s before it removes anything, a no-op target included.
+destroy_targets() {
+  local label=$1 target targets=()
+  shift
+  for target in "$@"; do
+    targets+=(-target="$(stack_address "$target")")
+  done
+  echo "==> Destroying ${#targets[@]} targets in one destroy: $label..."
+  if tf_step "$label" terraform destroy "${targets[@]}" -auto-approve; then
+    echo "SUCCESS: $label"
+  else
+    echo "FAILED: $label"
+    exit "$EXIT_ERROR"
+  fi
+}
+
 # kubectl in this script acts on this deployment's cluster and on nothing else.
 #
 # It used to follow the shell's current kubectl context. With this deployment's
@@ -541,11 +560,10 @@ fi
 
 fi # SKIP_UI_ALB_TEARDOWN
 
-# Same list install.sh applies, read backwards — not a second hand-kept copy.
-mapfile -t phase2_teardown < <(reversed "${PHASE2_MODULES[@]}")
-for target in "${phase2_teardown[@]}"; do
-  destroy_target "$target"
-done
+# Same list install.sh applies — not a second hand-kept copy — and, like its
+# apply, in one destroy: Terraform destroys a dependent before what it depends
+# on, which is the order reading the list backwards used to give by hand.
+destroy_targets "cluster add-ons" "${PHASE2_MODULES[@]}"
 
 # Force-drain backend nodes before EKS destroys the node group.
 # The backend node group hosts CoreDNS and other system addons with PodDisruptionBudgets.
