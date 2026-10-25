@@ -889,7 +889,12 @@ main() {
   # long" (hashicorp/terraform-provider-aws#50481; second-account rerun,
   # 2026-10-14). A lock that cannot satisfy the configuration fails here, naming
   # the provider; the fix is the example root's lock file, not -upgrade.
-  terraform init -input=false
+  #
+  # Through tf_step like every apply, so its forty lines go to the run's log and
+  # the terminal gets one, and a failure still prints Terraform's Error blocks:
+  # streamed, it opened every invocation with a screen of provider versions
+  # (acceptance install, 2026-10-25).
+  tf_step "providers and modules" terraform init -input=false
 
   resolve_stack_module
   echo "==> Targeting module \"$STACK_MODULE_NAME\" ($STACK_DIR)"

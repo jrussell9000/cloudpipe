@@ -221,18 +221,29 @@ def _require_declared(root: Path, answers: dict) -> None:
     if not missing:
         return
     example = render.CLONE / "terraform/modules/stack/example/main.tf"
+    # The text to paste, read from the example itself, so the deployer does not
+    # have to find it there. The remedy used to name the file and quote one module
+    # line, and said "the `variable` block for each of security_findings_emails"
+    # for a single variable (acceptance install, 2026-10-25).
+    blocks, lines = roots.example_snippets(example, missing)
+    one = len(missing) == 1
     raise CliError(
         "root.undeclared_variables",
         f"{root} does not declare and pass {', '.join(missing)}, so Terraform would ignore "
-        f"{'its value' if len(missing) == 1 else 'their values'} with only a warning. The "
+        f"{'its value' if one else 'their values'} with only a warning. The "
         "root was most likely copied from an older example.",
         exit_code=ExitCode.INVALID,
         remedy=Remedy(
             "human",
-            f"Copy the `variable` block for each of {', '.join(missing)} from {example} into "
-            f"{root / 'main.tf'}, and its line in the module \"stack\" call "
-            f"(`{missing[0]} = var.{missing[0]}`). Your answers are saved; run this again "
-            "afterwards.",
+            f"Add {'this' if one else 'these'} to {root / 'main.tf'}, beside its other "
+            f"`variable` blocks (copied from {example}):\n\n{blocks}\n\n"
+            f'and, inside its module "stack" call:\n\n  {lines}\n\n'
+            "Your answers are saved; run this again afterwards."
+            if blocks and lines
+            else f"Copy the `variable` block for {', '.join(missing)} from {example} into "
+            f"{root / 'main.tf'}, and {'its line' if one else 'their lines'} in the module "
+            f'"stack" call (`{missing[0]} = var.{missing[0]}`). Your answers are saved; run '
+            "this again afterwards.",
         ),
         detail={"root": str(root), "undeclared": missing},
     )

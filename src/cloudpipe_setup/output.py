@@ -43,6 +43,11 @@ class Record:
     state: str
     message: str
     remedy: Remedy | None = None
+    #: False for a check skipped because the deployment does not have what it
+    #: checks (no domain, no Globus ingress, no federation). Not serialised: the
+    #: contract's record keys are fixed, and the state is `skipped` either way.
+    #: Only a human summary reads it.
+    applicable: bool = True
 
     def __post_init__(self) -> None:
         if self.state not in STATES:
