@@ -1086,13 +1086,15 @@ spec:
                     surf_message = ("grayordinate components missing after preproc.py "
                                      "exit 0 (Stage 5b downgrade to volumetric-only)")
                 else:
-                    # compresslevel 1, not tarfile's default 9: the members are
-                    # mostly compressed already (GIFTI as gzip-base64, .nii.gz),
-                    # the tarball is transient (surface-resample deletes it), and
-                    # level 9 spends minutes of the session's one busy core on
-                    # ~2 GiB for little gain. surface-resample reads either.
+                    # compresslevel 0: a valid gzip stream of stored blocks, so the
+                    # .tar.gz name and every reader (surface-resample, inventory,
+                    # the outcome recorder) stay as they are, at no compression
+                    # cost. The tarball is transient (surface-resample deletes it)
+                    # and its members compress badly: BOLD floats in base64 GIFTI
+                    # and .nii.gz. Level 1 still cost ~21 s a run (01b, #860), and
+                    # tarfile's default 9 cost minutes.
                     with Timed(f"{task}_{rid}:components_tar"), \
-                            tarfile.open(surf_tarball(prefix), "w:gz", compresslevel=1) as tar:
+                            tarfile.open(surf_tarball(prefix), "w:gz", compresslevel=0) as tar:
                         for f in dict.fromkeys(gray):   # de-dup overlapping globs
                             tar.add(str(f), arcname=f"{task}_{rid}/{f.name}")
                     print(f"[driver] wrote {surf_tarball(prefix).name}")
