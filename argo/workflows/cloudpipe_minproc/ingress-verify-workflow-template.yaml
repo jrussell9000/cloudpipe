@@ -29,7 +29,11 @@ metadata:
 #
 # Exit status: 1 on any contract violation. Not retried — the workflow-level
 # retryStrategy admits only infrastructure codes (64/75/143), and a staging
-# mistake fails identically on every attempt.
+# mistake fails identically on every attempt. 75 when S3 itself failed (a read
+# timeout, a dropped connection): that says nothing about the staged input, and
+# a retry clears it. Before that mapping, func-reprocess-03-04 lost 2 of 2,000
+# subjects to a ReadTimeoutError on config/nss_volumes.csv, after a complete
+# and size-verified copy.
 spec:
   templates:
 
@@ -74,6 +78,21 @@ spec:
         sys.path.insert(0, "/app")
 
         INGRESS_MODES = ("globus", "presynced", "https")
+        # EX_TEMPFAIL, a code the workflow-level retryStrategy retries.
+        TEMPFAIL = 75
+
+
+        def is_transient(exc):
+            """True if `exc` is S3 or the network failing, not the staged input.
+
+            BotoCoreError covers read and connect timeouts and dropped
+            connections. ClientError is not one: a missing key or a denied read
+            is an answer about the bucket, and botocore has already retried the
+            throttling and 5xx answers itself.
+            """
+            from botocore.exceptions import BotoCoreError
+
+            return isinstance(exc, BotoCoreError)
 
 
         def unknown_mode_error(mode):
@@ -193,7 +212,17 @@ spec:
             if mode_error:
                 print(f"ERROR: {mode_error}", file=sys.stderr)
                 sys.exit(1)
-            errors, warnings = check_staged_input(boto3.client("s3"), bucket, subj, inventory)
+            try:
+                errors, warnings = check_staged_input(boto3.client("s3"), bucket, subj, inventory)
+            except Exception as exc:
+                if not is_transient(exc):
+                    raise
+                print(
+                    f"ERROR: S3 failed while checking {subj} ({type(exc).__name__}: {exc}); "
+                    f"forcing retry (exit {TEMPFAIL}).",
+                    file=sys.stderr,
+                )
+                sys.exit(TEMPFAIL)
             for w in warnings:
                 print(f"WARNING: {w}", file=sys.stderr)
             for e in errors:

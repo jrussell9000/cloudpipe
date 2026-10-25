@@ -228,11 +228,59 @@ sync_tunnel_token() {
   echo "    Stored token updated."
 }
 
+# The operator_emails addresses the Cognito pool has no user for, one per line,
+# lower-cased. Nothing for a deployment with an external identity provider,
+# whose pool output is null, or a root that does not name the variable
+# operator_emails (the wizard's roots all do).
+missing_operator_accounts() {
+  local pool=$1 wanted have
+  wanted=$(printf 'jsonencode(var.operator_emails)\n' | terraform console 2>/dev/null |
+    jq -r 'fromjson? | .[]?' 2>/dev/null | tr '[:upper:]' '[:lower:]' | sort -u) || true
+  [[ -n $wanted ]] || return 0
+  # shellcheck disable=SC2016 # `email` is a JMESPath literal, not a command substitution
+  have=$(aws cognito-idp list-users --user-pool-id "$pool" \
+    --query 'Users[].Attributes[?Name==`email`].Value[]' --output text 2>/dev/null |
+    tr '\t' '\n' | tr '[:upper:]' '[:lower:]' | sort -u) || true
+  comm -23 <(printf '%s\n' "$wanted") <(printf '%s\n' "$have" | sed '/^$/d')
+}
+
+# Offer to create the operators' Cognito accounts, on a terminal, before the
+# check below insists on one. Design D10 kept this a hand step; the acceptance
+# install (2026-10-25) revisited it: the deployer has already named these people
+# in operator_emails, and the hand-typed command is where `email_verified=true`
+# gets left off, which the UIs then silently refuse. It asks, and does nothing
+# without a yes. Without a terminal — the setup page's runner, a script — it
+# never asks, and the check below prints the command as before.
+#
+# Never fails the phase itself: whether there is now a user is the next check's
+# question, not this one's.
+offer_operator_accounts() {
+  local pool email answer missing=()
+  pool=$(terraform output -json cognito_user_pool_id 2>/dev/null | jq -r '. // empty')
+  [[ -n $pool ]] || return 0
+  mapfile -t missing < <(missing_operator_accounts "$pool")
+  [[ ${#missing[@]} -gt 0 && -n ${missing[0]} ]] || return 0
+  [[ -t 0 && -t 1 ]] || return 0
+  echo "The Cognito user pool $pool has no user for:"
+  printf '    %s\n' "${missing[@]}"
+  echo "Each account is created with a verified email, and Cognito emails it a temporary"
+  echo "password. Its first sign-in sets a real password and enrolls an authenticator app."
+  read -rp "Create these accounts now? [y/N] " answer || answer=""
+  [[ $answer == [yY] || $answer == [yY][eE][sS] ]] || return 0
+  for email in "${missing[@]}"; do
+    if aws cognito-idp admin-create-user --user-pool-id "$pool" --username "$email" \
+      --user-attributes Name=email,Value="$email" Name=email_verified,Value=true >/dev/null; then
+      echo "    Created $email."
+    else
+      echo "    Could not create $email; the command above says why." >&2
+    fi
+  done
+}
+
 # With Cognito, nobody can sign in to Cloudflare Access — and so reach the API
 # server over WARP — until a user exists in the pool. Closing the public endpoint
-# before then leaves only the VPN. Users are created by hand (design D10 of
-# openspec/changes/publish-phased-installer), so this checks and stops rather
-# than creating one.
+# before then leaves only the VPN. offer_operator_accounts asks first on a
+# terminal; this is the check that holds either way.
 #
 # Prints nothing and succeeds for a deployment with an external identity
 # provider, whose output is null.
@@ -253,6 +301,44 @@ cognito_has_users() {
   echo "Then enroll WARP in this deployment's team and sign in once, while the endpoint is" >&2
   echo "still open: docs/deployer-first-hour.md, \"Step 9 — connect WARP and sign in for the" >&2
   echo "first time\". The first sign-in sets the password and enrolls the authenticator app." >&2
+  return 1
+}
+
+# Whether THIS machine reaches the cluster's private API endpoint, which is the
+# only way in once the public one closes. The pool check above proves an account
+# exists, not that anyone can use it: enrolling WARP, the first sign-in, the
+# device profile and the route to the VPC all have to work too, and the guide
+# used to say the installer could not check them. It can, while the public
+# endpoint is still open: ask an API server address inside the VPC, by the
+# endpoint's own hostname so its certificate verifies, with this kubeconfig's
+# credentials. An answer proves the whole path. (The mTLS Client VPN routes the
+# same CIDR, so a deployer on the VPN passes too.)
+#
+# Safe against WARP on another team: a deployment that shares the VPC CIDR
+# routes these addresses to a different VPC, where no API server presents a
+# certificate for this cluster's hostname, so the check fails rather than
+# passing by accident.
+private_endpoint_reachable() {
+  local endpoint host ip ips
+  endpoint=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query cluster.endpoint \
+    --output text) || return 1
+  host=${endpoint#https://}
+  ips=$(aws ec2 describe-network-interfaces \
+    --filters "Name=description,Values=Amazon EKS $CLUSTER_NAME" "Name=status,Values=in-use" \
+    --query 'NetworkInterfaces[].PrivateIpAddress' --output text) || return 1
+  ips=${ips//$'\t'/ }
+  for ip in $ips; do
+    if [[ $(kubectl --server "https://$ip" --tls-server-name "$host" --request-timeout=10s \
+      get --raw /livez 2>/dev/null) == ok ]]; then
+      echo "    The private endpoint answers at $ip."
+      return 0
+    fi
+  done
+  echo "This machine cannot reach the cluster's private API endpoint (${ips:-no addresses found})." >&2
+  echo "After this phase that endpoint is the only way in. Connect WARP to this deployment's" >&2
+  echo "team and sign in once: docs/deployer-first-hour.md, \"Step 9 — connect WARP and sign" >&2
+  echo "in for the first time\". \`warp-cli status\` must say Connected, and to this team, not" >&2
+  echo "another deployment's." >&2
   return 1
 }
 
@@ -578,12 +664,20 @@ phase_7_prove_the_tunnel() {
       "LEFT OPEN (IAM-gated) so the cluster stays reachable. Fix the tunnel, then re-run" \
       "this phase."
   fi
+  # The accounts are needed before Phase 8, not at it: enrolling WARP is a
+  # sign-in, and Phase 8 checks that this machine got through. Offered here so
+  # the run goes Phase 7, WARP, Phase 8 without stopping in between.
+  offer_operator_accounts
+  echo "==> Next, while the public endpoint is still open: connect WARP to this deployment's"
+  echo "    team and sign in once (docs/deployer-first-hour.md, Steps 8 and 9). Phase 8"
+  echo "    checks that this machine reaches the private endpoint before it closes the public one."
 }
 
-# Lock down. Both gates are re-checked here, every time this phase runs, whether
-# or not Phase 7 ran in the same invocation: after this apply the cluster is
-# reached only over WARP, so a tunnel that is not healthy or a user pool with
-# nobody in it means nobody can get back in.
+# Lock down. All three gates are re-checked here, every time this phase runs,
+# whether or not Phase 7 ran in the same invocation: after this apply the cluster
+# is reached only over WARP, so a tunnel that is not healthy, a user pool with
+# nobody in it, or a machine that cannot reach the private endpoint means nobody
+# can get back in.
 phase_8_close_the_public_endpoint() {
   require_cluster
   require_cloudflare_ids
@@ -598,12 +692,22 @@ phase_8_close_the_public_endpoint() {
   fi
 
   echo "==> Checking that someone can sign in before locking down..."
+  offer_operator_accounts
   if ! cognito_has_users; then
     # 2, not 3: the check performed correctly and the answer is that a human has
     # to create a user. Only the exit code tells a caller those apart.
     fail "$EXIT_BLOCKED" \
       "FAILED: the public EKS endpoint has been LEFT OPEN (IAM-gated) and nothing was" \
       "applied. Create a user as printed above, then re-run this phase."
+  fi
+
+  echo "==> Checking that this machine reaches the private endpoint over WARP..."
+  if ! private_endpoint_reachable; then
+    # 2 again: nothing is broken that a script can see; a human has to enroll
+    # WARP and sign in.
+    fail "$EXIT_BLOCKED" \
+      "FAILED: the public EKS endpoint has been LEFT OPEN (IAM-gated) and nothing was" \
+      "applied. Connect WARP as printed above, then re-run this phase."
   fi
 
   echo "==> Final apply: disabling the public EKS endpoint..."
