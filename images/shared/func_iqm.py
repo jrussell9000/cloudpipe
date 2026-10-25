@@ -36,12 +36,11 @@ if TYPE_CHECKING:  # annotations only: the afni image ships pandas, src/ may not
 # @compute_gcor.  None of the three could ever have run (#119): at the time the
 # image took AFNI from conda-forge, whose package ships 71 of AFNI's ~600
 # programs, and none of these were among them.  The image now installs AFNI from
-# upstream, where all three DO exist, but ships only an allow-list of binaries
-# (AFNI_PROGRAMS in the Dockerfile, currently just 3dcalc) — so they are still
-# absent, now by choice rather than by accident.  Adding them back would be a
-# one-word Dockerfile edit; the numpy implementations below are kept because they
-# are exact and avoid three subprocess round-trips per run, not because AFNI's
-# are unavailable.  Reimplemented at AFNI's default settings so the values stay
+# upstream, then shipped only an allow-list of binaries (just 3dcalc), and since
+# 2026-10-24 ships no AFNI at all (Stage 5's mask multiply is numpy now).  The
+# numpy implementations below were kept on their own merits even while AFNI was
+# installable: they are exact and avoid three subprocess round-trips per run.
+# Reimplemented at AFNI's default settings so the values stay
 # comparable with AFNI's own and with MRIQC's aor/aqi/gcor, which wrap the same
 # programs.  All three take the in-mask voxel x time matrix, loaded once.
 
@@ -52,7 +51,7 @@ def _load_masked_timeseries(mni_bold: Path, mask_mni: Path) -> np.ndarray:
     Read whole rather than frame by frame: nibabel cannot random-access frames
     inside a gzip stream, so a per-frame loop re-inflates the entire file every
     frame.  The full 4D is transient (~1.7 GB for a 400-frame run on the 2 mm
-    MNI grid, as 3dcalc writes it in Stage 5); only the in-mask voxels are kept,
+    MNI grid, as Stage 5 writes it); only the in-mask voxels are kept,
     ~0.4 GB at a 250k-voxel mask.
     """
     mask = np.asanyarray(nib.load(mask_mni).dataobj) > 0
@@ -156,10 +155,14 @@ def func_qc_measures(
     n_nss_frames: int,
     mni_bold: Path,
     mask_mni: Path,
+    masked_ts: np.ndarray | None = None,
 ) -> dict:
     """The measured fields of a FuncQC record, in schema order.
 
     Reads only the outputs: the confounds table, the MNI BOLD and its brain mask.
+    `masked_ts`, when given, is that file's in-mask (n_voxels, n_frames) matrix
+    as already read (preproc.py hands over its read-back's), so the file is not
+    decompressed a second time; when None it is read from `mni_bold`.
 
     Every summary is taken over the steady-state frames, `n_nss_frames` onward
     (schema 1.3, #859). The non-steady-state frames stay in the BOLD and the
@@ -192,7 +195,9 @@ def func_qc_measures(
     try:
         # A view, not a copy: the metrics below each allocate their own working
         # array, so slicing costs nothing extra on the ~0.4 GB in-mask matrix.
-        steady_ts = _load_masked_timeseries(mni_bold, mask_mni)[:, nss:]
+        if masked_ts is None:
+            masked_ts = _load_masked_timeseries(mni_bold, mask_mni)
+        steady_ts = masked_ts[:, nss:]
         aor = float(np.mean(_outlier_fraction(steady_ts)))
         aqi = float(np.mean(_quality_index(steady_ts)))
         gcor = _gcor(steady_ts)
@@ -270,11 +275,13 @@ def compute_func_qc_summary(
     peak_memory_gb: float,
     args: argparse.Namespace,
     container_peak_memory_gb: float = 0.0,
+    masked_ts: np.ndarray | None = None,
 ) -> dict:
     """Compute a per-run QC summary dict from pipeline outputs.
 
     Called after confound estimation; inputs are already in memory/on disk.
     Returns a dict matching the FuncQC schema in src/metrics/schemas.py.
+    `masked_ts` is passed through to func_qc_measures.
     """
     from datetime import datetime, timezone
 
@@ -285,6 +292,7 @@ def compute_func_qc_summary(
         n_nss_frames=args.nss_frames,
         mni_bold=mni_bold,
         mask_mni=mask_mni,
+        masked_ts=masked_ts,
     )
     return {
         "schema_version": FUNC_QC_SCHEMA_VERSION,
