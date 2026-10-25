@@ -435,13 +435,19 @@ phase_3_kube_system_network_policies() {
 #
 # The token sync belongs to this phase, not the next: External Secrets must find
 # the current value on its first sync.
-# The namespaces ArgoCD creates that this apply writes into. ArgoCD is installed
-# in Phase 2 but syncs on its own clock, and on a fresh install Phase 4 reached
-# them first: `namespaces "prefect" not found`, `namespaces "grafana" not found`
+# The namespaces ArgoCD creates that the full apply writes into. ArgoCD syncs on
+# its own clock, and on a fresh install the full apply reached them first:
+# `namespaces "prefect" not found`, `namespaces "grafana" not found`
 # (second-account rerun, 2026-10-13). The reference cluster has had them since its
 # first sync, which is why this wait did not exist. Ten minutes each, because a
 # first sync pulls every chart; a namespace still missing after that is a sync
 # failure, and the message says where to look.
+#
+# ArgoCD has to be INSTALLED before this can pass, and nothing before Phase 4
+# installs it: its Helm release is a stack-level resource no Phase 2 target
+# depends on. The wait used to run before any apply in this phase, so on a fresh
+# install it waited ten minutes for a sync from an ArgoCD that did not exist
+# (acceptance install, 2026-10-24). Phase 4 now applies ARGOCD_BOOTSTRAP first.
 wait_for_argocd_namespaces() {
   local namespaces ns
   namespaces=$(stack_output argocd_created_namespaces)
@@ -463,6 +469,11 @@ wait_for_argocd_namespaces() {
 phase_4_full_apply_and_tunnel_token() {
   require_cluster
   require_helm_ecr_login
+  # ArgoCD and its root app, so that the first sync — which creates the
+  # namespaces the full apply writes into — can start. Their dependencies come
+  # with them (the Cognito clients the Dex connector names, among others); none
+  # is in an ArgoCD-created namespace.
+  apply_targets "ArgoCD" "${ARGOCD_BOOTSTRAP[@]}" -- -var="endpoint_public_access=true"
   wait_for_argocd_namespaces
   echo "==> Applying remaining resources (crds_available=false)..."
   tf_step "full apply (crds_available=false)" \

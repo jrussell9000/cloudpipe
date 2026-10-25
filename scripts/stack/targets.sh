@@ -269,6 +269,17 @@ KUBE_SYSTEM_NETWORK_POLICIES=(
   kubernetes_network_policy_v1.kube_system_karpenter_egress_pod_identity
 )
 
+# What Phase 4 applies before it waits for ArgoCD's namespaces: ArgoCD itself,
+# the repository credential a private gitops_repo_url needs (zero instances
+# otherwise, which a -target plans as nothing), and the root app whose sync
+# creates the namespaces. Nothing else installs ArgoCD before the full apply.
+# shellcheck disable=SC2034
+ARGOCD_BOOTSTRAP=(
+  helm_release.argocd
+  kubernetes_secret_v1.argocd_repo
+  kubectl_manifest.argocd_root_app
+)
+
 # Every address either script targets. This is what identifies the stack module
 # (resolve_stack_module) as well as what is validated before an apply, so the two
 # cannot disagree about which configuration is being driven.
@@ -278,6 +289,7 @@ ALL_TARGETS=(
   module.eks
   "${PHASE2_MODULES[@]}"
   "${KUBE_SYSTEM_NETWORK_POLICIES[@]}"
+  "${ARGOCD_BOOTSTRAP[@]}"
 )
 
 # Whether every given stack-relative address is declared in DIR. Quiet; returns
