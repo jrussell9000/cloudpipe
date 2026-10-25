@@ -47,6 +47,7 @@ from pathlib import Path
 
 import boto3
 from botocore.client import BaseClient
+from tqdm import tqdm
 
 REPO = Path(__file__).resolve().parent.parent
 # src/metrics/ modules import each other flatly, so the package directory itself
@@ -255,6 +256,16 @@ def list_objects(s3, bucket: str, prefix: str) -> list[dict]:
     return out
 
 
+def progress(items, desc: str, total: int, unit: str):
+    """`items` with a stderr progress bar, for one phase of a launch or verify.
+
+    A 2,000-subject verify spends many silent minutes listing and reading S3, and
+    looked hung. `disable=None` turns the bar off when stderr is not a terminal,
+    so a redirected log and the tests' captured output carry none of it.
+    """
+    return tqdm(items, desc=desc, total=total, unit=unit, disable=None, dynamic_ncols=True)
+
+
 _PROCESS_S3 = None  # one boto3 client per listing worker process
 
 
@@ -268,7 +279,9 @@ def _process_list(job: tuple[str, str, str]) -> tuple[str, list[str]]:
     return prefix, list_keys(_PROCESS_S3, bucket, part)
 
 
-def list_keys_parallel(s3, bucket: str, prefixes: list[str], workers: int) -> dict[str, list[str]]:
+def list_keys_parallel(
+    s3, bucket: str, prefixes: list[str], workers: int, desc: str = "listing"
+) -> dict[str, list[str]]:
     """Every key under each prefix, as `list_keys` returns it, listed in parallel.
 
     One delimited listing per prefix finds its partitions (`dt=YYYY-MM-DD/`) and
@@ -304,10 +317,17 @@ def list_keys_parallel(s3, bucket: str, prefixes: list[str], workers: int) -> di
         with ProcessPoolExecutor(
             max_workers=procs, initializer=_process_init, initargs=(s3.meta.region_name,)
         ) as pool:
-            listed = list(pool.map(_process_list, jobs))
+            listed = list(progress(pool.map(_process_list, jobs), desc, len(jobs), "part"))
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            listed = list(pool.map(lambda j: (j[1], list_keys(s3, j[0], j[2])), jobs))
+            listed = list(
+                progress(
+                    pool.map(lambda j: (j[1], list_keys(s3, j[0], j[2])), jobs),
+                    desc,
+                    len(jobs),
+                    "part",
+                )
+            )
     for prefix, keys in listed:
         out[prefix] += keys
     return {prefix: sorted(keys) for prefix, keys in out.items()}
@@ -379,7 +399,8 @@ def delete_audited(s3, bucket: str, keys: list[str], audit: Audit, category: str
     metrics bucket is versioned, so the marker is how a delete is undone).
     """
     done = 0
-    for i in range(0, len(keys), 1000):
+    starts = range(0, len(keys), 1000)
+    for i in progress(starts, f"delete {category}", len(starts), "batch"):
         chunk = keys[i : i + 1000]
         resp = s3.delete_objects(
             Bucket=bucket, Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": False}
@@ -449,8 +470,9 @@ def drop_compacted(
         except Exception as exc:  # noqa: BLE001 — reported per file, never swallowed
             return key, 0, exc
 
+    files = compacted_files(s3, bucket, table)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(one, compacted_files(s3, bucket, table)))
+        results = list(progress(pool.map(one, files), f"compacted {table}", len(files), "file"))
     rows, failed = 0, []
     for key, n, exc in results:
         if isinstance(exc, UnattributableRows):
@@ -681,10 +703,10 @@ def plan_flush(s3, data_bucket, metrics_bucket, subjects, workers) -> FlushPlan:
         ]
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        deriv = dict(pool.map(deriv_of, subjects))
+        deriv = dict(progress(pool.map(deriv_of, subjects), "derivatives", len(subjects), "subj"))
 
     listed = list_keys_parallel(
-        s3, metrics_bucket, [*FUNC_QC_PREFIXES, STEP_OUTCOME_PREFIX], workers
+        s3, metrics_bucket, [*FUNC_QC_PREFIXES, STEP_OUTCOME_PREFIX], workers, "metrics listing"
     )
     # The basename's first `_` field is the whole subject ID (IDs contain no `_`),
     # so this is an exact match — sub-AB never catches sub-ABC's records.
@@ -718,7 +740,8 @@ def preflight(s3, args, subjects: list[str]) -> list[str]:
         return None if object_exists(s3, args.data_bucket, key) else subj
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        missing = sorted(s for s in pool.map(no_template, subjects) if s)
+        checked = progress(pool.map(no_template, subjects), "long templates", len(subjects), "subj")
+        missing = sorted(s for s in checked if s)
     if missing:
         problems.append(
             f"{len(missing)} subject(s) have no long-template _complete.json, e.g. {missing[0]}"
@@ -1092,7 +1115,7 @@ def gather_derivatives(s3, args, evidence: dict[str, Evidence]) -> None:
 
     markers = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for objs in pool.map(deriv_of, evidence):
+        for objs in progress(pool.map(deriv_of, evidence), "derivatives", len(evidence), "subj"):
             for o in objs:
                 if m := MNI_BOLD_RE.match(o["Key"]):
                     u = m.groups()[:4]
@@ -1108,7 +1131,14 @@ def gather_derivatives(s3, args, evidence: dict[str, Evidence]) -> None:
                 elif u := unit_of_dtseries(o["Key"]):
                     evidence[u[0]].dtseries[u] = o["LastModified"]
 
-        docs = list(pool.map(lambda m: get_json(s3, args.data_bucket, m[2]), markers))
+        docs = list(
+            progress(
+                pool.map(lambda m: get_json(s3, args.data_bucket, m[2]), markers),
+                "session markers",
+                len(markers),
+                "doc",
+            )
+        )
     for (subj, ses, _), doc in zip(markers, docs, strict=True):
         record_marker(evidence[subj], subj, ses, doc)
 
@@ -1126,11 +1156,20 @@ def record_marker(ev: Evidence, subj: str, ses: str, doc: dict | None) -> None:
 
 
 def gather_raw_qc(s3, args, evidence: dict[str, Evidence]) -> None:
-    listed = list_keys_parallel(s3, args.metrics_bucket, FUNC_QC_PREFIXES, args.workers)
+    listed = list_keys_parallel(
+        s3, args.metrics_bucket, FUNC_QC_PREFIXES, args.workers, "raw QC listing"
+    )
     for prefix, attr in zip(FUNC_QC_PREFIXES, ("qc_raw", "surf_raw"), strict=True):
         keys = [k for k in listed[prefix] if (u := qc_unit(k)) and u[0] in evidence]
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            docs = list(pool.map(lambda k: get_json(s3, args.metrics_bucket, k), keys))
+            docs = list(
+                progress(
+                    pool.map(lambda k: get_json(s3, args.metrics_bucket, k), keys),
+                    f"raw {attr}",
+                    len(keys),
+                    "doc",
+                )
+            )
         for k, doc in zip(keys, docs, strict=True):
             u = qc_unit(k)
             getattr(evidence[u[0]], attr)[u].append(doc or {})
@@ -1139,10 +1178,12 @@ def gather_raw_qc(s3, args, evidence: dict[str, Evidence]) -> None:
 def gather_compacted(s3, args, evidence: dict[str, Evidence], earliest: datetime) -> None:
     cols = ("subject", "session", "task", "run", "completed_at")
     for table, attr in (("func_preproc", "qc_compacted"), ("surface_sample", "surf_compacted")):
-        for key in compacted_files(s3, args.metrics_bucket, table):
-            m = DT_IN_KEY_RE.search(key)
-            if m and m.group(1) < earliest.date().isoformat():
-                continue
+        keys = [
+            k
+            for k in compacted_files(s3, args.metrics_bucket, table)
+            if not ((m := DT_IN_KEY_RE.search(k)) and m.group(1) < earliest.date().isoformat())
+        ]
+        for key in progress(keys, f"compacted {table}", len(keys), "file"):
             for r in read_parquet_rows(s3, args.metrics_bucket, key, cols):
                 ev = evidence.get(r["subject"])
                 done = parse_instant(r["completed_at"])
@@ -1154,14 +1195,15 @@ def gather_steps(s3, args, evidence: dict[str, Evidence], earliest: datetime) ->
     """Which workflows ran each subject since its flush, and whether any ran anatomy."""
     anatomy_keys = []
     # Through tomorrow: a dt is the writer's UTC date, which can run ahead of ours.
-    for dt in dates_since(earliest, now_utc() + timedelta(days=1)):
+    dates = dates_since(earliest, now_utc() + timedelta(days=1))
+    for dt in progress(dates, "step-outcome days", len(dates), "day"):
         for k in list_keys(s3, args.metrics_bucket, f"{STEP_OUTCOME_PREFIX}dt={dt}/"):
             p = parse_step_outcome_key(k)
             if p and p.subject in evidence:
                 evidence[p.subject].workflows.add(p.workflow_name)
                 if p.step in ANATOMY_STEPS:
                     anatomy_keys.append((p.subject, k))
-    for subj, k in anatomy_keys:
+    for subj, k in progress(anatomy_keys, "anatomy outcomes", len(anatomy_keys), "doc"):
         doc = get_json(s3, args.metrics_bucket, k) or {}
         at = parse_instant(doc.get("recorded_at"))
         if at and at > evidence[subj].flushed_at and doc.get("status") not in ANATOMY_NOT_RUN:
@@ -1185,7 +1227,7 @@ def gather_readback(s3, args, evidence: dict[str, Evidence]) -> None:
                     ev.readback_errors += text.count(READBACK_ERROR)
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        list(pool.map(one, evidence))
+        list(progress(pool.map(one, evidence), "func pod logs", len(evidence), "subj"))
 
 
 def verify(s3, args) -> int:
@@ -1270,7 +1312,11 @@ def load_runs(s3, bucket: str, workers: int) -> list[Run]:
         k for k in list_keys(s3, bucket, WORKFLOW_RUN_PREFIX) if workflow_subject_from_run_key(k)
     ]
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        docs = list(pool.map(lambda k: get_json(s3, bucket, k), keys))
+        docs = list(
+            progress(
+                pool.map(lambda k: get_json(s3, bucket, k), keys), "workflow runs", len(keys), "doc"
+            )
+        )
     runs = []
     for k, doc in zip(keys, docs, strict=True):
         tag, subj = workflow_subject_from_run_key(k)
@@ -1391,7 +1437,14 @@ def plan_step_rows(s3, mb: str, workers: int, attr: Attribution) -> list[str]:
         elif verdict is None:
             need_status.append(k)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        docs = list(pool.map(lambda k: get_json(s3, mb, k), need_status))
+        docs = list(
+            progress(
+                pool.map(lambda k: get_json(s3, mb, k), need_status),
+                "step-outcome status",
+                len(need_status),
+                "doc",
+            )
+        )
     drop += [
         k for k, d in zip(need_status, docs, strict=True) if (d or {}).get("status") == "skipped"
     ]

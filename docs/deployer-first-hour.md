@@ -391,7 +391,7 @@ The eight phases, what each does, and the three variables that change between th
 
 - **Phase 4's tunnel-token sync.** Terraform never reads the Cloudflare tunnel's connector token, so it has to be copied into Secrets Manager separately. Without it cloudflared never connects. The script pipes it from Cloudflare to Secrets Manager, comparing hashes, so the token never reaches your terminal, your shell history or any process argument list.
 - **Phase 7's tunnel check, before Phase 8 closes the public endpoint.** After Phase 8 the EKS API is private-only, reached through the Cloudflare tunnel (or the VPN as a fallback). Close it before the tunnel is proven healthy, and the tunnel is the one route you cannot fix from outside. Phase 8 re-proves the tunnel itself, every time it runs, and leaves the endpoint open if it cannot.
-- **Steps 8 and 9 below, also before Phase 8.** The tunnel being healthy is not the same as somebody being able to log in to it. Phase 8 refuses to close the endpoint against an empty user pool and prints the command that fixes it. Step 9 is the sign-in itself, over WARP, which the installer cannot check for you.
+- **Steps 8 and 9 below, also before Phase 8.** The tunnel being healthy is not the same as somebody being able to log in to it. Phase 7 ends by offering to create the operators' accounts. Phase 8 refuses to close the endpoint against an empty user pool, and also refuses unless the machine running it reaches the cluster's private endpoint, which is what Step 9's WARP sign-in makes possible.
 
 Phase 6 also writes `install-state.auto.tfvars` in your root, holding `crds_available` and `vpc_cni_network_policy_enabled`, both `true`. (A third flag, `vpc_cni_strict_mode`, stays at its default of `false` and is yours to turn on later if you want it — strict enforcement denies any pod no NetworkPolicy selects, and this repo only ships policies for four namespaces; see #746.) Those two start `false` because the first phases run against a cluster with no CRDs and no kube-system NetworkPolicies, and they have to stay `true` afterwards — so they are persisted to a file every later `terraform` run loads, rather than living only on the install commands. Keep the file; it is gitignored, so a fresh clone needs it recreated before any apply. Losing it destroys the ExternalSecrets and disables NetworkPolicy enforcement, both quietly (#635; [operations.md → Updating infrastructure](operations.md#updating-infrastructure-terraform)).
 
@@ -399,9 +399,9 @@ The reference deployment runs this same script, which is the only thing that kee
 
 ## Step 8 — create the operators' sign-in accounts
 
-**Do this before the phase that closes the public EKS endpoint.** Terraform creates the Cognito user pool, but not the users in it, and neither does the installer. That is deliberate rather than unfinished: creating a sign-in identity is a change to your account that belongs to you, the operator then has to complete an authenticator enrollment interactively anyway, and the installer's job is to refuse to lock you out — which it does, by checking the pool before Phase 8 and printing the command below. It is two commands per operator.
+**Do this before the phase that closes the public EKS endpoint.** Terraform creates the Cognito user pool, but not the users in it. The installer offers to: at the end of Phase 7, and again in Phase 8 if any are still missing, it lists each `operator_emails` address the pool has no user for and asks `Create these accounts now? [y/N]`. It creates nothing without a yes, and never asks without a terminal. Creating a sign-in identity is a change to your account, so it is yours to agree to. Phase 8 also refuses to close the endpoint against an empty pool and prints the command below.
 
-Once the pool exists, for each address in `operator_emails`:
+To create them by hand instead, once the pool exists, for each address in `operator_emails`:
 
 ```bash
 POOL=$(terraform output -raw cognito_user_pool_id)
@@ -440,7 +440,7 @@ An unconfirmed address shows `PendingConfirmation` in place of an ARN.
 
 ## Step 9 — connect WARP and sign in for the first time
 
-Also before Phase 8. The installer only checks that the pool has a user. It cannot check that the user can actually sign in. Do that sign-in yourself while the public endpoint is still open, so a problem with it is one you can still fix from your laptop.
+Also before Phase 8, while the public endpoint is still open, so a problem with it is one you can still fix from your laptop. Nothing can do this step for you: it is a sign-in in your browser, with a password you choose and an authenticator you scan. What Phase 8 does is check that it worked. Before it closes the public endpoint, it asks the cluster's API server at its private address, inside the VPC, using your credentials. That answer can only come through WARP (or the VPN), from an operator who has signed in. If it does not come, Phase 8 leaves the endpoint open, says so, and points back here.
 
 **Install the client.** Cloudflare's WARP client is now called the Cloudflare One Client in its documentation. Install it from [Cloudflare's download page](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/) for your operating system. On Windows, the client on the host also carries traffic from WSL. A shell in WSL needs no client of its own: the second-account run reached the private endpoint that way.
 

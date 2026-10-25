@@ -141,8 +141,9 @@ class InstallPanel:
             if closes:
                 ui.label(
                     "This run closes the public Kubernetes endpoint. Afterwards, the cluster can be "
-                    "reached only through WARP. The installer checks that a sign-in account "
-                    "exists; it cannot check that someone has used it."
+                    "reached only through WARP. Before closing it, the installer checks that a "
+                    "sign-in account exists and that this computer reaches the cluster's private "
+                    "endpoint, and leaves the endpoint open if either check fails."
                 ).classes("text-sm text-orange-10 mt-2")
                 # `start` is looked up when the box is ticked, after it exists below.
                 ui.checkbox(

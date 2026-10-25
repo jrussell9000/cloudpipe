@@ -469,14 +469,15 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
             "WARP admits only identities the pool knows.",
             "remedy": {
                 "kind": "human",
-                # The sign-in itself, not only the account: the installer checks that
-                # the pool has a user, and cannot check that the user can get in
-                # (deployer-first-hour.md step 9; acceptance install, 2026-10-23).
+                # The sign-in itself, not only the account (deployer-first-hour.md
+                # step 9; acceptance install, 2026-10-23). Since 2026-10-25 Phase 7
+                # offers the accounts and Phase 8 checks the sign-in worked.
                 "text": "Once the pool exists, create one account per operator_emails entry — "
-                "the installer prints the command. Then, still before the phase that closes "
-                "the endpoint, connect WARP to your team and sign in as that operator: the "
-                "installer checks only that the pool has a user, not that the user can sign "
-                "in. docs/deployer-first-hour.md steps 8 and 9 cover both.",
+                "Phase 7 offers to, and Phase 8 prints the command if none exists. Then, "
+                "still before the phase that closes the endpoint, connect WARP to your team "
+                "and sign in as that operator. Phase 8 checks that this computer reaches the "
+                "cluster's private endpoint before closing the public one. "
+                "docs/deployer-first-hour.md steps 8 and 9 cover both.",
             },
         }
     )

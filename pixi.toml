@@ -222,6 +222,9 @@ pyyaml = ">=6.0.3,<7"
 # only transitively — through `pytest.importorskip`, so losing it would have
 # turned three schema checks into silent skips (#650). Matches the locked 4.26.0.
 jsonschema = ">=4.26.0,<5"
+# Same again. scripts/reprocess_func.py draws its phase progress bars with it, and
+# it resolved only through dipy. Matches the locked 4.70.1.
+tqdm = ">=4.70.1,<5"
 pip = ">=26.1.2,<27"
 pytest = ">=9.1.1,<10"
 # The coverage map (`pixi run coverage`, below) — report-only, not a gate.
