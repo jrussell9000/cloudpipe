@@ -9,7 +9,7 @@ Two things to know before you start, because they set expectations for everythin
 
 ## What you need to have in hand
 
-The wizard will ask you for eleven values, and fills in two of them from earlier answers. Most you can read off a dashboard in a few minutes; two things you have to own first, and a third only if you want hostnames. Every bucket this deployment needs is created for you in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack).
+The wizard will ask you for twelve values, and fills in three of them from earlier answers. Most you can read off a dashboard in a few minutes; two things you have to own first, and a third only if you want hostnames. Every bucket this deployment needs is created for you in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack).
 
 | You must already own | Why | Where it is checked |
 |---|---|---|
@@ -429,6 +429,14 @@ Three things worth knowing before you rely on this:
 - **The pool sends mail through Cognito's default sender**, which is rate-limited to a small number of messages per day. That is ample for a handful of operators and is not a path to build anything else on.
 
 Why this is a step rather than a footnote: after the endpoint closes, the cluster is reachable only over WARP, and WARP admits only identities the pool knows. An empty pool at that moment leaves the mTLS VPN as the only way in.
+
+**Confirm the security-alert subscriptions too.** Each address in `security_findings_emails` (the wizard offers the operators' addresses) gets one email from AWS Notifications after Phase 4, asking it to confirm a subscription. Until someone clicks that link, GuardDuty and Inspector findings reach nobody. Check with:
+
+```bash
+aws sns list-subscriptions --query "Subscriptions[?Protocol=='email'].[Endpoint,SubscriptionArn]" --output text
+```
+
+An unconfirmed address shows `PendingConfirmation` in place of an ARN.
 
 ## Step 9 — connect WARP and sign in for the first time
 
