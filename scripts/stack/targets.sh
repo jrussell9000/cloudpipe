@@ -644,7 +644,7 @@ _tf_step_once() {
     printf '\r\033[K'
   fi
 
-  local done_n total nochange elapsed counts
+  local done_n total nochange elapsed counts applied
   read -r done_n total nochange < <(_step_counts "$log")
   elapsed=$(_fmt_elapsed $((SECONDS - start)))
   if [[ $total -ge 0 ]]; then
@@ -653,10 +653,24 @@ _tf_step_once() {
     counts="$done_n changed"
   fi
   if [[ $rc -eq 0 ]]; then
-    if [[ $nochange -eq 1 && $done_n -eq 0 ]] || [[ $total -eq 0 && $done_n -eq 0 ]]; then
+    applied=$(_step_applied "$log")
+    if [[ $nochange -eq 1 && $done_n -eq 0 ]] || [[ $total -eq 0 && $done_n -eq 0 ]] ||
+      [[ $applied -eq 0 ]]; then
       counts="no changes"
+    elif [[ $applied -gt 0 && $total -ge 0 && $applied -ne $total ]]; then
+      # The plan's total counts every update Terraform could not rule out
+      # before apply — a role whose policy document is only read during apply
+      # plans as a change and then is not one. "10/22 changed" read as a step
+      # that stopped short (acceptance install, Phase 6, 2026-10-25); what
+      # happened is the apply's own summary.
+      counts="$applied changed (planned $total)"
     fi
-    printf '  ✓ %s  %s  %s\n' "$label" "$counts" "$elapsed"
+    if [[ $verb != apply && $verb != destroy ]]; then
+      # init and the like change no resource, so a count would be noise.
+      printf '  ✓ %s  %s\n' "$label" "$elapsed"
+    else
+      printf '  ✓ %s  %s  %s\n' "$label" "$counts" "$elapsed"
+    fi
     _step_warnings "$log"
   else
     if [[ $done_n -gt 0 || $total -gt 0 ]]; then
@@ -764,6 +778,24 @@ _step_current() {
       if (best != "") printf "%s\t%s\t%d\t%d\n", best, what[best], el[best], count - 1
     }
   ' "$1" 2>/dev/null || true
+}
+
+# What an apply or destroy actually did, from its own closing line —
+# `Apply complete! Resources: 5 added, 5 changed, 0 destroyed.` or `Destroy
+# complete! Resources: 12 destroyed.` — summed; -1 when there is no such line.
+_step_applied() {
+  awk '
+    function n(s, what) {
+      if (match(s, "[0-9]+ " what)) return substr(s, RSTART, RLENGTH) + 0
+      return 0
+    }
+    BEGIN { esc = sprintf("%c", 27); ansi = esc "\\[[0-9;]*[A-Za-z]"; total = -1 }
+    { gsub(ansi, "") }
+    /^(Apply|Destroy) complete! Resources: / {
+      total = n($0, "added") + n($0, "changed") + n($0, "destroyed")
+    }
+    END { print total }
+  ' "$1" 2>/dev/null || echo -1
 }
 
 # Terraform's `Error:` diagnostics from a step's log: each box from its

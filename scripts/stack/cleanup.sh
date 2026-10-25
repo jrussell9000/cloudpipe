@@ -385,8 +385,8 @@ require_cloudflare_api_token
 # `init` before the target validation, as in install.sh: it writes the module
 # manifest that resolves which module call is the stack. Never `-upgrade`, for
 # the reason install.sh gives: it trades the locked provider build for whatever
-# was published last.
-terraform init -input=false
+# was published last. Through tf_step, so its output goes to the run's log.
+tf_step "providers and modules" terraform init -input=false
 resolve_stack_module
 
 echo "==> Validating -target addresses against the configuration..."

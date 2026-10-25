@@ -92,7 +92,10 @@ def _report(emitter: Emitter, records: list[Record]) -> None:
             emitter.note(f"         {label}: {record.remedy.text}")
 
     failed = [record for record in records if record.state == "fail"]
-    skipped = [record for record in records if record.state == "skipped"]
+    skipped = [record for record in records if record.state == "skipped" and record.applicable]
+    not_applicable = [
+        record for record in records if record.state == "skipped" and not record.applicable
+    ]
     blocked = [record for record in records if record.state == "blocked"]
 
     emitter.note()
@@ -106,6 +109,15 @@ def _report(emitter: Emitter, records: list[Record]) -> None:
         emitter.note(
             f"{len(skipped)} check(s) could not be performed and are reported as skipped, not "
             "passed. Each names what was missing."
+        )
+    if not_applicable:
+        # Counted apart: these looked at nothing because there is nothing of
+        # theirs to look at, and folding them into the line above sent a
+        # deployer to look for IAM permissions (acceptance install, 2026-10-24).
+        emitter.note(
+            f"{len(not_applicable)} check(s) do not apply to this deployment and were skipped: "
+            + ", ".join(record.title for record in not_applicable)
+            + "."
         )
     if blocked:
         # Not failures and they do not change the exit code: each is something the

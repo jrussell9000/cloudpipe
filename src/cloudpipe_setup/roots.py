@@ -193,6 +193,28 @@ def undeclared(root: Path, variables: list[str]) -> list[str]:
     ]
 
 
+def example_snippets(example: Path, variables: list[str]) -> tuple[str, str]:
+    """The example root's own text for `variables`: each `variable` block with the
+    comment above it, and each one's line in the `module "stack"` call.
+
+    Read from the example file rather than written here, so what a refusal tells a
+    deployer to paste is exactly what the example holds. A variable the example
+    does not have is left out of both, never invented.
+    """
+    text = example.read_text()
+    blocks, lines = [], []
+    for name in variables:
+        block = re.search(
+            rf'((?:^#[^\n]*\n)*)^variable\s+"{re.escape(name)}"\s*\{{.*?^\}}', text, re.M | re.S
+        )
+        if block:
+            blocks.append(block.group(0))
+        line = re.search(rf"^[ \t]+{re.escape(name)}\s*=\s*var\.{re.escape(name)}\b.*$", text, re.M)
+        if line:
+            lines.append(line.group(0).strip())
+    return "\n\n".join(blocks), "\n".join(lines)
+
+
 def _refusal(candidate: Path, looked_for: str, because: str) -> CliError:
     return CliError(
         "root.not_a_stack_root",
