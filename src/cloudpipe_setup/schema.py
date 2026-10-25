@@ -174,6 +174,12 @@ def _fill(
     if any(source not in answers or answers[source] in (None, "") for source in sources):
         return None
     values = {source: answers[source] for source in sources}
+    # A list field whose template is one list source, `{operator_emails}`, is a
+    # copy of that list: formatting it would render the list's repr as one entry.
+    if is_list and not pattern and len(sources) == 1 and template == f"{{{sources[0]}}}":
+        source_value = values[sources[0]]
+        if isinstance(source_value, list):
+            return list(source_value)
     if pattern:
         (source,) = sources  # a pattern reads exactly one answer; the schema test holds it
         match = re.search(pattern, str(values[source]))

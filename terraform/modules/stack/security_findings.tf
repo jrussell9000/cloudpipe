@@ -449,7 +449,7 @@ data "aws_guardduty_detector" "inherited" {}
 check "security_findings_have_a_subscriber" {
   assert {
     condition     = length(var.security_findings_emails) > 0
-    error_message = "var.security_findings_emails is empty: GuardDuty/Inspector findings will be published to SNS and delivered to nobody. Set it in terraform.tfvars, then confirm the subscription email. A topic with no confirmed subscriber is not alert routing (POA&M P3-9c)."
+    error_message = "var.security_findings_emails is empty: GuardDuty/Inspector findings will be published to SNS and delivered to nobody. Set security_findings_emails in cloudpipe-answers.yaml and re-render with `cloudpipe setup --force` (or set it in terraform.tfvars), apply, then confirm each subscription email. A topic with no confirmed subscriber is not alert routing (POA&M P3-9c)."
   }
 }
 

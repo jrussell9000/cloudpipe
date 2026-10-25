@@ -84,6 +84,21 @@
       "x-source": "deployer-choice",
       "x-terraform-variable": "operator_emails"
     },
+    "security_findings_emails": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "title": "Email addresses that receive security alerts",
+      "description": "Who is emailed when AWS GuardDuty or Amazon Inspector reports a security finding in this deployment, separated by commas. The operators' addresses are offered; keep them unless alerts go to a security team instead.\n\nEach address gets one confirmation email from AWS after the install, and receives nothing until someone clicks its link. With no address here, findings are published and delivered to nobody, and the install warns about it.",
+      "x-section": "identity",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": "security_findings_emails",
+      "x-suggested-from": [
+        "operator_emails"
+      ],
+      "x-suggested-template": "{operator_emails}"
+    },
     "cognito_federation": {
       "type": [
         "object",

@@ -295,6 +295,13 @@ variable "operator_emails" {
   type = list(string)
 }
 
+# Who GuardDuty and Inspector findings are emailed to. `cloudpipe setup` offers
+# operator_emails. Each address confirms its subscription once, after the apply.
+variable "security_findings_emails" {
+  type    = list(string)
+  default = []
+}
+
 variable "github_user_url" {
   type = string
 }
@@ -400,6 +407,7 @@ module "stack" {
   external_identity              = var.external_identity
   cognito_federation             = var.cognito_federation
   operator_emails                = var.operator_emails
+  security_findings_emails       = var.security_findings_emails
   github_user_url                = var.github_user_url
   github_repo                    = var.github_repo
   gitops_repo_url                = var.gitops_repo_url
