@@ -469,7 +469,7 @@ def _check_hosted_zone(
         # Chosen, not missing: port-forward mode needs no zone. Reported as
         # skipped because nothing was checked — never as pass, and never as the
         # failure an absent zone would be with a domain.
-        return _skipped(
+        return _not_applicable(
             CHECK_HOSTED_ZONE,
             "Route53 hosted zone",
             "domain is null (port-forward mode), so no hosted zone is needed and none was "
@@ -538,7 +538,7 @@ def _check_prefix_lists(
         # instances, so there is no rule to resolve an id for — and reporting
         # this as outstanding would send a deployer to look up an id nothing
         # reads. See the spec: a check whose subject is not configured is not run.
-        return _skipped(
+        return _not_applicable(
             CHECK_PREFIX_LISTS,
             "Managed prefix lists",
             "globus_enabled is not true in this root, so the stack creates no security-group "
@@ -1482,6 +1482,27 @@ def _skipped(identifier: str, title: str, message: str, remedy: Remedy) -> Recor
     )
 
 
+def _not_applicable(identifier: str, title: str, message: str, remedy: Remedy) -> Record:
+    """A skip because this deployment does not have the thing the check checks.
+
+    Still `skipped` in every envelope — the contract has four states, and none of
+    them is "passed" for a check that looked at nothing. The difference is only
+    in the closing summary, which used to count these with the checks that could
+    not run: six "could not be performed" for a no-domain, no-Globus,
+    no-federation install whose one real skip was the account (acceptance
+    install, 2026-10-24), sending the deployer to look for permissions they
+    did not need.
+    """
+    return Record(
+        identifier=identifier,
+        title=title,
+        state="skipped",
+        message=message,
+        remedy=remedy,
+        applicable=False,
+    )
+
+
 def _federation(answers: dict[str, Any]) -> dict[str, Any] | None:
     """The federation block, or None when this deployment federates nothing."""
     block = answers.get("cognito_federation")
@@ -1504,7 +1525,7 @@ def _check_federation_metadata(world: World, answers: dict[str, Any]) -> Record:
     """
     federation = _federation(answers)
     if federation is None:
-        return _skipped(
+        return _not_applicable(
             CHECK_FEDERATION_METADATA,
             "Federated provider metadata",
             _NO_FEDERATION,
@@ -1592,7 +1613,7 @@ def _check_federation_evidence(answers: dict[str, Any]) -> Record:
     """
     federation = _federation(answers)
     if federation is None:
-        return _skipped(
+        return _not_applicable(
             CHECK_FEDERATION_EVIDENCE,
             "Federated MFA evidence",
             _NO_FEDERATION,
@@ -1647,7 +1668,7 @@ def _check_federation_secret(
     federation = _federation(answers)
     title = "Federated client secret"
     if federation is None or federation.get("type") != "oidc":
-        return _skipped(
+        return _not_applicable(
             CHECK_FEDERATION_SECRET,
             title,
             _NO_FEDERATION
