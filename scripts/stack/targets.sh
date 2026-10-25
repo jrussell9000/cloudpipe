@@ -635,6 +635,49 @@ _step_counts() {
   ' "$1" 2>/dev/null || echo "0 -1 0"
 }
 
+# The object a step is waiting on, as far as the log has been written: the
+# OLDEST resource whose `Creating...`, `Modifying...` or `Destroying...` line
+# has no `complete after` line yet, because with parallel operations the one
+# that started first and has not finished is the one a long wait is stuck on.
+# One tab-separated line, or nothing when no operation is in flight:
+#   <address>  <creating|modifying|destroying>  <seconds>  <others in flight>
+# <seconds> is Terraform's own figure from the object's last `Still ...
+# [.., 01m20s elapsed]` line, 0 before the first one (they come every 10s);
+# _step_progress keeps it ticking between them.
+_step_current() {
+  awk '
+    function secs(s,    t) {
+      t = 0
+      if (match(s, /[0-9]+h/)) t += substr(s, RSTART, RLENGTH - 1) * 3600
+      if (match(s, /[0-9]+m/)) t += substr(s, RSTART, RLENGTH - 1) * 60
+      if (match(s, /[0-9]+s/)) t += substr(s, RSTART, RLENGTH - 1)
+      return t
+    }
+    BEGIN { esc = sprintf("%c", 27); ansi = esc "\\[[0-9;]*[A-Za-z]" }
+    { gsub(ansi, "") }
+    match($0, /: (Creating|Modifying|Destroying)\.\.\./) {
+      addr = substr($0, 1, RSTART - 1)
+      verb = tolower(substr($0, RSTART + 2, RLENGTH - 5))
+      if (!(addr in seq)) { seq[addr] = ++n }
+      what[addr] = verb; flight[addr] = 1; el[addr] = 0
+      next
+    }
+    match($0, /: Still (creating|modifying|destroying)\.\.\. \[/) {
+      addr = substr($0, 1, RSTART - 1)
+      if ((addr in flight) && match($0, /[0-9hms]+ elapsed\]/)) el[addr] = secs(substr($0, RSTART, RLENGTH - 9))
+      next
+    }
+    match($0, /: (Creation|Modifications|Destruction) complete after /) {
+      delete flight[substr($0, 1, RSTART - 1)]
+    }
+    END {
+      best = ""; count = 0
+      for (a in flight) { count++; if (best == "" || seq[a] < seq[best]) best = a }
+      if (best != "") printf "%s\t%s\t%d\t%d\n", best, what[best], el[best], count - 1
+    }
+  ' "$1" 2>/dev/null || true
+}
+
 # Terraform's `Error:` diagnostics from a step's log: each box from its
 # `│ Error:` line through the closing `╵`, once each — the same diagnostic is
 # often printed more than once — and at most three, then how many more there
@@ -702,26 +745,81 @@ _step_warnings() {
 #
 # Always run in the background, so `set -e` is dropped: a failed read here must
 # cost a frame, not the progress line.
+#
+# After the bar, the object the step is waiting on (_step_current), so a wait
+# that runs long names its resource while it is happening rather than in the
+# log afterwards. Its time is Terraform's own, refreshed every 10s, and counted
+# on here in between; it restarts when a different object becomes the oldest.
 _step_progress() {
   set +e
   local label=$1 log=$2 running=$3 start=$4 cols=$5 parent=$6
   local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 done_n total nochange el line
+  local addr verb tf_secs others object key="" base=0
   while [[ -e $running ]] && kill -0 "$parent" 2>/dev/null; do
     read -r done_n total nochange < <(_step_counts "$log")
     el=$(_fmt_elapsed $((SECONDS - start)))
-    line=$(_step_line "${frames[i % ${#frames[@]}]}" "$label" "$done_n" "$total" "$el" "$cols")
+    addr="" verb="" tf_secs=0 others=0 object=()
+    IFS=$'\t' read -r addr verb tf_secs others < <(_step_current "$log")
+    if [[ -n $addr ]]; then
+      if [[ "$addr $verb" != "$key" ]] || ((SECONDS - base < tf_secs)); then
+        key="$addr $verb"
+        base=$((SECONDS - tf_secs))
+      fi
+      object=("$(_step_short_addr "$addr" "$label")" "$verb" "$(_fmt_elapsed $((SECONDS - base)))" "$others")
+    else
+      key=""
+    fi
+    line=$(_step_line "${frames[i % ${#frames[@]}]}" "$label" "$done_n" "$total" "$el" "$cols" "${object[@]}")
     printf '\r\033[K%s' "$line"
     i=$((i + 1))
     sleep 0.2
   done
 }
 
+# An in-flight object's address as the live line shows it: without the stack
+# module's prefix, and without the step's own label when the address is inside
+# it — `module.stack.module.eks.aws_eks_cluster.this[0]` under `module.eks` is
+# `aws_eks_cluster.this[0]`.
+_step_short_addr() {
+  local addr=$1 label=$2
+  [[ -n ${STACK_MODULE_NAME:-} ]] && addr=${addr#"module.$STACK_MODULE_NAME."}
+  [[ -n $label && $addr == "$label."* ]] && addr=${addr#"$label."}
+  printf '%s' "$addr"
+}
+
+# An address without its module path, for when the whole address does not fit:
+# `module.eks_managed_node_group["argo"].aws_eks_node_group.this[0]` is
+# `aws_eks_node_group.this[0] ["argo"]`. The innermost module key there is is
+# kept, because it is what tells one instance of a module from the next; a
+# keyless module inside a keyed one does not erase it.
+_step_bare_addr() {
+  local addr=$1 key="" re='^module\.[A-Za-z0-9_-]+(\[[^]]*\])?\.'
+  while [[ $addr =~ $re ]]; do
+    [[ -n ${BASH_REMATCH[1]} ]] && key=${BASH_REMATCH[1]}
+    addr=${addr:${#BASH_REMATCH[0]}}
+  done
+  printf '%s%s' "$addr" "${key:+ $key}"
+}
+
 # One frame of the live line, fitted to `cols` columns: the label is shortened
 # from the left with an ellipsis (the end of an address is the part that tells
 # one target from the next), and the bar narrows only if that is not enough.
+#
+# Arguments seven to ten are the in-flight object, from _step_progress: its
+# address, verb, time so far, and how many others are in flight. Its name is
+# what a long wait needs read, so the rest of the line gives way to it, in this
+# order, taking the first that fits: a 12-column bar and the whole address; no
+# bar (the count beside it still says how far along the step is); the address
+# without its module path; the step's label shortened to 16 columns; and only
+# then the address cut from the left. The verb and the time are never cut. With
+# fewer than 10 columns left for the address, it is left out.
 _step_line() {
-  local frame=$1 label=$2 done_n=$3 total=$4 el=$5 cols=$6
+  local frame=$1 label=$2 done_n=$3 total=$4 el=$5 cols=$6 addr=${7:-}
   local bw=20 counts tail fixed lw filled bar_full bar_empty
+  if [[ -n $addr && $total -ge 0 ]]; then
+    _step_line_object "$@"
+    return 0
+  fi
   if [[ $total -lt 0 ]]; then
     tail="planning…"
     fixed=$((4 + 2 + 9 + 2 + ${#el}))
@@ -746,6 +844,48 @@ _step_line() {
   printf -v bar_empty '%*s' $((bw - filled)) ''
   printf '  %s %s  [%s%s]  %s  %s' "$frame" "$(_fit_label "$label" "$lw")" \
     "${bar_full// /█}" "${bar_empty// /░}" "$counts" "$el"
+}
+
+# _step_line with an in-flight object; see there for the order things give way.
+_step_line_object() {
+  local frame=$1 label=$2 done_n=$3 total=$4 el=$5 cols=$6 addr=$7 verb=$8 took=$9
+  local others=${10:-0} counts="$done_n/$total" tail width bw=12 filled bar="" name lab room
+  tail=" $verb $took"
+  [[ $others -gt 0 ]] && tail+=" +$others"
+  width=$((cols - 1))
+  # The line's widths: "  F L  [bar]  C  E  · <name><tail>" is 12 + bar, and
+  # without the bar "  F L  C  E  · <name><tail>" is 8, each plus L, C and E,
+  # then 4 for the separator.
+  local with_bar=$((12 + bw + ${#counts} + ${#el} + 4 + ${#tail}))
+  local no_bar=$((8 + ${#counts} + ${#el} + 4 + ${#tail}))
+  local bare
+  bare=$(_step_bare_addr "$addr")
+  lab=$label
+  if ((with_bar + ${#lab} + ${#addr} <= width)); then
+    name=$addr
+  elif ((no_bar + ${#lab} + ${#addr} <= width)); then
+    name=$addr bw=0
+  elif ((no_bar + ${#lab} + ${#bare} <= width)); then
+    name=$bare bw=0
+  else
+    bw=0
+    [[ ${#lab} -gt 16 ]] && lab=$(_fit_label "$lab" 16)
+    room=$((width - no_bar - ${#lab}))
+    if [[ $room -lt 10 ]]; then
+      # No useful room for a name: the line without one.
+      _step_line "$frame" "$label" "$done_n" "$total" "$el" "$cols"
+      return 0
+    fi
+    name=$(_fit_label "$bare" "$room")
+  fi
+  if [[ $bw -gt 0 ]]; then
+    if [[ $total -le 0 || $done_n -ge $total ]]; then filled=$bw; else filled=$((done_n * bw / total)); fi
+    printf -v bar '%*s' "$filled" ''
+    local rest
+    printf -v rest '%*s' $((bw - filled)) ''
+    bar="  [${bar// /█}${rest// /░}]"
+  fi
+  printf '  %s %s%s  %s  %s  · %s%s' "$frame" "$lab" "$bar" "$counts" "$el" "$name" "$tail"
 }
 
 _fit_label() {

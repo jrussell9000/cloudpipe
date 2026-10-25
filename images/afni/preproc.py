@@ -37,7 +37,7 @@ Stages:
   2. Precompute composite displacement field            (ANTs: antsApplyTransforms)
   3. Warp unmasked BOLD → MNI (cubic B-spline)         (scipy: map_coordinates)
   4. Warp brain mask → MNI (nearest-neighbour)         (scipy: map_coordinates)
-  5. Apply MNI-space mask to MNI-space BOLD             (AFNI: 3dcalc)
+  5. Write the MNI BOLD masked, compressed once         (numpy + pigz)
      then read the result back against the warp       (fails the run on mismatch)
   6. Confound estimation
 
@@ -47,7 +47,7 @@ space creates a steep edge that LanczosWindowedSinc interpolation treats as
 high-frequency content, producing ringing ripples just inside/outside the
 cortex after warping.  Instead the unmasked BOLD is warped with Lanczos, then
 the mask is warped separately with NearestNeighbor (preserving binary values),
-and the final 3dcalc step zeroes non-brain voxels in MNI space.
+and the writer zeroes non-brain voxels in MNI space as it writes each frame.
 
 Registration inputs (bold2t1w affine, t1w2mni affine + warp) are produced
 upstream by bold_to_t1w.py and fst1w_to_mni.py respectively.
@@ -96,10 +96,12 @@ import resource
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import nibabel as nib
@@ -336,16 +338,53 @@ def precompute_composite_warp(
 # ---------------------------------------------------------------------------
 
 
+#: gzip level of the published MNI BOLD. zlib's default, what AFNI's 3dcalc
+#: wrote until 2026-10-24: level 1 is 7% larger (376 vs 351 MiB on a 1.6 GB
+#: run), ~4.5 TB over the cohort, for ~11 s a run saved once. pigz runs it in
+#: parallel, so it costs ~31 s at 2 threads, not zlib's ~67 s.
+PUBLISHED_GZIP_LEVEL = 6
+
+
+@dataclass
+class WarpedBold:
+    """Stage 3's output before it is written: frames in a disk scratch file.
+
+    `mean_map` is the warp's running temporal mean, the reference the read-back
+    checks the published file against; `coords` is reused by Stage 4.
+    """
+
+    scratch_path: Path
+    n_frames: int
+    shape: tuple[int, int, int]
+    header: "nib.Nifti1Header"
+    coords: "np.ndarray | None"
+    mean_map: np.ndarray
+
+
 def apply_transforms(
     bold: Path, mni_template: Path, composite_warp: Path, outdir: Path, prefix: str, threads: int
 ) -> tuple[Path, np.ndarray, np.ndarray]:
-    """Warp the unmasked 4D BOLD to MNI space using the precomputed composite
-    displacement field.
+    """Stage 3 on its own: warp, then write the UNMASKED MNI BOLD.
 
-    Returns (unmasked MNI BOLD path, warp coords, temporal-mean map). The mean
-    map comes from the float32 warp output in memory, never the file. This used
-    to return an all-frame tSNR map for FuncQC too; tSNR is now a steady-state
-    measure computed in func_iqm (#859).
+    Returns (unmasked MNI BOLD path, warp coords, temporal-mean map). The run
+    itself no longer writes an unmasked file (main() masks while writing, see
+    write_mni_bold); this composition stays for the writer tests and the
+    quantisation control, which want Stage 3's output alone.
+    """
+    warped = warp_bold(bold, mni_template, composite_warp, outdir, prefix, threads)
+    out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-unmasked_bold.nii.gz"
+    return write_mni_bold(warped, out, threads), warped.coords, warped.mean_map
+
+
+def warp_bold(
+    bold: Path, mni_template: Path, composite_warp: Path, outdir: Path, prefix: str, threads: int
+) -> WarpedBold:
+    """Warp the unmasked 4D BOLD to MNI space using the precomputed composite
+    displacement field, into a scratch file.
+
+    The mean map comes from the float32 warp output in memory, never the file.
+    This used to return an all-frame tSNR map for FuncQC too; tSNR is now a
+    steady-state measure computed in func_iqm (#859).
 
     The BOLD is intentionally left unmasked at this stage so that interpolation
     does not encounter the steep native-space brain boundary, which would produce
@@ -438,12 +477,9 @@ def apply_transforms(
     # A NaN or inf anywhere is a broken warp; stop here rather than ship it.
     if not np.isfinite(max_abs[0]):
         raise ValueError(f"warped BOLD contains non-finite values ({prefix})")
+    scratch.flush()
+    scratch = None  # rebind, not `del` — closed over by _warp_frame (see above)
 
-    # Write NIfTI manually, one frame at a time, to avoid a full 4D transpose.
-    # scratch is (n_frames, x, y, z) C-order; NIfTI expects each 3D volume
-    # stored in Fortran order (x-fastest). Frames are written in time order so
-    # the on-disk layout matches (x, y, z, t) Fortran order — identical to what
-    # nibabel would write.
     out_hdr = mni_img.header.copy()
     out_hdr.set_data_dtype(np.float32)
     out_hdr.set_data_shape((*mni_shape, n_frames))
@@ -458,39 +494,78 @@ def apply_transforms(
     # header (including the CIFTI -timestep, which is derived from this file).
     out_hdr.structarr['pixdim'][4] = float(bold_img.header.get_zooms()[3])
 
-    on_disk = np.dtype(np.float32).newbyteorder(out_hdr.endianness)
-    out_nii = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-unmasked_bold.nii"
-    with substage("4d_warp.write_nii"), open(str(out_nii), 'wb') as _f:
-        _f.write(bytes(np.array(out_hdr.structarr).tobytes()))  # 348-byte header
-        _f.write(b'\x00' * 4)  # pad to vox_offset=352
-        for t in range(n_frames):
-            # order='F' is what makes the bytes x-fastest. tobytes() defaults
-            # to 'C' whatever the array's memory layout, so the np.asfortranarray
-            # this line used to wrap was a no-op: on the 97x115x97 grid, where
-            # x and z have the same length, every reader saw the volume with x
-            # and z swapped, and Stage 5 then masked it with a correctly
-            # oriented mask.
-            _f.write(np.asarray(scratch[t]).astype(on_disk).tobytes(order='F'))
-    scratch = None  # rebind, not `del` — closed over by _warp_frame (see above)
-    scratch_path.unlink()
+    return WarpedBold(
+        scratch_path=scratch_path,
+        n_frames=n_frames,
+        shape=tuple(mni_shape),
+        header=out_hdr,
+        coords=coords,
+        mean_map=mean_map,
+    )
 
-    # Compress .nii → .nii.gz and remove the uncompressed file.
-    # pigz (parallel gzip) compresses in ~5-10s vs ~60-90s for Python's single-
-    # threaded gzip; fall back to gzip if pigz is not in PATH.
-    out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-unmasked_bold.nii.gz"
-    if shutil.which('pigz'):
-        run(['pigz', '-p', str(threads), '-1', str(out_nii)])
-        # pigz writes {out_nii}.gz in-place and removes the original
+
+def write_mni_bold(
+    warped: WarpedBold,
+    out: Path,
+    threads: int,
+    mask: "np.ndarray | None" = None,
+    level: int = PUBLISHED_GZIP_LEVEL,
+) -> Path:
+    """Write the warped frames as one gzipped NIfTI, masked if `mask` is given.
+
+    The run compresses its MNI BOLD ONCE (2026-10-24). It used to gzip an
+    unmasked intermediate here (pigz -1, 32 s a run), which Stage 5's 3dcalc
+    then un-gzipped, multiplied by the mask and gzipped again single-threaded
+    (48 s): two compressions and a decompression for one stored file. The mask
+    multiply is now done per frame as the frames are written. It is `a*step(b)`
+    exactly: a float32 multiply by 1.0 or 0.0, so values match 3dcalc's
+    (negative zeros included), checked against a published 3dcalc file.
+
+    Written by hand, one frame at a time, to avoid a full 4D transpose: scratch
+    is (n_frames, x, y, z) C-order, and NIfTI wants each 3D volume x-fastest.
+    This is now the only writer between the warp and the published file, so
+    verify_mni_bold_readback is what vouches for it.
+    """
+    if not out.name.endswith(".nii.gz"):
+        raise ValueError(f"{out.name}: write_mni_bold writes .nii.gz")
+    scratch = np.memmap(
+        warped.scratch_path, dtype=np.float32, mode="r", shape=(warped.n_frames, *warped.shape)
+    )
+    keep = None if mask is None else np.asarray(mask, dtype=bool).astype(np.float32)
+    if keep is not None and keep.shape != warped.shape:
+        raise ValueError(f"mask shape {keep.shape} does not match the warp's {warped.shape}")
+    on_disk = np.dtype(np.float32).newbyteorder(warped.header.endianness)
+    out_nii = out.with_name(out.name[: -len(".gz")])
+    with substage("masking.write_nii" if keep is not None else "4d_warp.write_nii"):
+        with open(str(out_nii), "wb") as _f:
+            _f.write(bytes(np.array(warped.header.structarr).tobytes()))  # 348-byte header
+            _f.write(b"\x00" * 4)  # pad to vox_offset=352
+            for t in range(warped.n_frames):
+                frame = np.asarray(scratch[t])
+                if keep is not None:
+                    frame = frame * keep
+                # order='F' is what makes the bytes x-fastest. tobytes() defaults
+                # to 'C' whatever the array's memory layout, so the
+                # np.asfortranarray this line used to wrap was a no-op: on the
+                # 97x115x97 grid, where x and z have the same length, every
+                # reader saw the volume with x and z swapped.
+                _f.write(frame.astype(on_disk).tobytes(order="F"))
+    del scratch
+    warped.scratch_path.unlink()
+
+    # pigz writes {out_nii}.gz in place and removes the original; fall back to
+    # gzip if pigz is not in PATH.
+    if shutil.which("pigz"):
+        run(["pigz", "-p", str(threads), f"-{level}", str(out_nii)])
     else:
         with (
-            substage("4d_warp.compress"),
-            open(str(out_nii), 'rb') as _src,
-            gzip.open(str(out), 'wb', compresslevel=1) as _dst,
+            substage("masking.compress"),
+            open(str(out_nii), "rb") as _src,
+            gzip.open(str(out), "wb", compresslevel=level) as _dst,
         ):
             shutil.copyfileobj(_src, _dst)
         out_nii.unlink()
-
-    return out, coords, mean_map
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -531,40 +606,6 @@ def warp_mask_to_mni(
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: Apply MNI-space mask to MNI-space BOLD (3dcalc)
-# ---------------------------------------------------------------------------
-
-
-def apply_mni_mask(bold_mni: Path, mask_mni: Path, outdir: Path, prefix: str) -> Path:
-    """Zero non-brain voxels in MNI space after warping is complete.
-
-    Masking here rather than before the warp prevents LanczosWindowedSinc
-    from ringing across the sharp native-space brain boundary.
-
-    -datum float pins the published dtype, matching Stage 3's float32. Without
-    it 3dcalc may choose its output datum itself, and a short output would be
-    re-quantised under a scale factor per sub-brick.
-    """
-    out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz"
-    run(
-        [
-            "3dcalc",
-            "-a",
-            str(bold_mni),
-            "-b",
-            str(mask_mni),
-            "-expr",
-            "a*step(b)",
-            "-datum",
-            "float",
-            "-prefix",
-            str(out),
-        ]
-    )
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Stage 5 read-back: check the published MNI BOLD against the warp
 # ---------------------------------------------------------------------------
 
@@ -579,8 +620,11 @@ class MNIBoldReadbackError(RuntimeError):
     """The published MNI BOLD does not hold the values the warp produced."""
 
 
-def verify_mni_bold_readback(mni_bold: Path, mask_mni: Path, mean_map: np.ndarray) -> None:
+def verify_mni_bold_readback(mni_bold: Path, mask_mni: Path, mean_map: np.ndarray) -> np.ndarray:
     """Fail the run if the published MNI BOLD does not read back as the warp.
+
+    Returns the file's in-mask (n_voxels, n_frames) matrix it read, so the QC
+    summary measures the same read instead of decompressing the file again.
 
     From 2026-05-25 to 2026-10-06 every MNI BOLD shipped corrupt. The Stage 3
     writer stored float16 bit patterns under DT_UINT16 and wrote its bytes in
@@ -612,7 +656,8 @@ def verify_mni_bold_readback(mni_bold: Path, mask_mni: Path, mean_map: np.ndarra
     if not mask.any():
         raise MNIBoldReadbackError(f"{mask_mni.name}: empty mask, nothing to verify")
 
-    got = _load_masked_timeseries(mni_bold, mask_mni).mean(axis=1, dtype=np.float64)
+    in_mask = _load_masked_timeseries(mni_bold, mask_mni)
+    got = in_mask.mean(axis=1, dtype=np.float64)
     want = mean_map[mask].astype(np.float64)
     err = np.abs(got - want)
     tol = READBACK_RTOL * float(np.abs(want).max())
@@ -625,10 +670,11 @@ def verify_mni_bold_readback(mni_bold: Path, mask_mni: Path, mean_map: np.ndarra
         raise MNIBoldReadbackError(
             f"{mni_bold.name} does not read back as the warp produced it: {summary}. "
             f"{np.count_nonzero(err > tol)} voxels out of tolerance. Suspect the "
-            "Stage 3 writer (datatype, scl_slope, byte or axis order) or the Stage 5 "
-            "3dcalc step before suspecting the data."
+            "writer (write_mni_bold: datatype, scl_slope, byte or axis order, the "
+            "mask multiply) before suspecting the data."
         )
     print(f"  read-back OK: {summary}", flush=True)
+    return in_mask
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +856,11 @@ def sample_cortical_ribbon(
                     data=ts[:, t],
                     intent="NIFTI_INTENT_TIME_SERIES",
                     datatype="NIFTI_TYPE_FLOAT32",
-                    encoding="GZipBase64Binary",
+                    # Plain base64, not gzip: these are intermediates, tarred and
+                    # read once by surface-resample. Gzip cost ~28 s a run for a
+                    # 15% smaller file (BOLD floats barely compress: 253 vs 292
+                    # MiB, 31 vs 2.9 s, 2026-10-24); wb_command reads either.
+                    encoding="Base64Binary",
                 )
                 for t in range(n_frames)
             ],
@@ -1491,6 +1541,29 @@ def missing_inputs(args: argparse.Namespace) -> list[str]:
     return [f"{flag}: {path}" for flag, path in required if not Path(path).exists()]
 
 
+def decompress_native_bold(bold: Path, outdir: Path, threads: int) -> Path:
+    """The native BOLD as an uncompressed .nii, decompressed once for the run.
+
+    Four readers open it: Stage 1 (its first frames), Stage 3's warp, the
+    cortical ribbon sampling and the confounds. nibabel cannot seek in a gzip
+    stream, so each full read decompressed all ~620 MB again: 4.6 + 4.6 + 5.1 s
+    a run in SUBSTAGES (2026-10-24). An uncompressed .nii is read straight
+    from disk instead.
+
+    The copy goes in a hidden directory under `outdir` so that none of the
+    driver's publish globs can match it, and is removed at exit. An input that
+    is not gzipped, or a host without pigz, is used as it is.
+    """
+    if not str(bold).endswith(".nii.gz") or not shutil.which("pigz"):
+        return bold
+    scratch = Path(tempfile.mkdtemp(prefix=".native-", dir=outdir))
+    atexit.register(shutil.rmtree, scratch, True)
+    local = scratch / Path(bold).name[: -len(".gz")]
+    with substage("native.decompress"), open(local, "wb") as fh:
+        subprocess.run(["pigz", "-d", "-c", "-p", str(threads), str(bold)], stdout=fh, check=True)
+    return local
+
+
 def refuse_if_inputs_missing(args: argparse.Namespace, prefix: str) -> None:
     """Exit EXIT_MISSING_INPUT if any required input is absent, computing nothing.
 
@@ -1532,6 +1605,8 @@ def main() -> None:
     pipeline_start = time.monotonic()
     _timings: dict = {}
 
+    args.bold = decompress_native_bold(args.bold, args.outdir, args.threads)
+
     print(
         f"\n--- Stage 1: Extract BOLD reference (mean of {args.nss_frames} NSS frames) ---",
         flush=True,
@@ -1547,6 +1622,7 @@ def main() -> None:
         print(f"  reusing MNI BOLD: {args.mni_bold_in}", flush=True)
         mni_bold = args.mni_bold_in
         mask_mni = None
+        masked_ts = None
     else:
         print("\n--- Stage 2: Precompute composite warp (bold→T1w→MNI) ---", flush=True)
         with timed_stage("composite_warp", _timings):
@@ -1561,7 +1637,7 @@ def main() -> None:
 
         print("\n--- Stage 3: Warp unmasked BOLD → MNI (cubic B-spline) ---", flush=True)
         with timed_stage("4d_warp", _timings):
-            bold_mni_unmasked, warp_coords, mean_map = apply_transforms(
+            warped = warp_bold(
                 bold=args.bold,
                 mni_template=args.mni_template,
                 composite_warp=composite_warp,
@@ -1578,26 +1654,32 @@ def main() -> None:
                 composite_warp=composite_warp,
                 outdir=args.outdir,
                 prefix=prefix,
-                coords=warp_coords,
+                coords=warped.coords,
             )
-        del warp_coords
+        warped.coords = None
 
         composite_warp.unlink()  # ~200 MB; not needed after Stage 4
 
-        print("\n--- Stage 5: Apply MNI mask, then read it back ---", flush=True)
+        print("\n--- Stage 5: Write the masked MNI BOLD, then read it back ---", flush=True)
         # The read-back runs inside the "masking" timing rather than under a
         # key of its own: a new timed_stage key must also be declared in both
         # Glue stage_timings_s structs (terraform/modules/metrics/main.tf), or
         # Athena silently drops it — see tests/metrics/test_stage_timings_struct.py.
         # It runs before Stage 5b, so a corrupt file costs no surface work. Not
         # on the grayordinate short path: that reuses an MNI BOLD it did not
-        # warp, so there is no in-memory mean to check against.
+        # warp, so there is no in-memory mean to check against. Since
+        # 2026-10-24 "masking" also holds the write and its one compression,
+        # which "4d_warp" used to (stage_timings_s, docs/metrics_data_dictionary.md).
         with timed_stage("masking", _timings):
-            mni_bold = apply_mni_mask(bold_mni_unmasked, mask_mni, args.outdir, prefix)
-            bold_mni_unmasked.unlink()
+            mni_bold = write_mni_bold(
+                warped,
+                args.outdir / f"{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz",
+                args.threads,
+                mask=np.asanyarray(nib.load(mask_mni).dataobj) > 0,
+            )
             with substage("masking.readback"):
-                verify_mni_bold_readback(mni_bold, mask_mni, mean_map)
-        del mean_map
+                masked_ts = verify_mni_bold_readback(mni_bold, mask_mni, warped.mean_map)
+        del warped
 
     surf_paths: dict[str, Path] = {}
     subcort: tuple[Path, Path, Path] | None = None
@@ -1709,8 +1791,9 @@ def main() -> None:
     # cost the MNI BOLD, the confounds and the surfaces (#119).
     try:
         confounds_df = pd.read_csv(confounds_tsv, sep='\t', na_values='n/a')
-        # func_qc covers the IQMs and the BOLD loads they need (func_iqm reads
-        # the MNI BOLD itself); nib.load here is header-only, so it is inside.
+        # func_qc covers the IQMs; nib.load here is header-only, so it is inside.
+        # The IQMs measure the read-back's in-mask matrix, the published file as
+        # read once, rather than decompressing it a second time.
         with substage("qc_summary.func_qc"):
             qc = compute_func_qc_summary(
                 confounds=confounds_df,
@@ -1722,7 +1805,9 @@ def main() -> None:
                 peak_memory_gb=peak_gb,
                 args=args,
                 container_peak_memory_gb=container_gb,
+                masked_ts=masked_ts,
             )
+        masked_ts = None
         # The volumetric record goes out FIRST, before any surface work. The
         # note above reasons that a missing metrics record costs one row in
         # Athena — but with the surface block ordered first, a failure in
