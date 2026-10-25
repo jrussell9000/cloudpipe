@@ -414,8 +414,8 @@ data "aws_iam_policy_document" "github_actions_assume" {
       # That was latent rather than exploitable — no workflow that assumes these
       # roles triggers on pull_request. ci.yaml requests no OIDC token at all;
       # pr-image-build.yaml requests one only for github_actions_pr_pull, whose
-      # trust is its own document below and names only the pull_request subject.
-      # Never add that subject here. This document is the assume-role
+      # trust is its own document below and names the pull_request subject (and
+      # main's, for the canary). Never add the pull_request subject here. This document is the assume-role
       # policy for BOTH github_actions_ecr and github_actions_packer, and the
       # Packer role can RunInstances and manage packer-* IAM roles. Adding
       # `id-token: write` to one PR workflow would have handed that to
@@ -546,10 +546,11 @@ output "github_actions_ecr_role_arn" {
 # role, but a PR job must never hold that role (see github_actions_assume).
 #
 # So PR builds get a role of their own, separate in BOTH halves:
-# - Trust: only the exact `pull_request` subject of this repository. It does not
-#   share github_actions_assume, so the push and Packer roles stay unreachable
-#   from a PR. GitHub issues no OIDC token to a pull_request run from a fork, so
-#   fork-authored code never reaches even this role.
+# - Trust: only the exact `pull_request` subject of this repository, plus main's
+#   for the weekly cold-build canary (image-cache-canary.yaml, same 429s, #432).
+#   It does not share github_actions_assume, so the push and Packer roles stay
+#   unreachable from a PR. GitHub issues no OIDC token to a pull_request run
+#   from a fork, so fork-authored code never reaches even this role.
 # - Permissions: the two account-level calls an authenticated PULL needs, and
 #   nothing else. The ECR Public token only identifies the caller; every push
 #   API is authorized per call against this role, which has none, so a push with
@@ -565,7 +566,14 @@ data "aws_iam_policy_document" "github_actions_pr_pull_assume" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:pull_request"]
+      # main's subject is for image-cache-canary.yaml, whose scheduled cold
+      # builds hit the same 429s (#432). A schedule runs main's copy of the
+      # workflow, so its ref claim is refs/heads/main. Main is written only by
+      # merges and the pin bot, and this role still has no push grant.
+      values = [
+        "repo:${var.github_repo}:pull_request",
+        "repo:${var.github_repo}:ref:refs/heads/main",
+      ]
     }
     condition {
       test     = "StringEquals"
@@ -578,7 +586,7 @@ data "aws_iam_policy_document" "github_actions_pr_pull_assume" {
 resource "aws_iam_role" "github_actions_pr_pull" {
   name                 = "${var.name}-github-actions-pr-pull"
   assume_role_policy   = data.aws_iam_policy_document.github_actions_pr_pull_assume.json
-  description          = "Assumed by pull_request image builds to authenticate ECR Public base-image pulls; no push or other access"
+  description          = "Assumed by pull_request image builds and the cold-build canary to authenticate ECR Public base-image pulls; no push or other access"
   max_session_duration = 3600
 }
 
@@ -601,7 +609,7 @@ resource "aws_iam_role_policy" "github_actions_pr_pull" {
 }
 
 output "github_actions_pr_pull_role_arn" {
-  description = "IAM role ARN to set as GHA secret AWS_PR_PULL_ROLE_ARN (pull_request image builds; ECR Public pull auth only)"
+  description = "IAM role ARN to set as GHA secret AWS_PR_PULL_ROLE_ARN (pull_request image builds and the cold-build canary; ECR Public pull auth only)"
   value       = aws_iam_role.github_actions_pr_pull.arn
 }
 
