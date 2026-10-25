@@ -504,13 +504,95 @@ init_step_logs() {
   echo "==> Full Terraform output for this run is logged under $STEP_LOG_DIR"
 }
 
+# How many times a step whose every error was transient is run again, and how
+# long to wait first. Exported values win, so a test can make the wait zero.
+CLOUDPIPE_INSTALL_RETRIES=${CLOUDPIPE_INSTALL_RETRIES:-2}
+CLOUDPIPE_INSTALL_RETRY_DELAY=${CLOUDPIPE_INSTALL_RETRY_DELAY:-60}
+
+# The log of the attempt _tf_step_once ran last.
+STEP_LAST_LOG=""
+
 # Run one Terraform command as a step: tf_step "<label>" terraform apply ...
 #
 # Returns the command's own exit status, unchanged, so a caller's `if` and the
 # scripts' `set -e` see exactly what they saw before. Callers rely on that: an
 # apply_target failure prints FAILED, and an unguarded one ends the run and
 # prints install.sh's `--from-phase N` line.
+#
+# A failure whose EVERY error is a transient API error (_step_transient) is run
+# again, up to CLOUDPIPE_INSTALL_RETRIES times, after CLOUDPIPE_INSTALL_RETRY_DELAY
+# seconds. That is the `--from-phase N` re-run an operator would do by hand, and
+# only that: a Terraform apply or destroy is safe to repeat, each attempt gets its
+# own log, and one error of any other kind means no retry. On a fresh install
+# ArgoCD's first sync and the Phase 4 full apply's refresh together overloaded a
+# new EKS control plane — 499 throttled requests in a minute, GET p99 at 60s —
+# and all 24 of the apply's errors were `TLS handshake timeout`, raised before it
+# had changed anything (acceptance install, 2026-10-24).
 tf_step() {
+  local label=$1 attempt=0 rc=0 why
+  shift
+  while true; do
+    if [[ $attempt -eq 0 ]]; then
+      _tf_step_once "$label" "$@" && return 0 || rc=$?
+    else
+      _tf_step_once "$label (retry $attempt)" "$@" && return 0 || rc=$?
+    fi
+    # Interrupted (Ctrl-C, SIGTERM): the operator stopped it, so it stays stopped.
+    [[ $rc -eq 130 || $rc -eq 143 ]] && return "$rc"
+    [[ $attempt -lt $CLOUDPIPE_INSTALL_RETRIES ]] || return "$rc"
+    why=$(_step_transient "$STEP_LAST_LOG") || return "$rc"
+    attempt=$((attempt + 1))
+    printf '    ↻ every error was a transient API error (%s); retrying in %ss (%d of %d)\n' \
+      "$why" "$CLOUDPIPE_INSTALL_RETRY_DELAY" "$attempt" "$CLOUDPIPE_INSTALL_RETRIES"
+    sleep "$CLOUDPIPE_INSTALL_RETRY_DELAY"
+  done
+}
+
+# Whether every `Error:` block in a step's log is a transient API error: the API
+# server, or the path to it, failing a request that would succeed again unchanged.
+# Prints a count per kind, e.g. `24× TLS handshake timeout`, and returns 0; returns
+# 1, printing nothing, if there is no Error block or any one is something else.
+#
+# Deliberately NOT here: `context deadline exceeded` and Terraform's own
+# `timeout while waiting for state`, which are how a provider reports a create
+# that ran out of time — retrying one would replace the tainted resource, not
+# repeat a request; and `connection refused`, which is usually an endpoint that
+# is closed, not busy.
+_step_transient() {
+  local summary
+  # The awk prints the summary only when every block is transient, so an empty
+  # result is the "no" answer.
+  summary=$(awk '
+    BEGIN {
+      esc = sprintf("%c", 27); ansi = esc "\\[[0-9;]*[A-Za-z]"
+      n = split("TLS handshake timeout|i/o timeout|connection reset by peer|Too Many Requests|" \
+        "the server is currently unable to handle the request|http2: client connection lost|" \
+        "unexpected EOF", kinds, "|")
+    }
+    function close_block(    i, hit) {
+      if (!inblk) return
+      blocks++; hit = 0
+      for (i = 1; i <= n; i++) if (index(blk, kinds[i])) { count[kinds[i]]++; hit = 1; break }
+      if (!hit) other = 1
+      blk = ""; inblk = 0
+    }
+    { gsub(ansi, "") }
+    /^(│ )?Error: / { close_block(); inblk = 1; blk = $0; next }
+    inblk && /^╵/ { close_block(); next }
+    inblk { blk = blk "\n" $0 }
+    END {
+      close_block()
+      if (blocks == 0 || other) exit
+      sep = ""
+      for (i = 1; i <= n; i++) if (count[kinds[i]]) { printf "%s%d× %s", sep, count[kinds[i]], kinds[i]; sep = ", " }
+    }
+  ' "$1" 2>/dev/null) || true
+  [[ -n $summary ]] || return 1
+  printf '%s' "$summary"
+}
+
+# One attempt of a step: what tf_step was before it retried.
+_tf_step_once() {
   local label=$1
   shift
   init_step_logs
@@ -527,6 +609,7 @@ tf_step() {
   done
   local log
   printf -v log '%s/%02d-%s.log' "$STEP_LOG_DIR" "$STEP_COUNT" "$(_step_slug "${verb:+$verb }$label")"
+  STEP_LAST_LOG=$log
 
   local start=$SECONDS rc=0
   if step_verbose; then

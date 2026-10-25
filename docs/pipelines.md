@@ -687,7 +687,7 @@ t1w→MNI warp a single download per session rather than one per run — see the
 cost deep-dive §3.2 (internal: `docs-internal/investigations/2026-07-20-cloudpipe-cost-reduction-deep-dive.md`).
 
 What `preproc.py` does (its own stage numbering):
-1. **Extract 3D BOLD reference** — mean of the `--nss-frames` leading volumes (nibabel)
+1. **Extract 3D BOLD reference** — temporal mean of the steady-state volumes, from frame `--nss-frames` onward (nibabel); the same image bold-to-t1w registers to
 2. **Precompute composite displacement field** — BOLD→T1w (ITK affine) + T1w→MNI (affine + SyN warp) collapsed into a single voxel-to-voxel map via `antsApplyTransforms -o [displacement_field]`
 3. **Warp unmasked BOLD → MNI** — scipy `map_coordinates`, cubic B-spline (`order=3`); thread count from the pod's CPU request
 4. **Warp brain mask → MNI** — same `map_coordinates` call reusing stage 3's coordinate array, nearest-neighbour (`order=0`) to preserve binary values
@@ -697,7 +697,7 @@ What `preproc.py` does (its own stage numbering):
 
 Three things about that order are deliberate and easy to get wrong:
 
-**Non-steady-state frames are flagged, not trimmed.** The leading volumes are used to build the stage-1 reference and then marked with one binary `non_steady_state_outlier_NN` column per frame. Nothing is removed, so the output frame count matches the input and stays aligned with task-timing files; excluding them is the analyst's decision in the GLM.
+**Non-steady-state frames are flagged, not trimmed.** The leading volumes are left out of the stage-1 reference and marked with one binary `non_steady_state_outlier_NN` column per frame. Nothing is removed, so the output frame count matches the input and stays aligned with task-timing files; excluding them is the analyst's decision in the GLM.
 
 **Masking happens after the warp, not before.** A hard binary mask applied in native space creates a steep edge that sinc-family interpolation treats as high-frequency content, producing Gibbs ringing just inside and outside the cortex. So the *unmasked* BOLD is warped, the mask is warped separately with nearest-neighbour, and stage 5 zeroes non-brain voxels in MNI space.
 
@@ -729,6 +729,8 @@ derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label
 derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{GM,WM,CSF}_probseg.nii.gz
 derivatives/func/{subj}/{ses}/_complete.json                         # written last
 ```
+
+**`desc-boldref` is the run's steady-state temporal mean**, in native BOLD space: the mean of every frame from `n_nss_frames` onward. It is the same image as the registration's `derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_ref.nii.gz`, so each run has one reference. Images before the #858 fix built it from the NSS frames instead, so its contrast depended on the scanner software: on GE DV26+ and Siemens VE11 those frames still carry the T1-saturation transient, while on GE DV25, Philips and Siemens XA30 they are already near steady state. `scripts/backfill_boldref.py` brings sessions published by those images to the same convention by copying each run's registration reference over its `desc-boldref`.
 
 **`_complete.json` is the only existence test**, as for the FastSurfer trees. It lists every run's files (`runs`, keyed `{task}_{run}`) and the session's tissue maps (`session_files`). Inventory sets `func_exists` from it, and a run's objects without the marker do not count: a pod reclaimed mid-upload leaves exactly that state. A pod usually redoes only some of a session's runs, so the publish merges. Runs it did not redo keep their marker entries and objects. A redone run's stale objects are pruned, including its legacy tarball. The order is: delete the marker, upload, prune, write the merged marker. A crash at any point leaves the session markerless, so the whole session reads as absent and is redone. A failed publish records the pod's runs as func-preproc failures and exits 75, which the retry expression retries.
 
