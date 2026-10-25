@@ -56,7 +56,7 @@ ESTABLISHED_CRDS=(
 # column of the table in docs/infrastructure.md, not here.
 PHASES=(
   "1|phase_1_network_and_cluster|true|Create the network and the Kubernetes cluster"
-  "2|phase_2_cluster_addons|true|Install the cluster add-ons and start ArgoCD"
+  "2|phase_2_cluster_addons|true|Install the cluster add-ons"
   "3|phase_3_kube_system_network_policies|true|Add the network rules for the cluster's system services"
   "4|phase_4_full_apply_and_tunnel_token|true|Create the remaining resources, including the Cloudflare tunnel, and store its token"
   "5|phase_5_wait_for_crds|true|Wait for ArgoCD to install the resource types later phases need"
@@ -367,26 +367,62 @@ phase_1_network_and_cluster() {
   kubectl create namespace argo-workflows --dry-run=client -o yaml | kubectl apply -f -
 }
 
-# EKS add-ons, Pod Identity associations, and ArgoCD bootstrap. Applied one
-# module at a time to surface errors early.
+# Several stack-relative addresses as -targets of ONE apply:
+#   apply_targets "<label>" <address>... -- <extra terraform args>...
+#
+# Every targeted apply pays about 30s before it creates anything — the plan,
+# the refresh of everything its targets depend on, the state read and write.
+# A no-op target pays it too: Phase 2's Globus module took 32s to change
+# nothing. Applied one address at a time, Phase 2 paid it seven times and
+# Phase 3 twelve, about eleven minutes of the acceptance install (2026-10-24).
+# In one apply Terraform orders whatever has an edge and runs the rest in
+# parallel, so this is only for addresses whose order Terraform can see.
+apply_targets() {
+  local label=$1 target targets=()
+  shift
+  while [[ $# -gt 0 && $1 != "--" ]]; do
+    target=$1
+    targets+=(-target="$(stack_address "$target")")
+    shift
+  done
+  [[ ${1:-} == "--" ]] && shift
+  echo "==> Applying ${#targets[@]} targets in one apply: $label..."
+  if tf_step "$label" terraform apply "${targets[@]}" "$@" -auto-approve; then
+    echo "SUCCESS: $label"
+  else
+    echo "FAILED: $label"
+    exit "$EXIT_ERROR"
+  fi
+}
+
+# EKS add-ons and Pod Identity associations, Karpenter, Argo Workflows' database
+# and RBAC, the Globus ingress when enabled, and FinOps. NOT ArgoCD: its Helm
+# release is a stack-level resource that no Phase 2 target depends on, so it is
+# created by Phase 4's full apply (the phase title said otherwise until
+# 2026-10-24).
+#
+# One apply rather than one per module. Their order is all in the graph: each
+# reads only module.eks and module.vpc, both from Phase 1, except FinOps, which
+# has `depends_on = [module.addons]`, and Globus, which reads
+# module.argo_workflows. Nothing waits on a pod: the two Helm releases,
+# Karpenter and Kubecost, set `wait = false`, and everything that needs a CRD is
+# gated off by crds_available until Phase 6.
 phase_2_cluster_addons() {
   require_cluster
   require_helm_ecr_login
-  local target
-  for target in "${PHASE2_MODULES[@]}"; do
-    apply_target "$target" -var="endpoint_public_access=true"
-  done
+  apply_targets "cluster add-ons" "${PHASE2_MODULES[@]}" -- -var="endpoint_public_access=true"
 }
 
 # NETWORK_POLICY_ENFORCING_MODE=strict blocks all traffic to pods with no policy,
 # so these must exist before Phase 6 turns strict mode on — see targets.sh.
+#
+# One apply: nothing depends on their order, since enforcement is off until
+# Phase 6, and on a re-run with it on, one apply shortens the gap between
+# default_deny and the allow rules from minutes to seconds.
 phase_3_kube_system_network_policies() {
   require_cluster
-  echo "==> Applying kube-system NetworkPolicies..."
-  local target
-  for target in "${KUBE_SYSTEM_NETWORK_POLICIES[@]}"; do
-    apply_target "$target" -var="endpoint_public_access=true"
-  done
+  apply_targets "kube-system NetworkPolicies" "${KUBE_SYSTEM_NETWORK_POLICIES[@]}" \
+    -- -var="endpoint_public_access=true"
 }
 
 # Full apply with crds_available at its default of false, to catch anything the
