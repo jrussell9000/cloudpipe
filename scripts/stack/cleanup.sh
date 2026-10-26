@@ -388,6 +388,9 @@ require_cloudflare_api_token
 # was published last. Through tf_step, so its output goes to the run's log.
 tf_step "providers and modules" terraform init -input=false
 resolve_stack_module
+# Before anything is destroyed: a token for another Cloudflare account fails
+# only in the final destroy, after the cluster is already gone.
+require_cloudflare_token_for_this_account
 
 echo "==> Validating -target addresses against the configuration..."
 assert_targets_declared module.vpc module.eks "${PHASE2_MODULES[@]}"

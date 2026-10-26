@@ -878,11 +878,15 @@ def sample_cortical_ribbon(
                     data=ts[:, t],
                     intent="NIFTI_INTENT_TIME_SERIES",
                     datatype="NIFTI_TYPE_FLOAT32",
-                    # Plain base64, not gzip: these are intermediates, tarred and
-                    # read once by surface-resample. Gzip cost ~28 s a run for a
-                    # 15% smaller file (BOLD floats barely compress: 253 vs 292
-                    # MiB, 31 vs 2.9 s, 2026-10-24); wb_command reads either.
-                    encoding="Base64Binary",
+                    # Gzip, NOT plain base64, although gzip costs ~28 s a run for a
+                    # 15% smaller file. wb_command's Base64Binary reader overruns
+                    # its buffer when an array's byte length is 8 mod 16 (a vertex
+                    # count of 2 mod 4), and on some of those it aborts with
+                    # `double free or corruption (!prev)`. #884 switched to plain
+                    # base64 and surface-resample then failed on 618 of the 2,000
+                    # func-reprocess-03-04 subjects. Gzip is the path every wave
+                    # before that read. tests/images/afni pins this.
+                    encoding="GZipBase64Binary",
                 )
                 for t in range(n_frames)
             ],

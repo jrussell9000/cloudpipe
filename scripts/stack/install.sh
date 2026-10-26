@@ -155,14 +155,9 @@ poll_until() {
   done
 }
 
-# Cloudflare API call. The Authorization header is read from a process
-# substitution rather than passed with -H, so the API token never appears in
-# the process argument list. CF_ACCOUNT_ID and CF_TUNNEL_ID come from
-# require_cloudflare_ids, which every phase that needs them calls itself.
-cf_api() {
-  curl -fsS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}$1" \
-    --header @<(printf 'Authorization: Bearer %s' "$CLOUDFLARE_API_TOKEN")
-}
+# cf_api is in targets.sh, which cleanup.sh shares. CF_ACCOUNT_ID and
+# CF_TUNNEL_ID come from require_cloudflare_ids, which every phase that needs
+# them calls itself.
 
 # The tunnel's account and id, read from the deployment rather than passed
 # between phases: a standalone Phase 7 or 8 has no Phase 4 to have resolved them.
@@ -348,7 +343,8 @@ k8s_token_is_current() {
 }
 
 tunnel_is_healthy() {
-  [[ "$(cf_api "/cfd_tunnel/${CF_TUNNEL_ID}" | jq -r '.result.status')" == "healthy" ]]
+  # Quiet: this is polled, and the token was checked before the phase began.
+  [[ "$(cf_api "/cfd_tunnel/${CF_TUNNEL_ID}" 2>/dev/null | jq -r '.result.status')" == "healthy" ]]
 }
 
 # The gate before the public endpoint closes: the in-cluster Secret must hold
@@ -868,11 +864,12 @@ main() {
   # Terraform creates every client and secret itself; a deployment that supplies
   # `external_identity` reads its own secrets in its own configuration, which is
   # where a missing one is reported.
-  local id
+  local id needs_cloudflare=false
   for id in "${selected[@]}"; do
     if [[ $id -ge 4 ]]; then
       echo "==> Checking Cloudflare prerequisites..."
       require_cloudflare_api_token
+      needs_cloudflare=true
       break
     fi
   done
@@ -901,6 +898,12 @@ main() {
 
   echo "==> Validating -target addresses against the configuration..."
   assert_targets_declared "${ALL_TARGETS[@]}"
+
+  # Set is not enough: the token has to be this deployment's account's, and a
+  # wrong one used to surface as a bare 403 in Phase 7, or as a failed Cloudflare
+  # resource in Phase 4's full apply. After resolve_stack_module, which the
+  # account id's lookup needs.
+  [[ $needs_cloudflare == true ]] && require_cloudflare_token_for_this_account
 
   # [3/8] is the phase's place in the whole install, not in this invocation, so
   # `--phase 6` alone still reads as six of eight.
