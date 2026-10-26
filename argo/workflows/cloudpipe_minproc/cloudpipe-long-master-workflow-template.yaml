@@ -703,6 +703,44 @@ spec:
                 value: '{{workflow.parameters.metrics-bucket}}'
           withParam: '{{tasks.published-sessions-dagtask.outputs.parameters.rejected-sessions}}'
 
+        # The workflow's verdict: Failed if any step RECORDED a failure.
+        #
+        # Every recorder above depends on its producer's `.Failed`, and Argo
+        # counts a failure that a downstream task depends on as handled. So a
+        # step that failed (registration, func-preproc, surface-resample, a
+        # whole anatomical phase) left the workflow Succeeded, with the truth
+        # only in its StepOutcome rows. func-reprocess-03-04 reported 1,998
+        # Succeeded while surface-resample had failed every run of 618 subjects.
+        #
+        # This reads those rows back and exits 1 on any failed or errored one,
+        # except qc_rejected (a registration gate that worked and said no). It
+        # waits on every leaf recorder, and only on Succeeded/Skipped/Omitted:
+        # naming a recorder's own `.Failed` here would absorb THAT failure the
+        # same way. A recorder that fails leaves this Omitted, and its own
+        # failure fails the workflow.
+        - name: workflow-verdict-dagtask
+          depends: >-
+            (record-outcome-fsqc-metrics-dagtask.Succeeded || record-outcome-fsqc-metrics-dagtask.Skipped || record-outcome-fsqc-metrics-dagtask.Omitted) &&
+            (record-outcome-subregion-seg-dagtask.Succeeded || record-outcome-subregion-seg-dagtask.Skipped || record-outcome-subregion-seg-dagtask.Omitted) &&
+            (record-outcome-anatomical-dagtask.Succeeded || record-outcome-anatomical-dagtask.Skipped || record-outcome-anatomical-dagtask.Omitted) &&
+            (record-outcome-session-dagtask.Succeeded || record-outcome-session-dagtask.Skipped || record-outcome-session-dagtask.Omitted) &&
+            (record-outcome-rejected-sessions-dagtask.Succeeded || record-outcome-rejected-sessions-dagtask.Skipped || record-outcome-rejected-sessions-dagtask.Omitted)
+          templateRef:
+            name: metrics-exit-handler
+            template: workflow-verdict-template
+          arguments:
+            parameters:
+              - name: workflow-name
+                value: '{{workflow.name}}'
+              - name: workflow-uid
+                value: '{{workflow.uid}}'
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: started-at
+                value: '{{workflow.creationTimestamp}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
 #######################################
 #----- Anatomical Processing DAG -----#
 #######################################
