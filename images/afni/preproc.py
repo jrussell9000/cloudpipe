@@ -89,6 +89,7 @@ import argparse
 import atexit
 import contextlib
 import gzip
+import itertools
 import json
 import os
 import re
@@ -117,6 +118,7 @@ from func_iqm import (  # noqa: F401
     _quality_index,
     compute_func_qc_summary,
 )
+from scipy import sparse
 from scipy.ndimage import binary_erosion, map_coordinates
 from sklearn.decomposition import PCA
 
@@ -778,17 +780,56 @@ def _bold_vox_to_aseg_vox(
     return np.linalg.inv(aseg_affine) @ np.linalg.inv(t1w2bold_ras) @ bold_ref_affine
 
 
+def _ribbon_weights(coords: np.ndarray, shape: tuple, n_depths: int) -> "sparse.csr_matrix":
+    """Sparse trilinear weights taking a flattened volume to per-vertex means.
+
+    `coords` is (3, n_depths * n_vert) BOLD voxel coordinates, depth-major as
+    sample_cortical_ribbon builds them. Row v of the result, dotted with a
+    volume flattened in Fortran order, equals the mean over vertex v's depths
+    of map_coordinates(order=1, mode="constant", cval=0.0): a point outside
+    [0, n-1] on any axis reads exactly 0 there (checked against scipy 1.17)
+    and still counts in the mean, so it contributes no entry here.
+
+    The weights depend only on the geometry, never on the frame, so building
+    them once replaces recomputing them inside map_coordinates every frame.
+    """
+    dims = np.asarray(shape[:3], dtype=np.int64)
+    n_vert = coords.shape[1] // n_depths
+    inside = np.all((coords >= 0) & (coords <= (dims - 1)[:, None]), axis=0)
+    crd = coords[:, inside]
+    vert = np.flatnonzero(inside) % n_vert
+    base = np.floor(crd).astype(np.int64)
+    frac = crd - base
+
+    rows, cols, vals = [], [], []
+    for corner in itertools.product((0, 1), repeat=3):
+        step = np.array(corner)[:, None]
+        # A point exactly on the far edge has frac 0 there, so its +1 corner
+        # carries no weight; clamping keeps that corner's index in range.
+        idx = np.minimum(base + step, (dims - 1)[:, None])
+        w = np.prod(np.where(step == 1, frac, 1.0 - frac), axis=0)
+        keep = w > 0
+        rows.append(vert[keep])
+        cols.append(np.ravel_multi_index(tuple(idx[:, keep]), tuple(dims), order="F"))
+        vals.append(w[keep] / n_depths)
+    # Duplicates (depths sharing a voxel) are summed in float64 by the CSR
+    # conversion, then stored float32 to match the BOLD.
+    w = sparse.csr_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n_vert, int(np.prod(dims))),
+    )
+    return w.astype(np.float32)
+
+
 def sample_cortical_ribbon(
     bold: Path,
     bold_ref: Path,
     aseg: Path,
     surf_dir: Path,
     bold2t1w_affine: Path,
-    outdir: Path,
-    prefix: str,
     n_depths: int = 5,
     threads: int = 1,
-) -> dict[str, Path]:
+) -> dict[str, np.ndarray]:
     """Sample the native BOLD onto each hemisphere's cortical ribbon.
 
     For every vertex, `n_depths` points are placed between the white and pial
@@ -802,7 +843,9 @@ def sample_cortical_ribbon(
     this is a single interpolation from the source data instead of a second
     resampling of data already warped to MNI.
 
-    Returns {"L": path, "R": path} of per-hemisphere `.func.gii`.
+    Returns {"L": ts, "R": ts}, each (n_vert, n_frames) float32. The caller
+    writes them with write_ribbon_gifti and measures them for QC while they
+    are still in memory.
     """
     aseg_img = nib.load(aseg)
     bold_img = nib.load(bold)
@@ -833,7 +876,17 @@ def sample_cortical_ribbon(
         del pts, hom
         print(f"  {hemi}: {n_vert[hemi]} vertices × {n_depths} depths", flush=True)
 
-    acc = {h: np.zeros((n_vert[h], n_frames), dtype=np.float32) for h in coords}
+    # Both hemispheres in one matrix, restricted to the voxels the ribbon
+    # touches, so the BOLD is gathered once and multiplied once.
+    with substage("grayordinates.ribbon_weights"):
+        weights = sparse.vstack(
+            [_ribbon_weights(coords[h], bold_img.shape, n_depths) for h in coords], format="csr"
+        )
+        # bincount, not np.unique: linear in the voxel count rather than a
+        # sort of every stored weight.
+        used = np.flatnonzero(np.bincount(weights.indices, minlength=weights.shape[1]))
+        weights = weights[:, used]
+    coords = None
 
     # Read the 4D array in one pass rather than frame by frame. nibabel's
     # ArrayProxy only does true random access into a .nii.gz when indexed_gzip
@@ -849,24 +902,49 @@ def sample_cortical_ribbon(
     with substage("grayordinates.load_native_bold"):
         bold_data = np.asarray(bold_img.dataobj, dtype=np.float32)
 
-    # With the data resident there is no file handle to contend over, so frames
-    # parallelise cleanly — map_coordinates releases the GIL, the same property
-    # apply_transforms relies on to thread its warp. Each frame owns column t
-    # of every accumulator, so the writes are disjoint and need no lock.
-    def _sample_frame(t: int) -> None:
-        vol = bold_data[..., t]
-        for hemi, crd in coords.items():
-            s = map_coordinates(vol, crd, order=1, mode="constant", cval=0.0)
-            acc[hemi][:, t] = s.reshape(n_depths, n_vert[hemi]).mean(axis=0)
+    # Per-frame map_coordinates rebuilt every point's weights 383 times a run,
+    # 26 s of the median run in 03-04 (2026-10-25). One sparse product does the
+    # same arithmetic once: about 10x faster on a synthetic 150k-vertex ribbon,
+    # equal to it within float32 summation order (~5e-7 relative).
+    #
+    # The product threads by vertex rows: scipy's sparse kernels release the
+    # GIL, and each worker writes its own rows of `ts`, so the writes are
+    # disjoint and the result does not depend on the thread count.
+    with substage("grayordinates.sample_ribbon"):
+        voxels = bold_data[np.unravel_index(used, bold_data.shape[:3], order="F")]
+        bold_data = None
+        ts = np.empty((weights.shape[0], n_frames), dtype=np.float32)
+        bounds = np.linspace(0, weights.shape[0], max(1, min(threads, weights.shape[0])) + 1)
+        spans = [(int(a), int(b)) for a, b in itertools.pairwise(bounds.round())]
 
-    with substage("grayordinates.sample_ribbon"), ThreadPoolExecutor(max_workers=threads) as pool:
-        list(pool.map(_sample_frame, range(n_frames)))
-    # Rebind, not `del` — both are closed over by _sample_frame (F821); see the
-    # note in apply_transforms. Same reference drop, same point in the function.
-    coords = bold_data = None
+        def _rows(span: tuple[int, int]) -> None:
+            a, b = span
+            ts[a:b] = weights[a:b] @ voxels
 
+        with ThreadPoolExecutor(max_workers=len(spans)) as pool:
+            list(pool.map(_rows, spans))
+    # Rebind, not `del` — closed over by _rows (F821); see the note in
+    # apply_transforms.
+    weights = voxels = None
+
+    out: dict[str, np.ndarray] = {}
+    start = 0
+    for hemi in ("L", "R"):
+        out[hemi] = ts[start : start + n_vert[hemi]]
+        start += n_vert[hemi]
+    return out
+
+
+def write_ribbon_gifti(
+    surf_ts: dict[str, np.ndarray], outdir: Path, prefix: str
+) -> dict[str, Path]:
+    """Write sample_cortical_ribbon's timeseries as per-hemisphere `.func.gii`.
+
+    Returns {"L": path, "R": path}.
+    """
     out: dict[str, Path] = {}
-    for hemi, ts in acc.items():
+    for hemi, ts in surf_ts.items():
+        n_frames = ts.shape[1]
         gii = nib.gifti.GiftiImage(
             meta=nib.gifti.GiftiMetaData(
                 {
@@ -907,6 +985,8 @@ def extract_subcortical(
     t1w2mni_warp: Path,
     outdir: Path,
     prefix: str,
+    masked_ts: "np.ndarray | None" = None,
+    mask_mni: "Path | None" = None,
 ) -> tuple[Path, Path, Path]:
     """Build the CIFTI subcortical block on the MNI BOLD's own grid.
 
@@ -914,6 +994,13 @@ def extract_subcortical(
     interpolation, restricted to the 19 standard CIFTI structures, and used to
     mask the MNI BOLD. Because the BOLD is *already* on that grid this is pure
     indexing — no second interpolation of the timeseries.
+
+    `masked_ts` and `mask_mni` are Stage 5's read-back of the file (the
+    (n_voxels, n_frames) matrix verify_mni_bold_readback returns) and the mask
+    it was read under. Given both, the block is filled from that matrix instead
+    of decompressing the ~1.7 GB file again: the file is zero outside the mask,
+    so the values are the same. The grayordinate short path has no read-back
+    and passes neither.
 
     Volume space is MNI152NLin2009cAsym, matching the rest of the pipeline
     rather than the MNI152NLin6Asym grid standard 91282-grayordinate files use;
@@ -961,9 +1048,24 @@ def extract_subcortical(
     if n_vox == 0:
         raise ValueError("no subcortical voxels survived the aseg warp")
 
-    with substage("grayordinates.load_mni_bold"):
-        data = bold_img.get_fdata(dtype=np.float32)
-    data[~mask] = 0.0
+    if masked_ts is not None and mask_mni is not None:
+        brain = np.asanyarray(nib.load(mask_mni).dataobj) > 0
+        if masked_ts.shape != (int(brain.sum()), bold_img.shape[3]):
+            raise ValueError(
+                f"read-back matrix {masked_ts.shape} does not fit {mask_mni.name} "
+                f"({int(brain.sum())} voxels) x {bold_img.shape[3]} frames"
+            )
+        # Row r of masked_ts is the r-th mask voxel in C order (boolean
+        # indexing order), so a C-order running count maps voxel to row.
+        row = np.cumsum(brain.ravel()) - 1
+        keep = mask & brain
+        data = np.zeros(bold_img.shape, dtype=np.float32)
+        data[keep] = masked_ts[row[keep.ravel()]]
+        del brain, row, keep
+    else:
+        with substage("grayordinates.load_mni_bold"):
+            data = bold_img.get_fdata(dtype=np.float32)
+        data[~mask] = 0.0
     bold_out = outdir / f"{prefix}_space-MNI152NLin2009cAsym_desc-subcort_bold.nii.gz"
     with substage("grayordinates.write_subcort"):
         nib.save(nib.Nifti1Image(data, bold_img.affine, bold_img.header), bold_out)
@@ -1296,8 +1398,34 @@ def _surface_qc(
     surf_paths: dict[str, Path],
     subcort: "tuple[Path, Path, Path] | None",
     nss_frames: int,
+    cortical: "dict | None" = None,
 ) -> dict:
     """QC for the grayordinate components.
+
+    `cortical` is _cortical_qc's result, measured while the sampled timeseries
+    were still in memory. Without it the GIFTIs are read back from
+    `surf_paths`, which cost ~5 s a run in 03-04 (2026-10-25).
+    """
+    if cortical is None:
+        cortical = _cortical_qc(
+            {
+                hemi: np.stack([d.data for d in nib.load(path).darrays], axis=1)
+                for hemi, path in surf_paths.items()
+            },
+            nss_frames,
+        )
+    qc: dict = dict(cortical)
+
+    if subcort is not None:
+        labels = nib.load(subcort[1]).get_fdata()
+        qc["subcort_n_voxels"] = int((labels > 0).sum())
+        qc["subcort_n_structures"] = int(len(np.unique(labels[labels > 0])))
+        qc["subcort_space"] = "MNI152NLin2009cAsym"
+    return qc
+
+
+def _cortical_qc(surf_ts: dict[str, np.ndarray], nss_frames: int) -> dict:
+    """Per-hemisphere QC of the sampled cortical timeseries, each (n_vert, T).
 
     Vertex coverage is the fraction of vertices whose timeseries is not
     identically zero — a vertex sampling outside the BOLD field of view reads
@@ -1310,9 +1438,7 @@ def _surface_qc(
     sampled, not the analysed window.
     """
     qc: dict = {}
-    for hemi, path in surf_paths.items():
-        gii = nib.load(path)
-        ts = np.stack([d.data for d in gii.darrays], axis=1)  # (n_vert, T)
+    for hemi, ts in surf_ts.items():
         n_vert = ts.shape[0]
         covered = np.any(ts != 0, axis=1)
         steady = ts[:, max(0, nss_frames) :]
@@ -1325,13 +1451,6 @@ def _surface_qc(
         qc[f"surf_{hemi}_tsnr_median"] = (
             round(float(np.median(tsnr[covered])), 3) if covered.any() else 0.0
         )
-        del ts
-
-    if subcort is not None:
-        labels = nib.load(subcort[1]).get_fdata()
-        qc["subcort_n_voxels"] = int((labels > 0).sum())
-        qc["subcort_n_structures"] = int(len(np.unique(labels[labels > 0])))
-        qc["subcort_space"] = "MNI152NLin2009cAsym"
     return qc
 
 
@@ -1384,6 +1503,7 @@ def _finish_grayordinate_only(
     subcort: "tuple[Path, Path, Path] | None",
     timings: dict,
     pipeline_start: float,
+    cortical_qc: "dict | None" = None,
 ) -> None:
     """Tail of the grayordinate-only short path.
 
@@ -1396,7 +1516,7 @@ def _finish_grayordinate_only(
 
     qc = {
         **_surface_qc_envelope(args, timings, total, peak_gb, _container_peak_memory_gb()),
-        **_surface_qc(surf_paths, subcort, args.nss_frames),
+        **_surface_qc(surf_paths, subcort, args.nss_frames, cortical_qc),
     }
     qc_path = Path(f"/tmp/{prefix}_surf_qc.json")
     qc_path.write_text(json.dumps(qc))
@@ -1709,21 +1829,21 @@ def main() -> None:
 
     surf_paths: dict[str, Path] = {}
     subcort: tuple[Path, Path, Path] | None = None
+    cortical_qc: dict | None = None
     if args.emit in ("grayordinate", "both"):
         print("\n--- Stage 5b: Grayordinate extraction ---", flush=True)
         try:
             with timed_stage("grayordinates", _timings):
-                surf_paths = sample_cortical_ribbon(
+                surf_ts = sample_cortical_ribbon(
                     bold=args.bold,
                     bold_ref=bold_ref,
                     aseg=args.aseg,
                     surf_dir=args.surf_dir,
                     bold2t1w_affine=args.bold2t1w_affine,
-                    outdir=args.outdir,
-                    prefix=prefix,
                     n_depths=args.ribbon_depths,
                     threads=args.threads,
                 )
+                surf_paths = write_ribbon_gifti(surf_ts, args.outdir, prefix)
                 subcort = extract_subcortical(
                     mni_bold=mni_bold,
                     aseg=args.aseg,
@@ -1732,7 +1852,19 @@ def main() -> None:
                     t1w2mni_warp=args.t1w2mni_warp,
                     outdir=args.outdir,
                     prefix=prefix,
+                    masked_ts=masked_ts,
+                    mask_mni=mask_mni,
                 )
+            # Measured now, while the timeseries are in memory, rather than
+            # read back from the GIFTIs in the QC block. Guarded on its own:
+            # QC never costs a derivative, so a failure here only leaves
+            # cortical_qc None and the QC block falls back to the files.
+            try:
+                with substage("qc_summary.surface_qc"):
+                    cortical_qc = _cortical_qc(surf_ts, args.nss_frames)
+            except Exception:
+                traceback.print_exc()
+            surf_ts = None
         except Exception:
             # On --emit both the volumetric MNI BOLD is already computed (Stage
             # 5) and is a complete derivative on its own. A surface-sampling
@@ -1755,9 +1887,10 @@ def main() -> None:
                 flush=True,
             )
             traceback.print_exc()
+            surf_ts = None
             surf_paths = {}
             subcort = None
-            # Purge any partial surface outputs. If sample_cortical_ribbon
+            # Purge any partial surface outputs. If write_ribbon_gifti
             # succeeded and extract_subcortical then failed, the cortical GIFTIs
             # are still on disk; left there, the driver's component glob would
             # find them and tar an INCOMPLETE components set that passes as a
@@ -1782,6 +1915,7 @@ def main() -> None:
             subcort,
             _timings,
             pipeline_start,
+            cortical_qc,
         )
         return
 
@@ -1851,7 +1985,7 @@ def main() -> None:
             # prefix never carries a stale record from an earlier short-path run.
             try:
                 with substage("qc_summary.surface_qc"):
-                    surf_metrics = _surface_qc(surf_paths, subcort, args.nss_frames)
+                    surf_metrics = _surface_qc(surf_paths, subcort, args.nss_frames, cortical_qc)
                 qc.update(surf_metrics)
                 qc_path.write_text(json.dumps(qc))  # re-write with surf folded in
                 Path(f"/tmp/{prefix}_surf_qc.json").write_text(

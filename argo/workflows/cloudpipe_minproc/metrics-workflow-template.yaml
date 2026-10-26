@@ -116,3 +116,144 @@ spec:
         - '{{inputs.parameters.workflow-uid}}'
         - --metrics-bucket
         - '{{inputs.parameters.metrics-bucket}}'
+
+  ###########################################################################
+  # The workflow's verdict, the last task of cloudpipe-long-master's DAG:
+  # exits 1 when any of this run's StepOutcome rows records a failure, so a
+  # failure a recorder absorbed still fails the workflow. See the comment on
+  # workflow-verdict-dagtask there.
+  #
+  # A script, not a new /app module: it uses only what this image digest
+  # already ships (boto3, /app/exit_handler.py's date range and run filter), so
+  # a merge needs no image rebuild, and no workflow submitted before a pin can
+  # run a template naming a module its image lacks.
+  # tests/argo/test_workflow_verdict.py runs this source.
+  ###########################################################################
+
+  - name: workflow-verdict-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: observability
+        cloudpipe.io/step: workflow-verdict
+    inputs:
+      parameters:
+        - name: workflow-name
+        - name: workflow-uid
+        - name: subject
+        - name: started-at
+        - name: metrics-bucket
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 128M
+          cpu: 100m
+      command: [python]
+      source: |
+        import json
+        import sys
+
+        sys.path.insert(0, "/app")
+
+        # Statuses that fail the workflow. Skipped and omitted steps are not
+        # failures: their upstream's own row is.
+        FAILING = ("failed", "error", "errored")
+        # A registration gate that worked and rejected its transform (exit 65).
+        # The run is correctly excluded; nothing broke.
+        NOT_A_FAILURE = ("qc_rejected",)
+        # EX_TEMPFAIL: the workflow retryStrategy retries it.
+        TEMPFAIL = 75
+
+
+        def load_rows(s3, bucket, name, dates, keep):
+            """Every StepOutcome row under this workflow's name on `dates`, for which
+            keep(row) is true. Strict, unlike the exit handler's loader, which logs
+            and skips a row it cannot read: a skipped row could be the failed one,
+            so any read error propagates (and main() retries)."""
+            rows = []
+            for dt in dates:
+                pages = s3.get_paginator("list_objects_v2").paginate(
+                    Bucket=bucket, Prefix=f"metrics/step-outcomes/dt={dt}/{name}__"
+                )
+                for page in pages:
+                    for obj in page.get("Contents", []):
+                        row = json.loads(s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read())
+                        if keep(row):
+                            rows.append(row)
+            return rows
+
+
+        def failures(rows):
+            """The rows that fail this workflow, in a stable order for the log."""
+            bad = [
+                r
+                for r in rows
+                if (r.get("status") or "").lower() in FAILING
+                and r.get("failure_category") not in NOT_A_FAILURE
+            ]
+            return sorted(
+                bad,
+                key=lambda r: tuple(r.get(k) or "" for k in ("step", "session", "task", "run")),
+            )
+
+
+        def verdict(rows):
+            """(exit code, lines to print) for this run's StepOutcome rows."""
+            if not rows:
+                # Every workflow that gets this far has written rows (a skipped
+                # step still writes one), so none means they are lost or
+                # unreadable, and nothing here can vouch for the run.
+                return 1, ["no StepOutcome rows found for this run; cannot vouch for it"]
+            bad = failures(rows)
+            lines = [f"{len(rows)} StepOutcome row(s), {len(bad)} failure(s)"]
+            for r in bad:
+                where = "/".join(r.get(k) or "na" for k in ("session", "task", "run"))
+                reason = " ".join((r.get("failure_reason") or "").split())[:300]
+                lines.append(
+                    f"FAILED {r.get('step')} {where}: {r.get('failure_category') or 'unknown'}"
+                    + (f" ({reason})" if reason else "")
+                )
+            return (1 if bad else 0), lines
+
+
+        def main():
+            from datetime import datetime, timezone
+
+            import boto3
+            import exit_handler
+            from botocore.exceptions import BotoCoreError, ClientError
+
+            name = "{{inputs.parameters.workflow-name}}"
+            uid = "{{inputs.parameters.workflow-uid}}"
+            subj = "{{inputs.parameters.subject}}"
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            s3 = boto3.client("s3", region_name=exit_handler.deployment_env.region())
+            try:
+                rows = load_rows(
+                    s3,
+                    "{{inputs.parameters.metrics-bucket}}",
+                    name,
+                    exit_handler._date_range("{{inputs.parameters.started-at}}", now),
+                    lambda r: exit_handler._belongs_to_this_run(r, uid, subj),
+                )
+            except (BotoCoreError, ClientError, ValueError) as exc:
+                print(
+                    f"ERROR: could not read StepOutcome rows ({type(exc).__name__}: {exc}); "
+                    f"forcing retry (exit {TEMPFAIL}).",
+                    file=sys.stderr,
+                )
+                sys.exit(TEMPFAIL)
+            code, lines = verdict(rows)
+            for line in lines:
+                print(line, file=sys.stderr if code else sys.stdout)
+            if code:
+                print(f"{name}: failing the workflow on the recorded failure(s) above.", file=sys.stderr)
+            sys.exit(code)
+
+
+        main()

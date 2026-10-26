@@ -869,6 +869,17 @@ Verified against the live controller on 2026-08-15 with probe workflows whose in
 
 When editing the expression, keep the code alternation explicit — a looser `matches "exit code"` re-admits the 137 above, since a real OOMKill surfaces as `main: Error (exit code 137)` — and keep the parentheses around the `||` group, or the missing-key guard binds to the `exitCode` arm alone and stops applying. `tests/argo/test_retry_expression.py` pins all 10 copies to one canonical string and classifies 15 failure shapes captured from real payloads, translating the YAML expression to Python so operands *and* boolean structure come from the file; a reworded Argo message breaks the test rather than the retry path.
 
+### What a Failed workflow means
+
+A workflow is **Failed when any step recorded a failure**, not only when a pod failure went unhandled. The outcome recorders depend on their producer's `.Failed`, and Argo counts a failure that a downstream task depends on as handled. So before the verdict task, a registration, func-preproc or surface-resample failure left the workflow **Succeeded**, with the truth only in its StepOutcome rows. `func-reprocess-03-04` reported 1,998 Succeeded while surface-resample had failed every run of 618 subjects.
+
+The last task of the master DAG, `workflow-verdict`, reads the run's StepOutcome rows back and exits 1 on any `failed` or `error` row. Its log names each one (`FAILED surface-resample ses-00A/task-rest/run-01: algorithm (…)`), and the WorkflowRun record's `failed_step` is the earliest of them. Two things do not fail it:
+
+- **A QC-gate rejection** (`failure_category: qc_rejected`, exit 65). The gate worked and said no.
+- **A skipped or omitted step.** Its upstream's own row is the failure.
+
+It also fails when it finds no rows at all, since then it cannot vouch for the run. A Failed workflow keeps its staged input: `delete-globus-input` runs only on Succeeded.
+
 Failed workflows are not auto-resubmitted. Resubmit a failed workflow manually:
 ```bash
 DEST_COLL=$(aws ssm get-parameter --name /cloudpipe/globus/collection-id --query Parameter.Value --output text)
