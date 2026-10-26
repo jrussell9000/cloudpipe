@@ -443,6 +443,64 @@ EOF
   fi
 }
 
+# Cloudflare API call against the deployment's account: cf_api /cfd_tunnel/<id>.
+# Prints the response body on a 2xx and returns 0; otherwise prints, to stderr,
+# the path and status and what a 401 or 403 usually means, and returns 1.
+#
+# The Authorization header is read from a process substitution rather than
+# passed with -H, so the API token never appears in the process argument list.
+# The body is held in a variable, never a file: the /token endpoint's body IS
+# the tunnel's connector token. CF_ACCOUNT_ID comes from require_cloudflare_ids
+# or require_cloudflare_token_for_this_account.
+#
+# It used to be `curl -fsS`, whose whole report of a wrong-account token was
+# `curl: (22) The requested URL returned error: 403` — no endpoint, no account,
+# no cause — in a Phase 7 run from a shell whose login had exported another
+# deployment's token (acceptance install, 2026-10-25).
+cf_api() {
+  local out status body
+  if ! out=$(curl -sS -w '\n%{http_code}' \
+    "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}$1" \
+    --header @<(printf 'Authorization: Bearer %s' "$CLOUDFLARE_API_TOKEN")); then
+    echo "ERROR: could not reach the Cloudflare API (GET /accounts/<account>${1%%\?*})." >&2
+    return 1
+  fi
+  status=${out##*$'\n'}
+  body=${out%$'\n'*}
+  if [[ $status == 2?? ]]; then
+    printf '%s' "$body"
+    return 0
+  fi
+  echo "ERROR: the Cloudflare API refused GET /accounts/${CF_ACCOUNT_ID}${1%%\?*}: HTTP $status." >&2
+  if [[ $status == 401 || $status == 403 ]]; then
+    echo "  CLOUDFLARE_API_TOKEN cannot read Cloudflare account $CF_ACCOUNT_ID. The usual cause is" >&2
+    echo "  a token for a different account — another deployment's — exported in this shell." >&2
+    echo "  Export this deployment's token; \`pixi run cloudpipe preflight\` says which it is." >&2
+  fi
+  return 1
+}
+
+# The token belongs to this deployment's Cloudflare account, checked before any
+# phase that needs it changes anything. require_cloudflare_api_token checks only
+# that a token is set; a token for another account passed it, and the first
+# Cloudflare call to fail was minutes in (acceptance install, 2026-10-25). In
+# the teardown that call is Terraform's, in the final destroy, after the cluster
+# is gone.
+#
+# One read of the account's tunnels: the permission every phase that talks to
+# Cloudflare needs, and the one a token for the wrong account lacks. MUST run
+# after resolve_stack_module, which stack_output needs to reach the variable
+# before the first apply has recorded any output.
+require_cloudflare_token_for_this_account() {
+  CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-$(stack_output cloudflare_account_id)}
+  if [[ -z $CF_ACCOUNT_ID ]]; then
+    fail "$EXIT_INVALID" "ERROR: could not read this deployment's cloudflare_account_id."
+  fi
+  echo "==> Checking that CLOUDFLARE_API_TOKEN belongs to Cloudflare account $CF_ACCOUNT_ID..."
+  cf_api "/cfd_tunnel?per_page=1" >/dev/null ||
+    fail "$EXIT_BLOCKED" "ERROR: nothing was changed. Export the right token, then run this again."
+}
+
 
 # ---------------------------------------------------------------------------
 # How Terraform's output is shown
