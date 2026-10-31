@@ -1,0 +1,147 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probseg-backfill
+  namespace: argo-workflows
+
+###########################################################################
+# One-off: regenerate the published label-{GM,WM,CSF}_probseg maps that were
+# fitted to brainmask.mgz before the orig_nu fix (about half name the wrong
+# tissue; images/afni/tissue_masks.py says why). Only the tissue maps are
+# redone, from inputs already in S3; the BOLD is never touched.
+#
+# Planned, submitted and verified by scripts/backfill_probseg.py, never by hand:
+# the session list it writes is the contract, and its `verify` is the proof.
+#
+#   sessions-key  the plan's session list, a key in the data bucket
+#   shards        how many pods share the list (each takes every shards-th)
+#
+# The shard count IS the concurrency: every shard starts at once and runs its
+# share to the end. There is deliberately no semaphore. With one (2026-10-27,
+# probseg-1) the controller re-acquired every shard's lock on each reconcile at
+# ~3.3 s apiece, hit its reconcile deadline after ~10, and never created the
+# rest: 400 shards on a semaphore of 60 ran 10 pods. spec.parallelism below is
+# only a runaway backstop; scripts/backfill_probseg.py refuses more shards than
+# it, so nothing ever queues. Stop and resubmit with fewer shards to give the
+# func reprocess its nodes back: sessions finished read as `already`.
+#
+# Every pod is idempotent per session (probseg_backfill.py: a session whose
+# probseg already has a newer TissueQC row is `already`), so retries are safe.
+###########################################################################
+
+spec:
+  # Runaway backstop, not the working cap (see above). Equals MAX_SHARDS in
+  # scripts/backfill_probseg.py; tests/argo hold the two together.
+  parallelism: 100
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  arguments:
+    parameters:
+      - name: sessions-key
+      - name: shards
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  entrypoint: backfill
+
+  templates:
+  - name: backfill
+    steps:
+    - - name: shard
+        template: backfill-shard
+        withSequence:
+          count: "{{workflow.parameters.shards}}"
+        arguments:
+          parameters:
+            - name: shard
+              value: "{{item}}"
+
+  - name: backfill-shard
+    metadata:
+      labels:
+        cloudpipe.io/phase: functional
+        cloudpipe.io/step: probseg-backfill
+    inputs:
+      parameters:
+        - name: shard
+    # Spot reclaims and S3 errors only, the same codes as functional-preprocessing:
+    # 64/143 executor or SIGTERM, 75 the module's own S3-error exit. A session
+    # tissue_masks.py fails on is recorded and skipped, never a pod failure, so a
+    # deterministic error cannot loop.
+    retryStrategy:
+      limit: "8"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:624223ddffb69842b9c45b184a65010c387d471c1b0ee6ab69ecab547f9d0c79"
+      imagePullPolicy: IfNotPresent
+      command: [/entrypoint.sh, python, -u, /app/probseg_backfill.py]
+      args:
+        - --sessions-key
+        - "{{workflow.parameters.sessions-key}}"
+        - --shard
+        - "{{inputs.parameters.shard}}"
+        - --shards
+        - "{{workflow.parameters.shards}}"
+        - --data-bucket
+        - "{{workflow.parameters.bucket}}"
+        - --metrics-bucket
+        - "{{workflow.parameters.metrics-bucket}}"
+        - --region
+        - "{{workflow.parameters.region}}"
+        - --scratch
+        - /tmp
+      env:
+        # Provenance for the TissueQC row's image_tag; repeats the image ref above
+        # so build-images.yaml's re-pin rewrites both together.
+        - name: CLOUDPIPE_IMAGE
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:624223ddffb69842b9c45b184a65010c387d471c1b0ee6ab69ecab547f9d0c79"
+        - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+          value: "2"
+      resources:
+        # One session at a time: the 1 mm HMRF (~8.5M voxels, 4 classes in
+        # float64) plus two linear warps. The func-preproc pod runs the same
+        # tissue_masks.py inside its 4G request.
+        requests:
+          cpu: "2"
+          memory: 4G
+          ephemeral-storage: 4G
+        limits:
+          memory: 6G
+          ephemeral-storage: 8G

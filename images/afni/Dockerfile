@@ -8,7 +8,7 @@
 # split the cohort's outputs by AFNI patch version (#338, #591).
 # preproc.py's other names for AFNI (3dvolreg motion, AFNI-equivalent aor/aqi/
 # gcor) describe upstream ABCD processing and numpy reimplementations, not binaries.
-FROM ghcr.io/prefix-dev/pixi:0.82.1 AS build
+FROM ghcr.io/prefix-dev/pixi:0.83.0 AS build
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). The pixi base is
 # Ubuntu 24.04 and this is the stage that ships, so that base layer goes out as-is and
@@ -46,6 +46,10 @@ RUN echo "#!/bin/bash" > /entrypoint.sh && \
     chmod +x /entrypoint.sh
 
 COPY images/afni/preproc.py images/afni/surf_geometry.py images/afni/tissue_masks.py ./
+# The one-off probseg backfill (probseg-backfill WorkflowTemplate); runs tissue_masks.py.
+COPY images/afni/probseg_backfill.py ./
+# The one-off confounds-only re-run (confounds-rerun WorkflowTemplate); runs preproc.py.
+COPY images/afni/confounds_rerun.py ./
 
 # The IQMs and FuncQC record preproc.py imports. Shared with src/equivalence, which
 # recomputes the same record from another pipeline's outputs with this same code.

@@ -1,0 +1,207 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: confounds-rerun
+  namespace: argo-workflows
+
+###########################################################################
+# One-off: recompute one subject's published confounds TSVs, which FuncQC
+# 1.3 and earlier wrote with the old CompCor and cosine columns (FuncQC 1.4,
+# 2026-10-27). Only the TSVs and the four confound counts in each FuncQC
+# record are redone; the MNI BOLD, the dtseries and the tissue maps are kept.
+# CompCor reads the native BOLD, which every func workflow deletes, so the
+# subject's func inputs are fetched again first.
+#
+# Planned, submitted and verified by scripts/rerun_confounds.py, never by hand:
+# its per-subject plan under config/confounds-rerun/{label}/ is the contract,
+# and its `verify` is the proof. One workflow per subject, submitted by the
+# cloudpipe-queue-manager flow (workflow_template=confounds-rerun), so the
+# concurrency cap and pacing are the production ones. The flow sends the
+# cloudpipe master's parameters; this template declares them all, and reads
+# only subjID, batch-label (the plan's label) and the source collection.
+#
+#   https-transfer  rest + n-back only, into staging/confounds-rerun/{subj}/,
+#                   NOT mmps_mproc/: input staged there by a failed func
+#                   workflow is kept on purpose (#505), and the pod below
+#                   deletes its own staging prefix when it is done. Shares the
+#                   `https-transfer` semaphore with the cloudpipe master, so the
+#                   two never hold more than its count of source connections.
+#   confounds       images/afni/confounds_rerun.py, every planned run of every
+#                   session, one pod. Idempotent per run (a 1.4 record reads as
+#                   `already`), so retries are safe.
+#
+# There is no semaphore of its own and no exit handler: the outcomes file
+# under config/confounds-rerun/{label}/outcomes/ is the record, and the
+# subject's WorkflowRun and StepOutcome rows still describe the workflow that
+# produced its derivatives. Its cost is not recorded either: the scraper and
+# the cost-gap check skip workflows named `confounds-rerun-*`
+# (src/metrics/kubecost_scraper.py UNRECORDED_WORKFLOW_PREFIXES).
+###########################################################################
+
+spec:
+  workflowMetadata:
+    annotations:
+      workflows.argoproj.io/title: "{{workflow.parameters.subjID}}"
+      workflows.argoproj.io/description: "confounds re-run {{workflow.parameters.batch-label}}"
+    labels:
+      pipeline: confounds-rerun
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  podMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+    labels:
+      app: cloudpipe
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnPodSuccess
+
+  # The cloudpipe master's TTL, for its reason: retained Workflow objects are
+  # (completion rate x TTL) + concurrency in the controller's informer cache.
+  ttlStrategy:
+    secondsAfterCompletion: 14400
+
+  activeDeadlineSeconds: 86400
+
+  arguments:
+    parameters:
+      - name: subjID
+      # The plan's label: config/confounds-rerun/{batch-label}/subjects/{subjID}.json.
+      - name: batch-label
+        value: ''
+      - name: globus-source-collection-id
+      - name: globus-source-base-path
+      # Sent by the queue manager and NOT read: the staging prefix and the scan
+      # types are fixed below, so no submission can point the pod's delete at
+      # mmps_mproc/ or stage anatomy.
+      - name: globus-dest-collection-id
+        value: ''
+      - name: globus-dest-base-path
+        value: ''
+      - name: globus-scan-types
+        value: ''
+      - name: ingress-mode
+        value: https
+      - name: fastsurfer-device
+        value: cpu
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  entrypoint: confounds-rerun-dag
+
+  templates:
+  - name: confounds-rerun-dag
+    dag:
+      tasks:
+        - name: https-transfer-dagtask
+          templateRef:
+            name: globus-transfer
+            template: https-transfer-template
+          arguments:
+            parameters:
+              - name: source-collection-id
+                value: '{{workflow.parameters.globus-source-collection-id}}'
+              - name: source-base-path
+                value: '{{workflow.parameters.globus-source-base-path}}'
+              - name: dest-bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: dest-base-path
+                value: staging/confounds-rerun
+              - name: scan-types
+                value: '["rest","nback"]'
+
+        - name: confounds-dagtask
+          depends: https-transfer-dagtask.Succeeded
+          template: confounds-template
+
+  - name: confounds-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: functional
+        cloudpipe.io/step: confounds-rerun
+    # Spot reclaims and S3 errors only, the same codes as functional-preprocessing:
+    # 64/143 executor or SIGTERM, 75 the module's own S3-error exit (which keeps
+    # the staged input for the retry). A run preproc.py fails on is recorded and
+    # the pod exits 1 after the rest, never retried.
+    retryStrategy:
+      limit: "8"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:624223ddffb69842b9c45b184a65010c387d471c1b0ee6ab69ecab547f9d0c79"
+      imagePullPolicy: IfNotPresent
+      command: [/entrypoint.sh, python, -u, /app/confounds_rerun.py]
+      args:
+        - --label
+        - "{{workflow.parameters.batch-label}}"
+        - --subject
+        - "{{workflow.parameters.subjID}}"
+        - --staging-prefix
+        - "staging/confounds-rerun/{{workflow.parameters.subjID}}"
+        - --data-bucket
+        - "{{workflow.parameters.bucket}}"
+        - --metrics-bucket
+        - "{{workflow.parameters.metrics-bucket}}"
+        - --region
+        - "{{workflow.parameters.region}}"
+        - --scratch
+        - /tmp
+      env:
+        # preproc.py's --threads; must equal the cpu request below.
+        - name: CPU_REQUEST
+          valueFrom:
+            resourceFieldRef:
+              containerName: main
+              resource: requests.cpu
+              divisor: "1"
+        - name: ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS
+          value: "2"
+        # Provenance in each outcome line (confounds_rerun.host_identity).
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+      resources:
+        # One run at a time: its native BOLD (~0.4 GB gzipped), the
+        # uncompressed copy preproc.py reads (~0.6 GB) and the float32 array
+        # compute_confounds loads (~1.3 GB, freed after the ROIs are cut).
+        # functional-preprocessing runs the same Stage 6 inside its 4G request.
+        requests:
+          cpu: "2"
+          memory: 4G
+          ephemeral-storage: 6G
+        limits:
+          memory: 6G
+          ephemeral-storage: 12G

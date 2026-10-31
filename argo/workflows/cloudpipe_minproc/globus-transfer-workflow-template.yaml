@@ -1,3 +1,8 @@
+# The network ingress step. The WorkflowTemplate and file keep the name
+# `globus-transfer` although the Globus Transfer task and the Globus Connect
+# Server host it ran on are retired (openspec retire-globus-host): the master,
+# confounds-rerun and both fmriprep_bench templates call it by this name, and a
+# rename would have to change every caller at once.
 apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
@@ -8,222 +13,25 @@ spec:
   templates:
 
   ###########################################################################
-  # Starts the Globus Connect Server EC2 instance and waits until it passes
-  # its status checks before the transfer step runs.  The instance ID is
-  # read from SSM Parameter Store so the template stays infrastructure-agnostic.
-  ###########################################################################
-
-  - name: start-globus-instance-template
-    metadata:
-      labels:
-        cloudpipe.io/phase: transfer
-        cloudpipe.io/step: start-globus-instance
-    # `Always`, not `OnFailure` — see the note on globus-transfer-template below.
-    retryStrategy:
-      limit: "3"
-      retryPolicy: Always
-      backoff:
-        duration: "30s"
-        factor: "2"
-
-    nodeSelector:
-      karpenter.sh/nodepool: cpu-light-nodepool
-
-    script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
-      imagePullPolicy: IfNotPresent
-      resources:
-        requests:
-          memory: 128M
-          cpu: '100m'
-          ephemeral-storage: 200M
-      env:
-        - name: AWS_DEFAULT_REGION
-          valueFrom:
-            configMapKeyRef:
-              name: cloudpipe-config
-              key: region
-      command: ["sh", "-c"]
-      source: |
-        python - <<EOF
-        import boto3
-        import socket
-        import sys
-        import time
-
-        ssm = boto3.client('ssm')
-        ec2 = boto3.client('ec2')
-
-        instance_id = ssm.get_parameter(
-            Name='/cloudpipe/globus/instance-id'
-        )['Parameter']['Value']
-
-        state = ec2.describe_instance_status(
-            InstanceIds=[instance_id],
-            IncludeAllInstances=True
-        )['InstanceStatuses'][0]['InstanceState']['Name']
-
-        if state == 'running':
-            print(f"Instance {instance_id} is already running.")
-        else:
-            print(f"Starting instance {instance_id} (current state: {state})...")
-            ec2.start_instances(InstanceIds=[instance_id])
-            waiter = ec2.get_waiter('instance_status_ok')
-            waiter.wait(
-                InstanceIds=[instance_id],
-                WaiterConfig={'Delay': 15, 'MaxAttempts': 40}
-            )
-            print(f"Instance {instance_id} passed EC2 health checks.")
-
-        # EC2 health checks pass before gcs-auto-reregister finishes starting gridftp.
-        # Poll port 443 until gridftp is accepting connections.
-        public_ip = ec2.describe_instances(
-            InstanceIds=[instance_id]
-        )['Reservations'][0]['Instances'][0]['PublicIpAddress']
-
-        # EC2 status checks pass before gcs-auto-reregister.service finishes
-        # restarting gridftp on the GCS instance. Polling port 443 directly
-        # is the correct readiness signal — the status check is not sufficient.
-        print(f"Waiting for gridftp on {public_ip}:443...")
-        for attempt in range(40):
-            try:
-                with socket.create_connection((public_ip, 443), timeout=5):
-                    print(f"gridftp is ready after {attempt * 15}s.")
-                    sys.exit(0)
-            except (OSError, socket.timeout):
-                print(f"  attempt {attempt + 1}/40: not ready, retrying in 15s...")
-                time.sleep(15)
-
-        print("Timed out waiting for gridftp on port 443.", file=sys.stderr)
-        sys.exit(1)
-        EOF
-
-  ###########################################################################
-  # Submits a Globus transfer from the remote collection to the destination
-  # collection and polls until completion.
-  #
-  # dest-collection-id points to the S3-backed collection, so GridFTP writes go
-  # directly to S3 and the transfer is the whole ingress. The POSIX staging
-  # alternative (EBS volume plus a follow-on sync step) was removed; `presynced`
-  # is the non-Globus path now. See ADR 001.
-  #
-  # Inputs:
-  #   source-collection-id  UUID of the remote Globus collection
-  #   source-base-path      Collection root on the source (subject ID appended automatically)
-  #   dest-collection-id    UUID of the destination GCS collection
-  #   dest-base-path        Path within the destination collection (subject ID appended automatically)
-  #   scan-types            JSON array of BIDS scan types, e.g. '["T1w","T2w","rest"]'
-  ###########################################################################
-
-  - name: globus-transfer-template
-    metadata:
-      labels:
-        cloudpipe.io/phase: transfer
-        cloudpipe.io/step: globus-transfer
-    synchronization:
-      semaphores:
-        - configMapKeyRef:
-            name: cloudpipe-semaphores
-            key: globus-transfer
-    # `Always`, not `OnFailure`. OnFailure retries phase=Failed only, and a
-    # throttled control plane produces phase=Error — `pod deleted`, or a wait
-    # container that cannot report status at all. So the retry budget was
-    # unreachable for exactly the failure class retries exist to absorb: in the
-    # 300-subject batch of 2026-08-14, four subjects died here inside a 41-second
-    # window on `etcdserver: throttle: too many requests`, each with one attempt
-    # and zero retries. See issue #269.
-    #
-    # No `expression` here, deliberately, unlike the workflow-level strategy in
-    # cloudpipe-long-master-workflow-template.yaml. That one exists to keep an
-    # 8-attempt budget away from deterministic failures on expensive GPU and
-    # cpu-heavy steps. This step is a 100m/256M cpu-light pod whose work is
-    # idempotent, and transfer.py exits 1 on transient Globus conditions
-    # (auth refresh, rate limiting) that OnFailure already retried — an
-    # infrastructure-codes-only expression would silently REDUCE coverage here
-    # rather than add the missing phase=Error case. `Always` with no expression
-    # is the strict superset of the behaviour being replaced.
-    #
-    # limit stays 3 rather than inheriting the workflow's 8: this step holds a
-    # semaphore (above), so its attempts are serialized against every other
-    # subject's transfer.
-    retryStrategy:
-      limit: "3"
-      retryPolicy: Always
-      backoff:
-        duration: "60s"
-        factor: "2"
-    activeDeadlineSeconds: 7200
-
-    inputs:
-      parameters:
-        - name: source-collection-id
-        - name: source-base-path
-        - name: dest-collection-id
-        - name: dest-base-path
-        - name: scan-types
-
-    nodeSelector:
-      karpenter.sh/nodepool: cpu-light-nodepool
-
-    container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:f7e0b78856c096c64147308f7ffcbbf5e3fd1f3dd913ed8a63b2ab242cba4d3d"
-      imagePullPolicy: IfNotPresent
-
-      resources:
-        requests:
-          memory: 256M
-          cpu: '100m'
-          ephemeral-storage: 200M
-
-      env:
-        - name: GLOBUS_NATIVE_APP_CLIENT_ID
-          valueFrom:
-            secretKeyRef:
-              name: globus-credentials
-              key: native-app-client-id
-        - name: GLOBUS_REFRESH_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: globus-credentials
-              key: refresh-token
-
-      command: [python, /app/transfer.py]
-      args:
-        - --subject-id
-        - '{{workflow.parameters.subjID}}'
-        - --source-collection-id
-        - '{{inputs.parameters.source-collection-id}}'
-        - --source-base-path
-        - '{{inputs.parameters.source-base-path}}'
-        - --dest-collection-id
-        - '{{inputs.parameters.dest-collection-id}}'
-        - --dest-base-path
-        - '{{inputs.parameters.dest-base-path}}'
-        - --scan-types
-        - '{{inputs.parameters.scan-types}}'
-        # The run's identity, not its name: Argo reuses workflow names across
-        # subjects, so a label built from the name alone can make one run adopt
-        # or cancel another's transfer. Safe to pass only because the pinned
-        # digest is an image that accepts it; transfer.py treats it as optional
-        # so the image could ship before this line existed.
-        - --workflow-uid
-        - '{{workflow.uid}}'
-
-  ###########################################################################
   # ingress-mode=https (openspec add-https-ingress-mode). Lists the subject
-  # through the Transfer API with globus-transfer-template's filter, then copies
-  # it with rclone over the source collection's own HTTPS server, straight into
+  # through the Globus Transfer API with production's scan-type filter
+  # (`listing.discover_files`), then copies it with rclone over the source
+  # collection's own HTTPS server, straight into
   # s3://{dest-bucket}{dest-base-path}/{subject}/, and checks every object's
   # size against the listing (images/globus/https_ingress.py). No Globus host
-  # of ours is involved, so nothing starts one.
+  # of ours is involved.
   #
   # Runs on ingress-nodepool: public-subnet nodes whose public address carries
   # this download, so it pays no NAT. Nothing else tolerates that pool's taint
   # (tests/argo/test_ingress_modes.py), and the nodes admit no inbound from the
   # internet (tests/test_ingress_node_isolation.py; plan 018 §8, option B).
   #
-  # Inputs: as globus-transfer-template, minus dest-collection-id (there is no
-  # destination collection in this path), plus dest-bucket.
+  # Inputs:
+  #   source-collection-id  UUID of the remote Globus collection
+  #   source-base-path      Collection root on the source (subject ID appended automatically)
+  #   dest-bucket           S3 bucket the copy writes to
+  #   dest-base-path        Prefix within dest-bucket (subject ID appended automatically)
+  #   scan-types            JSON array of BIDS scan types, e.g. '["T1w","T2w","rest"]'
   ###########################################################################
 
   - name: https-transfer-template
@@ -231,20 +39,39 @@ spec:
       labels:
         cloudpipe.io/phase: transfer
         cloudpipe.io/step: https-transfer
-    # Its own key, not globus-transfer's, so the two modes can run side by side
-    # during the test batch without sharing a cap (design D7).
+    # Caps concurrent copies against the source; the value and why it is not
+    # higher are in cloudpipe-semaphores-configmap.yaml.
     synchronization:
       semaphores:
         - configMapKeyRef:
             name: cloudpipe-semaphores
             key: https-transfer
-    # globus-transfer-template's strategy, for its reasons (above), with one
-    # exception: exit 78 is the step REFUSING — a session past the 30-day rule,
-    # or no HTTPS token — and it fails identically on every attempt, so a retry
-    # would only delay the message. Any other code, including an absent one
-    # (an init or wait container died), still retries. This is the one
+    # `Always`, not `OnFailure`. OnFailure retries phase=Failed only, and a
+    # throttled control plane produces phase=Error — `pod deleted`, or a wait
+    # container that cannot report status at all. So the retry budget was
+    # unreachable for exactly the failure class retries exist to absorb: in the
+    # 300-subject batch of 2026-08-14, four subjects died on the ingress step
+    # (then Globus's) inside a 41-second window on `etcdserver: throttle: too
+    # many requests`, each with one attempt and zero retries. See issue #269.
+    #
+    # Not the workflow-level `expression` from
+    # cloudpipe-long-master-workflow-template.yaml either. That one exists to
+    # keep an 8-attempt budget away from deterministic failures on expensive GPU
+    # and cpu-heavy steps. This step's work is idempotent (a rerun copies only
+    # what is missing), and it exits 1 on transient Transfer API conditions
+    # (auth refresh, rate limiting) — an infrastructure-codes-only expression
+    # would silently REDUCE coverage here.
+    #
+    # One exception: exit 78 is the step REFUSING — a session past the 30-day
+    # rule, or no HTTPS token — and it fails identically on every attempt, so a
+    # retry would only delay the message. Any other code, including an absent
+    # one (an init or wait container died), still retries. This is the one
     # expression tests/argo/test_retry_expression.py allows to differ from the
     # canonical string, and only as exactly this.
+    #
+    # limit is 3 rather than the workflow's 8: this step holds a semaphore
+    # (above), so its attempts are serialized against every other subject's
+    # copy.
     retryStrategy:
       limit: "3"
       retryPolicy: Always
@@ -271,9 +98,9 @@ spec:
         effect: NoSchedule
 
     container:
-      # The same image and digest as globus-transfer-template: the HTTPS step
-      # imports transfer.py's listing, and the pin job rewrites both lines.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:f7e0b78856c096c64147308f7ffcbbf5e3fd1f3dd913ed8a63b2ab242cba4d3d"
+      # The cloudpipe/globus image, pinned by digest (the pin job rewrites this
+      # line): it ships https_ingress.py with the listing module it imports.
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:5ee53a82de205dc8f656a07461e6b797c446e17c9355d5163ad1625751d54bab"
       imagePullPolicy: IfNotPresent
 
       # Plan 018 §7: one subject peaked at 1,118 MiB, about 8.4 CPU-s per GiB

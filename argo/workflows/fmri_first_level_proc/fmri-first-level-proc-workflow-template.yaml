@@ -53,7 +53,7 @@ spec:
     # artifact-staging class (#277). A missing artifact KEY is excluded, though:
     # its producer was skipped or failed, and a consumer retry cannot re-run the
     # producer. See the cloudpipe master template for the detail.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"

@@ -1,9 +1,9 @@
 """Stage one subject from the NBDC source collection over HTTPS (openspec add-https-ingress-mode).
 
 Runs as the `https-transfer` step of `ingress-mode=https`, once per subject, on the
-ingress node pool. It writes the same tree Globus ingress writes —
+ingress node pool. It writes the tree Globus ingress wrote —
 `{dest-base-path}/{subject}/{session}/{dir}/{file}` in the data bucket — so
-`ingress-verify`, inventory and everything after cannot tell the modes apart.
+`ingress-verify`, inventory and everything after see the layout they always have.
 Three phases, each with a failure behind it:
 
 **1. Refuse a stale session before any request.** The source grants access to a
@@ -18,10 +18,11 @@ for a hand `argo submit`.
 
 **2. List with production's walk, copy with rclone.** The HTTPS server cannot list
 directories, so the file set comes from the Transfer API through
-`transfer.discover_files` — the same filter and the same `TRANSFER-SUMMARY` line
-as Globus ingress. rclone then copies those exact paths. The access token reaches
-it only through `RCLONE_HTTP_HEADERS`, never its command line, so it appears in
-no process listing and no log. `no_check_bucket` stops rclone calling
+`listing.discover_files` — the filter Globus ingress used, and the same
+`TRANSFER-SUMMARY` line it printed. rclone then copies those exact paths. The
+access token reaches it only through `RCLONE_HTTP_HEADERS`, never its command
+line, so it appears in no process listing and no log. `no_check_bucket` stops
+rclone calling
 `CreateBucket` before its first upload, which failed with
 `IllegalLocationConstraintException` (plan 018, first T3 pod).
 
@@ -64,8 +65,8 @@ from urllib.parse import quote
 
 import boto3
 import globus_sdk
+import listing
 import requests
-import transfer
 
 from globus_admin.errors import globus_error
 from globus_admin.exits import CliError
@@ -151,8 +152,8 @@ def check_session(
 class RecordingTransferClient:
     """Passes `operation_ls` through and keeps every file's listed size.
 
-    `transfer.discover_files` keeps paths only. Wrapping the client, rather than
-    copying the walk, keeps the file set exactly the one Globus ingress transfers.
+    `listing.discover_files` keeps paths only. Wrapping the client, rather than
+    copying the walk, keeps the file set exactly the one the listing decides.
     """
 
     def __init__(self, inner: Any) -> None:
@@ -174,7 +175,7 @@ def list_subject(
     transfer_client: Any, source_id: str, subject_root: str, scan_types: list[str], subject_id: str
 ) -> tuple[Any, dict[str, int]]:
     recorder = RecordingTransferClient(transfer_client)
-    discovery = transfer.discover_files(
+    discovery = listing.discover_files(
         recorder, source_id, subject_root, scan_types, subject_id=subject_id
     )
     sizes = {rel: recorder.sizes[f"{subject_root}/{rel}"] for rel in discovery.rel_paths}
@@ -459,7 +460,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Prefix in the bucket, e.g. /mmps_mproc; the subject ID is appended",
     )
-    parser.add_argument("--scan-types", required=True, help="JSON array, as for transfer.py")
+    parser.add_argument(
+        "--scan-types",
+        required=True,
+        help=f"JSON array of scan types; valid: {sorted(listing.VALID_SCAN_TYPES)}",
+    )
     parser.add_argument("--session-param", default=SESSION_PARAM)
     parser.add_argument("--max-session-days", type=int, default=MAX_SESSION_DAYS)
     return parser.parse_args(argv)
@@ -480,7 +485,7 @@ def run(
     prober: Callable[..., dict[str, Any]] = probe_source,
 ) -> None:
     scan_types = json.loads(args.scan_types)
-    invalid = set(scan_types) - transfer.VALID_SCAN_TYPES
+    invalid = set(scan_types) - listing.VALID_SCAN_TYPES
     if invalid:
         raise ValueError(f"Unknown scan type(s): {sorted(invalid)}")
 
@@ -494,7 +499,7 @@ def run(
     discovery, sizes = list_subject(
         transfer_client, args.source_collection_id, source_root, scan_types, args.subject_id
     )
-    transfer.emit_summary(discovery, log=log)
+    listing.emit_summary(discovery, log=log)
     if not sizes:
         raise RuntimeError(
             "No matching files found for any requested scan type — check source-base-path "
@@ -565,7 +570,7 @@ def main(argv: list[str] | None = None) -> None:
             env=env,
             now=datetime.now(UTC),
             read_param=_read_param,
-            transfer_client=transfer.build_transfer_client(
+            transfer_client=listing.build_transfer_client(
                 env["GLOBUS_NATIVE_APP_CLIENT_ID"], env["GLOBUS_REFRESH_TOKEN"]
             ),
             auth_client=globus_sdk.NativeAppAuthClient(env["GLOBUS_NATIVE_APP_CLIENT_ID"]),
@@ -575,10 +580,10 @@ def main(argv: list[str] | None = None) -> None:
         print(f"error: {err}", file=sys.stderr, flush=True)
         sys.exit(EXIT_REFUSED)
     except CliError as err:
-        transfer.report_error(err)
+        listing.report_error(err)
         sys.exit(1)
     except globus_sdk.TransferAPIError as exc:
-        transfer.report_error(globus_error(exc))
+        listing.report_error(globus_error(exc))
         sys.exit(1)
     except (ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr, flush=True)

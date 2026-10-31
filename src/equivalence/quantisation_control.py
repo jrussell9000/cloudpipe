@@ -208,6 +208,8 @@ def quantisation_floor(
         mask_image,
         nib.Nifti1Image(quantised_data, image.affine, image.header),
         mask_image,
+        # One image against itself: its own mask is the only common mask there is.
+        template_mask=mask_image,
         n_nss_frames=n_nss_frames,
     )
 

@@ -65,7 +65,7 @@ argo submit --from workflowtemplate/cloudpipe \
 | Service account | `argo-workflows-runner` (Pod Identity → S3 + SSM) |
 | Security context | `runAsUser: 1000`, `runAsGroup: 1000`, `fsGroup: 1000` |
 | Karpenter annotation | `karpenter.sh/do-not-disrupt: "true"` on all pods |
-| Retry | limit 8, policy `Always`, triggers on `pod deleted`/`imminent node shutdown` or exit codes 64/75/143; backoff 1m × 2, capped at 5m. Exit 137 is **not** retried — see [operations.md](operations.md) |
+| Retry | limit 8, policy `Always`, triggers on `pod deleted`/`imminent node shutdown` or exit codes 64/75/143, or a failed pod whose main exited 0 (#404); backoff 1m × 2, capped at 5m. Exit 137 is **not** retried — see [operations.md](operations.md) |
 | `failFast` | `false` on all DAGs — a failed session does not abort other sessions or the anatomical phase |
 | Active deadline | 43200 seconds (12 hours) |
 | `ttlStrategy` | 86400 seconds after completion |
@@ -303,7 +303,7 @@ Surface reconstruction on the template: `--surf_only --base --edits --3T --fsapa
 
 Inputs: `template-base.tar.gz` from A, landed directly at `/work/subjects/{subjID}_template`, plus `config/fslicense`. `fsaverage` comes from the image (see Step A).
 
-On completion the step asserts `surf/{lh,rh}.white` and `mri/filled.mgz` exist and exits 75 (`EX_TEMPFAIL`, retryable) if not — `run_fastsurfer.sh` traps SIGTERM and exits 0 even when its `recon-all` child is killed mid-reconstruction by a spot reclaim, which would otherwise promote a truncated template that only detonates two steps later at `segment-subregions`.
+On completion the step checks `surf/{lh,rh}.white` and `mri/filled.mgz`. If `run_fastsurfer.sh` exited **non-zero**, that code propagates as-is — a `recon-all` failure (`exited with ERRORS`) is deterministic, so it is not retried; the missing files are still named in the pod log. Only when `run_fastsurfer.sh` exited **0** with one of those files missing does the step exit 75 (`EX_TEMPFAIL`, retryable), the case the guard was written for: a reclaim that leaves a truncated template which would otherwise be promoted and only detonate two steps later at `segment-subregions`. The gate was added by #961 after the per-attempt archive showed the ungated guard had never fired on a reclaim (all 706 landed as exit 143) and had spent every one of its 153 firings retrying one deterministic HISTOalloc failure to budget exhaustion.
 
 Resources: 3G memory, 4 CPU, 20G ephemeral-storage. CPU is also the thread count, so it must not go below 2 — see Step D.
 
@@ -407,6 +407,64 @@ if (nbins <= 0) nbins = 255;   /* :122 — guards non-positive, not absurdly lar
 
 All four observed counts — 2001891713, 2001892225, 2109135873, 2128137089 — are exactly **`128k + 1`**, and 128 is precisely the float32 ULP at magnitude 2×10⁹. The `+1` in the values *is* the `+ 1.0` in that expression, and `fmax` lands on the float32 lattice as a real number must. Four independent values on that lattice by chance is ~1 in 2.7×10⁸. So `nbins` is a faithful computation over a volume that genuinely contains a voxel of ~2×10⁹. Do not revive the uninitialized-read hypothesis. (Nor the earlier NaN one: casting `NaN`/`Inf` to `int32` on x86 `cvttss2si` yields `0x80000000`, a large *negative* value.)
 
+##### Two corrections from the 2026-09-18 batch — read these before citing the block above
+
+**1. The guard quoted above is in the WRONG FUNCTION, and there is no guard on the failing path at all.**
+
+`mrihisto.cpp:121-122` belongs to `MRIhistogramRegion`. The call at `mrinorm.cpp:3371` is
+`MRIhistogram(mri_src, 0)` — a *different* function, at `utils/mrihisto.cpp:725`:
+
+```c
+MRIvalRange(mri, &fmin, &fmax);
+if (!nbins) nbins = nint(fmax - fmin + 1.0);   /* :733 */
+if (fmin == fmax) fmax = 255;                  /* :734 */
+histo = HISTOalloc(nbins);                     /* :735 — no bound, one-sided or otherwise */
+```
+
+There is **no `if (nbins <= 0)` line here**. So the "one-sided guard" framing — in this file and in
+[freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452) — is wrong, and
+the issue's **suggested fix #2 (`make the guard at :122 symmetric`) would patch a function that is
+not on the failing path.** That matters if upstream ever acts on it.
+
+The negative bin count below is the proof: a `nbins <= 0` guard existed the entire time and did
+nothing, because it is in the other function.
+
+`MRIhistogram` also indexes `histo->counts[bin_no]` at `:747` with no bounds check, so had the
+allocation ever succeeded it would write out of bounds — a second latent bug on the same path.
+
+**2. A NEGATIVE bin count is now observed, and it does not tell you the cause.**
+
+On 2026-09-18 six subjects in the `retry13-infra-0910` batch failed in
+`fastsurfer-template-parcellation` with
+
+```
+error: HISTOalloc(-2147483648): could not allocate histogram
+```
+
+`-2147483648` is `0x80000000`, the x86 "integer indefinite" result that `cvttss2si`/`cvttsd2si`
+return for **any** conversion they cannot represent — a finite value above `INT_MAX`, *or* `NaN`,
+*or* `Inf`. So this value is consistent with both the huge-finite mechanism established above and
+with the NaN/Inf reading that the paragraph above rules out on the strength of the counts being
+positive. **With a negative count you cannot distinguish them from the log**, and neither reading
+should be asserted without measuring `fmin`/`fmax` directly.
+
+None of the six is among the 18 subjects already queued for a patched re-run (the internal
+handoff names them all). Two further facts from that batch:
+
+- **It hits the TEMPLATE phase**, not only the per-session long phase. These failed on
+  `<subject>_template`, so the whole subject fails rather than one timepoint.
+- **The retries are futile and expensive.** The failure is deterministic, but the wrapper reports it
+  as `exit 75` (`surface reconstruction was interrupted; forcing retry`), so each subject re-ran a
+  full CPU FastSurfer parcellation up to 8 times before anyone noticed. 39 failed pods across 7
+  workflows in under 90 minutes. If a HISTOalloc signature appears, terminate rather than let it
+  retry.
+
+Neither correction changes the fix. The sentinel in
+`images/fastsurfer/patches/0001-mri_normalize-bias-outlier-sentinel.patch` bounds the value at
+`mri_normalize.cpp:805`, before any histogram exists, and tests `!isfinite(val)` as well as
+`|val| > 1e5` — so it covers the positive, the overflowed and the non-finite cases alike, and does
+not depend on which histogram function is called or which guard is missing.
+
 **Where the 2×10⁹ voxel comes from.** The `if (mri_aseg)` branch calls `MRIapplyBiasCorrectionSameGeometry` (`mri_normalize.cpp:805` in v7.4.1), whose inner loop at `utils/mrinorm.cpp:3652` is
 
 ```c
@@ -419,16 +477,118 @@ with no zero guard, no clamp, and — unlike the `-surface` branch, which calls 
 
 **This is why no data-side gate generalises.** The trigger is the *bias fit* — control-point geometry — not intensities. That is exactly the shape of the evidence in the note above: control-point counts, saturation fraction, WM-peak location and NaN/Inf screening each flagged a different victim and cleared the others. Stop looking for an intensity screen. A contributing condition, not a cause: ABCD minimally preprocessed input is already intensity-inhomogeneity corrected (Hagler et al. 2019), which is why `wm_snr_norm` sits essentially on top of `wm_snr_orig` in the metrics dictionary. With the multiplicative field already removed, the bias-field fit is unconstrained to begin with — plausibly why this path is reached on ABCD input at all and would be rarer on raw data.
 
-**FreeSurfer 8 does not fix it; a version bump is not a mitigation.** `utils/mrihisto.cpp`, `utils/histo.cpp` and `utils/mrinorm.cpp` are **byte-identical** across `v7.4.1`, `v8.0.0`, `v8.1.0`, `v8.2.0` and `dev` (md5 `6f471ccf…`, `402aac69…`, `27617d37…`). That was verified with a positive control — `CMakeLists.txt` differs across all four refs, and `mri_normalize.cpp` does differ between 7.4.1 and 8.2.0 (sole change: a `copyVolGeom` → struct-assignment refactor in LTA handling, on a path we do not take) — so the identical hashes are real and not a fetch artifact. `HISTOalloc` in `dev` still has no upper bound. **Filed upstream 2026-08-15 as [freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452)** (text retained at `plans/histoalloc-upstream-issue-draft.md`) — the ask is a one-line symmetric bound on an already-existing one-sided guard. But it is **not our fix path**: `images/fastsurfer/Dockerfile` is `FROM deepmi/fastsurfer:latest`, so a merged fix must traverse an FS release *plus* FastSurfer adoption. Do not plan around it landing.
+**FreeSurfer 8 does not fix it; a version bump is not a mitigation.** `utils/mrihisto.cpp`, `utils/histo.cpp` and `utils/mrinorm.cpp` are **byte-identical** across `v7.4.1`, `v8.0.0`, `v8.1.0`, `v8.2.0` and `dev` (md5 `6f471ccf…`, `402aac69…`, `27617d37…`). That was verified with a positive control — `CMakeLists.txt` differs across all four refs, and `mri_normalize.cpp` does differ between 7.4.1 and 8.2.0 (sole change: a `copyVolGeom` → struct-assignment refactor in LTA handling, on a path we do not take) — so the identical hashes are real and not a fetch artifact. `HISTOalloc` in `dev` still has no upper bound. **Filed upstream 2026-08-15 as [freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452)** (text retained at `plans/histoalloc-upstream-issue-draft.md`) — the ask is a bound on an unguarded allocation. (The issue says "make the existing one-sided guard symmetric"; that is **wrong**, and the correction above explains why — the guard it names is in `MRIhistogramRegion`, not in the `MRIhistogram` that this path calls.) It was for a long time **not our fix path**: `images/fastsurfer/Dockerfile` is `FROM deepmi/fastsurfer:latest`, so a merged fix must traverse an FS release *plus* FastSurfer adoption. Do not plan around it landing.
 
 **Both candidate mitigations are now measured, and both are dead.** The probe (`histoalloc-confirm-rw94n`, 2026-08-15, 6m22s) reproduced `HISTOalloc(2128137089)` — byte-identical to what this session produced in the 2026-08-14 batch, which incidentally confirms the cross-batch divergence came from the upstream GPU stage regenerating `norm.mgz` rather than from any nondeterminism in `mri_normalize`.
 
 - **An external clamp is impossible.** `norm.mgz` on disk is `uint8`, max **160** (`min_positive` 3, zero NaN/Inf), as is `nu.mgz` (3–255) and `T1.mgz` (2–252). A `uint8` file cannot carry a 2×10⁹ voxel at all, so the outlier is unambiguously manufactured in-memory after the read. There is nothing outside the process to clamp.
 - **Raising the address-space cap does not work either, and the reason matters.** At a 24 GiB cap it still died on `HISTOalloc`, but cgroup `memory.peak` reached **17.53 G** — which is 2 × 8.51 GiB, i.e. the histogram at `mrinorm.cpp:3371` *did* allocate and populate. What failed is the **second** one: `hsmooth = HISTOsmooth(h, NULL, 2)` at `:3379` calls `HISTOcopy` → another `HISTOalloc(nbins)`. Two live histograms at this bin count need **~34 GiB** before any volume is counted, so the real requirement is ~36 GiB *per session* and k=4 run in parallel. That is ~140 GiB of request to salvage 1% of sessions.
 
-So the mitigation set is down to two: **status quo** — the #245 guard rejects the timepoint, #273 lets the subject land `partial` with its other sessions delivered, ~1% session loss — or an **upstream fix**, which is filed but which we cannot schedule.
+So the mitigation set was down to two: **status quo** — the #245 guard rejects the timepoint, #273 lets the subject land `partial` with its other sessions delivered, ~1% session loss — or an **upstream fix**, which is filed but which we cannot schedule.
 
 One correction for the upstream issue that follows from this: the memory figure is **31.7 GiB for the pair**, not the 15.9 GiB quoted for a single histogram, and a bound has to land *before* `:3371` to help.
+
+#### The third option: we compile the fix ourselves
+
+Upstream #1452 has had no maintainer response since it was filed, and 22 scans are
+stranded behind it. `images/fastsurfer/Dockerfile` now carries a `mrinorm-builder`
+stage that compiles `mri_normalize` from pinned FreeSurfer `v7.4.1` source with
+`images/fastsurfer/patches/0001-mri_normalize-bias-outlier-sentinel.patch` applied,
+and replaces `/opt/freesurfer/bin/mri_normalize` in the vendored tree.
+
+**"We consume a prebuilt base, so we cannot patch FreeSurfer" was wrong, and the
+reason it looked true is worth recording.** The apparent blocker is
+`find_package(ITK ... REQUIRED)` at `CMakeLists.txt:187`, which suggests a full
+ITK build. In fact `mri_normalize` needs only `libutils.a` plus the in-tree
+`packages/`, and ITK enters solely through `include/mri.h:38` (`itkImage.h`,
+declaring `ITKImageType` and `MRI::toITKImage`/`loadITKImage`). The only callers of
+those two methods anywhere in the tree are `AntsDenoiseImageFs` and
+`AntsN4BiasFieldCorrectionFs`, neither of which `mri_normalize` reaches — so ITK is
+a *link-time* dependency here, not a numerical one. No VTK, Qt, PETSc or fspython
+build is needed.
+
+**The binary must be static, and the first build was not.** It linked Ubuntu's
+shared `libinsighttoolkit4-dev`, and the image checks only grepped the binary for the
+sentinel string. Executed in the runtime image, it could not load:
+`libITKTransformFactory-4.13.so.1: cannot open shared object file` (found
+2026-10-29, before anything was deployed). Merged, that image would have failed every
+surface run at its first `mri_normalize`. Two facts made it so: every binary in the
+vendored FreeSurfer tree is a static executable, so the runtime image carries no
+FreeSurfer libraries; and the `cu128-v2.5.4` base is Ubuntu 24.04, not the 22.04 the
+tree is named for. The builder now compiles ITK 4.13.2 (FreeSurfer's pinned version,
+Core group only) as static libraries from the checksum-pinned upstream release, and
+links `mri_normalize` with `-static`. The build fails if the result has a dynamic
+loader, and the runtime stage executes `mri_normalize --version`, which must report
+the patched build.
+
+**What the patch does.** It is a *sentinel*, not a clamp. Immediately after
+`MRIapplyBiasCorrectionSameGeometry` at `mri_normalize.cpp:805` it replaces any
+non-finite value, or any `|value| > 1e5`, with the volume's range ceiling. The
+threshold sits ~400× above the 0–255 range the program commits to at `:647`
+(`MRIchangeType(..., 0, 255, 1)`) and again at `:971`, so it cannot fire on data
+that does not exhibit the bug. A clamp *at* 255 was rejected: intermediate values
+above 255 are legitimate and later passes pull them back down, so that would be a
+real behaviour change.
+
+**Two corrections to the filed issue came out of writing it**, both worth carrying
+upstream:
+
+- **Suggested fix #4 in the issue — "revive the dead clamp at `mrinorm.cpp:1475`"
+  — is unreachable, not merely dead.** That clamp sits in `MRI3dNormalize`'s voxel
+  loop at `:1465`, downstream of the `MRInormFindControlPoints` call at `:1418`
+  that aborts. The same applies to the `FZERO(bias)` guard at `:1470`. Neither
+  "misses" the outlier; neither executes.
+- **The synthetic reproducer sketched in the issue does not work.**
+  `MRIbuildBiasImage` fits the bias field *to the data*, so a 2e9 voxel written
+  into `norm.mgz` becomes its own control point, the bias there is fitted to ~2e9,
+  and `val *= (target_val / bias)` divides it straight back to ~110. The bug needs
+  a voxel that has intensity and *no* bias support — the inverse of what injection
+  produces. Measured 2026-09-17: the sentinel does not fire on such a phantom
+  because there is nothing left to bound. Do not "fix" the phantom by making the
+  outlier larger; the mechanism is absorption, not magnitude.
+
+**Validated 2026-10-29, before merge, on real data** (the probe below, plus its analysis
+pass `scripts/manifests/histoalloc-patch-probe-analysis.yaml`):
+
+- **It fixes every victim tried.** 9 sessions that fail with `HISTOalloc` on stock 7.4.1
+  every time: 7 subjects, 3 with the ~2e9 count and 6 with `-2147483648`. All 9 now
+  complete the full longitudinal surface run, with four surfaces and no `IsRunning`. The
+  sentinel fired on each one.
+- **It is inert on healthy data.** On 19 healthy published sessions of the same subjects,
+  the patched binary's `brain.mgz` matches the published stock 7.4.1 output on every voxel
+  (0 differing, same dtype and geometry), and the sentinel never fired.
+- **It only ever zeroes background.** Every bounded voxel was **non-finite**: 1,167 to
+  280,153 per session, none finite. No voxel that has signal in `norm.mgz` and is labelled
+  tissue is 0 in the recovered `brain.mgz`, in any of the 9. So the bounded voxels are
+  background, where intensity 0 times an infinite gain gives NaN, and 0 is the right value.
+- **The anatomy is plausible.** eTIV, BrainSegVol, cortex volume, thickness and surface area
+  sit on each subject's own trajectory across the healthy sessions. There is one exception,
+  a session whose T1 ABCD's own QC rejects (`t1_indicator = 0`). It completes, but with half
+  the brain volume of its siblings. That is the input, not the patch: it has 0 holes too,
+  and the missing tissue has no signal in `norm.mgz`. Re-running a `t1_indicator = 0`
+  session gains nothing.
+
+**The mechanism, corrected by that run.** Bias correction does not produce a ~2e9 voxel.
+Where the smoothed bias image is exactly 0, `mrinorm.cpp:3652` produces NaN, or +Inf where
+there is signal. The next call, `MRI3dGentleNormalize` (`mri_normalize.cpp:908`), declares
+`int src, bias` (`mrinorm.cpp:1512`), and `src = MRIgetVoxVal(...)` (`:1601`) turns NaN into
+`INT_MIN`. `norm = (float)src * wm_target / bias` (`:1608`) then stores a finite ~-2.1e9.
+That is the outlier `MRIhistogram` sees, and it is negative. `fmax - fmin + 1` comes to
+about 2^31, and it wraps to `-2147483648` when the local bias is below ~110, which is why
+both signs occur. The sentinel runs before `:908`, so it removes the NaN before any of this.
+
+**Merging deploys it**: a Dockerfile change on `main`
+rebuilds the image and `update-image-refs` re-pins every template to the new digest.
+So the test has to run before the merge, against an image pushed under a test tag.
+`scripts/manifests/histoalloc-patch-probe.yaml` (internal repo only) does that: it
+replays real victims' `scratch/` intermediates through the patched image, and re-runs
+the patched binary on healthy published sessions to diff its `brain.mgz` against
+theirs.
+
+Also still unobserved: the near-zero divisor itself. `-W` writes the bias volume at
+`mrinorm.cpp:1447`, past the abort, so it remains *inferred*. An instrumented build
+printing the bias field's `min_positive` and `mri_dst`'s max right after `:805` would
+settle it, and would close the last open gap in #1452.
 
 `scripts/manifests/histoalloc-confirm-probe.yaml` (internal repo only) answers exactly that. `scratch/{workflow.name}/anat/` survives on a 7-day lifecycle, so the `sessions-seg/{ses}.tar.gz` and `template-parcellated.tar.gz` that fed a known failure can be re-staged byte-identically. It targets subject C `ses-02A` (`cloudpipe-knwr6`, k=2 — the cheapest victim) with `ses-00A` as a passing in-subject control, pins the failing batch's image tags rather than today's, and runs three stages: reproduce at the production 8G cap; report dtype/min/max/min-positive/NaN/Inf/`voxels>255`/implied-`nbins` for `nu T1 norm brainmask aseg.presurf brain` on victim **and** control; then re-run the failing command standalone under a 24G cap with `-W /tmp/cp.mgz /tmp/bias.mgz` to capture the fitted bias field. It publishes nothing and exits 0 regardless, so a successful experiment is not recorded as a failed workflow. **Its inputs expire ~2026-08-21**, so a re-run after that needs a fresh victim.
 
@@ -693,7 +853,7 @@ What `preproc.py` does (its own stage numbering):
 4. **Warp brain mask → MNI** — same `map_coordinates` call reusing stage 3's coordinate array, nearest-neighbour (`order=0`) to preserve binary values
 5. **Apply the MNI-space mask to the MNI-space BOLD** — AFNI `3dcalc`
    - **5b. Grayordinate extraction** — see below
-6. **Confound estimation** — motion params + derivatives + powers, FD, DVARS, global signal, aCompCor (WM/CSF from `aseg.auto.mgz`), tCompCor, cosine regressors, NSS outlier indicators
+6. **Confound estimation** — motion params + derivatives + powers, FD, DVARS, global signal, aCompCor (WM/CSF from `aseg.auto.mgz`) and tCompCor computed as nipype does for fMRIPrep (cosine high-pass, variance normalisation, components to 50% variance), cosine regressors, NSS outlier indicators
 
 Three things about that order are deliberate and easy to get wrong:
 
@@ -701,7 +861,9 @@ Three things about that order are deliberate and easy to get wrong:
 
 **Masking happens after the warp, not before.** A hard binary mask applied in native space creates a steep edge that sinc-family interpolation treats as high-frequency content, producing Gibbs ringing just inside and outside the cortex. So the *unmasked* BOLD is warped, the mask is warped separately with nearest-neighbour, and stage 5 zeroes non-brain voxels in MNI space.
 
-**There is no bandpass filter and no spatial smoothing.** Neither stage exists — outputs are unsmoothed and unfiltered by design. High-pass filtering is available *implicitly* instead, as a discrete cosine basis in the confounds TSV (1/128 Hz, `floor(2·T·TR/128)` regressors, the fMRIPrep convention), so drift is removed inside the analyst's model rather than baked into the data. Slice timing correction is likewise absent, and deliberately: ABCD ships neither a `SliceTiming` sidecar field nor the NIfTI header slice fields, so the stage that once existed here detected no timing on every run ever processed and was removed (see #119). It would have to be reinstated as a native-space step *before* this script; it cannot be applied after the stage-3 warp.
+**There is no bandpass filter and no spatial smoothing.** Neither stage exists — outputs are unsmoothed and unfiltered by design. High-pass filtering is available *implicitly* instead, as a discrete cosine basis in the confounds TSV (1/128 Hz, nipype's basis as in fMRIPrep: built over the steady-state frames, zero on the NSS rows, `max(floor(2·N·TR/128), 1) − 1` regressors for N steady-state frames, since FuncQC schema 1.4), so drift is removed inside the analyst's model rather than baked into the data. Slice timing correction is likewise absent, and deliberately: ABCD ships neither a `SliceTiming` sidecar field nor the NIfTI header slice fields, so the stage that once existed here detected no timing on every run ever processed and was removed (see #119). It would have to be reinstated as a native-space step *before* this script; it cannot be applied after the stage-3 warp.
+
+**Confounds written before FuncQC 1.4 are being replaced.** Until 2026-10-27, CompCor removed only the mean before its SVD, did not variance-normalise, kept at most 5 components and ranked tCompCor voxels on raw SD, and the cosine basis spanned every frame, NSS included. A run's confounds TSV is current only when its FuncQC record says `schema_version` 1.4. The TSV says so too: its `cosine_*` columns are zero on the NSS rows, and there are `max(floor(2·N·TR/128), 1) − 1` of them. The MNI BOLD, the dtseries, the tissue maps and the IQMs of a 1.3 run are already correct. CompCor needs the native BOLD, which is deleted after each workflow, so the confounds-only re-run (`scripts/rerun_confounds.py`, WorkflowTemplate `confounds-rerun`) fetches each subject's func input again and runs `preproc.py --emit confounds`. That is stages 1 and 6 only, the same stage-6 call a full run makes. It overwrites each TSV in place and then sets the four confound counts and the `schema_version` of its FuncQC record.
 
 **MNI BOLD is float32 end to end.** Stage 3 warps each frame in float32 into a disk-backed scratch file (`np.memmap`), then copies those frames, unscaled, into a float32 NIfTI (`DT_FLOAT32`, `scl_slope` 1, `scl_inter` 0). Stage 5's `3dcalc -datum float` keeps that type through masking. No array holds the whole 4D run in anonymous memory, so this stays under the step's 6G limit. Earlier writers were lossy:
 
@@ -736,7 +898,11 @@ derivatives/func/{subj}/{ses}/_complete.json                         # written l
 
 Sessions processed before 2026-10-14 still hold one tarball per run (`{prefix}_space-MNI152NLin2009cAsym_bold.tar.gz`, rooted at `{task}_{run}/`). Inventory, `recover_mni_bold`, and the reprocess and equivalence tools all read either layout. The func reprocess (plan 017) republishes every session in the exploded layout.
 
-The `res-1` files are the session's FastSurfer tissue masks in MNI. FastSurfer's `aseg.auto.mgz` is in the subject's conformed T1w space, so `tissue_masks.py` warps it to the 1 mm MNI152NLin2009cAsym template, the grid the t1w-to-MNI SyN warp is defined on. It uses that session's t1w-to-MNI transforms with nearest-neighbour interpolation, then assigns every brain label to one class: 1 = GM, 2 = WM, 3 = CSF. The `_dseg.tsv` is the lookup table, and the label lists are `TISSUE_LABELS` in the script. These are anatomical masks, not the aCompCor noise ROIs, which are narrower, eroded, and in native BOLD space. They are on the 1 mm grid, so resample one before applying it to the 2 mm BOLD. The `probseg` maps are a second, independent segmentation of the same session, and they are probabilistic. FastSurfer's `brainmask.mgz` (skull-stripped and bias-corrected, the input DIPY's example asks for) is warped to the same 1 mm grid with linear interpolation. DIPY 1.12.1's hidden-Markov-random-field classifier (`TissueClassifierHMRF`, `beta` 0.1) then fits three classes to it. This is the same model family as FSL FAST, which fMRIPrep's `probseg` comes from. Each voxel's three values sum to 1 inside the brain and are 0 outside it.
+The `res-1` files are the session's FastSurfer tissue masks in MNI. FastSurfer's `aseg.auto.mgz` is in the subject's conformed T1w space, so `tissue_masks.py` warps it to the 1 mm MNI152NLin2009cAsym template, the grid the t1w-to-MNI SyN warp is defined on. It uses that session's t1w-to-MNI transforms with nearest-neighbour interpolation, then assigns every brain label to one class: 1 = GM, 2 = WM, 3 = CSF. The `_dseg.tsv` is the lookup table, and the label lists are `TISSUE_LABELS` in the script. These are anatomical masks, not the aCompCor noise ROIs, which are narrower, eroded, and in native BOLD space. They are on the 1 mm grid, so resample one before applying it to the 2 mm BOLD. The `probseg` maps are a second, independent segmentation of the same session, and they are probabilistic. FastSurfer's `orig_nu.mgz` (N4 bias-corrected, not intensity-normalised), masked by `brainmask.mgz > 0`, is warped to the same 1 mm grid with linear interpolation. Its intensities are clipped at 4/3 of the dseg's median white-matter intensity. DIPY starts its three classes at 1/4, 1/2 and 3/4 of the image maximum, so a few bright vessel or fat voxels inside the mask would otherwise start the fit off the tissue. DIPY 1.12.1's hidden-Markov-random-field classifier (`TissueClassifierHMRF`, `beta` 0.1) then fits three classes to it. This is the same model family as FSL FAST, which fMRIPrep's `probseg` comes from, and fMRIPrep likewise feeds FAST an N4-corrected, unnormalised T1w. Each voxel's three values sum to 1 inside the brain and are 0 outside it.
+
+**Probseg written before the fix is unreliable.** Until 2026-10-26 the fit used `brainmask.mgz`'s own intensities. FastSurfer normalises white matter to exactly 110, so 13–18% of brain voxels share that value, and in 32 of 60 audited sessions the WM class collapsed onto that spike. Those files sum to 1 and cover the brain, but they name the wrong tissue: `label-CSF_probseg` holds the grey matter and CSF (around 1,300 ml), `label-GM_probseg` holds the white matter, and `label-WM_probseg` is nearly empty. A `probseg` is right only when its session has a TissueQC row (`metrics/tissue-masks/`) newer than the `probseg` objects. Only the fixed code writes those rows, so any other `probseg`, including one written after the fix by a workflow still running an older image, must be regenerated before use. `scripts/backfill_probseg.py` does that. The dseg and the masks were never affected.
+
+**Each fit is checked before it is written.** For every dseg class, the share of its voxels whose `probseg` argmax is that class must be at least `PROBSEG_MIN_AGREEMENT` (0.5). Sound fits score 0.68–0.91 per class, and collapsed ones 0.0–0.44 on WM. A fit below the threshold writes no `probseg` at all, and logs `probseg REJECTED`; the dseg and masks are still written. `scripts/audit_func_outputs.py` runs the same check on published sessions.
 
 - **Intensity, not anatomy.** On a pilot session they agreed with the FastSurfer masks at Dice 0.836 for GM and 0.860 for WM. They should disagree most where tissue does not look like its class, e.g. WM-bright deep grey nuclei. Their CSF includes sulcal CSF, which aseg's does not.
 - **Thresholding.** Thresholding a `probseg` gives a hard mask, but one that differs from the FastSurfer mask by construction.
@@ -760,6 +926,8 @@ Volume space for the subcortical block is `MNI152NLin2009cAsym`, matching the re
 ```
 derivatives/func_surf/{subj}/{ses}/components/{subj}_{ses}_{task}_{run}_desc-grayordcomponents_bold.tar.gz
 ```
+
+The driver uploads each tarball itself and confirms its size in S3 before it writes the run's `surface-sample` record. A failed upload records `surface-sample` failed for that run alone and exits 75, which the retry strategy retries. The tarballs used to be an Argo output artifact, uploaded after the main container had exited, by which time the records already said `succeeded`. On 2026-10-29 four pods were lost after 4 of their 6 tarballs. That left two runs per session recorded `succeeded` with no components, and no dtseries, because `surface-resample` did not run after an `Errored` func-preproc. It does now.
 
 **Independent gating.** `func_exists` and `surf_exists` are separate inventory markers, and `--emit` picks the cheapest path producing whatever is absent:
 

@@ -226,16 +226,6 @@ variable "globus_client_id" {
   type        = string
 }
 
-variable "globus_source_collection_id" {
-  description = "Globus source collection UUID (remote endpoint data is transferred from). Stored in SSM so flows read it at runtime."
-  type        = string
-}
-
-variable "globus_source_base_path" {
-  description = "Root path on the source collection containing subject data. Subject ID is appended automatically. Stored in SSM so flows read it at runtime."
-  type        = string
-}
-
 variable "globus_owner_email" {
   description = <<-EOT
     Globus identity (email) of the person an institution should contact about this

@@ -34,6 +34,7 @@ _PREFIXES = {
     "surface_qc": "metrics/surface-sample/",
     "anat_qc": "metrics/anat-qc/",
     "fsqc_qc": "metrics/fsqc-qc/",
+    "tissue_qc": "metrics/tissue-masks/",
     "registration_qc": "metrics/registration/",
     "workflow_runs": "metrics/workflow-runs/",
     "costs": "metrics/costs/",
@@ -124,6 +125,14 @@ class CloudpipeMetrics:
         than `> 0`, since 0 is a real value for rot_tal_* and n_outlier_norms.
         """
         return self._query("fsqc_qc", filters, dt_from, dt_to)
+
+    def tissue_qc(self, dt_from: str | None = None, dt_to: str | None = None, **filters: Any):
+        """Return the per-session MNI tissue-map QC (TissueQC) as a DataFrame.
+
+        DuckDB twin of athena.CloudpipeMetrics.tissue_qc — read that docstring
+        for the grain and for how probseg_written and NULLs combine.
+        """
+        return self._query("tissue_qc", filters, dt_from, dt_to)
 
     def anatomical_qc(self, dt_from: str | None = None, dt_to: str | None = None, **filters: Any):
         """Return anat_qc and fsqc_qc as ONE per-subject×session anatomical view.

@@ -22,7 +22,7 @@ spec:
     # artifact-staging class (#277). A missing artifact KEY is excluded, though:
     # its producer was skipped or failed, and a consumer retry cannot re-run the
     # producer — the same reasoning that keeps exit 66 out. See the master template.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -165,6 +165,7 @@ spec:
   #                     (per session: DIPY HMRF tissue probabilities, 1 mm MNI)
   #   derivatives/func_surf/{subjID}/{session}/components/
   #     {subjID}_{session}_{task}_{run}_desc-grayordcomponents_bold.tar.gz
+  #                     (the driver too, before the surface-sample records)
   #
   # The two derivatives gate independently on inventory's func_exists and
   # surf_exists, and --emit selects the cheapest path producing what is absent:
@@ -192,8 +193,10 @@ spec:
       # Infrastructure codes only — see the spec-level block above for why 137 is
       # deliberately absent and what 75 is reserved for, and #277 for why the codes
       # are matched in the message as well as in exitCode, and why a missing
-      # artifact key is excluded from that.
-      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      # artifact key is excluded from that. "0" is #404: every session closed with
+      # one attempt there was THIS step, its main already exited 0 — see the
+      # master template for the mechanism.
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
       backoff:
         duration: "1m"
         factor: "2"
@@ -304,9 +307,22 @@ spec:
             region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/aseg.auto.mgz'
 
-        # Skull-stripped, bias-corrected T1w: the input to the DIPY probseg maps
-        # (tissue_masks.py --brainmask). A single .mgz, so `archive: none` is
-        # required for the same reason as the aseg above (#274).
+        # The DIPY probseg maps (tissue_masks.py --brainmask --orig-nu) take their
+        # brain extent from brainmask.mgz and their intensities from orig_nu.mgz
+        # (N4-corrected, not WM-normalised). brainmask.mgz's own intensities put
+        # 13-18% of the brain at exactly 110, and the WM class collapsed onto
+        # that spike in about half the sessions (2026-10-26). Single .mgz files,
+        # so `archive: none` is required for the same reason as the aseg (#274).
+        - name: fastsurfer-orig-nu
+          path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/orig_nu.mgz'
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/orig_nu.mgz'
+
         - name: fastsurfer-brainmask
           path: '/tmp/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/brainmask.mgz'
           archive:
@@ -366,28 +382,7 @@ spec:
 
     outputs:
       artifacts:
-        # Per-run StepOutcome JSON records, written directly by the driver
-        # (see ADR 016) instead of a separate outcome-recorder pod per run.
-        # The driver knows each run's real success/failure the moment it
-        # happens; a sibling DAG task re-deriving the same fact from an S3
-        # head_object is strictly worse information at higher cost. Filenames
-        # match StepOutcome.s3_key() exactly, so this uploads straight into
-        # the existing metrics/step-outcomes/ layout Athena already reads.
-        # optional: a session where every run was already complete writes no
-        # local files here, only the fallback aggregate record covers a pod
-        # that dies before this `finally` block runs (see the master
-        # template's record-outcome-func-preproc-dagtask /
-        # record-outcome-surface-sample-dagtask).
-        - name: step-outcomes
-          optional: true
-          path: /tmp/step_outcomes
-          archive:
-            none: {}
-          s3:
-            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
-            bucket: "{{workflow.parameters.metrics-bucket}}"
-            region: "{{workflow.parameters.region}}"
-            key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
+        # The step-outcomes artifact is LAST in this list (see there).
         # No output artifact for derivatives/func/: the driver publishes the
         # session's exploded files itself (images/shared/func_derivatives.py),
         # because the completion marker must land after every other object and
@@ -407,20 +402,11 @@ spec:
             region: "{{workflow.parameters.region}}"
             key: 'metrics/func-preproc/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
 
-        # Per-run grayordinate components (Stage 1): per-hemisphere fsnative
-        # GIFTI plus the MNI subcortical block and its label volume. Built and
-        # named by the driver, same as the volumetric tarball — the filename is
-        # inventory's surf_exists marker.
-        - name: grayord-components
-          optional: true
-          path: /tmp/surf_out
-          archive:
-            none: {}
-          s3:
-            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
-            bucket: "{{workflow.parameters.bucket}}"
-            region: "{{workflow.parameters.region}}"
-            key: 'derivatives/func_surf/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/components/'
+        # No output artifact for the per-run grayordinate components either: the
+        # driver uploads them itself (upload_components) BEFORE it writes the
+        # surface-sample records. As an artifact they went up after main exited,
+        # when the records already said `succeeded` (2026-10-29: four pods lost
+        # after 4 of 6 tarballs).
 
         # Session-level surface geometry (sphere.reg + midthickness as GIFTI),
         # written once per session. Small, and the reason the Stage 2 pod can
@@ -452,11 +438,55 @@ spec:
             region: "{{workflow.parameters.region}}"
             key: 'metrics/surface-sample/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
 
+        # Per-session TissueQC (tissue_masks.py --qc-out): the dseg and probseg
+        # volumes and their agreement, and whether the probseg was written.
+        - name: tissue-qc
+          optional: true
+          path: /tmp/tissue_qc
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            # Metrics artifact → versioned metrics bucket, not the data bucket.
+            bucket: "{{workflow.parameters.metrics-bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'metrics/tissue-masks/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
+
+        # Per-run StepOutcome JSON records, written directly by the driver
+        # (see ADR 016) instead of a separate outcome-recorder pod per run.
+        # The driver knows each run's real success/failure the moment it
+        # happens; a sibling DAG task re-deriving the same fact from an S3
+        # head_object is strictly worse information at higher cost. Filenames
+        # match StepOutcome.s3_key() exactly, so this uploads straight into
+        # the existing metrics/step-outcomes/ layout Athena already reads.
+        # optional: a session where every run was already complete writes no
+        # local files here, only the fallback aggregate record covers a pod
+        # that dies before this `finally` block runs (see the master
+        # template's record-outcome-func-preproc-dagtask /
+        # record-outcome-surface-sample-dagtask).
+        #
+        # LAST, after the QC artifacts it vouches for. The wait sidecar was seen
+        # uploading in declaration order (2026-10-29), so a pod lost mid-upload
+        # leaves no records, and the fallback recorder's session-level `error`
+        # stands instead of per-run records claiming QC that never landed.
+        # Argo does not document that order, so this narrows the window; the
+        # derivatives themselves no longer depend on it (upload_components).
+        - name: step-outcomes
+          optional: true
+          path: /tmp/step_outcomes
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.metrics-bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
+
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:509bd6cbfac6c856e7f25efd02e18297eec475dff4c1be97b0cff4a4c1776b05"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:624223ddffb69842b9c45b184a65010c387d471c1b0ee6ab69ecab547f9d0c79"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -515,7 +545,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:509bd6cbfac6c856e7f25efd02e18297eec475dff4c1be97b0cff4a4c1776b05"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:624223ddffb69842b9c45b184a65010c387d471c1b0ee6ab69ecab547f9d0c79"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather
@@ -638,7 +668,8 @@ spec:
         SURF_OUT = Path("/tmp/surf_out")
         SURF_QC = Path("/tmp/surf_qc")
         ANAT_OUT = Path("/tmp/surf_anat")
-        for d in (WORK_ROOT, OUT_DIR, QC_DIR, SURF_OUT, SURF_QC, ANAT_OUT):
+        TISSUE_QC = Path("/tmp/tissue_qc")
+        for d in (WORK_ROOT, OUT_DIR, QC_DIR, SURF_OUT, SURF_QC, ANAT_OUT, TISSUE_QC):
             d.mkdir(parents=True, exist_ok=True)
 
         # Shared across every run in the session — downloaded once.
@@ -781,13 +812,19 @@ spec:
                 "--t1w2mni-affine", str(T1W2MNI_AFFINE),
                 "--t1w2mni-warp", str(T1W2MNI_WARP),
                 "--brainmask", str(FS_ROOT / "mri" / "brainmask.mgz"),
+                "--orig-nu", str(FS_ROOT / "mri" / "orig_nu.mgz"),
                 "--outdir", str(OUT_DIR),
                 "--subj", SUBJ,
                 "--session", SES,
+                "--qc-out", str(TISSUE_QC),
+                "--image-tag", IMAGE_TAG,
             ]).returncode
             if rc != 0:
                 print(f"[driver] WARNING: tissue mask export failed (exit {rc})")
                 for f in OUT_DIR.glob(f"{SUBJ}_{SES}_space-MNI152NLin2009cAsym_res-1_*"):
+                    f.unlink()
+                # No maps, so no record describing them.
+                for f in TISSUE_QC.iterdir():
                     f.unlink()
 
         # run_id -> the volumetric files this pod wrote for it, filled by
@@ -848,6 +885,41 @@ spec:
                 traceback.print_exc()
                 return f"publish failed: {type(exc).__name__}: {exc}"
             return ""
+
+        def upload_components():
+            """Upload each run's components tarball; {prefix: error} for those that did not land.
+
+            In the driver, not an output artifact, so that each run's surface-sample
+            record describes an object already in S3. As an artifact the tarballs
+            went up after main exited, when the records already said `succeeded`;
+            on 2026-10-29 four pods were lost after 4 of 6 tarballs, leaving two
+            runs per session recorded `succeeded` with no components. A tarball
+            is its own existence test (inventory's surf_exists), so one failed
+            upload costs only its run.
+            """
+            suffix = "_desc-grayordcomponents_bold.tar.gz"
+            names = sorted(p.name for p in SURF_OUT.glob(f"*{suffix}"))
+            if not names:
+                return {}
+            # Fails closed: anything raised here would skip to the `finally`,
+            # which would then record every run's surface-sample `succeeded`.
+            try:
+                sys.path.insert(0, "/app")
+                import func_derivatives
+
+                errors = func_derivatives.upload_files(
+                    SURF_OUT,
+                    os.environ["DATA_BUCKET"],
+                    f"derivatives/func_surf/{SUBJ}/{SES}/components",
+                    names,
+                )
+            except Exception as exc:  # noqa: BLE001 -- every run's upload is then a failure
+                traceback.print_exc()
+                errors = {name: f"{type(exc).__name__}: {exc}" for name in names}
+            return {
+                name.removesuffix(suffix): f"components upload failed: {err}"
+                for name, err in errors.items()
+            }
 
         def recover_mni_bold(prefix, task, rid, work_dir):
             """The MNI BOLD this run already published, staged from S3.
@@ -1111,6 +1183,7 @@ spec:
 
         results = []
         publish_error = ""
+        upload_errors = {}
         pending_prefixes = {f"{SUBJ}_{SES}_{r['task']}_{r['run']}" for r in pending}
         try:
             with ThreadPoolExecutor(max_workers=JOBS) as pool:
@@ -1126,6 +1199,17 @@ spec:
                 published = {f"{SUBJ}_{SES}_{rid}" for rid in RUN_FILES}
                 results = [
                     (p, True, sf, False, publish_error, up) if p in published else (p, ff, sf, prod, msg, up)
+                    for p, ff, sf, prod, msg, up in results
+                ]
+            # Before the records below, so a surface-sample `succeeded` always
+            # names a tarball already in S3. Independent of the volumetric
+            # publish: each tarball stands alone.
+            with Timed("components_upload"):
+                upload_errors = upload_components()
+            if upload_errors:
+                print(f"[driver] FAILED to upload components: {' '.join(sorted(upload_errors))}")
+                results = [
+                    (p, ff, True, prod, upload_errors[p], up) if p in upload_errors else (p, ff, sf, prod, msg, up)
                     for p, ff, sf, prod, msg, up in results
                 ]
         finally:
@@ -1240,7 +1324,9 @@ spec:
                 return 1
             return 0
 
-        if publish_error:
+        # A components upload that failed is retryable on the same terms as the
+        # volumetric publish: S3 or the node, not the data.
+        if publish_error or upload_errors:
             sys.exit(EXIT_PUBLISH_FAILED)
         exit_code = session_exit_code(results, RUNS)
         if exit_code:

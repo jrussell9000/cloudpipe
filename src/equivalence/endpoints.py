@@ -7,12 +7,22 @@ quality agreement. Both carry the claim — the derived-analysis tier is deferre
 Three rules hold throughout, and each exists because of a way this comparison can
 be made to look better than it is:
 
-- **The mask is the intersection of the two arms' brain masks, and its Dice is
-  reported alongside every masked number.** A high correlation computed over a
-  small intersection is a high correlation over the easy voxels.
-- **Neither arm is resampled onto a third grid.** Both pipelines were asked to
-  write `MNI152NLin2009cAsym` at native BOLD resolution (D5), so a grid
-  disagreement is an error to raise, not something to interpolate away.
+- **The mask is the template's own brain mask, the same for both arms** (spec,
+  "Metrics computed on a common grid"), not either arm's mask or their
+  intersection: the arms build their masks differently, cloudpipe's from the
+  anatomy and fMRIPrep's from the BOLD, and that definitional difference would
+  leak into every masked number. One exclusion, applied identically to both
+  arms (amended 2026-10-28, before any sampled session): a voxel whose
+  steady-state series is identically zero in either arm is dropped and counted.
+  cloudpipe zeroes its MNI BOLD outside its own mask and fMRIPrep does not mask
+  at all, so without it ~2% of template voxels would compare a stored zero with
+  signal, which measures a storage convention. The two arms' own-mask Dice is
+  reported descriptively beside every masked number.
+- **Neither arm is resampled.** Both pipelines write `MNI152NLin2009cAsym` on
+  TemplateFlow's `res-02` grid (D5, corrected 2026-10-28), cloudpipe stored LPS
+  and fMRIPrep RAS. Every image is reoriented to RAS, which permutes and flips
+  axes without interpolating; after that a grid disagreement is an error to
+  raise, not something to interpolate away.
 - **Subcortical grayordinates are not an endpoint.** fMRIPrep samples them on a
   fixed grid derived from `MNI152NLin6Asym` and cloudpipe's are on
   `MNI152NLin2009cAsym` by design; no `--output-spaces` value reconciles them, so
@@ -96,12 +106,18 @@ class Tier1Result:
 
     mean_image: MaskedComparison
     tsnr_map: MaskedComparison
+    #: Dice of the two arms' OWN brain masks: descriptive, never the comparison mask.
     mask_dice: float
     # Signed, cloudpipe - reference. The spec's tier-1 figure is the absolute
     # difference, which is `abs()` of this; keeping the sign costs nothing and an
     # absolute value would tabulate a cloudpipe tSNR advantage identically to a
     # shortfall of the same size.
     tsnr_median_difference: float
+    #: Template-mask voxels, and those dropped as identically zero in either arm.
+    n_template_voxels: int = 0
+    n_no_signal: int = 0
+    #: The comparison mask itself, RAS, for the ruler to measure tier 2 on.
+    common_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     @property
     def tsnr_median_absolute_difference(self) -> float:
@@ -110,7 +126,8 @@ class Tier1Result:
     def __str__(self) -> str:
         return (
             f"{self.mean_image}\n{self.tsnr_map}\n"
-            f"brain-mask Dice {self.mask_dice:.4f}; "
+            f"own-mask Dice {self.mask_dice:.4f}; "
+            f"{self.n_no_signal} of {self.n_template_voxels} template voxels without signal; "
             f"Δ tsnr_median {self.tsnr_median_difference:+.3f}"
         )
 
@@ -123,11 +140,17 @@ def dice(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return float(2 * np.count_nonzero(a & b) / denominator) if denominator > 0 else 0.0
 
 
+def canonical(image) -> nib.Nifti1Image:
+    """The image loaded and reoriented to RAS: axes permuted and flipped, never resampled."""
+    loaded = image if hasattr(image, "get_fdata") else nib.load(image)
+    return nib.as_closest_canonical(loaded)
+
+
 def _require_same_grid(a: nib.Nifti1Image, b: nib.Nifti1Image, what: str) -> None:
     if a.shape[:3] != b.shape[:3]:
         raise GridMismatch(
             f"{what}: shapes {a.shape[:3]} and {b.shape[:3]} differ. Both arms were "
-            "asked to write MNI152NLin2009cAsym at native BOLD resolution (D5); "
+            "asked to write MNI152NLin2009cAsym on the res-02 grid (D5); "
             "resampling one onto the other here would hide that they did not."
         )
     if not np.allclose(a.affine, b.affine, atol=1e-3):
@@ -178,35 +201,42 @@ def tier1(
     tsnr_median_a: float | None = None,
     tsnr_median_b: float | None = None,
     *,
+    template_mask,
     n_nss_frames: int,
 ) -> Tier1Result:
-    """Tier-1 spatial endpoints for one run, over the two masks' intersection.
+    """Tier-1 spatial endpoints for one run, inside the template's brain mask.
 
     Arguments are paths or loaded images; nothing here knows which arm is which,
-    beyond the order of the pair. The mean image and tSNR map are over frames
-    `n_nss_frames` onward (see the module docstring); a supplied
-    `tsnr_median_*` must be measured the same way, as FuncQC 1.3 is.
+    beyond the order of the pair. Every image is reoriented to RAS first. The
+    comparison mask is `template_mask` minus the voxels whose steady-state
+    series is identically zero in either arm (module docstring); the arms' own
+    masks only give the descriptive Dice. The mean image and tSNR map are over
+    frames `n_nss_frames` onward; a supplied `tsnr_median_*` must be measured
+    the same way and over the same mask.
     """
-    image_a = bold_a if hasattr(bold_a, "get_fdata") else nib.load(bold_a)
-    image_b = bold_b if hasattr(bold_b, "get_fdata") else nib.load(bold_b)
-    mask_image_a = mask_a if hasattr(mask_a, "get_fdata") else nib.load(mask_a)
-    mask_image_b = mask_b if hasattr(mask_b, "get_fdata") else nib.load(mask_b)
+    image_a, image_b = canonical(bold_a), canonical(bold_b)
+    mask_image_a, mask_image_b = canonical(mask_a), canonical(mask_b)
+    template = canonical(template_mask)
 
     _require_same_grid(image_a, image_b, "MNI BOLD")
-    _require_same_grid(mask_image_a, mask_image_b, "brain mask")
+    _require_same_grid(image_a, mask_image_a, "brain mask")
+    _require_same_grid(image_a, mask_image_b, "brain mask")
+    _require_same_grid(image_a, template, "template brain mask")
 
     binary_a = np.asanyarray(mask_image_a.dataobj) > 0
     binary_b = np.asanyarray(mask_image_b.dataobj) > 0
-    shared = binary_a & binary_b
     mask_dice = dice(binary_a, binary_b)
-    if not shared.any():
-        raise RefusedEndpoint(
-            "the two arms' brain masks do not intersect; there is no shared mask to "
-            f"compare on (Dice {mask_dice:.4f})"
-        )
 
     data_a = _steady_state(np.asanyarray(image_a.dataobj), n_nss_frames, "MNI BOLD")
     data_b = _steady_state(np.asanyarray(image_b.dataobj), n_nss_frames, "MNI BOLD")
+    in_template = np.asanyarray(template.dataobj) > 0
+    no_signal = in_template & (~data_a.any(axis=-1) | ~data_b.any(axis=-1))
+    shared = in_template & ~no_signal
+    if not shared.any():
+        raise RefusedEndpoint(
+            f"no template-mask voxel has signal in both arms ({int(in_template.sum())} in "
+            "the template mask); there is nothing to compare on"
+        )
 
     mean_comparison = MaskedComparison(
         name="mean image voxelwise correlation",
@@ -231,6 +261,9 @@ def tier1(
         tsnr_map=tsnr_comparison,
         mask_dice=mask_dice,
         tsnr_median_difference=float(tsnr_median_a) - float(tsnr_median_b),
+        n_template_voxels=int(in_template.sum()),
+        n_no_signal=int(no_signal.sum()),
+        common_mask=shared,
     )
 
 

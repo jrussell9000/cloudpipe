@@ -33,6 +33,7 @@ locals {
     surface_sample    = "s3://${var.bucket}/metrics/surface-sample/"
     anat_qc           = "s3://${var.bucket}/metrics/anat-qc/"
     fsqc_qc           = "s3://${var.bucket}/metrics/fsqc-qc/"
+    tissue_masks      = "s3://${var.bucket}/metrics/tissue-masks/"
     registration_qc   = "s3://${var.bucket}/metrics/registration/"
     workflow_runs     = "s3://${var.bucket}/metrics/workflow-runs/"
     costs             = "s3://${var.bucket}/metrics/costs/"
@@ -96,6 +97,7 @@ locals {
     surface_sample    = "s3://${var.bucket}/metrics/compacted/surface_sample/"
     anat_qc           = "s3://${var.bucket}/metrics/compacted/anat_qc/"
     fsqc_qc           = "s3://${var.bucket}/metrics/compacted/fsqc_qc/"
+    tissue_masks      = "s3://${var.bucket}/metrics/compacted/tissue_masks/"
     workflow_runs     = "s3://${var.bucket}/metrics/compacted/workflow_runs/"
     step_outcomes     = "s3://${var.bucket}/metrics/compacted/step_outcomes/"
     subject_manifests = "s3://${var.bucket}/metrics/compacted/subject_manifests/"
@@ -136,7 +138,9 @@ resource "aws_glue_catalog_table" "func_preproc_compacted" {
     # 1.0 and 1.1 stay until no pre-reprocess partitions remain.
     # 1.3 added for #859 (every summary excludes the non-steady-state frames),
     # under the same rule: applied BEFORE any afni image emits it.
-    "projection.schema_version.values" = "1.0,1.1,1.2,1.3"
+    # 1.4 added for the nipype-equivalent CompCor and cosines (2026-10-27), again
+    # applied before the image that emits it is pinned.
+    "projection.schema_version.values" = "1.0,1.1,1.2,1.3,1.4"
   })
 
   partition_keys {
@@ -481,6 +485,114 @@ resource "aws_glue_catalog_table" "surface_sample_compacted" {
     columns {
       name = "subcort_space"
       type = "string"
+    }
+  }
+}
+
+resource "aws_glue_catalog_table" "tissue_masks_compacted" {
+  database_name = aws_glue_catalog_database.metrics.name
+  name          = "tissue_masks_compacted"
+
+  table_type = "EXTERNAL_TABLE"
+
+  parameters = merge(local.compacted_partition_projection.tissue_masks, {
+    "classification" = "parquet"
+    # 1.0 is the first and only version the emitter (images/afni/tissue_masks.py)
+    # stamps. "unknown" is declared for the same reason as surface_sample's: a
+    # record without schema_version compacts under that literal, and a value
+    # outside this enum returns ZERO ROWS with a successful query status (#241).
+    "projection.schema_version.values" = "unknown,1.0"
+  })
+
+  partition_keys {
+    name = "dt"
+    type = "string"
+  }
+  partition_keys {
+    name = "schema_version"
+    type = "string"
+  }
+
+  storage_descriptor {
+    location      = "s3://${var.bucket}/metrics/compacted/tissue_masks/"
+    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
+
+    ser_de_info {
+      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+    }
+
+    columns {
+      name = "subject"
+      type = "string"
+    }
+    columns {
+      name = "session"
+      type = "string"
+    }
+    columns {
+      name = "pipeline"
+      type = "string"
+    }
+    columns {
+      name = "image_tag"
+      type = "string"
+    }
+    columns {
+      name = "source"
+      type = "string"
+    }
+    columns {
+      name = "completed_at"
+      type = "string"
+    }
+    columns {
+      name = "dseg_gm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "dseg_wm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "dseg_csf_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_input"
+      type = "string"
+    }
+    columns {
+      name = "probseg_seed"
+      type = "int"
+    }
+    columns {
+      name = "probseg_written"
+      type = "boolean"
+    }
+    columns {
+      name = "probseg_gm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_wm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_csf_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "agreement_gm"
+      type = "double"
+    }
+    columns {
+      name = "agreement_wm"
+      type = "double"
+    }
+    columns {
+      name = "agreement_csf"
+      type = "double"
     }
   }
 }
@@ -2969,6 +3081,120 @@ resource "aws_glue_catalog_table" "surface_sample" {
     columns {
       name = "subcort_space"
       type = "string"
+    }
+  }
+}
+
+resource "aws_glue_catalog_table" "tissue_masks" {
+  # Added 2026-10-26: per-session QC of the 1 mm MNI tissue maps (TissueQC),
+  # written by images/afni/tissue_masks.py --qc-out from func-preproc and from
+  # the probseg backfill. Column order is the emitter's dict order.
+  database_name = aws_glue_catalog_database.metrics.name
+  name          = "tissue_masks"
+
+  table_type = "EXTERNAL_TABLE"
+
+  parameters = merge(local.partition_projection.tissue_masks, {
+    "classification"        = "json"
+    "compressionType"       = "none"
+    "typeOfData"            = "file"
+    "ignore.malformed.json" = "true"
+  })
+
+  partition_keys {
+    name = "dt"
+    type = "string"
+  }
+
+  storage_descriptor {
+    location      = "s3://${var.bucket}/metrics/tissue-masks/"
+    input_format  = "org.apache.hadoop.mapred.TextInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+
+    ser_de_info {
+      serialization_library = "org.openx.data.jsonserde.JsonSerDe"
+      parameters = {
+        # A name in `columns` but absent from `paths` reads NULL.
+        paths                   = "subject,session,pipeline,image_tag,source,schema_version,completed_at,dseg_gm_vol_mm3,dseg_wm_vol_mm3,dseg_csf_vol_mm3,probseg_input,probseg_seed,probseg_written,probseg_gm_vol_mm3,probseg_wm_vol_mm3,probseg_csf_vol_mm3,agreement_gm,agreement_wm,agreement_csf"
+        "ignore.malformed.json" = "true"
+      }
+    }
+
+    columns {
+      name = "subject"
+      type = "string"
+    }
+    columns {
+      name = "session"
+      type = "string"
+    }
+    columns {
+      name = "pipeline"
+      type = "string"
+    }
+    columns {
+      name = "image_tag"
+      type = "string"
+    }
+    columns {
+      name = "source"
+      type = "string"
+    }
+    columns {
+      name = "schema_version"
+      type = "string"
+    }
+    columns {
+      name = "completed_at"
+      type = "string"
+    }
+    columns {
+      name = "dseg_gm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "dseg_wm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "dseg_csf_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_input"
+      type = "string"
+    }
+    columns {
+      name = "probseg_seed"
+      type = "int"
+    }
+    columns {
+      name = "probseg_written"
+      type = "boolean"
+    }
+    columns {
+      name = "probseg_gm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_wm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_csf_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "agreement_gm"
+      type = "double"
+    }
+    columns {
+      name = "agreement_wm"
+      type = "double"
+    }
+    columns {
+      name = "agreement_csf"
+      type = "double"
     }
   }
 }

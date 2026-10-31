@@ -63,6 +63,7 @@ duplicate table — how the historical `anat`/`anat_qc` and
 | `metrics/surface-sample/` | `surface_sample` | Per BOLD run | `dt={date}/{subj}_{ses}_{task}_{run}_surf_qc.json` |
 | `metrics/anat-qc/` | `anat_qc` | Per subject × session | `dt={date}/{subj}_{ses}_anat_qc.json` |
 | `metrics/fsqc-qc/` | `fsqc_qc` | Per subject × session | `dt={date}/{subj}_{ses}_fsqc_qc.json` |
+| `metrics/tissue-masks/` | `tissue_masks` | Per subject × session | `dt={date}/{subj}_{ses}_tissue_qc.json` |
 | `metrics/registration/` | `registration` | Per registration step | `dt={date}/{subj}_{ses}_t1w_to_mni_reg_qc.json` / `dt={date}/{subj}_{ses}_{task}_{run}_bold_to_t1w_reg_qc.json` |
 | `metrics/workflow-runs/` | `workflow_runs` | Per Argo workflow | `dt={date}/{workflow-name}__{subj}_run_summary.json` |
 | `metrics/costs/` | `costs` | Per Argo workflow × scrape date | `dt={date}/{date}_{workflow-name}_cost_allocation.json` |
@@ -133,6 +134,29 @@ Three caveats when parsing:
 - **`memory.used` is whole-card, not per-process.** Under GPU time-slicing (see `handoffs/gpu-time-slicing.md`, internal repo only) **three** pods share one physical GPU, so any co-tenant's footprint is included. In practice this shows up as a multi-modal split at ~1×, ~2× and ~3× the solo figure, which is what lets you recover the per-pod working set by differencing the populations. Historical records predating the 2-to-3 raise are bimodal only, so read the slice count from the node's `nvidia.com/gpu` capacity at the time rather than assuming it. DCGM would not improve on this — its fields are all device-scoped, so pod-label enrichment attributes the same whole-card value to every slice.
 - **The CSV format widened from 4 columns to 6.** `name` and `memory.total` were added to the monitors so each sample is self-describing about headroom (T4 15 GiB vs A10G/L4 ~23 GiB). Logs archived before that change lack both columns, so a parser spanning the corpus must accept either width — a fixed-field regex will silently skip half the data rather than error.
 - **Two streams are interleaved, sometimes on one line.** `nvidia-smi` CSV rows and Python `logging` lines share the file, and `tqdm` writes without newlines, so match both with regexes applied anywhere in the line rather than splitting on position.
+
+### GPU slice occupancy from Prometheus
+
+VRAM has to come from the logs above, but **slice occupancy** — how many of the advertised `nvidia.com/gpu` slices were requested at a given moment — is a Prometheus query since #405. The in-cluster Prometheus scrapes kube-state-metrics through a keep-list (`gitops/apps/prometheus/values.yaml`), and that list admits `kube_node_status_allocatable` and `kube_pod_container_resource_requests` **for the GPU resource only** (`resource="nvidia_com_gpu"`; kube-state-metrics rewrites `nvidia.com/gpu` with `[^a-zA-Z0-9_]` → `_`). The CPU and memory series of those families stay dropped, so a query for `resource="cpu"` returns nothing by design.
+
+Occupancy per nodepool, requested slices over allocatable slices:
+
+```promql
+sum by (label_karpenter_sh_nodepool) (
+  sum by (node) (
+    kube_pod_container_resource_requests{resource="nvidia_com_gpu"}
+    * on (pod, namespace) group_left kube_pod_status_phase{phase="Running"} > 0
+  )
+  * on (node) group_left(label_karpenter_sh_nodepool) kube_node_labels
+)
+/
+sum by (label_karpenter_sh_nodepool) (
+  kube_node_status_allocatable{resource="nvidia_com_gpu"}
+  * on (node) group_left(label_karpenter_sh_nodepool) kube_node_labels
+)
+```
+
+Both series exist only while a GPU node is up, and retention is Prometheus's (not S3), so run it over the batch window rather than weeks later. Query from a workstation with `kubectl -n prometheus port-forward svc/prometheus-kube-prometheus-prometheus 9090:9090`.
 
 ---
 

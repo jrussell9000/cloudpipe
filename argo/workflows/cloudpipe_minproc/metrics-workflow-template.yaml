@@ -45,7 +45,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:57d929e8ef38d3d481fef3372c29a9545f9b3056b7ace3c2b9a37bced2df3d01"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -100,7 +100,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:57d929e8ef38d3d481fef3372c29a9545f9b3056b7ace3c2b9a37bced2df3d01"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -147,7 +147,7 @@ spec:
       karpenter.sh/nodepool: cpu-light-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:57d929e8ef38d3d481fef3372c29a9545f9b3056b7ace3c2b9a37bced2df3d01"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -166,6 +166,13 @@ spec:
         # A registration gate that worked and rejected its transform (exit 65).
         # The run is correctly excluded; nothing broke.
         NOT_A_FAILURE = ("qc_rejected",)
+        # Status-only rollups of a whole sub-DAG (the master template's
+        # record-outcome-anatomical/session-dagtask). A session whose every run
+        # the gate rejects exits 65 at bold-to-t1w, which fails that session's
+        # sub-DAG, so session-phase records a bare `failed` (category unknown)
+        # beside the qc_rejected row that is the whole story: on 2026-10-27 that
+        # failed func-reprocess-05-12 workflows whose outputs were complete.
+        ROLLUPS = ("anatomical-phase", "session-phase")
         # EX_TEMPFAIL: the workflow retryStrategy retries it.
         TEMPFAIL = 75
 
@@ -189,13 +196,28 @@ spec:
 
 
         def failures(rows):
-            """The rows that fail this workflow, in a stable order for the log."""
+            """The rows that fail this workflow, in a stable order for the log.
+
+            A rollup's bare `failed` is explained, and dropped, when the run also
+            recorded a qc_rejected row and no real (non-rollup) failure: the
+            rejection is why the sub-DAG failed. A rollup `failed` with no
+            rejection anywhere still counts, since it is the only trace of a
+            step that died without recording itself, and a rollup `error`
+            (infrastructure) always counts.
+            """
             bad = [
                 r
                 for r in rows
                 if (r.get("status") or "").lower() in FAILING
                 and r.get("failure_category") not in NOT_A_FAILURE
             ]
+            real = [r for r in bad if r.get("step") not in ROLLUPS]
+            rejected = any(r.get("failure_category") in NOT_A_FAILURE for r in rows)
+            if not real and rejected:
+                bad = [
+                    r for r in bad
+                    if not (r.get("step") in ROLLUPS and (r.get("status") or "").lower() == "failed")
+                ]
             return sorted(
                 bad,
                 key=lambda r: tuple(r.get(k) or "" for k in ("step", "session", "task", "run")),

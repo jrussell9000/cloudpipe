@@ -34,7 +34,7 @@ spec:
     # strictly worse than the unbounded hang it was added to catch. A step that
     # blows a deadline sized at ~1.75x its observed maximum is deterministic, not
     # transient, so it must fail on the first occurrence.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -203,7 +203,7 @@ spec:
 
     initContainers:
       - name: download-t1w-inputs
-        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:57d929e8ef38d3d481fef3372c29a9545f9b3056b7ace3c2b9a37bced2df3d01"
         imagePullPolicy: IfNotPresent
         resources:
           requests:
@@ -248,7 +248,7 @@ spec:
       # slice-hours, and this one fetched a tree FastSurfer never opened.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:391244dd292ede02c182f86bf6b1f4d3cad4ff27d2ca66e8152052ae9c5f0ec2"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:fd118b11da90760bb8897936af1d3744184298e3be3a18b397af2a9fc9826b7c"
       imagePullPolicy: IfNotPresent
       volumeMounts:
       - name: work
@@ -420,22 +420,34 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
-    # Bounds a wedged topology correction. recon-surf.sh runs the hemispheres as
-    # sibling PIDs and `wait`s on them in order, and only lh's stdout reaches the
-    # pod log — so a hung rh presents as a log whose last line is
-    # "recon-all ... finished without error", with no error anywhere and no exit
-    # code ever produced. Nothing else in the step can catch that: the exit-75
-    # truncated-surface guard below only runs AFTER run_fastsurfer.sh returns, and
-    # the retryStrategy needs a terminal pod to fire. Before this deadline the only
-    # backstop was the master workflow's 24h activeDeadlineSeconds, so one such
-    # subject held a 4-cpu cpu-heavy pod and a concurrency slot for a full day.
+    # Backstop for a wedged step. recon-surf.sh runs the hemispheres as sibling
+    # PIDs and `wait`s on them in order, and a hemisphere's log reaches stdout
+    # only when it FINISHES — so a hung hemisphere presents as a log whose last
+    # line is "Waiting for PID ...", with no error anywhere and no exit code ever
+    # produced. The exit-75 truncated-surface guard below only runs AFTER
+    # run_fastsurfer.sh returns, and the retryStrategy needs a terminal pod to
+    # fire. Before this deadline the only backstop was the master workflow's 24h
+    # activeDeadlineSeconds, so one such subject held a 4-cpu cpu-heavy pod and a
+    # concurrency slot for a full day.
+    #
+    # The hang itself is now bounded INSIDE the image (#958): the fastsurfer
+    # image wraps mris_fix_topology and mris_topo_fixer in a 30 min `timeout`
+    # (CLOUDPIPE_TOPOLOGY_TIMEOUT_S below), so a hopeless hemisphere ends as a
+    # named failure — exit 70, failure_category `data` — while the other
+    # hemisphere finishes, instead of a silent deadline kill at 3h. The args
+    # block also traps SIGTERM and dumps the unfinished hemisphere logs, so
+    # whatever else ever hangs here leaves its last lines in the pod log.
     #
     # Observed in workflow cloudpipe-qqtg7 (2026-08-18): rh mris_fix_topology
     # ran 3.0h and then FAILED with "euler number != 2", handing off to FreeSurfer's
     # mris_topo_fixer fallback, which spun at 100% cpu with no progress output and
     # no bound. Deterministic — the seed is fixed at 1234 and the input surface is
     # identical, so every retry reproduces it exactly (cf. the #235 HISTOalloc
-    # subject-deterministic pattern). Two attempts burned 8.4h and 4.2h.
+    # subject-deterministic pattern). Two attempts burned 8.4h and 4.2h. Four more
+    # on 2026-10-30 (#958); the one visible hemisphere (an lh built from a
+    # saturated T1w) came out of marching cubes with eno=-1954 and ONE defect of
+    # 311,919 of its 314,570 vertices, against eno >= -82 and defects <= 902
+    # vertices in 600 healthy cohort hemispheres.
     #
     # 3h is sized from 1102 successful parcellation pods in cluster history:
     #     min 21.5m   median 46.9m   p90 67.6m   max 102.4m
@@ -453,7 +465,7 @@ spec:
     # See the fsaverage link in the args block below.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:391244dd292ede02c182f86bf6b1f4d3cad4ff27d2ca66e8152052ae9c5f0ec2"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:fd118b11da90760bb8897936af1d3744184298e3be3a18b397af2a9fc9826b7c"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -465,6 +477,16 @@ spec:
         value: /opt/freesurfer/.license
       - name: SUBJECTS_DIR
         value: /work/subjects
+
+      # Seconds mris_fix_topology / mris_topo_fixer may run per hemisphere before
+      # the image's wrapper kills them (#958; images/fastsurfer/topology_bound.sh,
+      # which also holds the sizing: the whole `recon-all -fix` stage took at
+      # most 6.9 min across 600 healthy cohort hemispheres). Read by the wrapper
+      # through the environment recon-all inherits; tuning it needs no rebuild.
+      # Keep it well under activeDeadlineSeconds above or the deadline wins and
+      # the failure goes back to being nameless.
+      - name: CLOUDPIPE_TOPOLOGY_TIMEOUT_S
+        value: "1800"
 
       # --threads is derived from this value rather than written in the master
       # template, so the resources block below is the single source of truth and
@@ -546,32 +568,92 @@ spec:
           fi
           echo "cpu request=${CPU_REQUEST} --threads=${THREADS} (threads_hemi=$((THREADS / 2)))" >&2
 
+          # Post-mortem on SIGTERM (#958). recon-surf.sh's RunBatchJobs writes each
+          # hemisphere to scripts/<hemi>.processing.cmdf.log and appends it to the
+          # pod log only when that hemisphere FINISHES, so a hemisphere that is
+          # still running when the deadline or a reclaim kills the pod leaves
+          # nothing behind. Argo's executor signals the whole process group, so
+          # the children die first; bash runs this handler once run_fastsurfer.sh
+          # has returned, inside the kubelet's grace period, and tails whatever
+          # per-hemisphere logs are still on disk — the finished one was already
+          # appended and deleted. Exit 143 as an untrapped SIGTERM would have.
+          dump_unfinished_hemisphere_logs() {
+            local f
+            for f in "$SD/$BASE"/scripts/*.processing.cmdf.log; do
+              [[ -f "$f" ]] || continue
+              echo "=== post-mortem: $(basename "$f") was still running; last 40 lines ===" >&2
+              tail -n 40 "$f" >&2
+            done
+          }
+          trap 'echo "SIGTERM: deadline or node reclaim; dumping unfinished hemisphere logs (#958)" >&2; dump_unfinished_hemisphere_logs; exit 143' TERM
+
           /fastsurfer/run_fastsurfer.sh {{inputs.parameters.argstring}} --threads "$THREADS"
           EXIT=$?
+          trap - TERM
 
-          # run_fastsurfer.sh traps SIGTERM and exits 0 even when its recon-all child
-          # is killed mid-reconstruction (spot reclaim / Karpenter consolidation on
-          # cpu-heavy-nodepool). That leaves a truncated base template — no white
-          # surfaces, no filled.mgz — which is then promoted and only detonates two
+          # A hemisphere whose topology correction ran past its bound (#958). The
+          # image's wrapper around mris_fix_topology / mris_topo_fixer leaves this
+          # marker; recon-all turns the kill into a plain exit 1, so the marker is
+          # the only thing that distinguishes "the surface is not a brain" from a
+          # crash. Checked BEFORE the exit-75 guard below: the hemisphere's white
+          # surface is missing too, and 75 would retry a deterministic failure
+          # eight times. 70 is TOPOLOGY_UNFIXABLE_EXIT_CODE in
+          # images/shared/step_outcome.py — failure_category `data` — and is in
+          # no retry expression.
+          if compgen -G "$SD/$BASE/scripts/topology-unfixable.*" > /dev/null; then
+            echo "ERROR: topology correction exceeded its bound; this subject's surface cannot be fixed (#958):" >&2
+            cat "$SD/$BASE"/scripts/topology-unfixable.* >&2
+            exit 70
+          fi
+
+          # Truncated-template guard (#115), gated on run_fastsurfer.sh's exit (#961).
+          #
+          # Written for one case: a spot reclaim kills recon-all mid-reconstruction,
+          # run_fastsurfer.sh traps the SIGTERM and returns 0, and a base template
+          # with no white surfaces and no filled.mgz is promoted — to detonate two
           # steps later at segment-subregions ("base-tps: No such file or directory").
-          # Validate the surface outputs long_compat_segmentHA.py / segment_subregions
-          # depend on, and exit 75 (EX_TEMPFAIL — a retryable code per retryStrategy
-          # above) so the step re-runs on a fresh node instead of shipping a half-built
-          # template.
+          # So the guard checks the files long_compat_segmentHA.py / segment_subregions
+          # depend on and exits 75 (EX_TEMPFAIL, in the retryStrategy above) so the
+          # step re-runs on a fresh node.
+          #
+          # It did not look at the exit code, and the per-attempt archive (#961;
+          # argo-nodes snapshots 2026-08-10 → 10-30, 14,371 attempts of this step)
+          # says that was the wrong half to guard:
+          #   - every one of the 706 reclaims landed as exit 143 — bash dies of the
+          #     SIGTERM before reaching this line (explicitly now, via the trap above)
+          #     — so the guard has never once fired on a reclaim;
+          #   - all 153 exit-75s were ONE deterministic failure (HISTOalloc, #235 /
+          #     #422) on 6 subjects, each retried until the 8-attempt budget was gone:
+          #     ~8 h of 4-cpu pod time per subject to fail identically, recorded as a
+          #     retry exhaustion rather than as its cause.
+          # run_fastsurfer.sh:1456 turns a failed or killed recon-surf.sh into exit 1
+          # (its SIGTERM trap only echoes, and bash 5.1 keeps PIPESTATUS across it),
+          # so recon-all's "exited with ERRORS" always arrives here as EXIT=1.
+          #
+          # Hence: a non-zero EXIT is the failure and propagates as-is — 1 is in no
+          # retry arm, and a reclaim that lands non-zero is already retried by the
+          # `imminent node shutdown` / `pod deleted` MESSAGE arm. The missing files
+          # are still named for the pod log. 75 is kept for the one shape the guard
+          # was written for — EXIT=0 with a principal output missing — which a
+          # deterministic recon-all failure cannot produce.
           #
           # This used to exit 137, which collided with a genuine kernel OOMKill and
           # forced the retry expression to treat both alike. 75 is ours alone; nothing
           # in the cluster emits it. See issue #115.
-          #
-          # A retry now restarts from a clean emptyDir re-seeded from step A's
-          # artifact rather than resuming over a dirty shared volume, so the
-          # truncated-state hazard is far less likely to arise in the first place —
-          # but the guard stays, since an interrupted run still uploads nothing.
+          MISSING=""
           for f in surf/lh.white surf/rh.white mri/filled.mgz; do
-            if [[ ! -s "${SD}/${BASE}/${f}" ]]; then
-              echo "ERROR: base template output missing after run_fastsurfer.sh: ${BASE}/${f}" >&2
-              echo "       surface reconstruction was interrupted; forcing retry (exit 75)." >&2
-              exit 75
-            fi
+            [[ -s "${SD}/${BASE}/${f}" ]] || MISSING="${MISSING} ${BASE}/${f}"
           done
-          exit $EXIT
+          if [[ "$EXIT" -ne 0 ]]; then
+            if [[ -n "$MISSING" ]]; then
+              echo "ERROR: run_fastsurfer.sh exited ${EXIT}; base template output missing:${MISSING}" >&2
+              echo "       a failed reconstruction is deterministic — not forcing a retry (#961); see the recon-all ERRORS above." >&2
+            fi
+            exit "$EXIT"
+          fi
+          if [[ -n "$MISSING" ]]; then
+            echo "ERROR: run_fastsurfer.sh exited 0 but base template output is missing:${MISSING}" >&2
+            echo "       surface reconstruction was interrupted; forcing retry (exit 75)." >&2
+            exit 75
+          fi
+          exit 0

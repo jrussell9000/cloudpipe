@@ -45,7 +45,7 @@ spec:
     # The 143 arm above therefore MATCHES a deadline kill, and without this clause
     # the deadline would multiply the burn by the retry limit rather than bound it.
     # Same reasoning as fast-tmpl, where this was first found.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"

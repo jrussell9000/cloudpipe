@@ -4,14 +4,9 @@ metadata:
   name: cloudpipe-semaphores
   namespace: argo-workflows
 data:
-  # Maximum concurrent Globus transfers through the single GCS EC2 instance.
-  # The GCS instance (c5n.xlarge, 4 vCPU / 10.5 GB RAM) runs one GridFTP process
-  # per active transfer. 8 is a safe ceiling for large BOLD file transfers.
-  globus-transfer: "8"
   # Maximum concurrent ingress-mode=https copies (each runs rclone with
-  # `--transfers 8`, so 4 here is at most 32 GETs on the NBDC source). Not bound
-  # by our GCS host — there is none in that path — but by the source: its HTTP
-  # 500s are load-dependent. Measured in wave 1 (2026-10-21) on the same code, 8
+  # `--transfers 8`, so 4 here is at most 32 GETs on the NBDC source). Bound by
+  # the source, not by anything of ours: its HTTP 500s are load-dependent. Measured in wave 1 (2026-10-21) on the same code, 8
   # gave 40.7% of requests answered 500 and 109 subjects/h; 4 gave 13.6% and
   # 112 subjects/h. At 8 the rejected requests ate the extra slots. Do not raise
   # it without the source operators' agreement (MSI, globus-admin@msi.umn.edu)

@@ -379,7 +379,7 @@ variable "public_ami_regions" {
 #######################
 
 # Whether this deployment stands up the Globus ingress at all, and therefore
-# whether the seven variables below are required. See the header of
+# whether the six variables below are required. See the header of
 # `globus.tf` for what enabling it costs the deployer, and the Globus
 # section of docs/deployer-first-hour.md for how to turn it on later.
 variable "globus_enabled" {
@@ -405,7 +405,9 @@ variable "globus_s3_destination_bucket" {
   }
 }
 
-# The seven variables below are required only when `globus_enabled` is true.
+# The six variables below are required only when `globus_enabled` is true.
+# (There were seven until `globus_source_collection_id` stopped being ingress-
+# gated; see its declaration further down.)
 #
 # Each one defaults to the empty string and each validation refuses the empty
 # string once the ingress is on, which keeps #526's rule — a default must not be
@@ -501,14 +503,19 @@ variable "globus_client_id" {
   }
 }
 
+# The two source variables below are not ingress-gated: HTTPS ingress reads them
+# from SSM whether or not `module.globus` exists (ingress_session.tf). They keep
+# their `globus_` names because Terraform only warns about an undeclared tfvars
+# value and then drops it, so a rename would quietly turn a configured source
+# into the placeholder.
 variable "globus_source_collection_id" {
-  description = "Globus source collection UUID (NBDC Data Hub collection). Required when globus_enabled is true."
+  description = "Globus source collection UUID (NBDC Data Hub collection) that `ingress-mode=https` copies from. Empty is a complete deployment that ingresses nothing itself (`ingress-mode=presynced`); the SSM parameter then holds a placeholder the queue manager refuses."
   type        = string
   default     = ""
 
   validation {
-    condition     = !var.globus_enabled || can(regex("^[0-9a-f-]{36}$", var.globus_source_collection_id))
-    error_message = "globus_source_collection_id must be a Globus collection UUID."
+    condition     = var.globus_source_collection_id == "" || can(regex("^[0-9a-f-]{36}$", var.globus_source_collection_id))
+    error_message = "globus_source_collection_id must be empty or a Globus collection UUID."
   }
 }
 

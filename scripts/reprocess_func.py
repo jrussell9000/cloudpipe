@@ -47,6 +47,7 @@ from pathlib import Path
 
 import boto3
 from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 from tqdm import tqdm
 
 REPO = Path(__file__).resolve().parent.parent
@@ -72,6 +73,12 @@ from prep_test_batch import (  # noqa: E402
 FUNC_DERIV_PREFIXES = ["derivatives/func/{subj}/", "derivatives/func_surf/{subj}/"]
 # Per-scan QC computed from the func derivatives, keyed {subject}_{session}_...
 FUNC_QC_PREFIXES = ["metrics/func-preproc/", "metrics/surface-sample/"]
+# Per-session QC of the session's MNI tissue maps, keyed {subject}_{session}_...
+# Flushed with the per-scan QC (a reprocess rewrites the maps, so the old row no
+# longer describes them) but kept out of FUNC_QC_PREFIXES, whose two entries
+# verify pairs positionally with the per-run evidence it checks.
+TISSUE_QC_PREFIX = "metrics/tissue-masks/"
+FLUSHED_QC_PREFIXES = [*FUNC_QC_PREFIXES, TISSUE_QC_PREFIX]
 # step_outcomes steps whose rows describe the func derivatives (all eras deleted).
 FUNC_STEPS = ("func-preproc", "surface-sample", "surface-resample")
 # T1w is required: inventory sets t1w_available from the staged T1w and the
@@ -113,7 +120,12 @@ READBACK_ERROR = "MNIBoldReadbackError"
 # (tests/test_reprocess_func.py holds them together). FuncQC 1.3 / SurfaceSampleQC
 # 1.1 since #859 (summaries exclude the NSS frames); a 1.2 / 1.0 record was
 # written by an image from before it, so the run is redone, not accepted.
-FUNC_QC_SCHEMA = "1.3"
+# FuncQC 1.4 (nipype-equivalent CompCor and cosines) is the schemas.py default;
+# 1.3 is ALSO accepted here, because 1.3 and 1.4 runs have identical BOLD, dtseries
+# and IQMs, and their confounds are rewritten by the confounds-only repair, which
+# checks for 1.4 itself. So func-reprocess-05-12, split across the pin, verifies.
+FUNC_QC_SCHEMA = "1.4"
+FUNC_QC_SCHEMAS_ACCEPTED = ("1.3", "1.4")
 SURFACE_QC_SCHEMA = "1.1"
 
 # Producer window slack, the same rule data/census/cost_cleanup.py attributes
@@ -333,10 +345,27 @@ def list_keys_parallel(
     return {prefix: sorted(keys) for prefix, keys in out.items()}
 
 
+#: S3 error codes that mean "no such object" (GetObject, and HeadObject's bare 404).
+ABSENT_CODES = ("NoSuchKey", "404")
+
+
 def get_json(s3, bucket: str, key: str) -> dict | None:
+    """The object as a dict; None if the key is absent or does not hold a JSON object.
+
+    Every other error raises. This used to return None for any exception, so an
+    expired SSO token read as missing data: `rerun_confounds.py verify` printed
+    "no plan at ..." for a plan that was there (2026-10-29), and a flush or
+    verify would have drawn conclusions from an S3 it could not read.
+    """
     try:
-        doc = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
-    except Exception:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ABSENT_CODES:
+            return None
+        raise
+    try:
+        doc = json.loads(body)
+    except ValueError:
         return None
     return doc if isinstance(doc, dict) else None
 
@@ -706,13 +735,13 @@ def plan_flush(s3, data_bucket, metrics_bucket, subjects, workers) -> FlushPlan:
         deriv = dict(progress(pool.map(deriv_of, subjects), "derivatives", len(subjects), "subj"))
 
     listed = list_keys_parallel(
-        s3, metrics_bucket, [*FUNC_QC_PREFIXES, STEP_OUTCOME_PREFIX], workers, "metrics listing"
+        s3, metrics_bucket, [*FLUSHED_QC_PREFIXES, STEP_OUTCOME_PREFIX], workers, "metrics listing"
     )
     # The basename's first `_` field is the whole subject ID (IDs contain no `_`),
     # so this is an exact match — sub-AB never catches sub-ABC's records.
     qc_raw = [
         k
-        for prefix in FUNC_QC_PREFIXES
+        for prefix in FLUSHED_QC_PREFIXES
         for k in listed[prefix]
         if k.rsplit("/", 1)[-1].split("_", 1)[0] in subject_set
     ]
@@ -865,7 +894,7 @@ def flush_func_compacted(s3, args, subjects, write: bool) -> tuple[int, int, lis
         s3,
         args.metrics_bucket,
         subjects,
-        compacted_tables(FUNC_QC_PREFIXES),
+        compacted_tables(FLUSHED_QC_PREFIXES),
         not write,
         args.workers,
     )
@@ -1021,14 +1050,19 @@ def dates_since(start: datetime, end: datetime) -> list[str]:
     return [(start.date() + timedelta(days=i)).isoformat() for i in range(days + 1)]
 
 
-def fresh_single(records: list[dict], after: datetime, schema_version: str | None) -> bool:
-    """Exactly one record, completed after `after` (and at `schema_version`, if given)."""
+def fresh_single(
+    records: list[dict], after: datetime, schema_version: str | tuple[str, ...] | None
+) -> bool:
+    """Exactly one record, completed after `after` (and at `schema_version`, or one of them)."""
     if len(records) != 1:
         return False
     done = parse_instant(records[0].get("completed_at"))
     if done is None or done <= after:
         return False
-    return schema_version is None or records[0].get("schema_version") == schema_version
+    if schema_version is None:
+        return True
+    accepted = (schema_version,) if isinstance(schema_version, str) else schema_version
+    return records[0].get("schema_version") in accepted
 
 
 def raw_problems(ev: Evidence, units: set) -> list[str]:
@@ -1051,7 +1085,7 @@ def raw_problems(ev: Evidence, units: set) -> list[str]:
         reasons.append(f"{len(no_surf)} run(s) have no new fsLR32k dtseries")
     # A record below the current version was written by an image from before #859.
     for name, raw, version in (
-        ("func_preproc", ev.qc_raw, FUNC_QC_SCHEMA),
+        ("func_preproc", ev.qc_raw, FUNC_QC_SCHEMAS_ACCEPTED),
         ("surface_sample", ev.surf_raw, SURFACE_QC_SCHEMA),
     ):
         bad = [u for u in units if not fresh_single(raw.get(u, []), ev.flushed_at, version)]
@@ -1609,9 +1643,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("launch", help="flush one slice's func outputs and submit it")
     common(sp, subjects=True)
     sp.add_argument("--batch-label", required=True)
-    # Required, never defaulted: https is the fast path, globus the rollback, and a
-    # launch should say which it is rather than inherit the queue manager's default.
-    sp.add_argument("--ingress-mode", required=True, choices=("https", "globus"))
+    # The queue manager's modes and default. `globus` left with the Globus host
+    # (openspec retire-globus-host), so https is the only network ingress; it is
+    # still passed to the flow explicitly, and into the recovery command and audit.
+    sp.add_argument("--ingress-mode", default="https", choices=("https", "presynced"))
     sp.add_argument("--write", action="store_true", help="Delete and submit (default: dry run).")
     sp.add_argument("--yes", action="store_true", help="Skip the typed confirmation.")
     sp.add_argument(

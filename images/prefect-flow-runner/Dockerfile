@@ -20,7 +20,7 @@
 # Comment on its own line because Dockerfiles have no inline comments — see the
 # note in images/fastsurfer/Dockerfile.
 # tag: 3-python3.12 (upstream pushed 2026-10-06)
-FROM prefecthq/prefect:3-python3.12@sha256:57e02b3f63d663e02b06d4127362ea48d92d4b361fbd96c8ba8f01e5702755f4
+FROM prefecthq/prefect:3-python3.12@sha256:5b665ed7b55836b1c50b0733dd7f2812db57f82a748b5fd1bf765842e5501dee
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). `upgrade`, not
 # `dist-upgrade`: it only moves already-installed packages to a newer revision of the
@@ -33,10 +33,11 @@ RUN apt-get update \
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# globus-sdk is here for one call: the queue manager's batch gate lists the
-# destination collection before submitting, which is the only way to catch a
-# revoked session (lib/globus_session.py). Without it the gate still checks the
-# session's age, but says out loud that the live half was skipped.
+# globus-sdk is here for the queue manager's batch gate: before submitting, it
+# lists the source collection and refreshes the HTTPS token, which is the only
+# way to catch a revoked session or a missing HTTPS grant (lib/globus_session.py).
+# Without it the gate still checks the session's age, but says out loud that the
+# live half was skipped.
 #
 # Every package carries the band pixi.toml declares, so the flows run the major
 # version tests/prefect/ ran against. Unpinned, `hera` in particular could jump a

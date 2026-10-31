@@ -56,6 +56,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 | View QC metrics and cost dashboards | [observability.md](observability.md) |
 | Query pipeline metrics in Python or SQL | [observability.md → Querying](observability.md#querying-with-python) |
 | Look up what a metrics field means | [metrics_data_dictionary.md](metrics_data_dictionary.md) |
+| Understand what a QC metric measures and how it is computed | [qc-metrics-explained.md](qc-metrics-explained.md) |
 | Get FastSurfer and subregion stats for the whole cohort as tables | [anatomical-stats.md](anatomical-stats.md) |
 | Understand why `bold_to_t1w` NMI is ~1.02 and not ~2.0 | [nmi-interpretation.md](nmi-interpretation.md) |
 | Update `preproc.py` | [operations.md → Updating code](operations.md#updating-code) |
@@ -89,6 +90,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 ### Observability
 
 - [**observability.md**](observability.md) — Unified pipeline observability layer: data flow, S3 layout, Grafana dashboards, Python/SQL querying (Athena + DuckDB), Kubecost scraper, and how to add a new metric.
+- [**qc-metrics-explained.md**](qc-metrics-explained.md) — What each QC metric is, how cloudpipe computes it and what it means: motion (FD), DVARS, global signal, tSNR, the AFNI artefact indices (`gcor`, `aor`, `aqi`) and the confound regressor counts, plus the agreement metrics that compare two preprocessed outputs of the same data.
 - [**metrics_data_dictionary.md**](metrics_data_dictionary.md) — Field-by-field reference for every metrics table (9 schemas + 3 non-schema S3 prefixes): types, units, gating thresholds, and where the live emitted JSON has drifted from the `schemas.py` dataclasses.
 - [**how-to-timeframe-metrics-dataframe.md**](how-to-timeframe-metrics-dataframe.md) — Recipe for assembling a date-bounded DataFrame across metrics tables. Read the partition-key caveat: QC tables partition on workflow **start** date and `workflow_runs` on **finish** date, so a single-day window silently returns only one side of a batch that crossed midnight.
 - [**anatomical-stats.md**](anatomical-stats.md) — Aggregating every FastSurfer `.stats` file and subregion volume table across the cohort: the long-format shards, the per-file wide tables (one row per subject × session), the QC join, how to run the aggregation in-region, and why a missing row and a null cell mean different things.

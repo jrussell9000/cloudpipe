@@ -193,8 +193,8 @@ Requires the fsLR meshes staged at `s3://{bucket}/config/fsLR/` — see [pipelin
 **ECR repo**: `cloudpipe/fastsurfer`  
 **Tag**: SHA-pinned  
 **Platform**: `linux/amd64`  
-**Base**: `deepmi/fastsurfer:latest`  
-**Contents**: FastSurfer with a `nonroot` user (UID/GID 1000) added. `/opt/freesurfer` ownership transferred to 1000.
+**Base**: `deepmi/fastsurfer:cu128-v2.5.4`, pinned by digest: FastSurfer 2.5.4 with FreeSurfer 7.4.1 for its surface stage. Held for the cohort so every subject's anatomy comes from one build; Dependabot ignores it, and a release change means re-running the anatomy  
+**Contents**: FastSurfer with a `nonroot` user (UID/GID 1000) added. `/opt/freesurfer` ownership transferred to 1000. **`/opt/freesurfer/bin/mri_normalize` is replaced** with a static build (like every binary in the tree; it links a static ITK 4.13.2 compiled in the builder stage) from pinned FreeSurfer `v7.4.1` source carrying `images/fastsurfer/patches/0001-mri_normalize-bias-outlier-sentinel.patch` (the HISTOalloc fix, [freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452)); it self-identifies as `7.4.1-cloudpipe-histoalloc1452` in the MGH tag block of every volume it writes. The rest of the FreeSurfer tree is the base image's, untouched. See `docs/pipelines.md` ("The third option: we compile the fix ourselves"). Validated 2026-10-29 on 9 real failing sessions (all recovered) and 19 healthy ones (voxel-identical to stock).
 
 Used by the four anatomical phase templates (`fastsurfer-template-build-template`, `fastsurfer-template-parcellation-template`, `fastsurfer-long-segmentation-template`, `fastsurfer-long-parcellation-template`).
 
@@ -291,7 +291,7 @@ Build context is the repo root (not `images/prefect-flow-runner/`) so the `COPY 
 |---|---|---|
 | `fsl` | Unused in current pipelines | FSL/topup groundwork for the planned `cloudpipe_fullproc` pipeline (SDC step) — see [architecture.md](architecture.md#cloudpipe_fullproc-planned--design-only-not-implemented). Parked out of CI (`build-images.yaml`) until that pipeline is implemented. |
 | `diffusion` | Present, not yet integrated | For future DWI processing; unrelated to `cloudpipe_fullproc`, no consumer planned yet |
-| `fmriprep` | **Directory removed** | Legacy full-preproc approach, replaced by cloudpipe_minproc |
+| `fmriprep` | Benchmark only, not a pipeline step | Upstream `nipreps/fmriprep` 25.2.5 pinned by digest, with every TemplateFlow file its command line needs baked in and checked offline at build time. The reference arm of the fMRIPrep equivalence benchmark; nothing in `cloudpipe_minproc` runs it. Carries FSL, so it is never published to ECR Public. Dependabot ignores it: the release is fixed for the study. (The earlier full-preproc `fmriprep` directory was removed when `cloudpipe_minproc` replaced it.) |
 | `ants` | **Directory removed** | Was never buildable (no Dockerfile — only `__pycache__`) |
 | `bravePy` | **Directory removed** — consolidated into `python` | Was Python+boto3 without metrics scripts. Any doc or template still saying `bravepy` is stale; the image is `cloudpipe/python`. |
 

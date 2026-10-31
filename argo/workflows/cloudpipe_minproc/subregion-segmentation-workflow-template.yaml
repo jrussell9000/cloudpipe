@@ -43,7 +43,7 @@ spec:
     # artifact-staging class (#277). A missing artifact KEY is excluded, though:
     # its producer was skipped or failed, and a consumer retry cannot re-run the
     # producer. See the master template for the detail.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -286,7 +286,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:3abfd19aa254d7bf340b981ab8ed7d6575140df84168ca399094ba9d4a89fa40"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:ae0ccbcd210996fb8299a837303a6779d9ba8fde9b97d50933a726ee55d1f5f4"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
