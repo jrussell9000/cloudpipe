@@ -69,10 +69,14 @@ class RunInputs:
     n_nss_frames: int = 0
 
 
-def recompute_func_qc(inputs: RunInputs, arm: str) -> dict:
+def recompute_func_qc(inputs: RunInputs, arm: str, masked_ts=None) -> dict:
     """A FuncQC-shaped dict for one run, measured from its own outputs.
 
     `arm` is written to the record's `pipeline` field and used nowhere else.
+    `masked_ts`, when given, is the in-mask (n_voxels, n_frames) matrix already
+    read (the comparison's common mask, `endpoints.Tier1Result.common_mask`), and
+    is what the voxel measures are taken over; `func_iqm` reads it the way
+    `preproc.py` hands over its own.
 
     `n_frames` and `tr_seconds` are read from the MNI BOLD header rather than
     from a native-space image: neither pipeline resamples in time, and
@@ -91,6 +95,7 @@ def recompute_func_qc(inputs: RunInputs, arm: str) -> dict:
         n_nss_frames=inputs.n_nss_frames,
         mni_bold=inputs.mni_bold,
         mask_mni=inputs.brain_mask,
+        masked_ts=masked_ts,
     )
 
     return {

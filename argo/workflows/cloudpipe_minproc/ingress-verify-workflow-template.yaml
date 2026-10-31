@@ -6,9 +6,11 @@ metadata:
 
 # Staged-input validator for `ingress-mode=presynced` (#336,
 # plans/011-pluggable-data-ingress.md §6), and for `ingress-mode=https` after its
-# copy (openspec add-https-ingress-mode, design D2). Invoked only through
-# templateRef from cloudpipe-long-master, so it has no entrypoint and no
-# spec.arguments.
+# copy (openspec add-https-ingress-mode, design D2). The master runs it in every
+# mode, unguarded, so it is also where any other mode — a typo, or `globus`
+# from a pre-retirement parameter set (openspec retire-globus-host) — is
+# refused. Invoked only through templateRef (cloudpipe-long-master, and the
+# fmriprep_bench templates), so it has no entrypoint and no spec.arguments.
 #
 # In https mode the copy has already checked every object's size against the
 # listing. This checks the contract — session naming, the literal T1w key, at
@@ -44,7 +46,7 @@ spec:
         cloudpipe.io/step: verify-staged-input
     inputs:
       parameters:
-        # The master runs this on `ingress-mode != "globus"`, so it is the only
+        # The master runs this in every mode (no `when`), so it is the only
         # thing that sees a misspelt mode, and must reject it (see the note on
         # the ingress-mode parameter in cloudpipe-long-master).
         - name: ingress-mode
@@ -53,7 +55,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:57d929e8ef38d3d481fef3372c29a9545f9b3056b7ace3c2b9a37bced2df3d01"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -77,7 +79,7 @@ spec:
 
         sys.path.insert(0, "/app")
 
-        INGRESS_MODES = ("globus", "presynced", "https")
+        INGRESS_MODES = ("https", "presynced")
         # EX_TEMPFAIL, a code the workflow-level retryStrategy retries.
         TEMPFAIL = 75
 
@@ -97,13 +99,14 @@ spec:
 
         def unknown_mode_error(mode):
             """An error message if this step should not be validating `mode` at all."""
-            if mode in ("presynced", "https"):
+            if mode in INGRESS_MODES:
                 return None
             return (
-                f"ingress-mode={mode!r} is not one of {list(INGRESS_MODES)}. The Globus "
-                f"and HTTPS tasks were skipped because it is neither 'globus' nor "
-                f"'https', so nothing was transferred; refusing to run inventory over "
-                f"whatever is staged. Resubmit with a valid mode."
+                f"ingress-mode={mode!r} is not one of {list(INGRESS_MODES)}. The HTTPS "
+                f"copy was skipped because the mode is not 'https', so nothing was "
+                f"transferred; refusing to run inventory over whatever is staged. "
+                f"Resubmit with ingress-mode=https (or omit it), or presynced for "
+                f"input already staged under mmps_mproc/."
             )
 
 

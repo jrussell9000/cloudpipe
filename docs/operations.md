@@ -67,8 +67,8 @@ Common optional parameters:
 | `globus_scan_types` | `'["T1w","T2w","rest","nback"]'` | BIDS scan types to transfer |
 | `globus_source_collection_id` | (from SSM) | Override source Globus collection UUID |
 | `globus_source_base_path` | (from SSM) | Override source base path |
-| `globus_dest_base_path` | `/mmps_mproc` | Destination path within GCS collection |
-| `ingress_mode` | `globus` | `https` reads the source collection over its HTTPS server on the ingress node pool, with no Globus endpoint — see [data-ingress.md](data-ingress.md#reading-the-source-over-https-ingress-modehttps). The batch is refused if the last `pixi run globus login` would pass 30 days within the safety margin. `presynced` skips Globus and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else fails the flow at start |
+| `globus_dest_base_path` | `/mmps_mproc` | Destination prefix in the data bucket |
+| `ingress_mode` | `https` | `https` reads the source collection over its HTTPS server on the ingress node pool — see [data-ingress.md](data-ingress.md#reading-the-source-over-https-ingress-modehttps). The batch is refused if the last `pixi run globus login` would pass 30 days within the safety margin. `presynced` skips ingress and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else, including the retired `globus`, fails the flow at start |
 
 `ingress_mode` (like `batch_label`) exists only once the deployment has been re-registered with `pixi run prefect-deploy`; until then `-p ingress_mode=…` fails with "parameters were specified but not found on the deployment".
 
@@ -124,6 +124,8 @@ Always use `submit --from workflowtemplate/` — never `resubmit` (resubmit snap
 `bucket`, `metrics-bucket`, `ecr-registry` and `region` are read automatically from the `cloudpipe-config` ConfigMap and do not need to be specified. Globus collection UUIDs are read from SSM at submission time.
 
 For data already staged in S3, add `-p ingress-mode=presynced` and pass the `globus-*` parameters empty — the full command is in [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced).
+
+To keep one session's T1w out of a subject's longitudinal template, add `-p exclude-sessions=ses-00A` (comma-separated for several). Inventory reports the session `t1w_available: false`, so it is left out of template-build and, by the published-sessions filter, out of functional processing — the same as a session that never had a T1w. The staged input is untouched, and the inventory log carries an `EXCLUDED` line. This is for a T1w that is unusable and would otherwise break the whole subject: a saturated volume with no grey/white contrast, or a field of view that missed the head (both seen 2026-10-30, each failing or hanging FastSurfer's template stage). Look at the image first; the queue manager does not set this, so such a subject is submitted on its own.
 
 ### fmri-first-level-proc (via Prefect)
 
@@ -239,6 +241,30 @@ aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/registration/NDARINVXXXXXXXX/" --r
 # FastSurfer derivatives
 aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/fastsurfer/NDARINVXXXXXXXX/" --recursive
 ```
+
+### Auditing func outputs: content, not presence
+
+`reprocess_func.py verify` proves that every run's outputs exist and are fresh, and that the in-pod read-back guard passed. It never opens a file. `scripts/audit_func_outputs.py` does. It samples subjects at random (seeded), picks one session and one run of each (`--all-runs` for every run), and downloads that run's outputs into a scratch directory. It checks them against each other, against the MNI template and against the run's FuncQC record, then deletes them before the next subject. It is read-only on S3.
+
+```bash
+pixi run -e ops python scripts/audit_func_outputs.py \
+    --subjects data/reprocess/func_reprocess_03_04.csv --sample 50 \
+    --data-bucket "$CLOUDPIPE_BUCKET" --metrics-bucket "$CLOUDPIPE_METRICS_BUCKET" \
+    --out audit_03_04.jsonl --mosaics audit_03_04_png
+```
+
+| Area | Checks | The defect it would have caught |
+|---|---|---|
+| MNI BOLD header | float32, identity scaling, template grid and affine, 2 mm, TR and frame count match the record | |
+| MNI BOLD values | finite, zero outside the mask, not whole numbers, no constant in-mask voxels | float16 bit patterns stored as integers (2026-05-25 to 10-06) |
+| Orientation | the mean image is most symmetric under an x flip; the mask matches the template brain | the x↔z transpose (same period) |
+| Time axis | the MNI global signal tracks the confounds' column at lag 0 | a shuffled, dropped or shifted frame |
+| Confounds | one row per frame, n/a only where expected, NSS indicators match `n_nss_frames`, CompCor zero on NSS rows, FD recomputes from the motion columns, cosine count | |
+| dtseries | frame count, step = TR, 29,696 + 29,716 cortical vertices, subcortical count matches the record, each subcortical grayordinate equals its MNI BOLD voxel, the cortex tracks the global signal | a missing or corrupt surface output (#884) |
+| Tissue maps | template grid, the masks equal the dseg, the dseg matches the template brain, probseg sums to 1, and its classes agree with the dseg | the collapsed probseg classes (found 2026-10-26) |
+| QC record | present, schema 1.3, and FuncQC recomputed from the published file equals the in-pod record | a record that does not describe the file |
+
+It takes about 2.5 minutes and 0.5 GB of download per run. Look at the mosaics as well: one image per run (the mean BOLD over the template outline) and one per session (dseg above probseg, coloured alike). Each threshold's comment in the script says what a good run measures and what the defect measured.
 
 ### Prefect flow run status
 
@@ -849,7 +875,7 @@ Any FAIL on the first six checks requires investigation before proceeding to a p
 
 ### Retries
 
-All spot-exposed workflow templates retry automatically on spot interruption (`pod deleted`, `imminent node shutdown`, exit codes 64/143) and on exit 75, the `EX_TEMPFAIL` guard the fastsurfer templates raise when a reclaim truncated their output. The budget is 8 attempts with exponential backoff from 1 minute, each delay capped at 5 minutes.
+All spot-exposed workflow templates retry automatically on spot interruption (`pod deleted`, `imminent node shutdown`, exit codes 64/143) and on exit 75, the `EX_TEMPFAIL` guard the fastsurfer templates raise when a reclaim truncated their output. That guard is gated on `run_fastsurfer.sh` exiting 0 (#961): a non-zero exit — every `recon-all` error — propagates as its own code and is not retried. They also retry a pod that failed after its main container exited 0 (exitCode `"0"`): whatever failed is then the wait container, teardown, or the pod itself, never the step's own work. Argo v4.1 can decide the retry on an early verdict and only later relabel the node `pod deleted`, so without the `"0"` code these finished pods got one attempt (#404). The budget is 8 attempts with exponential backoff from 1 minute, each delay capped at 5 minutes.
 
 **The budget is sized for infrastructure, not for the workload.** Every nodepool is spot-only, so consecutive reclaims on a single long step are routine and 8 attempts exist to absorb them. Exit **137 is deliberately not retried**: a genuine OOMKill in this pipeline has always been deterministic (#120, #129, #134 each needed a memory or partitioning change, and no number of retries would have helped), so retrying it would burn the budget re-running an identical failure. If you find yourself wanting 137 back in the expression, the real fix is almost certainly a memory request or a step split. See issue #115.
 

@@ -37,7 +37,7 @@ from restore_links import COMPLETE_SIDECAR
 KIND = "func-session"
 SCHEMA_VERSION = 1
 
-__all__ = ["publish_session", "read_marker", "run_id", "PublishError"]
+__all__ = ["publish_session", "read_marker", "run_id", "upload_files", "PublishError"]
 
 
 def run_id(task: str, run: str) -> str:
@@ -146,3 +146,40 @@ def publish_session(
         f"{len(kept_runs)} kept) -> s3://{bucket}/{prefix}/"
     )
     return marker
+
+
+def upload_files(
+    tree: Path | str, bucket: str, prefix: str, names: list[str], *, s3=None
+) -> dict[str, str]:
+    """Upload each of `names` from `tree` into `prefix`, and confirm its size.
+
+    Returns {name: error} for every file that did not land intact; never raises.
+    This is for the grayordinate components (`derivatives/func_surf/.../components/`),
+    one tarball per run with no marker over them: each tarball is its own existence
+    test (inventory's surf_exists), so a failed upload costs only that run, and the
+    caller records the failure against it.
+
+    They used to go up as an Argo output artifact, after the main container had
+    exited and the driver had already recorded surface-sample `succeeded`. On
+    2026-10-29 four pods were lost after 4 of their 6 tarballs, which left two
+    runs recorded `succeeded` with no components in S3.
+    """
+    tree = Path(tree)
+    prefix = prefix.rstrip("/")
+
+    def _put(worker_s3, name: str) -> tuple[str, str]:
+        key = f"{prefix}/{name}"
+        try:
+            size = (tree / name).stat().st_size
+            with (tree / name).open("rb") as fh:
+                worker_s3.put_object(Bucket=bucket, Key=key, Body=fh)
+            landed = worker_s3.head_object(Bucket=bucket, Key=key).get("ContentLength")
+        except Exception as exc:  # noqa: BLE001 -- reported per file, the caller records it
+            return name, f"{type(exc).__name__}: {exc}"
+        if landed != size:
+            return name, f"{key} is {landed} B in S3, {size} B on disk"
+        return name, ""
+
+    errors = {name: err for name, err in _transfer(_put, list(names), s3) if err}
+    log(f"upload: {len(names) - len(errors)} of {len(names)} files -> s3://{bucket}/{prefix}/")
+    return errors

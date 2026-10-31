@@ -423,10 +423,26 @@ def check_subregions_derivatives(s3, bucket: str, subj: str) -> bool:
     return len(missing) == 0
 
 
-def build_inventory(s3, bucket: str, subj: str) -> tuple[list[dict], bool, bool]:
+def parse_excluded_sessions(value: str | None) -> set[str]:
+    """`--exclude-sessions` as a set: comma-separated, whitespace and empties dropped."""
+    return {s.strip() for s in (value or "").split(",") if s.strip()}
+
+
+def build_inventory(
+    s3, bucket: str, subj: str, exclude_sessions: set[str] | None = None
+) -> tuple[list[dict], bool, bool]:
     """
     Run all discovery and completion checks; return
     (session_list, fastsurfer_exists, subregions_exists).
+
+    `exclude_sessions` names sessions whose T1w must not enter the longitudinal
+    template, reported as `t1w_available: false` whatever is staged. Everything
+    downstream already keys off that flag: the template-build fan-out drops the
+    session, and published-sessions excludes it from functional processing like
+    any session that never had a T1w. The session stays in the list so the
+    exclusion is visible in the inventory output, not silent. For a T1w that is
+    unusable (saturated, FOV missed the head) and would otherwise break the whole
+    subject's template; the operator decides, session by session.
 
     session_list — one dict per session:
       {
@@ -445,6 +461,13 @@ def build_inventory(s3, bucket: str, subj: str) -> tuple[list[dict], bool, bool]
     """
     sessions = list_sessions(s3, bucket, subj)
     nss_map = load_nss_volumes(s3, bucket, subj)
+    excluded = exclude_sessions or set()
+    unknown = sorted(excluded - set(sessions))
+    if unknown:
+        print(
+            f"WARNING: --exclude-sessions names {unknown}, not staged for {subj}; ignored",
+            file=sys.stderr,
+        )
 
     result = []
     t1w_sessions = []
@@ -453,6 +476,13 @@ def build_inventory(s3, bucket: str, subj: str) -> tuple[list[dict], bool, bool]
         check_run_completion(s3, bucket, subj, ses, runs)
         t1w_exists = check_t1w_completion(s3, bucket, subj, ses)
         t1w_available = check_t1w_source_exists(s3, bucket, subj, ses)
+        if ses in excluded and t1w_available:
+            print(
+                f"EXCLUDED {subj}/{ses}: T1w staged but excluded by --exclude-sessions; "
+                "it enters neither the longitudinal template nor functional processing",
+                file=sys.stderr,
+            )
+            t1w_available = False
         if t1w_available:
             t1w_sessions.append(ses)
 
@@ -522,6 +552,14 @@ def main() -> None:
         "--inventory-json",
         help="JSON array from the inventory pass; required for --mode published-sessions",
     )
+    parser.add_argument(
+        "--exclude-sessions",
+        default="",
+        help=(
+            "comma-separated session IDs whose T1w must not enter the longitudinal "
+            "template (reported t1w_available=false); e.g. ses-00A"
+        ),
+    )
     args = parser.parse_args()
 
     s3 = boto3.client("s3")
@@ -533,7 +571,9 @@ def main() -> None:
         return
 
     try:
-        session_list, fs_exists, subregions_exists = build_inventory(s3, args.bucket, args.subject)
+        session_list, fs_exists, subregions_exists = build_inventory(
+            s3, args.bucket, args.subject, parse_excluded_sessions(args.exclude_sessions)
+        )
     except InventoryError as e:
         # Sole exit-status decision for the step; the marker files and the JSON
         # array are deliberately left unwritten so no downstream fan-out reads

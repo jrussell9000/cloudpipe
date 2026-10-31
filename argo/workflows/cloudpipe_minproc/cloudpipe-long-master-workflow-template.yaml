@@ -53,7 +53,16 @@ spec:
     # init failures in the 2026-08-15 sample were this shape; without the guard
     # they would each burn all 8 attempts (~32m of backoff) to fail identically.
     # Compare the exit-66 rule in docs/pipelines.md, which predates this.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    #
+    # "0" in the code list is #404. A pod whose main exited 0 can still end Failed
+    # or Error, and then the failure is everything after main — the wait container,
+    # teardown, the pod itself — never the step's own work. Argo v4.1 can also
+    # decide the retry on an early verdict and only later rewrite the Pod node to
+    # `pod deleted`, so the message arm never sees the text it would match: 7
+    # func-preproc sessions (2026-10-26..29) finished 6/6 runs, kept their node,
+    # and were closed with ONE attempt as `retryStrategy.expression evaluated to
+    # false`. DAG/Steps wrappers report exitCode -1, so this cannot retry them.
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -189,53 +198,78 @@ spec:
             name: cloudpipe-config
             key: region
 
-      # Globus transfer parameters
+      # Ingress parameters. The `globus-` prefix is historical: https ingress
+      # lists the source collection through the Globus Transfer API, and the
+      # names are kept so no caller has to change (openspec retire-globus-host).
       - name: globus-source-collection-id
       - name: globus-source-base-path
         # Collection root — subject ID is appended automatically, e.g. /abcd/raw
+      # DEPRECATED and UNUSED. It named the destination collection on our own
+      # Globus Connect Server host, which is retired with globus ingress
+      # (openspec retire-globus-host); https ingress writes to the bucket
+      # directly and has no destination collection. Nothing reads its value.
+      #
+      # It stays DECLARED on purpose, like globus-use-s3-gateway below: a
+      # parameter set copied from a workflow submitted before the retirement
+      # still carries it, and must still be admitted. Defaulted to "" so that a
+      # submission written after the retirement need not pass it at all.
       - name: globus-dest-collection-id
+        value: ""
       - name: globus-dest-base-path
-        # Collection root — subject ID is appended automatically, e.g. /mmps_mproc
+        # Prefix in the bucket — subject ID is appended automatically, e.g. /mmps_mproc
       # JSON array of BIDS scan types to transfer across all sessions, e.g.:
       # '["T1w", "T2w", "rest", "dwi"]'
       # Valid values: T1w, T2w, rest, nback, sst, mid, dwi
       - name: globus-scan-types
-      # DEPRECATED and UNUSED. The POSIX staging path it selected is gone: the
-      # GCS endpoint always uses an S3 storage gateway now, so GridFTP writes
-      # straight to S3 and there is no post-transfer sync step to skip.
+      # DEPRECATED and UNUSED. It selected between the Globus host's S3 storage
+      # gateway and a POSIX staging path; both went with that host (the POSIX
+      # path first, then globus ingress itself in openspec retire-globus-host).
       #
-      # It stays DECLARED on purpose. Callers still pass it, and a submission
+      # It stays DECLARED on purpose. A parameter set copied from a workflow
+      # submitted before the retirement still carries it, and a submission
       # carrying a parameter the template does not declare may be rejected, so
-      # removing the declaration is a breaking change for anything that has not
-      # been updated yet. Nothing reads its value.
+      # removing the declaration is a breaking change for any such caller.
+      # Nothing reads its value.
       - name: globus-use-s3-gateway
         value: "true"
 
       # Where the input data comes from (#336, plans/011-pluggable-data-ingress.md).
-      #   globus    — pull it from the source collection (production default)
-      #   presynced — it is already under mmps_mproc/ in S3; verify it and proceed.
-      #               The Globus tasks are Skipped and the input is NOT deleted on
-      #               success, because the pipeline cannot re-fetch it.
       #   https     — copy it over the source collection's HTTPS server straight
-      #               to S3 (openspec add-https-ingress-mode), then verify it as
-      #               presynced input is verified. No Globus host is started;
-      #               the input is deleted on success, as in globus mode.
-      # Omitting it gives the globus DAG unchanged. See docs/data-ingress.md.
+      #               to S3 (openspec add-https-ingress-mode), then verify it.
+      #               The input is deleted on success. The default, and the only
+      #               network ingress: globus mode was removed with our Globus
+      #               Connect Server host (openspec retire-globus-host).
+      #   presynced — it is already under mmps_mproc/ in S3; verify it and proceed.
+      #               The HTTPS copy is Skipped and the input is NOT deleted on
+      #               success, because the pipeline cannot re-fetch it.
+      # Omitting it gives https. See docs/data-ingress.md.
       #
       # The enum is a UI dropdown and NOTHING MORE: Argo v4.0.6 accepted
       # `ingress-mode=presync` through both the API (workflowTemplateRef, the
       # Prefect path) and `argo submit --from workflowtemplate/` (probe, #336).
-      # Typos are caught by the DAG instead — the Globus tasks run on
-      # `== "globus"` and verify-staged-input on its exact complement
-      # `!= "globus"`, so every value reaches either the Globus arm or the
-      # validator, and the validator fails any value that is not `presynced`
-      # or `https`.
+      # So `ingress-mode=globus` from an old parameter set is admitted too.
+      # Unknown values are caught by the DAG instead: the HTTPS copy runs only
+      # on `== "https"`, and verify-staged-input has no `when` at all, so every
+      # value reaches the validator, whose unknown_mode_error fails anything
+      # that is not `https` or `presynced`. A misspelt mode therefore copies
+      # nothing and fails the workflow before inventory.
       - name: ingress-mode
-        value: globus
+        value: https
         enum:
-          - globus
-          - presynced
           - https
+          - presynced
+
+      # Comma-separated session IDs whose T1w must not enter this subject's
+      # longitudinal template, e.g. "ses-00A". Inventory reports them
+      # `t1w_available: false`, so they are left out of template-build and, by
+      # the existing published-sessions filter, out of functional processing,
+      # exactly as a session that never had a T1w. The staged input is not
+      # touched. For a T1w that is unusable and would otherwise break the whole
+      # subject (2026-10-30: one saturated T1w hung template-parc for 3 h, one
+      # whose FOV missed the head failed mri_robust_template with "Images do not
+      # overlap"); set per submission, by the operator, after looking at the image.
+      - name: exclude-sessions
+        value: ""
 
       # Where FastSurfer segmentation inference runs (#373). "cuda" is the normal
       # path: template-build and long-segmentation on gpu-nodepool, time-sliced.
@@ -275,31 +309,26 @@ spec:
       # Providing each task in the DAG, its dependencies, and any output artifacts to be passed
       tasks:
         # ---- Ingress (#336) -------------------------------------------------
-        # Every Globus task carries the ingress-mode guard, and every `depends`
-        # between them accepts an upstream Skipped. Both halves are required:
-        # guard only the head and its dependants are Omitted (a `depends` that
-        # is never satisfied is Omitted, not Skipped), which omits inventory
-        # and everything after it — the workflow "succeeds" having processed
-        # nothing. With both, a presynced skip propagates as Skipped all the
-        # way down, and Omitted keeps its only useful meaning here: an
-        # upstream task actually failed. NEVER add `.Omitted` to the inventory
-        # gate to "fix" a skip — a failed globus-transfer leaves its dependants
-        # Omitted too, so inventory would run over a failed ingress.
+        # Two tasks, then inventory. https-transfer is guarded on
+        # `== "https"` and has no `depends`, so it either runs or is Skipped,
+        # never Omitted. verify-staged-input has no `when`: it runs in every
+        # mode, so it is the one place an unknown mode is refused (its
+        # unknown_mode_error). Its `depends` and the inventory gate accept an
+        # upstream Skipped, so a presynced skip propagates as Skipped and
+        # Omitted keeps its only useful meaning here: an upstream task
+        # actually failed (a `depends` that is never satisfied is Omitted, not
+        # Skipped). NEVER add `.Omitted` to the inventory gate to "fix" a skip
+        # — a failed https-transfer leaves the validator Omitted, so accepting
+        # Omitted on the validator's term leaves only the copy's own term
+        # between a failed ingress and inventory.
         # tests/argo/test_ingress_modes.py pins this; `argo lint` cannot see it
         # (plans/011-pluggable-data-ingress.md §1).
 
-        # Start the Globus Connect Server EC2 instance and wait for it to be ready.
-        # Skips the start call if the instance is already running (safe to re-run).
-        - name: start-globus-instance-dagtask
-          when: '"{{workflow.parameters.ingress-mode}}" == "globus"'
-          templateRef:
-            name: globus-transfer
-            template: start-globus-instance-template
-
         # Records the real wall-clock time the DAG began running, for the exit
         # handler's pending_duration_s (#147). No `depends`, so it starts
-        # immediately alongside start-globus-instance-dagtask. Written to S3
-        # rather than threaded through workflow.outputs.parameters: Argo's
+        # immediately, beside the ingress head (https-transfer-dagtask, run or
+        # Skipped). Written to S3 rather than threaded through
+        # workflow.outputs.parameters: Argo's
         # onExit templates never see workflow-level outputs in `argo lint
         # --offline`'s static resolution (confirmed against argo v4.0.7 with
         # the documented globalName export — lint still fails), even though
@@ -318,33 +347,11 @@ spec:
               - name: metrics-bucket
                 value: '{{workflow.parameters.metrics-bucket}}'
 
-        # Pull all subject files from the remote Globus collection directly into
-        # the cloudpipe S3 bucket via the GCS S3 storage gateway.
-        - name: globus-transfer-dagtask
-          depends: "start-globus-instance-dagtask.Succeeded || start-globus-instance-dagtask.Skipped"
-          when: '"{{workflow.parameters.ingress-mode}}" == "globus"'
-          templateRef:
-            name: globus-transfer
-            template: globus-transfer-template
-          arguments:
-            parameters:
-              - name: source-collection-id
-                value: '{{workflow.parameters.globus-source-collection-id}}'
-              - name: source-base-path
-                value: '{{workflow.parameters.globus-source-base-path}}'
-              - name: dest-collection-id
-                value: '{{workflow.parameters.globus-dest-collection-id}}'
-              - name: dest-base-path
-                value: '{{workflow.parameters.globus-dest-base-path}}'
-              - name: scan-types
-                value: '{{workflow.parameters.globus-scan-types}}'
-
-        # ingress-mode=https: list through Globus Transfer, copy over the source's
-        # HTTPS server straight to S3, check every size. A head task like
-        # start-globus-instance: no `depends`, so it is Skipped or it ran, never
-        # Omitted. It writes where globus-transfer does —
-        # {globus-dest-base-path}/{subjID}/ in the bucket — so inventory and
-        # delete-globus-input need no change of prefix.
+        # ingress-mode=https: list through the Globus Transfer API, copy over the
+        # source's HTTPS server straight to S3, check every size. The ingress
+        # head: no `depends`, so it is Skipped or it ran, never Omitted. It
+        # writes to {globus-dest-base-path}/{subjID}/ in the bucket, the prefix
+        # inventory reads and delete-globus-input deletes.
         - name: https-transfer-dagtask
           when: '"{{workflow.parameters.ingress-mode}}" == "https"'
           templateRef:
@@ -365,21 +372,23 @@ spec:
 
         # Checks staged input against the ingress contract before anything
         # consumes it: what an operator staged (presynced), or what the HTTPS
-        # copy wrote (https). Skipped in globus mode. See docs/data-ingress.md.
+        # copy wrote (https). See docs/data-ingress.md.
         #
-        # `!= "globus"`, NOT `== "presynced"`: this must be the exact complement
-        # of the Globus guard. With `== "presynced"` a misspelt mode skips both
-        # arms and inventory runs over whatever is staged (observed live — the
-        # parameter enum does not stop it). The template fails any mode other
-        # than presynced or https, so a typo fails the workflow instead.
+        # NO `when`, deliberately: it runs in every mode, so it is the one place
+        # an unknown mode is refused. A misspelt mode (or `globus`, from a
+        # parameter set copied off a pre-retirement workflow) skips the HTTPS
+        # copy, and the template's unknown_mode_error then fails the workflow
+        # before inventory. A guard here — `== "presynced"`, say — would let
+        # such a mode skip both tasks and run inventory over whatever is staged
+        # (observed live under #336 — the parameter enum does not stop it).
         #
         # Its one `depends` is the HTTPS copy, Succeeded or Skipped. In every mode
         # but https that task is Skipped by its `when`, so this runs exactly as it
-        # did with no `depends`. In https mode a failed copy leaves this Omitted,
-        # and so inventory too — the validator never inspects a half-copied tree.
+        # would with no `depends`. In https mode a failed copy leaves this
+        # Omitted, and so inventory too — the validator never inspects a
+        # half-copied tree.
         - name: verify-staged-input-dagtask
           depends: "https-transfer-dagtask.Succeeded || https-transfer-dagtask.Skipped"
-          when: '"{{workflow.parameters.ingress-mode}}" != "globus"'
           templateRef:
             name: ingress-verify
             template: verify-staged-input-template
@@ -396,17 +405,21 @@ spec:
           templateRef:
             name: inventory
             template: subject-data-inventory-template
+          arguments:
+            parameters:
+              - name: exclude-sessions
+                value: '{{workflow.parameters.exclude-sessions}}'
           # Waits for every ingress task to succeed or be Skipped:
-          #   globus    — globus-transfer runs; https-transfer and the check Skip.
-          #   presynced — the check runs; both transfers Skip.
-          #   https     — https-transfer, then the check; globus-transfer Skips.
+          #   https     — https-transfer, then the check.
+          #   presynced — the check runs; https-transfer Skips.
+          #   anything else — https-transfer Skips and the check fails it.
           #
           # No `.Omitted` on any term — see the Ingress note above. A failed
-          # transfer of either kind, or a failed check, leaves this Omitted, so
-          # inventory never runs over a failed ingress. The HTTPS copy is named
-          # here as well as in the check's `depends`, so the gate still covers
-          # it if that `depends` is ever edited away.
-          depends: "(globus-transfer-dagtask.Succeeded || globus-transfer-dagtask.Skipped) && (https-transfer-dagtask.Succeeded || https-transfer-dagtask.Skipped) && (verify-staged-input-dagtask.Succeeded || verify-staged-input-dagtask.Skipped)"
+          # copy, or a failed check, leaves this Omitted, so inventory never
+          # runs over a failed ingress. The HTTPS copy is named here as well as
+          # in the check's `depends`, so the gate still covers it if that
+          # `depends` is ever edited away.
+          depends: "(https-transfer-dagtask.Succeeded || https-transfer-dagtask.Skipped) && (verify-staged-input-dagtask.Succeeded || verify-staged-input-dagtask.Skipped)"
 
         # Anatomical processing pipeline
         - name: anatomical-processing-pipeline-dagtask
@@ -1204,10 +1217,15 @@ spec:
         # it consumes the grayordinate components that task produces. Runs on
         # Failed too: func-preproc fails only when EVERY run failed, and a
         # partial failure still leaves usable components for its siblings.
+        # And on Errored: a pod lost after uploading some runs' components left
+        # them orphaned with no dtseries (2026-10-29, 4 of 6 runs in each of 4
+        # sessions). The components input is optional and the driver checks
+        # each run, so a run with nothing uploaded is simply not assembled.
         - name: surface-resample-dagtask
           depends: >-
             functional-preprocessing-dagtask.Succeeded ||
             functional-preprocessing-dagtask.Failed ||
+            functional-preprocessing-dagtask.Errored ||
             functional-preprocessing-dagtask.Skipped
           templateRef:
             name: surface-resample
@@ -1257,8 +1275,8 @@ spec:
 #----- Workflow Exit Handler -----#
 # Runs on workflow completion (success or failure)
 # via onExit. Emits WorkflowRun metrics to S3,
-# then deletes the Globus-transferred input files
-# from S3 on success (globus ingress mode only).
+# then deletes the subject's staged input from S3
+# on success, in every ingress mode but presynced.
 ##################################################
 
   - name: emit-workflow-metrics-template
@@ -1290,7 +1308,7 @@ spec:
     # Every mode but presynced. In presynced mode mmps_mproc/{subj}/ is data the
     # operator staged by hand and the pipeline cannot re-fetch, so deleting it on
     # success is data loss, not cleanup (#336). `!= "presynced"` rather than
-    # naming globus and https: a fourth mode then defaults to cleaning up, and
+    # `== "https"`: a new fetching mode then defaults to cleaning up, and
     # the other default — mmps_mproc/ silently filling — is the one nobody sees
     # (design D8). A misspelt mode fails the workflow, so it never gets here.
     - - name: delete-globus-input
@@ -1298,9 +1316,11 @@ spec:
         when: '{{workflow.status}} == Succeeded && "{{workflow.parameters.ingress-mode}}" != "presynced"'
 
 ##################################################
-#----- Globus Input Cleanup -----#
-# Deletes the Globus-transferred input files from
-# S3 after a successful workflow run.
+#----- Staged Input Cleanup -----#
+# Deletes the subject's staged input files from
+# S3 after a successful workflow run. The
+# delete-globus-input name is historical and kept:
+# it is a step label (src/workflow_steps.py).
 ##################################################
 
   - name: delete-globus-input-template
@@ -1311,7 +1331,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:57d929e8ef38d3d481fef3372c29a9545f9b3056b7ace3c2b9a37bced2df3d01"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

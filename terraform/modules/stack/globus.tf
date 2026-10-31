@@ -63,8 +63,6 @@ module "globus" {
   globus_collection_name      = var.globus_collection_name
   globus_gateway_name         = var.globus_gateway_name
   globus_client_id            = var.globus_client_id
-  globus_source_collection_id = var.globus_source_collection_id
-  globus_source_base_path     = var.globus_source_base_path
   globus_staging_enabled      = var.globus_staging_enabled
   globus_session_timeout_days = var.globus_session_timeout_days
   globus_production_managed   = var.globus_production_managed

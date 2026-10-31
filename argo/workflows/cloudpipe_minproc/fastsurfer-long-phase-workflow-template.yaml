@@ -22,7 +22,7 @@ spec:
     # artifact-staging class (#277). A missing artifact KEY is excluded, though:
     # its producer was skipped or failed, and a consumer retry cannot re-run the
     # producer. See the master template for the detail.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -204,7 +204,7 @@ spec:
     # so 312 sequential S3 GETs were billed as slice time.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:391244dd292ede02c182f86bf6b1f4d3cad4ff27d2ca66e8152052ae9c5f0ec2"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:fd118b11da90760bb8897936af1d3744184298e3be3a18b397af2a9fc9826b7c"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -701,7 +701,7 @@ spec:
     # $FREESURFER_HOME/subjects/fsaverage — see the args block below.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:391244dd292ede02c182f86bf6b1f4d3cad4ff27d2ca66e8152052ae9c5f0ec2"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:fd118b11da90760bb8897936af1d3744184298e3be3a18b397af2a9fc9826b7c"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

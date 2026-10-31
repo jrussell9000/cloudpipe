@@ -12,6 +12,15 @@ spec:
       labels:
         cloudpipe.io/phase: inventory
         cloudpipe.io/step: subject-data-inventory
+    inputs:
+      parameters:
+        # Comma-separated session IDs whose T1w must not enter the longitudinal
+        # template; inventory reports them `t1w_available: false`. An input with a
+        # default rather than a `{{workflow.parameters.*}}` read, so a caller that
+        # does not declare the workflow parameter still resolves. See the master
+        # template's `exclude-sessions`.
+        - name: exclude-sessions
+          value: ""
     # `Always`, not `OnFailure`: OnFailure cannot see phase=Error, so a
     # control-plane-throttled or deleted pod got zero retries out of a budget of
     # three. Same defect and same reasoning as globus-transfer-workflow-template
@@ -36,7 +45,7 @@ spec:
             path: /tmp/subregions_exists.txt
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:57d929e8ef38d3d481fef3372c29a9545f9b3056b7ace3c2b9a37bced2df3d01"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -57,6 +66,8 @@ spec:
         - '{{workflow.parameters.subjID}}'
         - --bucket
         - '{{workflow.parameters.bucket}}'
+        - --exclude-sessions
+        - '{{inputs.parameters.exclude-sessions}}'
 
   # Re-reads the FastSurfer completion markers AFTER the anatomical phase and
   # splits the inventory into the sessions that have derivatives and those that
@@ -119,7 +130,7 @@ spec:
             path: /tmp/rejected_count.txt
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:57d929e8ef38d3d481fef3372c29a9545f9b3056b7ace3c2b9a37bced2df3d01"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

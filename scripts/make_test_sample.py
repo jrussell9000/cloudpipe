@@ -5,7 +5,7 @@ Why stratified rather than random: cost and wall-clock scale near-linearly in a
 subject's session count k ($0.096 at k=1 to $0.305 at k=4, issue #133), and k is
 also what drives per-workflow footprint on cpu-light-nodepool (2 + 2k cpu,
 5G + 4G*k memory). A random draw's k-mix drifts from the corpus, so extrapolating
-its cost and duration to the full 11,628 is unreliable. Matching the corpus
+its cost and duration to the full 11,621 is unreliable. Matching the corpus
 proportions makes the batch's mean directly scalable.
 
 Prior test subjects are re-usable, but ONLY after a flush. Once a subject has been

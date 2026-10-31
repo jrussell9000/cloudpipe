@@ -123,6 +123,19 @@ LABEL_SUBJECT = "subjectid"
 # _capacity_type, which falls back to the `preemptible` field for those.
 LABEL_CAPACITY_TYPE = "karpenter_sh_capacity_type"
 
+# Workflows whose cost is deliberately not recorded, by name prefix (Argo names a
+# workflow `{template}-{suffix}`). The confounds-only re-run (confounds-rerun,
+# 2026-10-28) only repairs TSVs a cloudpipe workflow already produced and was
+# costed for, and writes no WorkflowRun row; operator decision: drop its cost
+# rather than add it to the subject's. Both scrape grains skip these, and
+# cost_gaps does not count them as unbilled.
+UNRECORDED_WORKFLOW_PREFIXES = ("confounds-rerun-",)
+
+
+def cost_is_recorded(workflow_name: str) -> bool:
+    return not workflow_name.startswith(UNRECORDED_WORKFLOW_PREFIXES)
+
+
 _BYTES_PER_GB = 1024**3
 
 # Kubecost reconciliation against the AWS CUR converges at age 3 and then never
@@ -241,6 +254,8 @@ def parse_allocations(
 
     for workflow_name, alloc in allocation_set.items():
         if not workflow_name or workflow_name.startswith("__"):
+            continue
+        if not cost_is_recorded(workflow_name):
             continue
 
         subject = alloc.get("properties", {}).get("labels", {}).get("subjectid", "")
@@ -397,7 +412,7 @@ def parse_pod_allocations(
             continue
 
         workflow_name = _label(alloc, LABEL_WORKFLOW)
-        if not workflow_name:
+        if not workflow_name or not cost_is_recorded(workflow_name):
             continue
 
         props = alloc.get("properties", {})

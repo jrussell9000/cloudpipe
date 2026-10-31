@@ -180,6 +180,31 @@ _UNION_COLUMNS = {
         "pipeline",
         "completed_at",
     ],
+    # The whole table: identity, provenance, then the dseg and probseg volumes
+    # and their agreement, in emitter order (images/afni/tissue_masks.py).
+    # probseg_* and agreement_* are NULL when no probseg was fitted; read
+    # probseg_written to tell a rejected fit (FALSE, values present) from one
+    # that was never attempted (FALSE, values NULL).
+    "tissue_masks": [
+        "subject",
+        "session",
+        "pipeline",
+        "image_tag",
+        "source",
+        "completed_at",
+        "dseg_gm_vol_mm3",
+        "dseg_wm_vol_mm3",
+        "dseg_csf_vol_mm3",
+        "probseg_input",
+        "probseg_seed",
+        "probseg_written",
+        "probseg_gm_vol_mm3",
+        "probseg_wm_vol_mm3",
+        "probseg_csf_vol_mm3",
+        "agreement_gm",
+        "agreement_wm",
+        "agreement_csf",
+    ],
     "workflow_runs": [
         "workflow_name",
         # Schema 1.3+: the run's identity — Argo reuses names (#638). "" or NULL
@@ -711,6 +736,27 @@ class CloudpipeMetrics:
         non-zero = it degraded, NULL = it never reported).
         """
         return self._query("fsqc_qc", filters, dt_from, dt_to, compacted)
+
+    def tissue_qc(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return the per-session MNI tissue-map QC (TissueQC) as a DataFrame.
+
+        One row per subject+session: the FastSurfer dseg's and the DIPY
+        probseg's volume per class, and how far the two agree. Written by
+        func-preproc (source "func-preproc") and by the probseg backfill
+        (source "probseg-backfill"); a session reprocessed later appears under
+        the later dt, so dedupe on subject+session by latest completed_at.
+
+        probseg_written FALSE with values present is a fit the agreement guard
+        rejected (no probseg was published); FALSE with NULL values means no
+        fit was attempted.
+        """
+        return self._query("tissue_masks", filters, dt_from, dt_to, compacted)
 
     def anatomical_qc(
         self,

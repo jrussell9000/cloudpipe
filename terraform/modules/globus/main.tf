@@ -249,48 +249,9 @@ resource "aws_ssm_parameter" "globus_gateway_name" {
   }
 }
 
-resource "aws_ssm_parameter" "globus_source_collection_id" {
-  name  = "${local.ssm_prefix}/source-collection-id"
-  type  = "String"
-  value = var.globus_source_collection_id
-
-  tags = {
-    Name = "${var.name}-globus-source-collection-id"
-  }
-}
-
-resource "aws_ssm_parameter" "globus_source_base_path" {
-  name  = "${local.ssm_prefix}/source-base-path"
-  type  = "String"
-  value = var.globus_source_base_path
-
-  tags = {
-    Name = "${var.name}-globus-source-base-path"
-  }
-}
-
-# When the Globus session behind the stored refresh token was established.
-#
-# Written by `globus login`, read by `globus doctor` and by the queue manager's
-# batch gate. Deliberately NOT derived from the secret's LastChangedDate: that
-# also moves when the secret is edited for an unrelated reason, which would
-# silently reset the clock a 300-subject batch depends on.
-#
-# Terraform creates it empty and never writes it again. An empty value reads as
-# "no login recorded", which the gate treats as unusable — the safe direction.
-resource "aws_ssm_parameter" "globus_session_established_at" {
-  name  = "${local.ssm_prefix}/session-established-at"
-  type  = "String"
-  value = "REPLACE_AFTER_GCS_SETUP"
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-
-  tags = {
-    Name = "${var.name}-globus-session-established-at"
-  }
-}
+# `source-collection-id`, `source-base-path` and `session-established-at` moved to
+# `terraform/modules/stack/ingress_session.tf`: HTTPS ingress reads all three,
+# and it must not depend on this module existing (retire-globus-host, design D5).
 
 ################################################################################
 # The GCS configuration document — the declared state the on-instance reconcile

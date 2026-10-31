@@ -1,0 +1,54 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: fmriprep-bench-nodepool
+spec:
+  # On-demand capacity for the fMRIPrep reference arm of the equivalence
+  # benchmark (argo/workflows/fmriprep_bench), by the operator's decision
+  # (2026-10-28): the reference arm runs on-demand so its runtime and cost
+  # figures carry no reclaim, while cloudpipe stays on spot. Every other pool is
+  # spot-only, which is why this one exists.
+  #
+  # Tainted so nothing else lands here: an on-demand node costs roughly three
+  # times a spot one, and without the taint any cpu-heavy pod could schedule
+  # onto it. Only the bench template tolerates cloudpipe.io/fmriprep-bench.
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 10m
+  # A backstop, not a budget: 16 vCPU per node, so 256 cpu caps the arm at 16
+  # concurrent sessions (the template requests 14 of 16, one pod per node).
+  limits:
+    cpu: 256
+    memory: "1024Gi"
+  template:
+    spec:
+      expireAfter: 720h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: nodeclass
+      taints:
+        - key: cloudpipe.io/fmriprep-bench
+          value: "true"
+          effect: NoSchedule
+      requirements:
+      - key: "kubernetes.io/arch"
+        operator: In
+        values: ["amd64"]
+      - key: "kubernetes.io/os"
+        operator: In
+        values: ["linux"]
+      - key: "karpenter.sh/capacity-type"
+        operator: In
+        values: ["on-demand"]
+      # cpu-heavy's families at the one size that fits the 14-vCPU request, so
+      # the two arms run on the same hardware classes.
+      - key: "karpenter.k8s.aws/instance-category"
+        operator: In
+        values: ["c", "m"]
+      - key: karpenter.k8s.aws/instance-size
+        operator: In
+        values: [4xlarge]
+      - key: "karpenter.k8s.aws/instance-hypervisor"
+        operator: In
+        values: ["nitro"]

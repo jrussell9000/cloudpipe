@@ -73,6 +73,11 @@ Inputs (via CLI args):
   --aseg             aseg.mgz from FastSurfer (for WM/CSF masks in aCompCor)
   --motion-file      ABCD 3dvolreg motion parameter TSV
 
+--emit confounds runs Stage 1 and Stage 6 only and writes just the confounds TSV
+(and the boldref, which Stage 6 reads for its grid). It is the confounds-only
+re-run's path (images/afni/confounds_rerun.py): the published MNI BOLD is kept,
+so the MNI template and the T1w→MNI pair are not needed and not read.
+
 Outputs written to --outdir:
   <prefix>_desc-boldref.nii.gz                          steady-state mean reference volume
   <prefix>_space-MNI152NLin2009cAsym_brainmask.nii.gz  MNI-space brain mask
@@ -117,10 +122,12 @@ from func_iqm import (  # noqa: F401
     _outlier_fraction,
     _quality_index,
     compute_func_qc_summary,
+    load_as,
 )
+from nibabel.spatialimages import SpatialImage
+from scipy import linalg as scipy_linalg
 from scipy import sparse
 from scipy.ndimage import binary_erosion, map_coordinates
-from sklearn.decomposition import PCA
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -212,7 +219,7 @@ def extract_bold_ref(bold: Path, outdir: Path, prefix: str, nss_frames: int) -> 
             f'nss_frames={nss_frames} gives no frames to average for the BOLD '
             'reference; expected at least 1'
         )
-    img = nib.load(bold)
+    img = load_as(bold, SpatialImage)
     n_vols = img.shape[3] if len(img.shape) == 4 else 1
     # A run with no steady-state frame would make the mean all-NaN with only a
     # RuntimeWarning, and that reference is the geometry input for the
@@ -261,7 +268,7 @@ def _read_itk_affine(path: Path) -> np.ndarray:
 
 
 def _build_warp_coords(
-    composite_warp: Path, moving_affine: np.ndarray, mni_img: nib.Nifti1Image
+    composite_warp: Path, moving_affine: np.ndarray, mni_img: SpatialImage
 ) -> np.ndarray:
     """Load an ANTs composite displacement field and return moving-space voxel
     coordinates for each MNI output voxel as an array of shape (3, X, Y, Z).
@@ -273,7 +280,7 @@ def _build_warp_coords(
     The returned coordinate array is suitable as the ``coordinates`` argument
     to scipy.ndimage.map_coordinates.
     """
-    warp_img = nib.load(composite_warp)
+    warp_img = load_as(composite_warp, SpatialImage)
     warp_data = np.asarray(warp_img.dataobj, dtype=np.float64)
     if warp_data.ndim == 5:
         warp_data = warp_data[:, :, :, 0, :]  # (X, Y, Z, 3)
@@ -379,7 +386,7 @@ class WarpedBold:
 
     scratch_path: Path
     n_frames: int
-    shape: tuple[int, int, int]
+    shape: tuple[int, ...]  # (x, y, z)
     header: "nib.Nifti1Header"
     coords: "np.ndarray | None"
     mean_map: np.ndarray
@@ -387,7 +394,7 @@ class WarpedBold:
 
 def apply_transforms(
     bold: Path, mni_template: Path, composite_warp: Path, outdir: Path, prefix: str, threads: int
-) -> tuple[Path, np.ndarray, np.ndarray]:
+) -> tuple[Path, np.ndarray | None, np.ndarray]:
     """Stage 3 on its own: warp, then write the UNMASKED MNI BOLD.
 
     Returns (unmasked MNI BOLD path, warp coords, temporal-mean map). The run
@@ -440,8 +447,9 @@ def warp_bold(
     (4 bytes x N_mni x n_frames), not RAM.
     """
     with substage("4d_warp.load_bold"):
-        mni_img = nib.load(mni_template)
-        bold_img = nib.load(bold)
+        # NIfTI, not just any volume: out_hdr below is built from its header.
+        mni_img = load_as(mni_template, nib.Nifti1Image)
+        bold_img = load_as(bold, SpatialImage)
         n_frames = bold_img.shape[3]
         bold_data = np.asarray(bold_img.dataobj, dtype=np.float32)
 
@@ -496,13 +504,13 @@ def warp_bold(
     # _warp_frame closure above, and `del`ing a closed-over name makes pyflakes
     # (F821) treat every use inside the closure as unbound. Rebinding drops the
     # same reference at the same point, so the arrays are freed identically.
-    bold_data = mean_acc = None
+    bold_data = mean_acc = None  # type: ignore[assignment]
 
     # A NaN or inf anywhere is a broken warp; stop here rather than ship it.
     if not np.isfinite(max_abs[0]):
         raise ValueError(f"warped BOLD contains non-finite values ({prefix})")
     scratch.flush()
-    scratch = None  # rebind, not `del` — closed over by _warp_frame (see above)
+    scratch = None  # type: ignore[assignment]  # rebind, not `del`: closed over by _warp_frame
 
     out_hdr = mni_img.header.copy()
     out_hdr.set_data_dtype(np.float32)
@@ -614,8 +622,8 @@ def warp_mask_to_mni(
     coords can be passed from apply_transforms (Stage 3) to avoid recomputing
     _build_warp_coords; the BOLD and brainmask share the same native-space affine.
     """
-    mni_img = nib.load(mni_template)
-    mask_img = nib.load(brainmask)
+    mni_img = load_as(mni_template, SpatialImage)
+    mask_img = load_as(brainmask, SpatialImage)
     mask_data = np.asarray(mask_img.dataobj, dtype=np.float32)
 
     if coords is None:
@@ -670,8 +678,8 @@ def verify_mni_bold_readback(mni_bold: Path, mask_mni: Path, mean_map: np.ndarra
     It is also deterministic, so the step's retryStrategy (64/75/143) leaves it
     alone.
     """
-    mask = np.asanyarray(nib.load(mask_mni).dataobj) > 0
-    shape = nib.load(mni_bold).shape[:3]
+    mask = np.asanyarray(load_as(mask_mni, SpatialImage).dataobj) > 0
+    shape = load_as(mni_bold, SpatialImage).shape[:3]
     if shape != mean_map.shape or shape != mask.shape:
         raise MNIBoldReadbackError(
             f"{mni_bold.name}: spatial shape {shape} does not match the warp's "
@@ -847,9 +855,9 @@ def sample_cortical_ribbon(
     writes them with write_ribbon_gifti and measures them for QC while they
     are still in memory.
     """
-    aseg_img = nib.load(aseg)
-    bold_img = nib.load(bold)
-    bold_ref_img = nib.load(bold_ref)
+    aseg_img = load_as(aseg, nib.MGHImage)  # the tkr frame needs MGH's header
+    bold_img = load_as(bold, SpatialImage)
+    bold_ref_img = load_as(bold_ref, SpatialImage)
     n_frames = bold_img.shape[3]
 
     # tkrRAS → scanner RAS → BOLD RAS → BOLD voxel.
@@ -886,7 +894,7 @@ def sample_cortical_ribbon(
         # sort of every stored weight.
         used = np.flatnonzero(np.bincount(weights.indices, minlength=weights.shape[1]))
         weights = weights[:, used]
-    coords = None
+    coords = None  # type: ignore[assignment]
 
     # Read the 4D array in one pass rather than frame by frame. nibabel's
     # ArrayProxy only does true random access into a .nii.gz when indexed_gzip
@@ -912,7 +920,7 @@ def sample_cortical_ribbon(
     # disjoint and the result does not depend on the thread count.
     with substage("grayordinates.sample_ribbon"):
         voxels = bold_data[np.unravel_index(used, bold_data.shape[:3], order="F")]
-        bold_data = None
+        bold_data = None  # type: ignore[assignment]
         ts = np.empty((weights.shape[0], n_frames), dtype=np.float32)
         bounds = np.linspace(0, weights.shape[0], max(1, min(threads, weights.shape[0])) + 1)
         spans = [(int(a), int(b)) for a, b in itertools.pairwise(bounds.round())]
@@ -925,7 +933,7 @@ def sample_cortical_ribbon(
             list(pool.map(_rows, spans))
     # Rebind, not `del` — closed over by _rows (F821); see the note in
     # apply_transforms.
-    weights = voxels = None
+    weights = voxels = None  # type: ignore[assignment]
 
     out: dict[str, np.ndarray] = {}
     start = 0
@@ -1029,8 +1037,8 @@ def extract_subcortical(
         ]
     )
 
-    bold_img = nib.load(mni_bold)
-    lab_src = np.round(nib.load(aseg_mni).get_fdata()).astype(np.int32)
+    bold_img = load_as(mni_bold, SpatialImage)
+    lab_src = np.round(load_as(aseg_mni, SpatialImage).get_fdata()).astype(np.int32)
 
     labels = np.zeros(lab_src.shape, dtype=np.int16)
     present: dict[int, str] = {}
@@ -1049,7 +1057,7 @@ def extract_subcortical(
         raise ValueError("no subcortical voxels survived the aseg warp")
 
     if masked_ts is not None and mask_mni is not None:
-        brain = np.asanyarray(nib.load(mask_mni).dataobj) > 0
+        brain = np.asanyarray(load_as(mask_mni, SpatialImage).dataobj) > 0
         if masked_ts.shape != (int(brain.sum()), bold_img.shape[3]):
             raise ValueError(
                 f"read-back matrix {masked_ts.shape} does not fit {mask_mni.name} "
@@ -1110,6 +1118,123 @@ def _pad_nss(comps: np.ndarray, nss_frames: int) -> np.ndarray:
     return np.vstack([np.zeros((nss_frames, comps.shape[1]), dtype=comps.dtype), comps])
 
 
+# --- CompCor and the cosine basis, as nipype computes them (fMRIPrep) --------
+#
+# Reimplemented from nipype.algorithms.confounds (Apache-2.0; _cosine_drift and
+# _full_rank there are from nipy 0.4.1, BSD), which is what fMRIPrep's
+# init_bold_confs_wf runs: ACompCor/TCompCor with pre_filter='cosine',
+# high_pass_cutoff=128, variance_threshold=0.5, percentile_threshold=0.02 and
+# ignore_initial_volumes = the dummy scans. The functions keep nipype's names
+# and steps so the two can be read side by side, and
+# tests/images/afni/test_compcor_nipype_parity.py holds them to a verbatim copy
+# of nipype's code. Until 2026-10-27 this stage demeaned only, did not
+# variance-normalise, ranked tCompCor voxels on raw SD and built the cosines
+# over every frame, NSS included; each of those departed from the method.
+
+#: Period (s) of nipype's cosine high-pass, high_pass_cutoff's default.
+HIGH_PASS_PERIOD_S = 128.0
+#: fMRIPrep's variance_threshold for both CompCor decompositions.
+COMPCOR_VARIANCE_THRESHOLD = 0.5
+#: TCompCor's percentile_threshold: the top 2% of brain voxels by tSTD.
+TCOMPCOR_PERCENTILE = 0.02
+
+
+def _cosine_drift(period_cut: float, frametimes: np.ndarray) -> np.ndarray:
+    """nipype's DCT-II drift matrix: `order - 1` cosines, then a constant column."""
+    len_tim = len(frametimes)
+    n_times = np.arange(len_tim)
+    hfcut = 1.0 / period_cut
+    dt = frametimes[1] - frametimes[0]
+    order = max(int(np.floor(2 * len_tim * hfcut * dt)), 1)
+    cdrift = np.zeros((len_tim, order))
+    nfct = np.sqrt(2.0 / len_tim)
+    for k in range(1, order):
+        cdrift[:, k - 1] = nfct * np.cos((np.pi / len_tim) * (n_times + 0.5) * k)
+    cdrift[:, order - 1] = 1.0
+    return cdrift
+
+
+def _full_rank(X: np.ndarray, cmax: float = 1e15) -> np.ndarray:
+    """nipype's regularisation of an ill-conditioned design (a no-op for a DCT basis)."""
+    U, s, V = np.linalg.svd(X, full_matrices=False)
+    smax, smin = s.max(), s.min()
+    if smax / smin < cmax:
+        return X
+    lda = (smax - cmax * smin) / (cmax - 1)
+    return np.dot(U, np.dot(np.diag(s + lda), V))
+
+
+def _cosine_filter(data: np.ndarray, timestep: float) -> tuple[np.ndarray, np.ndarray]:
+    """High-pass `data` (voxels x time) with the cosine basis, mean included.
+
+    Returns (residuals, the non-constant cosine regressors), as nipype's
+    cosine_filter does with remove_mean=True.
+    """
+    timepoints = data.shape[-1]
+    frametimes = timestep * np.arange(timepoints)
+    X = _full_rank(_cosine_drift(HIGH_PASS_PERIOD_S, frametimes))
+    basis = X[:, :-1] if X.shape[1] > 1 else np.zeros((timepoints, 0))
+    betas = np.linalg.lstsq(X, data.T, rcond=None)[0]
+    return data - X.dot(betas).T, basis
+
+
+def _regress_poly(degree: int, data: np.ndarray) -> np.ndarray:
+    """`data` (voxels x time) with a Legendre polynomial of `degree` and the mean removed."""
+    timepoints = data.shape[-1]
+    X = np.ones((timepoints, 1))
+    for i in range(degree):
+        legendre = np.polynomial.legendre.Legendre.basis(i + 1)
+        X = np.hstack((X, legendre(np.linspace(-1, 1, timepoints))[:, np.newaxis]))
+    betas = np.linalg.pinv(X).dot(data.T)
+    return data - X.dot(betas).T
+
+
+def _tstd(M: np.ndarray, bad: float, axis: int = 0) -> np.ndarray:
+    """nipype's _compute_tSTD: standard deviation with zero and NaN replaced by `bad`."""
+    std = np.std(M, axis=axis)
+    std[std == 0] = bad
+    std[np.isnan(std)] = bad
+    return std
+
+
+def _noise_components(
+    voxel_timecourses: np.ndarray, timestep: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """One mask's CompCor, as nipype's compute_noise_components (pre_filter='cosine').
+
+    `voxel_timecourses` is (voxels x steady-state frames). Returns (components,
+    cumulative explained variance): the leading left singular vectors of the
+    cosine-filtered, variance-normalised data, as many as it takes to explain
+    COMPCOR_VARIANCE_THRESHOLD of the variance.
+    """
+    voxel_timecourses = voxel_timecourses.astype(np.float64, copy=True)
+    voxel_timecourses[np.isnan(np.sum(voxel_timecourses, axis=1)), :] = 0
+    filtered, _ = _cosine_filter(voxel_timecourses, timestep)
+    M = filtered.T
+    M = M / _tstd(M, 1.0)
+    try:
+        u, s, _ = np.linalg.svd(M, full_matrices=False)
+    except np.linalg.LinAlgError:
+        # nipype's fallback_svd: the slower but more robust LAPACK driver.
+        u, s, _ = scipy_linalg.svd(M, full_matrices=False, lapack_driver="gesvd")
+    explained = (s**2) / np.sum(s**2)
+    cumulative = np.cumsum(explained)
+    n = int(np.searchsorted(cumulative, COMPCOR_VARIANCE_THRESHOLD) + 1)
+    return u[:, :n], cumulative
+
+
+def _tcompcor_voxels(brain_timecourses: np.ndarray) -> np.ndarray:
+    """TCompCor's noise ROI within the brain mask, as nipype's _process_masks.
+
+    `brain_timecourses` is (voxels x steady-state frames). A quadratic detrend,
+    then the voxels at or above the (1 - TCOMPCOR_PERCENTILE) percentile of tSTD.
+    """
+    detrended = _regress_poly(2, brain_timecourses.astype(np.float64))
+    tstd = _tstd(detrended, 0, axis=-1)
+    threshold = np.percentile(tstd, np.round(100.0 * (1.0 - TCOMPCOR_PERCENTILE)).astype(int))
+    return tstd >= threshold
+
+
 def compute_confounds(
     bold: Path,
     brainmask: Path,
@@ -1134,12 +1259,18 @@ def compute_confounds(
         converting rotations to mm assuming a 50 mm head radius
       - DVARS (RMS of temporal derivative of masked BOLD signal)
       - Global signal (mean over brain mask)
-      - aCompCor: PCA components from eroded WM and CSF masks derived from
+      - aCompCor: components from eroded WM and CSF masks derived from
         FastSurfer aseg.mgz, warped to BOLD native space via the inverse of
-        the bold2t1w affine transform; retains the minimum of 5 components
-        or the number needed to explain ≥50% of variance (fMRIPrep default)
-      - tCompCor: 5 PCA components from the top 2% of brain voxels ranked
-        by temporal standard deviation (data-driven noise ROI)
+        the bold2t1w affine transform, each decomposed as nipype's ACompCor
+        does for fMRIPrep: cosine high-pass, per-voxel variance normalisation,
+        SVD, and as many components as explain 50% of the variance
+      - tCompCor: the same decomposition over the top 2% of brain voxels by
+        temporal SD after a quadratic detrend (nipype's TCompCor)
+
+    The decompositions are nipype's (see _noise_components and the note above
+    it), held to a verbatim copy of nipype's code by a parity test. Our masks
+    are not fMRIPrep's: fMRIPrep builds WM/CSF/combined masks from FAST
+    probability maps, this uses the aseg labels.
 
     Both CompCor decompositions EXCLUDE the non-steady-state frames (#643).
     The T1-saturation transient in the first 8-16 frames is the largest
@@ -1157,8 +1288,9 @@ def compute_confounds(
     zero-to-five fMRIPrep documents as typical, so the excluded fraction here is
     larger than in most fMRIPrep runs. Do not quote "8 or 16": the 5s are a
     tenth of the GE data.
-      - Cosine (DCT) regressors: discrete cosine basis for implicit high-pass
-        filtering at 1/128 Hz; number of regressors = floor(2·T·TR/128)
+      - Cosine (DCT) regressors: nipype's discrete cosine basis for high-pass
+        filtering at 1/128 Hz, over the steady-state frames and zero on the NSS
+        rows; max(floor(2·(T−nss)·TR/128), 1) − 1 columns
       - Non-steady-state outlier indicators: one binary column per NSS frame
         (non_steady_state_outlier_00 … _NN), for explicit GLM exclusion
 
@@ -1184,10 +1316,10 @@ def compute_confounds(
     fd = np.concatenate([[np.nan], fd_raw])
 
     # --- Load BOLD metadata and brain mask ---
-    bold_img = nib.load(bold)
+    bold_img = load_as(bold, SpatialImage)
     n_frames = bold_img.shape[3]
     tr = float(bold_img.header.get_zooms()[3])
-    mask_data = nib.load(brainmask).get_fdata() > 0
+    mask_data = load_as(brainmask, SpatialImage).get_fdata() > 0
 
     # Frames that feed the CompCor decompositions (#643). Guarded rather than
     # clamped: nss_frames comes from tools/nss_volumes.csv keyed by run, so a
@@ -1205,7 +1337,7 @@ def compute_confounds(
 
     # --- aCompCor tissue masks: precompute before loading bold_data so that
     #     bold_data can be freed immediately after ROI extraction. ---
-    aseg_img = nib.load(aseg)
+    aseg_img = load_as(aseg, SpatialImage)
     aseg_data = np.round(aseg_img.get_fdata()).astype(int)
 
     wm_arr = np.isin(aseg_data, [2, 41]).astype(np.uint8)
@@ -1214,7 +1346,7 @@ def compute_confounds(
     wm_arr = binary_erosion(wm_arr, iterations=1).astype(np.uint8)
 
     # Precompute the BOLD voxel → T1w voxel coordinate map for tissue mask warping.
-    bold_ref_img = nib.load(bold_ref)
+    bold_ref_img = load_as(bold_ref, SpatialImage)
     M_bold_to_t1w_vox = _bold_vox_to_aseg_vox(
         _read_itk_affine(bold2t1w_affine), aseg_img.affine, bold_ref_img.affine
     )
@@ -1252,34 +1384,37 @@ def compute_confounds(
     # --- Global signal ---
     global_signal = brain_ts.mean(axis=1)
 
-    # --- tCompCor: top-2% temporal-SD voxels, steady-state frames only ---
+    # --- tCompCor: nipype's TCompCor over the brain mask, steady-state frames ---
     #
-    # The SD ranking runs on the steady-state frames too, not just the PCA. The
-    # transient is what makes a voxel high-variance, so ranking over the full
-    # series selects the voxels that saturate most rather than the noisiest
-    # ones, and the noise ROI itself comes out wrong (#643).
-    steady_ts = brain_ts[nss_frames:]  # (n_keep, n_brain)
-    temporal_std = steady_ts.std(axis=0)  # (voxels,)
-    sd_threshold = np.percentile(temporal_std, 98)
-    high_var_ts = steady_ts[:, temporal_std >= sd_threshold]  # (n_keep, n_hv)
-    high_var_ts = high_var_ts - high_var_ts.mean(axis=0)  # voxelwise demean
-    n_tcc = min(5, high_var_ts.shape[1], n_keep)
+    # The noise ROI is the top 2% of brain voxels by tSTD after a quadratic
+    # detrend, then decomposed like aCompCor. Steady-state frames only, the
+    # ranking included: the transient is what makes a voxel high-variance, so a
+    # full-series ranking selects the voxels that saturate most (#643).
+    steady_brain = brain_ts[nss_frames:].T  # (n_brain, n_keep)
+    noise_roi = _tcompcor_voxels(steady_brain)
     t_comp_cor_cols: dict = {}
-    if n_tcc > 0:
+    if noise_roi.any():
         with substage("confounds.pca"):
-            t_comps = _pad_nss(
-                PCA(n_components=n_tcc).fit_transform(high_var_ts), nss_frames
-            )  # (T, n_tcc)
-        for i in range(n_tcc):
+            t_comps, t_cumvar = _noise_components(steady_brain[noise_roi], tr)
+        t_comps = _pad_nss(t_comps, nss_frames)  # (T, n_tcc)
+        print(
+            f"  tCompCor: {t_comps.shape[1]} components from {int(noise_roi.sum())} voxels "
+            f"({t_cumvar[t_comps.shape[1] - 1]:.1%} variance explained)",
+            flush=True,
+        )
+        for i in range(t_comps.shape[1]):
             t_comp_cor_cols[f't_comp_cor_{i:02d}'] = t_comps[:, i]
 
-    # --- Cosine (DCT) regressors for implicit high-pass filtering at 1/128 Hz ---
-    n_cosines = int(np.floor(2 * n_frames * tr / 128.0))
-    t_idx = np.arange(n_frames)
-    cosine_cols: dict = {
-        f'cosine_{k:02d}': np.sqrt(2 / n_frames) * np.cos(np.pi / n_frames * k * (t_idx + 0.5))
-        for k in range(1, n_cosines + 1)
-    }
+    # --- Cosine (DCT) regressors: nipype's high-pass basis at 1/128 Hz ---
+    #
+    # Built over the steady-state frames and zero on the NSS rows, as fMRIPrep's
+    # cosine columns are, so it is the same basis the CompCor fits removed.
+    # Count: max(floor(2 * n_keep * TR / 128), 1) - 1, nipype's DCT order less
+    # its constant column. Until 2026-10-27 the basis spanned every frame and
+    # held floor(2 * n_frames * TR / 128) columns.
+    steady_cosines = _cosine_filter(np.zeros((1, n_keep)), tr)[1]  # (n_keep, n_cos)
+    cosines = _pad_nss(steady_cosines, nss_frames)
+    cosine_cols: dict = {f'cosine_{k + 1:02d}': cosines[:, k] for k in range(cosines.shape[1])}
 
     # --- aCompCor: WM and CSF components (from pre-extracted ROI arrays) ---
     #
@@ -1313,21 +1448,15 @@ def compute_confounds(
 
     comp_cor_cols: dict = {}
     for tissue, ts in [('wm', wm_ts), ('csf', csf_ts)]:
-        n_vox = ts.shape[1]
-
-        # Steady-state frames only, and the demean is taken over those frames
-        # as well — demeaning across the transient leaves the NSS rows offset
-        # and shifts the whole series, which the PCA then fits (#643).
-        roi_ts = ts[nss_frames:] - ts[nss_frames:].mean(axis=0)  # voxelwise demean
-
-        # Fit up to 5 components, then trim to whichever is fewer: 5 or the
-        # minimum number of components needed to explain ≥50% of variance.
-        max_comp = min(5, n_vox, n_keep)
+        assert ts is not None  # empty_tissues raised above
+        # nipype's ACompCor per mask (merge_method='none'): steady-state frames
+        # only (#643), cosine high-pass, per-voxel variance normalisation, SVD,
+        # and as many components as explain half the variance. No cap: fMRIPrep
+        # sets variance_threshold=0.5 and nothing else.
         with substage("confounds.pca"):
-            pca = PCA(n_components=max_comp).fit(roi_ts)
-        cumvar = np.cumsum(pca.explained_variance_ratio_)
-        n_comp = min(int(np.searchsorted(cumvar, 0.50)) + 1, max_comp)
-        comps = _pad_nss(pca.transform(roi_ts)[:, :n_comp], nss_frames)  # (T, n_comp)
+            comps, cumvar = _noise_components(ts[nss_frames:].T, tr)
+        n_comp = comps.shape[1]
+        comps = _pad_nss(comps, nss_frames)  # (T, n_comp)
         print(
             f"  aCompCor {tissue.upper()}: {n_comp} components "
             f"({cumvar[n_comp - 1]:.1%} variance explained)",
@@ -1409,7 +1538,7 @@ def _surface_qc(
     if cortical is None:
         cortical = _cortical_qc(
             {
-                hemi: np.stack([d.data for d in nib.load(path).darrays], axis=1)
+                hemi: np.stack([d.data for d in load_as(path, nib.GiftiImage).darrays], axis=1)
                 for hemi, path in surf_paths.items()
             },
             nss_frames,
@@ -1417,7 +1546,7 @@ def _surface_qc(
     qc: dict = dict(cortical)
 
     if subcort is not None:
-        labels = nib.load(subcort[1]).get_fdata()
+        labels = load_as(subcort[1], SpatialImage).get_fdata()
         qc["subcort_n_voxels"] = int((labels > 0).sum())
         qc["subcort_n_structures"] = int(len(np.unique(labels[labels > 0])))
         qc["subcort_space"] = "MNI152NLin2009cAsym"
@@ -1576,10 +1705,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--bold", required=True, type=Path)
     p.add_argument("--brainmask", required=True, type=Path)
-    p.add_argument("--mni-template", required=True, type=Path)
+    # Required unless --emit confounds, which never leaves native space.
+    p.add_argument("--mni-template", type=Path)
     p.add_argument("--bold2t1w-affine", required=True, type=Path)
-    p.add_argument("--t1w2mni-affine", required=True, type=Path)
-    p.add_argument("--t1w2mni-warp", required=True, type=Path)
+    p.add_argument("--t1w2mni-affine", type=Path)
+    p.add_argument("--t1w2mni-warp", type=Path)
     p.add_argument("--outdir", required=True, type=Path)
     p.add_argument("--subj", required=True)
     p.add_argument("--session", required=True)
@@ -1612,10 +1742,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--emit",
         default="volumetric",
-        choices=["volumetric", "grayordinate", "both"],
+        choices=["volumetric", "grayordinate", "both", "confounds"],
         help="Which derivatives to produce. 'grayordinate' skips the "
         "composite warp and 4D MNI warp and reuses an existing "
-        "MNI BOLD supplied via --mni-bold-in.",
+        "MNI BOLD supplied via --mni-bold-in. 'confounds' writes only "
+        "the confounds TSV.",
     )
     p.add_argument(
         "--surf-dir",
@@ -1641,6 +1772,10 @@ def parse_args() -> argparse.Namespace:
         p.error("--surf-dir is required unless --emit volumetric")
     if args.emit == "grayordinate" and args.mni_bold_in is None:
         p.error("--mni-bold-in is required for --emit grayordinate")
+    if args.emit != "confounds":
+        for flag in ("mni_template", "t1w2mni_affine", "t1w2mni_warp"):
+            if getattr(args, flag) is None:
+                p.error(f"--{flag.replace('_', '-')} is required unless --emit confounds")
     return args
 
 
@@ -1667,18 +1802,22 @@ def missing_inputs(args: argparse.Namespace) -> list[str]:
     turn a working configuration into a refusal: the grayordinate short path
     skips Stages 2-5 and Stage 6, so it never opens the brain mask or the
     motion file, and only that path passes --mni-bold-in. The T1w→MNI pair is
-    required on every path — the short path still warps the subcortical block
-    with it (extract_subcortical).
+    required on every path but --emit confounds — the short path still warps
+    the subcortical block with it (extract_subcortical). --emit confounds reads
+    Stage 6's inputs only.
     """
     required = [
         ("--bold", args.bold),
-        ("--mni-template", args.mni_template),
         ("--aseg", args.aseg),
         ("--bold2t1w-affine", args.bold2t1w_affine),
-        ("--t1w2mni-affine", args.t1w2mni_affine),
-        ("--t1w2mni-warp", args.t1w2mni_warp),
     ]
-    if args.emit in ("volumetric", "both"):
+    if args.emit != "confounds":
+        required += [
+            ("--mni-template", args.mni_template),
+            ("--t1w2mni-affine", args.t1w2mni_affine),
+            ("--t1w2mni-warp", args.t1w2mni_warp),
+        ]
+    if args.emit in ("volumetric", "both", "confounds"):
         required += [("--brainmask", args.brainmask), ("--motion-file", args.motion_file)]
     if args.emit in ("grayordinate", "both"):
         required.append(("--surf-dir", args.surf_dir))
@@ -1734,6 +1873,42 @@ def refuse_if_inputs_missing(args: argparse.Namespace, prefix: str) -> None:
     sys.exit(EXIT_MISSING_INPUT)
 
 
+def _purge_partial_surface(outdir: Path, prefix: str) -> None:
+    """Remove the surface outputs a failed Stage 5b left behind.
+
+    If write_ribbon_gifti succeeded and extract_subcortical then failed, the
+    cortical GIFTIs are still on disk; left there, the driver's component glob
+    would find them and tar an INCOMPLETE components set that passes as a
+    success and breaks Stage 2. These globs mirror the driver's.
+    """
+    for pat in (
+        f"{prefix}_hemi-*_space-fsnative_bold.func.gii",
+        f"{prefix}_*desc-subcort*",
+        f"{prefix}_desc-subcort_labellist.txt",
+    ):
+        for stale in outdir.glob(pat):
+            stale.unlink(missing_ok=True)
+
+
+def _estimate_confounds(
+    args: argparse.Namespace, prefix: str, bold_ref: Path, timings: dict
+) -> Path:
+    """Stage 6, the one call both the full path and --emit confounds make."""
+    print("\n--- Stage 6: Confound Estimation ---", flush=True)
+    with timed_stage("confounds", timings):
+        return compute_confounds(
+            bold=args.bold,
+            brainmask=args.brainmask,
+            aseg=args.aseg,
+            bold2t1w_affine=args.bold2t1w_affine,
+            motion_file=args.motion_file,
+            outdir=args.outdir,
+            prefix=prefix,
+            bold_ref=bold_ref,
+            nss_frames=args.nss_frames,
+        )
+
+
 def main() -> None:
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -1759,6 +1934,22 @@ def main() -> None:
     )
     with timed_stage("boldref", _timings):
         bold_ref = extract_bold_ref(args.bold, args.outdir, prefix, args.nss_frames)
+
+    # The confounds-only re-run: Stage 6 straight after Stage 1, through the
+    # same call the full path makes, so the TSV is the one a full run of this
+    # image would write. No QC record: the published one describes the MNI BOLD
+    # this path keeps, and confounds_rerun.py patches its confound counts.
+    if args.emit == "confounds":
+        print("\n--- Stages 2-5b: SKIPPED (--emit confounds) ---", flush=True)
+        _estimate_confounds(args, prefix, bold_ref, _timings)
+        total = time.monotonic() - pipeline_start
+        print(
+            f"\n=== preproc complete (confounds only): {prefix} "
+            f"({total:.1f}s / {total / 60:.1f}m) ===",
+            flush=True,
+        )
+        print(f"  Peak memory: {_peak_memory_gb():.2f} GB", flush=True)
+        return
 
     # Stages 2-5 produce the volumetric derivative. On a grayordinate-only
     # rerun they are skipped entirely — that warp chain is the expensive part —
@@ -1821,7 +2012,7 @@ def main() -> None:
                 warped,
                 args.outdir / f"{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz",
                 args.threads,
-                mask=np.asanyarray(nib.load(mask_mni).dataobj) > 0,
+                mask=np.asanyarray(load_as(mask_mni, SpatialImage).dataobj) > 0,
             )
             with substage("masking.readback"):
                 masked_ts = verify_mni_bold_readback(mni_bold, mask_mni, warped.mean_map)
@@ -1864,7 +2055,7 @@ def main() -> None:
                     cortical_qc = _cortical_qc(surf_ts, args.nss_frames)
             except Exception:
                 traceback.print_exc()
-            surf_ts = None
+            surf_ts = None  # type: ignore[assignment]
         except Exception:
             # On --emit both the volumetric MNI BOLD is already computed (Stage
             # 5) and is a complete derivative on its own. A surface-sampling
@@ -1890,19 +2081,7 @@ def main() -> None:
             surf_ts = None
             surf_paths = {}
             subcort = None
-            # Purge any partial surface outputs. If write_ribbon_gifti
-            # succeeded and extract_subcortical then failed, the cortical GIFTIs
-            # are still on disk; left there, the driver's component glob would
-            # find them and tar an INCOMPLETE components set that passes as a
-            # success and breaks Stage 2. These globs mirror the driver's.
-            outdir = Path(args.outdir)
-            for pat in (
-                f"{prefix}_hemi-*_space-fsnative_bold.func.gii",
-                f"{prefix}_*desc-subcort*",
-                f"{prefix}_desc-subcort_labellist.txt",
-            ):
-                for stale in outdir.glob(pat):
-                    stale.unlink(missing_ok=True)
+            _purge_partial_surface(Path(args.outdir), prefix)
 
     # Confounds belong to the volumetric derivative. A grayordinate-only rerun
     # already has them in the existing tarball, and recomputing would burn the
@@ -1919,19 +2098,7 @@ def main() -> None:
         )
         return
 
-    print("\n--- Stage 6: Confound Estimation ---", flush=True)
-    with timed_stage("confounds", _timings):
-        confounds_tsv = compute_confounds(
-            bold=args.bold,
-            brainmask=args.brainmask,
-            aseg=args.aseg,
-            bold2t1w_affine=args.bold2t1w_affine,
-            motion_file=args.motion_file,
-            outdir=args.outdir,
-            prefix=prefix,
-            bold_ref=bold_ref,
-            nss_frames=args.nss_frames,
-        )
+    confounds_tsv = _estimate_confounds(args, prefix, bold_ref, _timings)
 
     total = time.monotonic() - pipeline_start
     print(f"\n=== preproc complete: {prefix} ({total:.1f}s / {total / 60:.1f}m) ===", flush=True)
@@ -1955,9 +2122,11 @@ def main() -> None:
         # The IQMs measure the read-back's in-mask matrix, the published file as
         # read once, rather than decompressing it a second time.
         with substage("qc_summary.func_qc"):
+            # Stage 4 ran: only grayordinate-only skips it, and that returned above.
+            assert mask_mni is not None
             qc = compute_func_qc_summary(
                 confounds=confounds_df,
-                bold_img=nib.load(args.bold),
+                bold_img=load_as(args.bold, SpatialImage),
                 mni_bold=mni_bold,
                 mask_mni=mask_mni,
                 stage_timings=_timings,

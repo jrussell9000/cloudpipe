@@ -558,6 +558,13 @@ def main() -> None:
         # CloudpipeMetrics.anatomical_qc() for the view that does it.
         "anat_qc": lambda: m.anat_qc(dt_from=args.dt_from, dt_to=args.dt_to),
         "fsqc_qc": lambda: m.fsqc_qc(dt_from=args.dt_from, dt_to=args.dt_to),
+        # QC of the session's 1 mm MNI tissue maps (TissueQC): dseg and probseg
+        # volumes and their agreement, subject×session grain. Not in
+        # DT_SCOPED_GRAINS, for surface_qc's reason and one of its own: the
+        # probseg backfill writes rows under the dt it ran, not the batch's,
+        # so sessions processed before 2026-10-26 only appear in a window that
+        # covers the backfill.
+        "tissue_qc": lambda: m.tissue_qc(dt_from=args.dt_from, dt_to=args.dt_to),
         "registration_qc": lambda: m.registration_qc(dt_from=args.dt_from, dt_to=args.dt_to),
         "workflow_runs": lambda: m.workflow_runs(dt_from=args.dt_from, dt_to=args.dt_to),
         "costs_raw": lambda: m.costs(dt_from=date_from, dt_to=date_to),

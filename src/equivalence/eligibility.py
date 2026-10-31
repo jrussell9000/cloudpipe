@@ -35,6 +35,7 @@ COMPLETE_MARKER = "_complete.json"
 
 #: Exclusion reasons. `missing_in_arm_<arm>` is formatted per arm (spec).
 ANATOMY_UNAVAILABLE = "anatomy_unavailable"
+CLOUDPIPE_OUTPUT_SUPERSEDED = "cloudpipe_output_superseded"
 FRAME_COUNT_MISMATCH = "frame_count_mismatch"
 NOT_ATTEMPTED = "not_attempted"
 
@@ -133,14 +134,19 @@ def _listed(s3, bucket: str, object_key: str) -> bool:
     return any(obj["Key"] == object_key for obj in response.get("Contents", []))
 
 
-def cloudpipe_output_exists(s3, bucket: str, key: RunKey) -> bool:
-    """Is cloudpipe's volumetric derivative present for this run?
+#: `cloudpipe_output` results.
+CURRENT, SUPERSEDED, ABSENT = "current", "superseded", "absent"
 
-    The same test `inventory.py` gates func-preproc on: the session's
-    `_complete.json` lists the run (ADR 017; the driver writes the marker after
-    every file it names), or, for a session not yet republished in the exploded
-    layout, the run's legacy tarball exists — a single PUT, so its key alone is
-    a whole run.
+
+def cloudpipe_output(s3, bucket: str, key: RunKey) -> str:
+    """Is cloudpipe's volumetric derivative present for this run, and is it current?
+
+    `CURRENT` when the session's `_complete.json` lists the run (ADR 017; the
+    driver writes the marker after every file it names). `SUPERSEDED` when only
+    the run's legacy tarball exists: `inventory.py` still counts that as done, but
+    it predates the func reprocess (plan 017), and its MNI BOLD holds float16 bit
+    patterns on transposed axes (#629, #630) — not a cloudpipe arm worth
+    comparing. `ABSENT` otherwise.
     """
     session_prefix = f"derivatives/func/{key.subject}/{key.session}/"
     marker_key = session_prefix + COMPLETE_MARKER
@@ -149,10 +155,10 @@ def cloudpipe_output_exists(s3, bucket: str, key: RunKey) -> bool:
         if marker.get("kind") == "func-session" and (
             f"{key.task}_{key.run}" in (marker.get("runs") or {})
         ):
-            return True
-    return _listed(
-        s3, bucket, f"{session_prefix}{key.prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
-    )
+            return CURRENT
+    if _listed(s3, bucket, f"{session_prefix}{key.prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"):
+        return SUPERSEDED
+    return ABSENT
 
 
 def sampling_frame(s3, bucket: str, candidates: list[RunKey]) -> Census:
@@ -179,7 +185,18 @@ def sampling_frame(s3, bucket: str, candidates: list[RunKey]) -> Census:
             )
             continue
 
-        if not cloudpipe_output_exists(s3, bucket, key):
+        output = cloudpipe_output(s3, bucket, key)
+        if output == SUPERSEDED:
+            census.exclusions.append(
+                Exclusion(
+                    key,
+                    CLOUDPIPE_OUTPUT_SUPERSEDED,
+                    "legacy tarball only; predates the func reprocess, so not yet a "
+                    "current cloudpipe output",
+                )
+            )
+            continue
+        if output == ABSENT:
             census.exclusions.append(
                 Exclusion(key, missing_in_arm("cloudpipe"), "no derivatives/func/ output")
             )

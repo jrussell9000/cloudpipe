@@ -21,6 +21,7 @@ Every table also includes `pipeline` (str, always `"cloudpipe_minproc"` today) a
 | [SurfaceSampleQC](#surfacesampleqc--per-bold-run) | `metrics/surface-sample/` | 1 row per BOLD run | `images/afni/preproc.py` | raw dict — matches dataclass | `surface_qc.csv` |
 | [AnatQC](#anatqc--per-subjectsession) | `metrics/anat-qc/` | 1 row per subject×session | `images/fastsurfer/extract_qc.py` | raw dict — matches dataclass | `anat_qc.csv` |
 | [FsqcQC](#fsqcqc--per-subjectsession) | `metrics/fsqc-qc/` | 1 row per subject×session | `images/fsqc/stage_and_run.py` | raw dict — matches dataclass | `fsqc_qc.csv` |
+| [TissueQC](#tissueqc--per-subjectsession) | `metrics/tissue-masks/` | 1 row per subject×session | `images/afni/tissue_masks.py` | raw dict — matches dataclass | `tissue_qc.csv` |
 | [RegistrationQC](#registrationqc--per-registration-step) | `metrics/registration/` | 1 row per registration | `images/fireANTs/scripts/fst1w_to_mni.py`, `images/freesurfer/bold_to_t1w.py` | raw dict — **drifts heavily** | `registration_qc.csv` |
 | [WorkflowRun](#workflowrun--per-argo-workflow) | `metrics/workflow-runs/` | 1 row per Argo workflow | `src/metrics/exit_handler.py` | dataclass — no drift possible | `workflow_runs.csv` |
 | [CostAllocation](#costallocation--per-workflow-per-scrape-date) | `metrics/costs/` | 1 row per workflow×scrape-date | `src/metrics/kubecost_scraper.py` | dataclass — no drift possible | `costs_raw.csv` (raw), `costs_by_subject.csv` (summed per subject) |
@@ -28,12 +29,12 @@ Every table also includes `pipeline` (str, always `"cloudpipe_minproc"` today) a
 | [StepOutcome](#stepoutcome--per-step-per-scan-unit) | `metrics/step-outcomes/` | 1 row per (workflow, step, subject, session, task, run) | `src/metrics/outcome_recorder.py` | dataclass — no drift possible | *not exported* |
 | [SubjectManifest](#subjectmanifest--per-workflow-per-subject) | `metrics/subject-manifests/` | 1 row per (workflow, subject) | `src/metrics/exit_handler.py` | dataclass — no drift possible | *not exported* |
 
-All ten are partitioned `dt=YYYY-MM-DD/` (the write date, except `CostAllocation`/`PodCost`
+All eleven are partitioned `dt=YYYY-MM-DD/` (the write date, except `CostAllocation`/`PodCost`
 where `dt` equals the cost *report* date — see those tables' notes) and queryable via
 `metrics.athena.CloudpipeMetrics` / `metrics.duckdb_query.CloudpipeMetrics`
-(`func_qc`/`surface_qc`/`anat_qc`/`fsqc_qc`/`registration_qc`/`workflow_runs`/`costs`/`pod_costs`), or in bulk via
+(`func_qc`/`surface_qc`/`anat_qc`/`fsqc_qc`/`tissue_qc`/`registration_qc`/`workflow_runs`/`costs`/`pod_costs`), or in bulk via
 `scripts/export_batch_metrics.py`. `StepOutcome` and `SubjectManifest` are queryable but have no
-CSV export today — `export_batch_metrics.py` only pulls the six tables in the rightmost column
+CSV export today — `export_batch_metrics.py` only pulls the tables named in the rightmost column
 above. Two more S3 prefixes exist under `metrics/` that are **not** part of this queryable set
 — see [Non-schema objects](#non-schema-s3-objects) at the bottom.
 
@@ -79,7 +80,7 @@ S3 key: `metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json`
 | `peak_memory_gb` | float | Peak RSS for **this run only** (`RUSAGE_SELF`/`RUSAGE_CHILDREN` max) — resets per run |
 | `container_peak_memory_gb` | float | Peak RSS over the **container's lifetime** — climbs across a multi-run session even when runs are identically sized; size pod memory limits against this one, not `peak_memory_gb` |
 | `pipeline`, `image_tag` | str | Provenance: pipeline name and image SHA |
-| `schema_version` | str | `"1.3"`: every summary is over the steady-state frames (#859, see below). `"1.2"` (#643) changed only the confounds, whose CompCor excludes the NSS frames. `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that #119 showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
+| `schema_version` | str | `"1.4"`: the confounds the counts describe (`n_acompcor_*`, `n_tcompcor`, `n_cosines`) are nipype's CompCor and cosine basis, as fMRIPrep computes them (#923); every IQM is as in 1.3. `"1.3"`: every summary is over the steady-state frames (#859, see below). `"1.2"` (#643) changed only the confounds, whose CompCor excludes the NSS frames. `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that #119 showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
 
 **`gcor`/`aor`/`aqi` are computed in-process in `preproc.py`, at the same definitions as AFNI's
 `@compute_gcor`, `3dToutcount -fraction` and `3dTqual`** — the tools MRIQC wraps for the same
@@ -362,6 +363,61 @@ degradation (non-zero status, `NaN` fields, exit 0) instead of by conditional fl
 
 Recorded but not gated: no thresholds are calibrated for any of these fields. Treat them as
 candidates for cross-subject outlier review, on the same reasoning as `AnatQC`'s IQMs above.
+
+---
+
+## `TissueQC` — per subject×session
+
+**`export_batch_metrics.py` output file: `tissue_qc.csv`**
+
+QC of the session's two 1 mm MNI tissue segmentations, published beside its BOLD in
+`derivatives/func/{subj}/{ses}/` (see `docs/pipelines.md`):
+
+- the **dseg** is FastSurfer's aseg, warped to MNI and grouped into GM/WM/CSF;
+- the **probseg** is DIPY's HMRF, fitted to the session's `orig_nu.mgz` inside its brainmask.
+
+Emitted by `images/afni/tissue_masks.py --qc-out` as a raw dict whose key order is the column order.
+Two writers set `source`: func-preproc (`"func-preproc"`) and the probseg backfill (`"probseg-backfill"`).
+Matches `TissueQC` in `src/metrics/schemas.py`; `tests/metrics/test_tissue_qc_schema_sync.py`
+holds the emitter, the dataclass, both Glue tables and `_UNION_COLUMNS` together.
+
+S3 key: `metrics/tissue-masks/dt={dt}/{subject}_{session}_tissue_qc.json`
+
+**Sessions published before 2026-10-26 have no row until the probseg backfill writes one.** Their
+published probseg was fitted to `brainmask.mgz`'s WM-normalised intensities, and in 32 of 60
+audited sessions its classes collapsed: `label-CSF_probseg` held the grey matter and
+`label-WM_probseg` was nearly empty. Do not use a probseg that has no `probseg_written = true`
+row here.
+
+**`agreement_{gm,wm,csf}`** is, for one dseg class, the share of its voxels whose probseg argmax is
+the same class. The two segmentations differ by construction (sulcal CSF is in the probseg's CSF
+only, WM-bright deep grey nuclei go to its WM), so sound fits score about 0.68–0.91 per class;
+collapsed fits scored 0.0–0.44 on WM. Below `PROBSEG_MIN_AGREEMENT` (0.5) on any class,
+`tissue_masks.py` publishes **no** probseg and records `probseg_written = false`; the dseg and
+masks are always published.
+
+**`NULL`, never `0.0`, is "not fitted"** for every `probseg_*` and `agreement_*` field. 0.0 is a real
+volume and a real agreement. `probseg_written = false` with values present is a rejected fit; with
+`NULL` values, no fit was attempted.
+
+| Field | Type | Description |
+|---|---|---|
+| `subject`, `session` | str | Identity |
+| `pipeline` | str | `"cloudpipe_minproc"` |
+| `image_tag` | str | Tag half of the producing pod's image ref |
+| `source` | str | `"func-preproc"` or `"probseg-backfill"` |
+| `schema_version` | str | `"1.0"` |
+| `completed_at` | str | ISO 8601 UTC, when the record was written |
+| `dseg_gm_vol_mm3`, `dseg_wm_vol_mm3`, `dseg_csf_vol_mm3` | float | Dseg volume per class (mm³). Its CSF is the ventricles and choroid plexus only, so it is small (~20 ml) |
+| `probseg_input` | str? | The image the probseg was fitted to: `"orig_nu"` |
+| `probseg_seed` | int? | The HMRF's RNG seed (`PROBSEG_SEED`); the same input and seed give bit-identical maps |
+| `probseg_written` | bool | Whether the probseg was published |
+| `probseg_gm_vol_mm3`, `probseg_wm_vol_mm3`, `probseg_csf_vol_mm3` | float? | Sum of each class's probabilities (mm³). Its CSF includes sulcal CSF (~450 ml) |
+| `agreement_gm`, `agreement_wm`, `agreement_csf` | float? | Per dseg class, the share of its voxels whose probseg argmax agrees (0–1) |
+
+Deduplicate on `subject`+`session` by latest `completed_at`: a reprocess flushes the old row
+(`scripts/reprocess_func.py`), but a retried session or a re-run backfill writes a second row
+under a later `dt=` (`scripts/purge_superseded_metrics.py --table tissue_masks` removes it).
 
 ---
 
@@ -820,7 +876,7 @@ message, falling back to container exit code since `{{tasks.<name>.message}}` do
 | Category | Trigger examples |
 |---|---|
 | `infrastructure` | `OOMKilled`, exit 137/143, node eviction/cordon, `Unschedulable`, deadline exceeded |
-| `data` | `NoSuchKey`/`NoSuchBucket`, missing/corrupt input, `nss_volumes` errors |
+| `data` | `NoSuchKey`/`NoSuchBucket`, missing/corrupt input, `nss_volumes` errors; exit 70: `fastsurfer-template-parc`'s topology correction ran past its 30 min bound on a hemisphere whose surface is not a brain (a saturated T1w gives one defect spanning the hemisphere), so the anatomy is unusable rather than the step broken (#958) |
 | `algorithm` | `AssertionError`/`ValueError`/`RuntimeError`, segfault (incl. exit 139), `CalledProcessError` |
 | `dependency` | Upstream DAG task failed or was skipped |
 | `qc_rejected` | Exit 65: `t1w-to-mni` or `bold-to-t1w` evaluated its own output, its QC gate said `fail`, and it exited without promoting anything. **Not a defect** — the step worked; the session/run is still lost (no transform, so no `derivatives/func/`). The gated metric is in `registration` (`verdict = 'fail'`) |
@@ -952,6 +1008,8 @@ deliberately. 3,031 records were written that neither engine could read.
 ---
 
 ## See also
+
+- [qc-metrics-explained.md](qc-metrics-explained.md): what the QC metrics in these tables measure and how they are computed.
 
 - [`src/metrics/schemas.py`](https://github.com/jrussell9000/cloudpipe/blob/main/src/metrics/schemas.py) — the dataclasses (authoritative for
   the five tables built via constructor; a useful but sometimes-stale reference for the two

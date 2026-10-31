@@ -1,0 +1,142 @@
+diff --git a/mri_normalize/mri_normalize.cpp b/mri_normalize/mri_normalize.cpp
+index 88a4cfd..9dc4a53 100644
+--- a/mri_normalize/mri_normalize.cpp
++++ b/mri_normalize/mri_normalize.cpp
+@@ -27,6 +27,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <math.h>
++#include <cmath>
+ #include <ctype.h>
+ 
+ #include "mri.h"
+@@ -159,6 +160,120 @@ static int remove_nonwm_voxels(MRI *mri_ctrl_src,
+                                MRI *mri_aseg,
+                                MRI *mri_ctrl_dst) ;
+ 
++/* ------------------------------------------------------------------------
++   cloudpipe local patch -- freesurfer/freesurfer#1452
++
++   MRIapplyBiasCorrectionSameGeometry (utils/mrinorm.cpp:3652) computes
++
++       val *= (target_val / bias);
++
++   with no floor on `bias`, no bound on the product and no finite check.
++   Where the smoothed bias image has no control-point support it can
++   interpolate to ~1e-6, which turns an ordinary 110-intensity voxel into
++   ~2e9.  That value is FINITE, so the MRIremoveNaNs that the -surface
++   branch calls one line later (mri_normalize.cpp:505) would not catch it
++   even if the -aseg branch called it.
++
++   The value then survives every downstream guard:
++
++     - MRI3dGentleNormalize (mrinorm.cpp:1595) declares `int src, bias`,
++       so a 1e-6 bias truncates to 0 and hits the `if (!bias) norm = src`
++       escape at :1603 -- the outlier is passed through unchanged.
++     - MRI3dNormalize's FZERO(bias) test (:1470) and `norm > 255.0f` clamp
++       (:1475) are both inside a voxel loop at :1465 that is never reached,
++       because the abort happens earlier in the same function, in the
++       MRInormFindControlPoints call at :1418.
++
++   find_tissue_intensities then calls MRIhistogram(mri_src, 0)
++   (mrinorm.cpp:3371).  mrihisto.cpp:121 computes
++   nbins = nint(fmax - fmin + 1.0) -- guarded at :122 against a
++   non-positive count but not an absurdly large positive one -- so nbins
++   becomes ~2e9 and HISTOalloc requests 31.7 GiB for the histogram pair
++   (the second allocation, via HISTOsmooth -> HISTOcopy at :3379, is the
++   one that actually fails).  A bound therefore has to land before :3371,
++   which is why this runs at the call site rather than in the histogram.
++
++   WHY A SENTINEL AND NOT A CLAMP.  mri_normalize promotes the volume to
++   MRI_FLOAT at :647 with MRIchangeType(..., 0, 255, 1) and converts it
++   back to MRI_UCHAR at :971, so 0-255 is the range the program commits to
++   at both ends.  A clamp AT 255 would be a real behaviour change, because
++   intermediate values above 255 are legitimate and later passes pull them
++   back down.  The threshold here instead sits ~400x above that ceiling:
++   nothing a healthy volume carries at this point comes close, so the pass
++   is inert on data that does not exhibit the bug -- which is a property we
++   can test by diffing output against a stock build.  Outliers are set to
++   the range ceiling rather than to zero so that the whole-volume histogram
++   downstream keeps its normal ~256 bins.
++   ------------------------------------------------------------------------ */
++#define CP_BIAS_OUTLIER_THRESHOLD  1.0e5
++#define CP_BIAS_OUTLIER_CEILING    255.0f
++#define CP_BIAS_OUTLIER_FLOOR      0.0f
++
++static int
++cp_clamp_bias_outliers(MRI *mri, const char *where)
++{
++  int    x, y, z, nclamped = 0, nhigh = 0, nlow = 0, nbad = 0 ;
++  float  val, repl ;
++  double worst = 0.0 ;
++
++  if (mri == NULL)
++  {
++    return(0) ;
++  }
++
++  for (x = 0 ; x < mri->width ; x++)
++  {
++    for (y = 0 ; y < mri->height ; y++)
++    {
++      for (z = 0 ; z < mri->depth ; z++)
++      {
++        val = MRIgetVoxVal(mri, x, y, z, 0) ;
++
++        if (std::isfinite(val))
++        {
++          if (std::fabs((double)val) <= CP_BIAS_OUTLIER_THRESHOLD)
++          {
++            continue ;
++          }
++          if (std::fabs((double)val) > worst)
++          {
++            worst = std::fabs((double)val) ;
++          }
++          repl = (val < 0.0f) ? CP_BIAS_OUTLIER_FLOOR : CP_BIAS_OUTLIER_CEILING ;
++          if (val < 0.0f)
++          {
++            nlow++ ;
++          }
++          else
++          {
++            nhigh++ ;
++          }
++        }
++        else
++        {
++          repl = CP_BIAS_OUTLIER_FLOOR ;
++          nbad++ ;
++        }
++
++        MRIsetVoxVal(mri, x, y, z, 0, repl) ;
++        nclamped++ ;
++      }
++    }
++  }
++
++  /* Silent when it does not fire, so a healthy run's log is unchanged. */
++  if (nclamped > 0)
++  {
++    printf("cloudpipe: bounded %d bias-correction outlier voxel(s) after %s "
++           "(%d high, %d low, %d non-finite; worst |value| %.9g) "
++           "-- freesurfer/freesurfer#1452\n",
++           nclamped, where, nhigh, nlow, nbad, worst) ;
++    fflush(stdout) ;
++  }
++
++  return(nclamped) ;
++}
++
+ int
+ main(int argc, char *argv[])
+ {
+@@ -805,6 +920,8 @@ main(int argc, char *argv[])
+     mri_dst = MRIapplyBiasCorrectionSameGeometry
+               (mri_dst, mri_bias, mri_dst,
+                DEFAULT_DESIRED_WHITE_MATTER_VALUE) ;
++    cp_clamp_bias_outliers(mri_dst,
++                           "MRIapplyBiasCorrectionSameGeometry (-aseg)") ;
+     if (Gdiag & DIAG_WRITE && DIAG_VERBOSE_ON)
+     {
+       MRIwrite(mri_dst, "norm_1.mgz") ;
