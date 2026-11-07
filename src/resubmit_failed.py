@@ -11,7 +11,7 @@ over the ~13-day full-ABCD run it is tens of subjects that no one is watching fo
 Resubmitting is cheap because it is idempotent. Every expensive stage gates on a
 `_complete.json` marker (ADR 017), so a re-driven subject skips anatomical,
 subregion, and registration work that already published and picks up where it
-stopped. The cost of a wrong resubmit is a Globus transfer and an inventory pass.
+stopped. The cost of a wrong resubmit is an ingress copy and an inventory pass.
 
 The cost of a *pointless* resubmit is higher than that, though, which is what most
 of this module is about. A deterministic failure reproduces identically on every
@@ -68,6 +68,10 @@ from validate_test_batch import (
 # terminal and both are in scope; the distinction matters for classification, not
 # for selection.
 TERMINAL_PHASES = frozenset({"Failed", "Error"})
+
+# The ingress mode retired with the Globus host (openspec retire-globus-host).
+# `submit_args` rewrites it to `https`, which replaced it in place.
+RETIRED_INGRESS_MODE = "globus"
 
 # Messages that make a failure deterministic on a single sighting, no repetition
 # needed. Matched case-insensitively against the node message.
@@ -394,18 +398,35 @@ def submit_args(workflow: dict) -> list[str]:
     """The `argo submit` command that re-drives this workflow.
 
     Parameters are copied from the failed workflow's own
-    `spec.arguments.parameters` rather than rebuilt: they carry the Globus
-    collection IDs and base paths resolved from SSM at original submission time,
+    `spec.arguments.parameters` rather than rebuilt: they carry the Globus source
+    collection ID and base path resolved from SSM at original submission time,
     and re-deriving them here would be a second source of truth that can drift.
 
     `submit --from workflowtemplate/` — never `resubmit`, which snapshots the
     templates from the prior run and would re-drive the subject against exactly
     the code that failed it.
+
+    One parameter is translated rather than copied. `ingress-mode=globus` named
+    the retired Globus host, and a workflow submitted with it now runs no ingress
+    and fails at `verify-staged-input`, so it is rewritten to `https` and the
+    rewrite is printed. A set with no `ingress-mode`
+    — what the queue manager's old globus branch sent — is left as it is, and
+    takes the template's default, `https`. The deprecated `globus-use-s3-gateway`
+    and `globus-dest-collection-id` are still copied: the template keeps them
+    declared so that such a set is admitted.
     """
+    metadata = workflow.get("metadata") or {}
     template = (workflow.get("spec") or {}).get("workflowTemplateRef", {}).get("name", "")
     args = ["argo", "-n", ARGO_NAMESPACE, "submit", "--from", f"workflowtemplate/{template}"]
     for parameter in ((workflow.get("spec") or {}).get("arguments") or {}).get("parameters", []):
-        args += ["-p", f"{parameter['name']}={parameter['value']}"]
+        value = parameter["value"]
+        if parameter["name"] == "ingress-mode" and value == RETIRED_INGRESS_MODE:
+            value = "https"
+            print(
+                f"{metadata.get('name', '(unnamed)')}: rewrote ingress-mode="
+                f"{RETIRED_INGRESS_MODE} to ingress-mode=https (the Globus host is retired)"
+            )
+        args += ["-p", f"{parameter['name']}={value}"]
     return args + ["-o", "name"]
 
 

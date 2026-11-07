@@ -21,12 +21,29 @@ from typing import TYPE_CHECKING
 
 import nibabel as nib
 import numpy as np
+from nibabel.filebasedimages import FileBasedImage
+from nibabel.spatialimages import SpatialImage
 from scipy.stats import rankdata
 
 if TYPE_CHECKING:  # annotations only: the afni image ships pandas, src/ may not need it
     import argparse
 
     import pandas as pd
+
+
+def load_as[ImageT: FileBasedImage](path: Path | str, kind: type[ImageT]) -> ImageT:
+    """nib.load, checked to be a `kind`.
+
+    nib.load is typed to return FileBasedImage, which has no .dataobj, .affine
+    or .get_fdata; those live on the subclasses (#288). Checking here gives the
+    caller the type it reads, and a file of the wrong kind fails at its load
+    with its path, not later as an AttributeError on some attribute.
+    """
+    img = nib.load(path)
+    if not isinstance(img, kind):
+        raise TypeError(f"{path}: expected {kind.__name__}, nibabel read {type(img).__name__}")
+    return img
+
 
 # ---------------------------------------------------------------------------
 # BOLD image-quality metrics: aor / aqi / gcor
@@ -54,8 +71,8 @@ def _load_masked_timeseries(mni_bold: Path, mask_mni: Path) -> np.ndarray:
     MNI grid, as Stage 5 writes it); only the in-mask voxels are kept,
     ~0.4 GB at a 250k-voxel mask.
     """
-    mask = np.asanyarray(nib.load(mask_mni).dataobj) > 0
-    data = np.asanyarray(nib.load(mni_bold).dataobj)
+    mask = np.asanyarray(load_as(mask_mni, SpatialImage).dataobj) > 0
+    data = np.asanyarray(load_as(mni_bold, SpatialImage).dataobj)
     ts = data[mask].astype(np.float32)
     del data
     return ts
@@ -84,9 +101,19 @@ def _quality_index(ts: np.ndarray) -> np.ndarray:
 
     1 minus the Spearman correlation between each frame and the median volume,
     over in-mask voxels.  Lower is better.
+
+    Ranks are float64 whatever `rankdata` returns. SciPy 1.18 made its output
+    follow the input dtype, so float32 data gives float32 ranks, and `_corr`'s
+    sums over ~250k of them then shift AQI by ~0.03% (found by the equivalence
+    calibration, 2026-10-26). Ranks are whole or half integers far below 2**24,
+    so the cast is exact and the result is what SciPy < 1.18 always produced.
     """
-    ref = rankdata(np.median(ts, axis=1))
-    return np.array([1.0 - _corr(rankdata(ts[:, t]), ref) for t in range(ts.shape[1])])
+    ref = _ranks(np.median(ts, axis=1))
+    return np.array([1.0 - _corr(_ranks(ts[:, t]), ref) for t in range(ts.shape[1])])
+
+
+def _ranks(values: np.ndarray) -> np.ndarray:
+    return np.asarray(rankdata(values), dtype=np.float64)
 
 
 def _corr(x: np.ndarray, y: np.ndarray) -> float:
@@ -128,7 +155,9 @@ def _gcor(ts: np.ndarray) -> float:
 # them together. It sat at "1.1" here after #643 moved schemas.py to "1.2", so
 # every record computed with the #643 CompCor was still labelled 1.1.
 # 1.3 (#859): every summary excludes the non-steady-state frames.
-FUNC_QC_SCHEMA_VERSION = "1.3"
+# 1.4 (2026-10-27): the confounds the record counts (n_acompcor_*, n_tcompcor,
+# n_cosines) are nipype's CompCor and cosine basis (preproc.compute_confounds).
+FUNC_QC_SCHEMA_VERSION = "1.4"
 
 
 def _tsnr(ts: np.ndarray) -> np.ndarray:
@@ -144,7 +173,7 @@ def tsnr_map_from_file(mni_bold: Path, n_nss_frames: int = 0) -> np.ndarray:
     Population std (ddof=0). Frames before `n_nss_frames` are excluded, for the
     reason given in func_qc_measures.
     """
-    bold_data = nib.load(mni_bold).get_fdata(dtype=np.float32)
+    bold_data = load_as(mni_bold, SpatialImage).get_fdata(dtype=np.float32)
     return _tsnr(bold_data[..., n_nss_frames:])
 
 
@@ -217,7 +246,7 @@ def func_qc_measures(
     if tsnr_median is None:
         # tSNR has no "not computed" default, so it is retried from the file the
         # way it was always computed, and a failure here still propagates.
-        mask_data = nib.load(mask_mni).get_fdata() > 0
+        mask_data = load_as(mask_mni, SpatialImage).get_fdata() > 0
         tsnr_map = tsnr_map_from_file(mni_bold, nss)
         tsnr_median = float(np.median(tsnr_map[mask_data])) if mask_data.any() else 0.0
 
@@ -267,7 +296,7 @@ def func_qc_measures(
 
 def compute_func_qc_summary(
     confounds: pd.DataFrame,
-    bold_img: nib.Nifti1Image,
+    bold_img: SpatialImage,
     mni_bold: Path,
     mask_mni: Path,
     stage_timings: dict,

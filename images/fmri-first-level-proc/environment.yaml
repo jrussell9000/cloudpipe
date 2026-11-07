@@ -1,26 +1,21 @@
 # ============================================================================
-# Conda environment for ABCD_fmri_orchestrator_S3
+# Conda environment for the first-level image: fmri_first_level_proc and the
+# cloudpipe stager (stage_first_level.py)
 # ============================================================================
 #
-# Create:  conda env create -f environment.yaml
-# Activate: conda activate ABCD_fmri_orchestrator_S3
-# Update:  conda env update -f environment.yaml --prune
-#
-# NOTE: AFNI must be installed separately (not available via conda-forge).
-#       See https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html
+# AFNI is installed separately in the Dockerfile (not available via conda-forge).
 # ============================================================================
 
-name: ABCD_fmri_orchestrator_S3
+name: first_level
 
 channels:
   - conda-forge
-  - defaults
 
 dependencies:
-  - python>=3.8
-  - numpy
-  - pandas
+  - python=3.14    # = the minor validated in fmri_first_level_proc/tools.lock.yaml (a mismatch only warns)
+  - numpy=2.5.4    # = tools.lock.yaml's validated version; bump both together, or every analysis warns
+  - pandas=3.1.1   # = tools.lock.yaml's validated version; bump both together
   - pyyaml
-  - matplotlib     # QC carpet plots and tSNR visualization
-  - boto3          # AWS S3 data transfer
-  - pip
+  - packaging      # fmri-first-level-proc's tool version checks
+  - nibabel        # fmri-first-level-proc's abcd extra: NIfTI headers, tissue masks
+  - pip            # boto3 is pip-pinned in the Dockerfile, with the other publish images

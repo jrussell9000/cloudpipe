@@ -294,7 +294,8 @@ def wait_for_pace(
     arrive. From an empty queue the cap admits its whole width in minutes, and every
     one of those workflows first-reconciles together: on 2026-09-14, 300 workflows in
     7 minutes drove the control plane into `etcdserver: throttle`, which leaked the
-    `globus-transfer` semaphore in the controller's memory (a 2-hour transfer stall)
+    then-current `globus-transfer` semaphore in the controller's memory (a 2-hour
+    transfer stall; the Globus ingress it guarded is retired, the hazard is not)
     and stranded four WorkflowTaskResults at `report-outputs-completed=false` (#393).
     Neither recovered without a hand fix. Spacing arrivals is the fix; lowering the
     cap would cut steady-state throughput to buy the same thing.

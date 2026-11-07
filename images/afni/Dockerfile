@@ -8,7 +8,7 @@
 # split the cohort's outputs by AFNI patch version (#338, #591).
 # preproc.py's other names for AFNI (3dvolreg motion, AFNI-equivalent aor/aqi/
 # gcor) describe upstream ABCD processing and numpy reimplementations, not binaries.
-FROM ghcr.io/prefix-dev/pixi:0.82.1 AS build
+FROM ghcr.io/prefix-dev/pixi:0.83.0 AS build
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1). The pixi base is
 # Ubuntu 24.04 and this is the stage that ships, so that base layer goes out as-is and
@@ -46,10 +46,20 @@ RUN echo "#!/bin/bash" > /entrypoint.sh && \
     chmod +x /entrypoint.sh
 
 COPY images/afni/preproc.py images/afni/surf_geometry.py images/afni/tissue_masks.py ./
+# The one-off probseg backfill (probseg-backfill WorkflowTemplate); runs tissue_masks.py.
+# probseg_state.py is its fixed-or-not rule, shared with first-level's session listing.
+COPY images/afni/probseg_backfill.py ./
+COPY images/shared/probseg_state.py /app/probseg_state.py
+# The one-off confounds-only re-run (confounds-rerun WorkflowTemplate); runs preproc.py.
+COPY images/afni/confounds_rerun.py ./
 
 # The IQMs and FuncQC record preproc.py imports. Shared with src/equivalence, which
 # recomputes the same record from another pipeline's outputs with this same code.
 COPY images/shared/func_iqm.py /app/func_iqm.py
+COPY images/shared/nss.py /app/nss.py
+# The confounds TSV's dvars_mean1000 column. Standard-library only; the python
+# image's dvars-backfill pod adds the same column with this same module.
+COPY images/shared/confounds_dvars.py /app/confounds_dvars.py
 
 # Exploded-derivative link replay (ADR 017). ONLY restore_links.py — this image
 # has no boto3 and no AWS CLI, and deliberately keeps it that way: Argo does the

@@ -79,8 +79,9 @@ REFERENCE = Provider(
 )
 NSS = Provider(
     "your NSS table",
-    f"Run `{_script('make_nss_volumes.py')} --mr-info <path>/mr_y_adm__info` on the "
-    "ABCD table from your own data access, then upload the result to config/nss_volumes.csv. "
+    f"Run `{_script('make_nss_volumes.py')} --mr-info <path>/mr_y_adm__info "
+    "--mr-qc-nback <path>/mr_y_qc__raw__tfmri__nback.tsv` on the "
+    "ABCD tables from your own data access, then upload the result to config/nss_volumes.csv. "
     "This deployment's table is keyed by subject ID and is never published.",
 )
 
@@ -105,14 +106,29 @@ def required_keys(repo: Path) -> dict[str, list[str]]:
             found[key].append(rel)
 
     for top in TEMPLATE_ROOTS:
-        for path in sorted((repo / top).rglob("*.yaml")):
+        for path in _tracked(repo, top, "*.yaml"):
             for key in _ARTIFACT_KEY.findall(path.read_text(encoding="utf-8")):
                 add(key, path)
     for top in CODE_ROOTS:
-        for path in sorted((repo / top).rglob("*.py")):
+        for path in _tracked(repo, top, "*.py"):
             for key in _CODE_KEY.findall(path.read_text(encoding="utf-8")):
                 add(key, path)
     return dict(sorted(found.items()))
+
+
+def _tracked(repo: Path, top: str, pattern: str) -> list[Path]:
+    """Files under `top` matching `pattern`, outside any hidden directory.
+
+    A hidden directory is never ours: an image's local pixi environment
+    (`images/afni/.pixi/`) holds a whole site-packages, one of whose test files
+    is deliberately not UTF-8, so reading it failed every caller.
+    """
+    root = repo / top
+    return sorted(
+        p
+        for p in root.rglob(pattern)
+        if not any(part.startswith(".") for part in p.relative_to(root).parts[:-1])
+    )
 
 
 def provider(key: str) -> Provider | None:

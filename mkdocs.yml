@@ -110,6 +110,7 @@ nav:
   - Methods & QC:
       - nmi-interpretation.md
       - observability.md
+      - qc-metrics-explained.md
       - metrics_data_dictionary.md
       - how-to-timeframe-metrics-dataframe.md
       - anatomical-stats.md

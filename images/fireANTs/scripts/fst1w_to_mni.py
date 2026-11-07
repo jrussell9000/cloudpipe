@@ -145,15 +145,13 @@ def parse_args():
     # Registration tuning. The affine stage is SimpleITK (self-tuning via
     # SetOptimizerScalesFromPhysicalShift), so only the SyN stage is exposed.
     # Defaults validated offline (10-subject 1mm sample): lr 0.25 + [100,100,100]
-    # give lncc ~0.80 with jac_det_frac_negative ~0.0004-0.0013 (diffeomorphic);
-    # higher lr / fewer smoothing folds the warp.
+    # give lncc ~0.80 and a diffeomorphic warp: on the corrected Jacobian (#1020)
+    # no production registration with these defaults folds a single brain voxel.
+    # Higher lr / less smoothing may fold it. (The 0.0004-0.0013 folding this
+    # comment used to quote was the pre-#1020 artefact, not real folding.)
     #
-    # The gate is jac_det_frac_negative > 0.005 (registration_qc.py). This comment
-    # used to cite 0.001 as the bound, which is the value the 2026-07-23
-    # recalibration REMOVED for sitting inside the healthy distribution — a normal
-    # registration tripped it ~17% of the time. Quoting it here made the fused_ops
-    # A/B (2026-08-05) look marginal when it was 2.6-3.8x over the real bound;
-    # registration_qc.py is the source of truth for every threshold.
+    # The folding gate fails on ANY folded brain voxel; registration_qc.py is the
+    # source of truth for every threshold, so no bound is quoted here.
     p.add_argument('--syn-scales', nargs='+', type=int, default=[4, 2, 1])
     p.add_argument('--syn-iterations', nargs='+', type=int, default=[100, 100, 100])
     p.add_argument(
@@ -334,7 +332,10 @@ def resolve_syn_loss(use_ffo: bool, env: dict) -> tuple[str, dict]:
     the spatial smoothing that keeps a deformation locally consistent, and dropping
     it is the measured cause of the 2026-08-05 A/B failure: `jac_det_frac_negative`
     0.0129-0.0191 against a 0.005 fail bound, i.e. 1.3-1.9% of brain voxels folded,
-    while `lncc` went UP by +0.078 (#163, #165). Defaulting it off makes
+    while `lncc` went UP by +0.078 (#163, #165). CAVEAT: those folding figures came
+    from the pre-#1020 Jacobian, which reported folding in warps that had none
+    (0.0004-0.0013 on healthy ones), so the A/B's folding verdict needs re-measuring
+    on the corrected computation before it is cited again. Defaulting it off makes
     'cc' -> 'fusedcc' a like-for-like swap of the GRADIENT as well as the metric —
     which is what the fused arm has to be before it can be considered for adoption.
 

@@ -261,10 +261,10 @@ pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/seed
 pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/seed_reference_files.py --bucket <data bucket>
 ```
 
-Build `nss_volumes.csv` from the ABCD release your data use agreement gives you: the `mr_y_adm__info` table and its data dictionary (`mr_y_adm__info.tsv` and `.json`). The number of non-steady-state frames depends on the scanner, which the images don't record: GE DV25 → 5, GE DV26 and later → 16, Philips and Siemens → 8. A session that matches no rule stops the script; it never guesses. The reference deployment's own table is keyed by subject ID and is never published.
+Build `nss_volumes.csv` from the ABCD release your data use agreement gives you: the `mr_y_adm__info` table and its data dictionary (`mr_y_adm__info.tsv` and `.json`), and `mr_y_qc__raw__tfmri__nback.tsv`. The number of non-steady-state frames depends on the scanner, which the images don't record: GE DV25 → 5, GE DV26 and later → 16, Philips and Siemens → 8. Because the recorded software version is occasionally wrong, a GE session's n-back run length overrides it: 367 frames → 5, 378 → 16. The pipeline then checks every GE run's own length as it processes it (`images/shared/nss.py`), because a few sessions scanned rest and n-back on software that drops different numbers of frames. So a GE row only has to say 5 or 16; each run gets the count its length implies. A session that matches no rule stops the script; it never guesses. The reference deployment's own table is keyed by subject ID and is never published.
 
 ```bash
-pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/make_nss_volumes.py --mr-info /path/to/mr_y_adm__info --out nss_volumes.csv
+pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/make_nss_volumes.py --mr-info /path/to/mr_y_adm__info --mr-qc-nback /path/to/mr_y_qc__raw__tfmri__nback.tsv --out nss_volumes.csv
 aws s3 cp nss_volumes.csv s3://<data bucket>/config/nss_volumes.csv
 ```
 

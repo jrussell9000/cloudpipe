@@ -1,0 +1,25 @@
+[workspace]
+authors = ["Justin Russell"]
+channels = ["conda-forge"]
+name = "equivalence"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+# The one ruler's runtime: what src/equivalence imports at module level, and
+# nothing from either arm. numpy/scipy/nibabel/pandas are the same bands as the
+# afni image, which runs the same func_iqm.py in-pod, so the IQMs are computed by
+# the same library versions on both sides of the calibration gate (task 2.3).
+python = ">=3.13,<3.15"
+numpy = ">=1.26.0,<3"
+scipy = ">=1.13.0,<2"
+nibabel = ">=5.0.0,<6"
+pandas = ">=3.0.0,<4"
+pyyaml = ">=6.0,<7"
+# Reads both arms' outputs from the data bucket. The same pins as every other
+# image that ships boto3 (#268), so a client-side fault reproduces identically.
+boto3 = "==1.43.72"
+botocore = "==1.43.72"
+urllib3 = "==2.7.0"

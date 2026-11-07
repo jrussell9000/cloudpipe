@@ -71,9 +71,9 @@ ENV MAMBA_ROOT_PREFIX=/opt/conda
 #
 # `--build-arg AFNI_SHA256_ARM64=` (empty) skips the digest check for an
 # emergency build; the version assertion still applies.
-ARG AFNI_VERSION=AFNI_26.3.02
-ARG AFNI_SHA256_AMD64=b2f834925818d1b8b38a4ae2a337af067bd8ad160d05d39c642ecc7661840d85
-ARG AFNI_SHA256_ARM64=09fc3ffbe279606bd0f4e75d1203290ac5c20a5e3bb1e2acf1d1b2288e86700f
+ARG AFNI_VERSION=AFNI_26.3.07
+ARG AFNI_SHA256_AMD64=a65d5dd466830de2e222bc305020e23b29de45dc677b26a1e6ce2a0f0c44ea6d
+ARG AFNI_SHA256_ARM64=9391701ed9fe81d5ddf2c19ab250eef53f301767150289c8d3914ab60dfc97c6
 
 RUN set -eu; \
     if [ "${TARGETARCH}" = "arm64" ]; then \
@@ -109,27 +109,36 @@ RUN set -eu; \
     curl -fsL "https://micro.mamba.pm/api/micromamba/linux-${MAMBA_ARCH}/latest" \
         | tar -xvj -C /usr/local/bin --strip-components=1 bin/micromamba
 
-ENV PATH="/opt/afni:/opt/conda/envs/ABCD_fmri_orchestrator_S3/bin:$PATH"
+ENV PATH="/opt/afni:/opt/conda/envs/first_level/bin:$PATH"
 
 # 4. App Setup
+#
+# The build context is the repo root (build-fmri-first-level-proc.yaml), so the
+# image can take the shared publish modules from images/shared/. The
+# fmri-first-level-proc package is checked out by that workflow at a pinned commit.
 WORKDIR /app
 
-COPY environment.yaml /app/environment.yaml
-COPY ABCD_fmri_orchestrator_S3/ /app/ABCD_fmri_orchestrator_S3/
-COPY fmri-first-level-proc/ /tmp/fmri-first-level-proc/
-WORKDIR /app/ABCD_fmri_orchestrator_S3
+COPY images/fmri-first-level-proc/environment.yaml /app/environment.yaml
+COPY images/fmri-first-level-proc/fmri-first-level-proc/ /tmp/fmri-first-level-proc/
 
 RUN --mount=type=cache,target=/opt/conda/pkgs \
     --mount=type=cache,target=/root/.cache/pip \
     micromamba env create --yes -f /app/environment.yaml && \
     pip install /tmp/fmri-first-level-proc/ && \
-    rm -rf /tmp/fmri-first-level-proc/
+    rm -rf /tmp/fmri-first-level-proc/ && \
+    pip install --disable-pip-version-check --root-user-action=ignore \
+        boto3==1.43.72 \
+        botocore==1.43.72 \
+        urllib3==2.7.0
+# boto3/botocore/urllib3 are pinned, and in step with every other image that ships
+# fs_derivatives.py (#268; tests/images/test_publish_pin_parity.py): bump all at once.
 
-# Atlas and configs
-COPY Schaefer2018_400Parcels_7Networks_order_Tian_Subcortex_S4_3T_MNI152NLin2009cAsym_2mm.nii.gz \
-     orch_config_final.yaml \
-     proc_config_final.yaml \
-     ./
+# The runner (OpenSpec first-level-direct-inputs, D12) and what it imports: the
+# exploded publish (ADR 017; fs_derivatives needs restore_links' sidecar names).
+# Staging and the analysis template live in fmri-first-level-proc.
+COPY images/shared/fs_derivatives.py images/shared/restore_links.py ./
+COPY images/fmri-first-level-proc/stage_first_level.py ./
+# The atlas ships inside the fmri-first-level-proc package, with its licences (4.0.0+cp.4).
 
 # Point directly to the python in the env
-ENTRYPOINT ["python3", "orchestrate_first_level.py"]
+ENTRYPOINT ["python3", "stage_first_level.py"]

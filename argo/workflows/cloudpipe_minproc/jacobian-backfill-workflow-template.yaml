@@ -1,0 +1,153 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: jacobian-backfill
+  namespace: argo-workflows
+
+###########################################################################
+# One-off: recompute the jac_det_* and log_jac_* fields of every past T1w->MNI
+# RegistrationQC record from its warp (#1020). Before #1022, jacobian_stats()
+# differentiated fireANTs' LPS displacement vectors against RAS voxel axes, so
+# those 13 fields are wrong on every record. The warps are all in S3; this
+# recomputes, with the fixed registration_qc.py, exactly what fst1w_to_mni.py
+# computes (images/freesurfer/jacobian_backfill.py).
+#
+# The pods WRITE NO METRICS. Each appends one outcome line per session to
+# config/jacobian-backfill/{label}/outcomes/ in the data bucket, and
+# scripts/backfill_jacobian.py patch applies them to the records on a
+# workstation, behind its own checks and audit. Planned, submitted and patched
+# by that script, never by hand:
+#
+#   plan-key  the plan, a key in the data bucket
+#   shards    how many pods share the plan (each takes every shards-th session)
+#
+# The shard count IS the concurrency, as in probseg-backfill (read its header
+# for why there is no semaphore). spec.parallelism is only a runaway backstop;
+# scripts/backfill_jacobian.py refuses more shards than it.
+#
+# Idempotent per session (a session already in the shard's outcome file is
+# skipped), so retries and a resubmit with the same shard count are safe.
+###########################################################################
+
+spec:
+  # Runaway backstop, not the working cap. Equals MAX_SHARDS in
+  # scripts/backfill_jacobian.py; tests hold the two together.
+  parallelism: 100
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  arguments:
+    parameters:
+      - name: plan-key
+      - name: shards
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  entrypoint: backfill
+
+  templates:
+  - name: backfill
+    steps:
+    - - name: shard
+        template: backfill-shard
+        withSequence:
+          count: "{{workflow.parameters.shards}}"
+        arguments:
+          parameters:
+            - name: shard
+              value: "{{item}}"
+
+  - name: backfill-shard
+    metadata:
+      labels:
+        cloudpipe.io/phase: registration
+        cloudpipe.io/step: jacobian-backfill
+    inputs:
+      parameters:
+        - name: shard
+    # Spot reclaims and S3 errors only, the same codes as probseg-backfill:
+    # 64/143 executor or SIGTERM, 75 the module's own S3-error exit. A warp
+    # jacobian_stats fails on is recorded and skipped, never a pod failure, and
+    # the self-check's exit 70 (a pre-#1022 registration_qc.py in the image) is
+    # deliberately not retried.
+    retryStrategy:
+      limit: "8"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+    container:
+      # The freesurfer image: it ships registration_qc.py (bold-to-t1w) and boto3
+      # on the system python, and already runs on cpu-heavy-nodepool. Re-pinned
+      # with every freesurfer build by build-images.yaml.
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:87733859a676285e772c1067935685828d9d37e1b65b5f5981625749a8168698"
+      imagePullPolicy: IfNotPresent
+      # The system interpreter, not bare `python3`: FreeSurfer's bundled 3.8 is
+      # first on PATH and has no boto3 (see bold-to-t1w-session-template).
+      command: [/usr/bin/python3, -u, /app/jacobian_backfill.py]
+      args:
+        - --plan-key
+        - "{{workflow.parameters.plan-key}}"
+        - --shard
+        - "{{inputs.parameters.shard}}"
+        - --shards
+        - "{{workflow.parameters.shards}}"
+        - --data-bucket
+        - "{{workflow.parameters.bucket}}"
+        - --region
+        - "{{workflow.parameters.region}}"
+        - --scratch
+        - /tmp
+      env:
+        # Only /app: the image's PYTHONPATH also carries FreeSurfer's 3.8
+        # packages, which the system 3.10 interpreter has no use for.
+        - name: PYTHONPATH
+          value: /app
+        # Provenance on each outcome line; repeats the image ref above so
+        # build-images.yaml's re-pin rewrites both together.
+        - name: CLOUDPIPE_IMAGE
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:87733859a676285e772c1067935685828d9d37e1b65b5f5981625749a8168698"
+        - name: OMP_NUM_THREADS
+          value: "1"
+        - name: OPENBLAS_NUM_THREADS
+          value: "1"
+      resources:
+        # One session at a time, single-threaded numpy. A 193x229x193x3 float32
+        # field is ~100 MB; jacobian_stats holds the field, three gradients and
+        # the nine Jacobian terms at once, ~0.75 GB peak measured on a full-size
+        # synthetic field. The warp (~100 MB gzipped) is the only scratch file.
+        requests:
+          cpu: "1"
+          memory: 2G
+          ephemeral-storage: 1G
+        limits:
+          memory: 3G
+          ephemeral-storage: 2G

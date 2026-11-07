@@ -75,7 +75,13 @@ MAPPING: tuple[ColumnPair, ...] = (
         canonical="dvars",
         cloudpipe="dvars",
         fmriprep="dvars",
-        relationship="Same quantity.",
+        relationship=(
+            "Same quantity, different intensity scale: fMRIPrep's is nipype "
+            "ComputeDVARS, which scales the run to an in-mask median of 1000 first; "
+            "cloudpipe's is in the input BOLD's own units, which vary about 60-fold "
+            "between ABCD scanners. Compare them only after putting one on the "
+            "other's scale (describe.session_dvars_common_scale)."
+        ),
     ),
     ColumnPair(
         canonical="global_signal",

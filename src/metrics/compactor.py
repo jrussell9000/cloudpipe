@@ -45,8 +45,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 log = logging.getLogger(__name__)
+
+# Concurrent GetObjects when reading one dt's raw records. Read one at a time,
+# each key cost ~30 ms of network wait: a func_preproc dt of 33k records took
+# 17 min to compact (2026-10-29, the confounds re-run's `finish`). boto3
+# clients are thread-safe, and the pool only overlaps those waits.
+READ_WORKERS = 32
 
 # table_name (Glue-table form) -> raw S3 prefix. Compacted output for each
 # table is written under metrics/compacted/{table_name}/ rather than the
@@ -57,6 +64,7 @@ RAW_PREFIXES = {
     "surface_sample": "metrics/surface-sample/",
     "anat_qc": "metrics/anat-qc/",
     "fsqc_qc": "metrics/fsqc-qc/",
+    "tissue_masks": "metrics/tissue-masks/",
     "workflow_runs": "metrics/workflow-runs/",
     "step_outcomes": "metrics/step-outcomes/",
     "subject_manifests": "metrics/subject-manifests/",
@@ -96,7 +104,7 @@ def read_raw_records(s3_client, bucket: str, keys: list[str]) -> list[dict]:
 
 
 def read_raw_records_counting_skips(
-    s3_client, bucket: str, keys: list[str]
+    s3_client, bucket: str, keys: list[str], workers: int = READ_WORKERS
 ) -> tuple[list[dict], int]:
     """read_raw_records, plus how many keys were skipped as unreadable.
 
@@ -107,25 +115,31 @@ def read_raw_records_counting_skips(
     failure would either shrink a live partition or empty one outright.
     Callers that mutate compacted state from this set must check the count
     and stand down when it is non-zero.
+
+    Keys are fetched `workers` at a time; records come back in key order, so
+    the compacted rows are the same as from a serial read.
     """
     records = []
     skipped = 0
-    for key in keys:
-        try:
-            body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
-        except Exception as exc:
-            log.warning("Skipping unreadable record %s: %s", key, exc)
-            skipped += 1
-            continue
-
-        try:
-            records.append(json.loads(body))
-        except json.JSONDecodeError:
-            parsed = _parse_jsonl(body, key)
-            if not parsed:
-                skipped += 1
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(keys)))) as pool:
+        for parsed, unreadable in pool.map(lambda k: _read_one(s3_client, bucket, k), keys):
             records.extend(parsed)
+            skipped += unreadable
     return records, skipped
+
+
+def _read_one(s3_client, bucket: str, key: str) -> tuple[list[dict], bool]:
+    """One key's records, and whether the key counts as skipped."""
+    try:
+        body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except Exception as exc:
+        log.warning("Skipping unreadable record %s: %s", key, exc)
+        return [], True
+    try:
+        return [json.loads(body)], False
+    except json.JSONDecodeError:
+        parsed = _parse_jsonl(body, key)
+        return parsed, not parsed
 
 
 def _parse_jsonl(body: bytes, key: str) -> list[dict]:

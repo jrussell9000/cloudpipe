@@ -22,7 +22,7 @@ spec:
     # artifact-staging class (#277). A missing artifact KEY is excluded, though:
     # its producer was skipped or failed, and a consumer retry cannot re-run the
     # producer. See the master template for the detail.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -252,7 +252,7 @@ spec:
       # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
       # rewrites this to sha-<commit> once the first build lands, and only after
       # confirming that tag actually reached the registry.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:321be98fc9405f07e689997b5778e4b57117d2320525de6e059e6f3cb46808ab"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:f369ede1a2521935b0143720e5807bb4ee14a69a0fe0be17bd5e999ce3917383"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -401,6 +401,46 @@ spec:
             # Same floor as the local check: a truncated upload is not a result.
             return head["ContentLength"] >= MIN_DTSERIES_BYTES
 
+        def transform_absent(task, rid):
+            """True only if S3 positively shows bold-to-t1w left no transform for this run.
+
+            That is what a QC rejection (exit 65) does: the transform is never
+            published, func-preproc skips the run (its `SKIPPED ... no
+            bold_to_t1w transform (QC-rejected upstream)` line), and so no
+            components ever exist for this pod. Such a run is `skipped` with
+            upstream_failed_step bold-to-t1w, exactly as func-preproc and
+            surface-sample record it, not a surface-resample failure: recorded
+            as failed it made the workflow verdict (#899) fail every subject
+            with a rejected run. A listing, not a HEAD, so a credential or
+            network fault cannot pass for "absent": any error returns False and
+            the run keeps the failure path.
+            """
+            prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+            key = (f"derivatives/registration/{SUBJ}/{SES}/bold_to_t1w_{task}_{rid}/"
+                   f"{prefix}_desc-bold2t1w_itk.txt")
+            try:
+                resp = boto3.client("s3").list_objects_v2(Bucket=BUCKET, Prefix=key, MaxKeys=1)
+            except Exception:
+                return False
+            return not any(o["Key"] == key for o in resp.get("Contents", []))
+
+        # A pending run with no components of any kind (no directory, no
+        # tarball) whose transform is absent never reached func-preproc. Decided
+        # before the geometry check: a session whose every run was rejected
+        # has no geometry either, and that is not a fault.
+        skipped = {}
+        for r in pending:
+            task, rid = r["task"], r["run"]
+            prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+            has_components = (
+                (COMPONENTS / f"{task}_{rid}").is_dir()
+                or (COMPONENTS / f"{prefix}_desc-grayordcomponents_bold.tar.gz").exists()
+            )
+            if not has_components and transform_absent(task, rid):
+                print(f"[driver] SKIPPED {prefix}: no bold_to_t1w transform (QC-rejected upstream)")
+                skipped[prefix] = "bold-to-t1w left no transform for this run (QC-rejected upstream)"
+        pending = [r for r in pending if f"{SUBJ}_{SES}_{r['task']}_{r['run']}" not in skipped]
+
         # Runs excluded from `pending` already had their dtseries verified in S3
         # by inventory's surf_target_exists, so their components are reclaimable
         # with no local check — this is what clears the backlog left by sessions
@@ -516,12 +556,17 @@ spec:
             for r in RUNS:
                 task, rid = r["task"], r["run"]
                 prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+                if prefix in skipped:
+                    write_outcome("surface-resample", task, rid, "skipped", skipped[prefix],
+                                  upstream_failed_step="bold-to-t1w")
+                    continue
                 if prefix in failed:
                     status, reason = "failed", reason_by_prefix.get(prefix, "")
                 else:
                     status, reason = "succeeded", ""
                 write_outcome("surface-resample", task, rid, status, reason)
-        print(f"[driver] {len(pending) - len(failed)} succeeded, {len(failed)} failed")
+        print(f"[driver] {len(pending) - len(failed)} succeeded, {len(failed)} failed, "
+              f"{len(skipped)} skipped (QC-rejected upstream)")
 
         # Reclaim runs after the outcome records are written, so a failure in
         # here can never cost us the StepOutcome facts for this session.

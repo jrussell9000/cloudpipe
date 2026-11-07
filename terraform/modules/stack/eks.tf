@@ -262,7 +262,8 @@ module "eks" {
 
   # Define managed node groups for the EKS cluster
   eks_managed_node_groups = {
-    # The backend group will hold all non-Karpenter, non-NVIDIA system processes
+    # The backend group holds the non-NVIDIA system processes, and since
+    # 2026-11-06 the Karpenter controller too (see the note after this group).
     backend = {
       name = "backend"
       # Don't use this name as a prefix prepended to a random alphanumeric string
@@ -378,52 +379,20 @@ module "eks" {
       }
     }
 
-    # Will host the Karpenter controller
-    karpenter = {
-      name            = "karpenter"
-      use_name_prefix = false
-      ami_type        = "BOTTLEROCKET_ARM_64"
-      instance_types  = ["m7g.xlarge"]
-
-      min_size     = 0
-      max_size     = 3
-      desired_size = 1
-
-      # SSM requires this
-      metadata_options = {
-        http_endpoint               = "enabled"
-        http_tokens                 = "required"
-        http_put_response_hop_limit = 3
-        instance_metadata_tags      = "enabled"
-      }
-
-
-      # Node group IAM Role/Instance Profile
-      use_name_prefix          = false
-      iam_role_name            = "${var.name}-karpenter-nodegroup-iam-role"
-      iam_role_use_name_prefix = false
-      iam_role_additional_policies = {
-        # Required by SSM
-        AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-        # Required by Container Insights
-        CloudWatchAgentServerPolicy = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-        # Required to pull images from private ECR registries (if so desired)
-        AmazonEC2ContainerRegistryReadOnly = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-        # Required by EKS CNI
-        AmazonEKS_CNI_Policy = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-        # Required for writing to AMP
-        AmazonPrometheusRemoteWriteAccess = "arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess"
-      }
-
-      # Prefix delegation assigns /28 blocks to ENIs; pod IPs are not the ENI's
-      # primary IP, so AWS drops outbound pod traffic unless SrcDstCheck is off.
-      network_interfaces = [{ source_dest_check = false }]
-
-      labels = {
-        # Used to ensure Karpenter runs on nodes that it does not manage
-        "karpenter.sh/controller" = "true"
-      }
-    }
+    # There is no `karpenter` group any more (removed 2026-11-06). It was one
+    # m7g.xlarge (~$119/mo, on every deployment) whose memory was 3% requested,
+    # kept only so the Karpenter controller had a node Karpenter does not manage.
+    # `backend` is such a node, so the controller runs there now — pinned by
+    # `eks.amazonaws.com/nodegroup In [backend]` plus `karpenter.sh/nodepool
+    # DoesNotExist` in modules/karpenter/helm-values/values-karpenter.yaml. With
+    # two backend nodes, the chart's required hostname anti-affinity also lets
+    # BOTH controller replicas run; on the single karpenter node one was always
+    # Pending.
+    #
+    # Everything that ran on the old node needs a toleration for a tainted group
+    # now, because no managed node is untainted: a pod with none would land on
+    # Karpenter spot capacity and hold a node up around the clock. cloudflared
+    # (backend + argo) and reloader (backend) were moved in the same change.
     argo = {
       name            = "argo"
       use_name_prefix = false

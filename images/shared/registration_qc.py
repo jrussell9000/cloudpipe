@@ -508,12 +508,27 @@ _T1W_MNI_THRESHOLDS = {
     # gates add so little. (The original 0.85/0.75 was above the achievable
     # ceiling, so every subject warned; recalibrated 2026-07-03, Part E.)
     'lncc': {'fail': 0.65, 'direction': 'below'},
-    # Folding budget: at most 0.5% of brain voxels may have det(J) < 0. The
-    # prior 0.001 sat *inside* the healthy distribution (10-subject batch:
-    # mean 0.0004, sd 0.0002, max 0.0013), so a normal registration tripped it
-    # ~17% of the time — it was measuring the population mean, not detecting
-    # anomalies.
-    'jac_det_frac_negative': {'fail': 0.005, 'direction': 'above'},
+    # Folding: ANY folded brain voxel fails (det J < 0 anywhere in the template
+    # brain). THE BOUND IS STRUCTURAL, NOT CALIBRATED, like nmi_gain's below: a
+    # diffeomorphic SyN warp folds nothing, and a fold is a place where the map
+    # is not invertible. No healthy warp comes near it.
+    #
+    # Measured 2026-11-06 on the corrected Jacobian (#1020, backfilled over the
+    # whole cohort): 0 of 33,468 passing registrations has a single folded brain
+    # voxel, first-attempt and rescued affines alike. The smallest det J of any
+    # voxel in any of them is 0.119; the 0.1st percentile of the per-
+    # registration minimum is 0.150 and the median 0.251. Zero false fails in
+    # 33,468 puts the false-fail rate below 3/33,468 ≈ 0.009% (rule of three, 95%),
+    # and a false fail still goes through the rescue ladder before it is final.
+    # Every one of the cohort's 16 genuine failures failed on lncc.
+    #
+    # HISTORY. 0.001 (2026-07-03), then 0.005 (2026-07-23), were fitted to a
+    # "healthy" folding distribution (mean 0.0004, max 0.0013) that was an
+    # artefact: until #1020 jacobian_stats() differentiated LPS vectors against
+    # RAS voxel axes and reported folding that ANTs' own Jacobian does not find.
+    # Under that error 3 sessions failed and 25 were rescued on folding alone;
+    # all 3 passed with 0 folded voxels when re-registered on the fix.
+    'jac_det_frac_negative': {'fail': 0.0, 'direction': 'above'},
     # DELIBERATELY NOT GATED, recorded only:
     #
     #   ice_* — the forward∘inverse round-trip residual, and the withdrawn third
@@ -680,6 +695,13 @@ def jacobian_stats(warp_path: str, mask_path: str | None = None) -> dict:
     distribution (log_jac_*). A healthy SyN warp has all determinants > 0 (no
     folding) and mean ≈ 1.
 
+    The field's vectors are LPS mm (ITK's frame); the grid is differentiated
+    in that same frame through _load_displacement_field()'s voxel→LPS matrix.
+    Checked against ANTs' CreateJacobianDeterminantImage on a production
+    fireANTs warp: r = 0.9993, no folded voxel in the brain either way (#1020).
+    Every jac_det_* and log_jac_* value recorded before that fix was computed
+    against RAS voxel axes and is wrong.
+
     Why log(det J) and not det J alone: det J is multiplicative and asymmetric —
     a doubling of local volume is 2.0 but a halving is 0.5, so expansion and
     compression are not comparable on one scale and summary statistics are
@@ -711,29 +733,29 @@ def jacobian_stats(warp_path: str, mask_path: str | None = None) -> dict:
     with nibabel so it shares the warp's (x, y, z) axis order; a
     SimpleITK-derived mask is (z, y, x) and would mis-index silently.
     """
-    img = nib.load(warp_path)
-    d = img.get_fdata(dtype=np.float32)
-    if d.ndim == 5:
-        d = d[:, :, :, 0, :]  # (X, Y, Z, 1, 3) → (X, Y, Z, 3)
-    vox = np.abs(img.header.get_zooms()[:3]).tolist()
+    d, vox_to_lps = _load_displacement_field(warp_path)
+    world_to_vox = np.linalg.inv(vox_to_lps)
 
-    ux, uy, uz = d[..., 0], d[..., 1], d[..., 2]
-
-    j11 = 1 + np.gradient(ux, vox[0], axis=0)
-    j12 = np.gradient(ux, vox[1], axis=1)
-    j13 = np.gradient(ux, vox[2], axis=2)
-    j21 = np.gradient(uy, vox[0], axis=0)
-    j22 = 1 + np.gradient(uy, vox[1], axis=1)
-    j23 = np.gradient(uy, vox[2], axis=2)
-    j31 = np.gradient(uz, vox[0], axis=0)
-    j32 = np.gradient(uz, vox[1], axis=1)
-    j33 = 1 + np.gradient(uz, vox[2], axis=2)
+    # J = I + du/dx, both in the field's own LPS frame. np.gradient gives
+    # du_c/di_k along the voxel axes; the chain rule through the voxel→LPS
+    # matrix turns that into du_c/dx_j. Differentiating the stored vectors
+    # against RAS voxel axes (as this used to) mixes two frames: on a RAS grid
+    # the x and y rows enter with the wrong sign, and the determinant is
+    # reported folded where ANTs finds none (#1020).
+    j = [[None] * 3 for _ in range(3)]
+    for c in range(3):
+        grads = np.gradient(d[..., c])
+        for col in range(3):
+            j[c][col] = sum(grads[k] * np.float32(world_to_vox[k, col]) for k in range(3))
+        j[c][c] = j[c][c] + 1
+        del grads
 
     det = (
-        j11 * (j22 * j33 - j32 * j23)
-        - j12 * (j21 * j33 - j31 * j23)
-        + j13 * (j21 * j32 - j31 * j22)
+        j[0][0] * (j[1][1] * j[2][2] - j[2][1] * j[1][2])
+        - j[0][1] * (j[1][0] * j[2][2] - j[2][0] * j[1][2])
+        + j[0][2] * (j[1][0] * j[2][1] - j[2][0] * j[1][1])
     )
+    del j
 
     sel = np.isfinite(det)
     if mask_path is not None:
@@ -798,14 +820,26 @@ def jacobian_stats(warp_path: str, mask_path: str | None = None) -> dict:
     }
 
 
+# nibabel's affine maps voxels to RAS; ITK, and so every ANTs-format field,
+# works in LPS. The two differ by negating x and y.
+_RAS_TO_LPS = np.diag([-1.0, -1.0, 1.0])
+
+
 def _load_displacement_field(path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Load an ANTs displacement field as (X, Y, Z, 3) mm, plus voxel spacing."""
+    """Load an ANTs displacement field: (X, Y, Z, 3) vectors in LPS mm, and the 3×3
+    matrix taking voxel-index steps to LPS mm.
+
+    An ANTs NIfTI field stores each vector in ITK's LPS physical frame, whatever
+    the image's orientation. The header affine is RAS (nibabel's convention), so
+    the vectors and the grid are in different frames unless the matrix returned
+    here is used to bring the grid into LPS. A RAS-oriented 1 mm grid has
+    voxel→LPS matrix diag(-1, -1, 1), not the identity.
+    """
     img = nib.load(path)
     d = img.get_fdata(dtype=np.float32)
     if d.ndim == 5:
         d = d[:, :, :, 0, :]  # (X, Y, Z, 1, 3) → (X, Y, Z, 3)
-    vox = np.abs(img.header.get_zooms()[:3]).astype(np.float32)
-    return d, vox
+    return d, _RAS_TO_LPS @ img.affine[:3, :3]
 
 
 def inverse_consistency_error(
@@ -838,11 +872,10 @@ def inverse_consistency_error(
 
     Both fields must be ANTs-convention displacements on the SAME grid — for
     ANTs/FireANTs, Warp and InverseWarp are both defined on the fixed (template)
-    grid, so this holds. Displacement components are assumed to correspond to
-    array axes in order and to be expressed in mm, which is the same assumption
-    jacobian_stats() already makes when it differentiates with voxel spacing;
-    it holds for axis-aligned volumes and would need an affine rotation term
-    otherwise.
+    grid, so this holds. The vectors are LPS mm; each is taken into voxel steps
+    through the grid's own voxel→LPS matrix before it moves a voxel index, so the
+    composition is right for any orientation (#1020: adding LPS vectors to RAS
+    voxel axes moved points the wrong way in x and y).
 
     `mask_path` restricts the statistics to voxels where that image is > 0 — pass
     the template so the numbers describe brain tissue rather than the
@@ -850,15 +883,17 @@ def inverse_consistency_error(
     """
     from scipy.ndimage import map_coordinates
 
-    fwd, vox = _load_displacement_field(forward_warp_path)
+    fwd, vox_to_lps = _load_displacement_field(forward_warp_path)
     inv, _ = _load_displacement_field(inverse_warp_path)
     if fwd.shape != inv.shape:
         raise ValueError(f'forward {fwd.shape} and inverse {inv.shape} fields must share a grid')
 
-    # Where each voxel lands under the forward field, in VOXEL units (the
-    # displacements are mm, so divide by spacing before adding to indices).
+    # Where each voxel lands under the forward field, in VOXEL units: the
+    # displacements are LPS mm, so take them through LPS→voxel before adding
+    # them to indices.
+    to_vox = np.linalg.inv(vox_to_lps).astype(np.float32)
     grid = np.indices(fwd.shape[:3]).astype(np.float32)  # (3, X, Y, Z)
-    target = grid + np.stack([fwd[..., k] / vox[k] for k in range(3)])
+    target = grid + np.einsum('kc,...c->k...', to_vox, fwd)
 
     # Sample the inverse field at those positions. order=1 is trilinear;
     # mode='nearest' clamps points pushed outside the field rather than

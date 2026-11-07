@@ -13,7 +13,8 @@ SQL see both — and an exported metrics dataset has to describe the data that w
 actually processed, not every attempt at it. The 2026-09-11 census found ~2.5% of
 every per-scan table superseded (raw rows: registration t1w_to_mni 826 of 31,965,
 bold_to_t1w 4,290, anat_qc 803, fsqc_qc 932, func_preproc 4,113). Every per-scan
-QC table is in TABLES: registration, func_preproc, surface_sample, anat_qc, fsqc_qc.
+QC table is in TABLES: registration, func_preproc, surface_sample, anat_qc, fsqc_qc,
+tissue_masks.
 
 Step outcomes are deliberately NOT touched. They are an event log — a failure
 happened — not a measurement, and the failure-triage dashboard counts them over time.
@@ -130,6 +131,12 @@ def _fastsurfer_marker(scan: tuple) -> str:
     return f"derivatives/fastsurfer/{subj}/{ses}/_complete.json"
 
 
+def _tissue_marker(scan: tuple) -> str:
+    """The session's dseg: written whether or not the probseg passed its guard."""
+    subj, ses = scan
+    return f"derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_dseg.nii.gz"
+
+
 @dataclass(frozen=True)
 class TableSpec:
     raw: str
@@ -203,6 +210,18 @@ TABLES = {
         scan=("subject", "session"),
         marker=_fastsurfer_marker,
         stale_margin_min=0,
+    ),
+    # TissueQC (2026-10-26). A func reprocess flushes the old row, but a re-run
+    # backfill or a retried session can still leave two. NOT measured like the
+    # margins above (no cohort yet): tissue_masks.py writes the record minutes
+    # before the same pod publishes the dseg, so 120 min is the func_preproc
+    # margin reused, to be re-measured once the backfill has run.
+    "tissue_masks": TableSpec(
+        raw="tissue_masks",
+        compacted="tissue_masks_compacted",
+        scan=("subject", "session"),
+        marker=_tissue_marker,
+        stale_margin_min=120,
     ),
 }
 REGISTRATION_TYPES = ("t1w_to_mni", "bold_to_t1w")

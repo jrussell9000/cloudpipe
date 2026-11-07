@@ -86,11 +86,13 @@ Cost is roughly 30–45 runner-minutes per week for the current 8 images, domina
 
 ### build-fmri-first-level-proc.yaml
 
-Separate workflow because `fmri-first-level-proc` requires two private repositories cloned at build time:
-- `jrussell9000/ABCD_fmri_orchestrator_S3`
-- `jrussell9000/fmri-first-level-proc`
+Separate workflow because `fmri-first-level-proc` clones a private repository at build time, `jrussell9000/fmri-first-level-proc` (the analysis package).
 
-Builds `linux/arm64` on `ubuntu-24.04-arm`. After push, rewrites the SHA tag in `argo/workflows/fmri_first_level_proc/fmri-first-level-proc-workflow-template.yaml` and commits.
+- **Pinned checkout.** The checkout is pinned to a commit SHA with `ref:`, not a branch. Before the pin, a push to the fork's `main` changed what the next rebuild shipped.
+- **Repo-root context.** The build context is the repo root, so the Dockerfile can copy `images/shared/` modules. `build-images.yaml` skips this image, so the three shared files it copies are listed in this workflow's push paths.
+- **Rebuild triggers.** Editing the workflow file triggers a rebuild, so bumping the pin is enough. (`jrussell9000/ABCD_fmri_orchestrator_S3` is no longer a build input.)
+
+Builds `linux/arm64` on `ubuntu-24.04-arm`. After push, rewrites the image digest in `argo/workflows/fmri_first_level_proc/fmri-first-level-proc-workflow-template.yaml` (both steps) and commits.
 
 ### build-prefect-flow-runner.yaml
 
@@ -193,8 +195,8 @@ Requires the fsLR meshes staged at `s3://{bucket}/config/fsLR/` — see [pipelin
 **ECR repo**: `cloudpipe/fastsurfer`  
 **Tag**: SHA-pinned  
 **Platform**: `linux/amd64`  
-**Base**: `deepmi/fastsurfer:latest`  
-**Contents**: FastSurfer with a `nonroot` user (UID/GID 1000) added. `/opt/freesurfer` ownership transferred to 1000.
+**Base**: `deepmi/fastsurfer:cu128-v2.5.4`, pinned by digest: FastSurfer 2.5.4 with FreeSurfer 7.4.1 for its surface stage. Held for the cohort so every subject's anatomy comes from one build; Dependabot ignores it, and a release change means re-running the anatomy  
+**Contents**: FastSurfer with a `nonroot` user (UID/GID 1000) added. `/opt/freesurfer` ownership transferred to 1000. **`/opt/freesurfer/bin/mri_normalize` is replaced** with a static build (like every binary in the tree; it links a static ITK 4.13.2 compiled in the builder stage) from pinned FreeSurfer `v7.4.1` source carrying `images/fastsurfer/patches/0001-mri_normalize-bias-outlier-sentinel.patch` (the HISTOalloc fix, [freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452)); it self-identifies as `7.4.1-cloudpipe-histoalloc1452` in the MGH tag block of every volume it writes. The rest of the FreeSurfer tree is the base image's, untouched. See `docs/pipelines.md` ("The third option: we compile the fix ourselves"). Validated 2026-10-29 on 9 real failing sessions (all recovered) and 19 healthy ones (voxel-identical to stock).
 
 Used by the four anatomical phase templates (`fastsurfer-template-build-template`, `fastsurfer-template-parcellation-template`, `fastsurfer-long-segmentation-template`, `fastsurfer-long-parcellation-template`).
 
@@ -256,16 +258,17 @@ Used by the `subregion-seg` WorkflowTemplate (`segment-subregions-gems-template`
 **ECR repo**: `cloudpipe/fmri-first-level-proc`  
 **Tag**: SHA-pinned  
 **Platform**: `linux/arm64` (runs on Graviton `backend` or Karpenter ARM nodes)  
-**Base**: `ubuntu:24.04`  
-**Contents**: AFNI (ARM build from AFNI official), micromamba, conda environment from `environment.yaml` (includes ABCD_fmri_orchestrator_S3 and fmri-first-level-proc packages). Schaefer 400-parcel + Tian S4 subcortical atlas baked in.
+**Base**: `ubuntu:26.04`  
+**Contents**:
+- AFNI (ARM build from AFNI official, digest- and version-pinned);
+- micromamba, with the `first_level` conda environment from `environment.yaml`;
+- the `fmri_first_level_proc` package (`jrussell9000/fmri-first-level-proc`, cloned at a pinned commit and pip-installed), which ships `proc_config_final.yaml` and the Schaefer 400-parcel + Tian S4 subcortical atlas with its licences;
+- `boto3`/`botocore`/`urllib3`, pinned in step with the other `fs_derivatives.py` images;
+- from `images/shared/`: `fs_derivatives.py` and `restore_links.py`.
 
-Two private repositories cloned at build time by the GitHub Actions workflow:
-- `jrussell9000/ABCD_fmri_orchestrator_S3` — orchestration logic
-- `jrussell9000/fmri-first-level-proc` — first-level GLM implementation (installed as a Python package)
+Entrypoint: `python3 stage_first_level.py` (`list-sessions` or `run`). See [pipelines.md](pipelines.md#fmri-first-level-proc).
 
-Entrypoint: `python3 orchestrate_first_level.py`. Config files `orch_config_final.yaml` and `proc_config_final.yaml` are baked in.
-
-Used by the `fmri-first-level-proc` WorkflowTemplate. 2-hour active deadline; 300 Gi emptyDir scratch volume.
+Used by the `fmri-first-level-proc` WorkflowTemplate. Per-session pod: 2-hour active deadline, 300 Gi emptyDir scratch volume.
 
 ---
 
@@ -291,7 +294,7 @@ Build context is the repo root (not `images/prefect-flow-runner/`) so the `COPY 
 |---|---|---|
 | `fsl` | Unused in current pipelines | FSL/topup groundwork for the planned `cloudpipe_fullproc` pipeline (SDC step) — see [architecture.md](architecture.md#cloudpipe_fullproc-planned--design-only-not-implemented). Parked out of CI (`build-images.yaml`) until that pipeline is implemented. |
 | `diffusion` | Present, not yet integrated | For future DWI processing; unrelated to `cloudpipe_fullproc`, no consumer planned yet |
-| `fmriprep` | **Directory removed** | Legacy full-preproc approach, replaced by cloudpipe_minproc |
+| `fmriprep` | Benchmark only, not a pipeline step | Upstream `nipreps/fmriprep` 25.2.5 pinned by digest, with every TemplateFlow file its command line needs baked in and checked offline at build time. The reference arm of the fMRIPrep equivalence benchmark; nothing in `cloudpipe_minproc` runs it. Carries FSL, so it is never published to ECR Public. Dependabot ignores it: the release is fixed for the study. (The earlier full-preproc `fmriprep` directory was removed when `cloudpipe_minproc` replaced it.) |
 | `ants` | **Directory removed** | Was never buildable (no Dockerfile — only `__pycache__`) |
 | `bravePy` | **Directory removed** — consolidated into `python` | Was Python+boto3 without metrics scripts. Any doc or template still saying `bravepy` is stale; the image is `cloudpipe/python`. |
 
