@@ -1,0 +1,61 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-ondemand-nodepool
+spec:
+  # On-demand GPU capacity, OPT-IN, for runs that cannot wait out a GPU spot
+  # drought: first the equivalence benchmark's D20 anchor runs
+  # (argo/workflows/fmriprep_bench/fmriprep-bench-anchor-workflow-template.yaml,
+  # `gpu-capacity: on-demand`). Added 2026-10-30, when every GPU spot type in the
+  # region read spot placement score 1/10 and 196 anchor fireANTs pods sat Pending
+  # for five hours on UnfulfillableCapacity.
+  #
+  # Tainted so nothing lands here by accident: on-demand GPU costs ~3x spot, and
+  # cloudpipe's own GPU steps stay on gpu-nodepool / gpu-dense-nodepool, which they
+  # select by affinity and which carry no taint. Only a template that tolerates
+  # cloudpipe.io/gpu-on-demand can schedule here; tests/argo/test_gpu_step_resources.py
+  # treats a tainted GPU pool as opt-in on that basis.
+  #
+  # The five gpu-nodepool types, so the default 3-slice device-plugin profile and the
+  # gpu-timeslice-3x overlay apply unchanged (the dense 2xlarge types are excluded:
+  # gpu-dense-timeslice-4x models them at 4, and a node from here would advertise 3).
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 10m
+  # 16 xlarge nodes at 3 slices: 48 fireANTs pods at once. A backstop, not a budget.
+  limits:
+    cpu: 64
+    memory: 256Gi
+  template:
+    spec:
+      expireAfter: 720h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-nodeclass
+      taints:
+        - key: cloudpipe.io/gpu-on-demand
+          value: "true"
+          effect: NoSchedule
+      requirements:
+      - key: "kubernetes.io/arch"
+        operator: In
+        values: ["amd64"]
+      - key: "kubernetes.io/os"
+        operator: In
+        values: ["linux"]
+      - key: "karpenter.sh/capacity-type"
+        operator: In
+        values: ["on-demand"]
+      - key: "karpenter.k8s.aws/instance-hypervisor"
+        operator: In
+        values: ["nitro"]
+      - key: "karpenter.k8s.aws/instance-gpu-manufacturer"
+        operator: In
+        values: ["nvidia"]
+      - key: "node.kubernetes.io/instance-type"
+        operator: In
+        values: ["g4dn.xlarge", "g4dn.2xlarge", "g5.xlarge", "g6.xlarge", "g6e.xlarge"]
+      - key: "topology.kubernetes.io/zone"
+        operator: In
+        values: ${zones_list}

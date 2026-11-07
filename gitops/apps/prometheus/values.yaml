@@ -231,22 +231,50 @@ kube-prometheus-stack:
           # watched, but pods still emit ~30 families each, and pod identity turns
           # over ~3,200 times per 30 minutes during a cohort run.
           #
-          # The five families below are every kube_* metric any dashboard in
-          # gitops/apps/grafana queries. Verified before narrowing: 0
+          # The five families in the first alternative are every kube_* metric any
+          # dashboard in gitops/apps/grafana queries. Verified before narrowing: 0
           # PrometheusRule objects exist in the cluster (defaultRules.create is
-          # false and none are hand-written), and the nine families this drops —
-          # kube_pod_status_reason, kube_pod_container_resource_requests,
+          # false and none are hand-written), and the nine families this dropped
+          # on 2026-08-19 — kube_pod_status_reason,
+          # kube_pod_container_resource_requests,
           # kube_pod_status_{qos_class,scheduled,ready},
           # kube_pod_container_info, kube_pod_container_status_{ready,waiting,
-          # terminated} — have zero references anywhere in the repo while
+          # terminated} — had zero references anywhere in the repo while
           # accounting for ~97k of 262,011 head series.
           #
           # kube_pod_status_phase is kept despite being the single largest of the
           # five (5 series per pod, one per phase) because pod-phase counts are the
           # primary scheduling signal this Prometheus exists to provide.
+          #
+          # The second alternative re-admits two of the dropped families for the
+          # GPU resource ONLY (#405), so "how full were the GPU slices?" is
+          # answerable for a past batch instead of depending on a workstation
+          # sampler that stops when the laptop sleeps:
+          #   kube_node_status_allocatable{resource="nvidia_com_gpu"}      capacity
+          #   kube_pod_container_resource_requests{resource="nvidia_com_gpu"} demand
+          # kube-state-metrics writes the resource name through
+          # SanitizeLabelName — `[^a-zA-Z0-9_]` → `_` — so nvidia.com/gpu is
+          # `nvidia_com_gpu` (v2.17.0, pkg/metric/utils.go). The cpu / memory /
+          # ephemeral_storage / hugepages_* / pods series of both families, which
+          # were the bulk of the 97k, stay dropped: one allocatable series per GPU
+          # node plus one request series per GPU container, with that pod
+          # turnover, is a small fraction of what kube_pod_status_phase already
+          # carries. The resource gate has to live in THIS rule — sequential
+          # `keep`s AND together, so a second rule over `resource` alone would
+          # also drop the five families above, none of which carry that label.
+          #
+          # Slice occupancy per nodepool, joined through kube_node_labels:
+          #   sum by (label_karpenter_sh_nodepool) (
+          #     sum by (node) (kube_pod_container_resource_requests{resource="nvidia_com_gpu"}
+          #       * on (pod, namespace) group_left kube_pod_status_phase{phase="Running"} > 0)
+          #     * on (node) group_left(label_karpenter_sh_nodepool) kube_node_labels)
+          #   / sum by (label_karpenter_sh_nodepool) (
+          #     kube_node_status_allocatable{resource="nvidia_com_gpu"}
+          #       * on (node) group_left(label_karpenter_sh_nodepool) kube_node_labels)
           - action: keep
-            sourceLabels: [__name__]
-            regex: kube_pod_status_phase|kube_pod_info|kube_pod_labels|kube_pod_container_status_restarts_total|kube_node_labels
+            sourceLabels: [__name__, resource]
+            separator: ";"
+            regex: (kube_pod_status_phase|kube_pod_info|kube_pod_labels|kube_pod_container_status_restarts_total|kube_node_labels);.*|(kube_node_status_allocatable|kube_pod_container_resource_requests);nvidia_com_gpu
     # Also BestEffort until now, so it was next in the eviction queue behind
     # Prometheus. Sized well above the 48Mi observed at ~160 active workflows:
     # this exporter's footprint scales with the number of live objects it labels,

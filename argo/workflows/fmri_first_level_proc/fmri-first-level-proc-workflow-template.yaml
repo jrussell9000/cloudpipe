@@ -4,6 +4,23 @@ metadata:
   name: fmri-first-level-proc
   namespace: argo-workflows
 
+###########################################################################
+# First-level analysis for one subject, from cloudpipe's own func outputs
+# (OpenSpec change first-level-direct-inputs; replaces ABCD_fmri_orchestrator_S3).
+#
+#   list-sessions  the subject's sessions with a func _complete.json
+#                  (stage_first_level.py list-sessions)
+#   first-level    one pod per session: download derivatives/func/{subj}/{ses}/,
+#                  run fmri-first-level-abcd on it (staging and every analysis live
+#                  in that repo), publish to derivatives/first_levels/{subj}/{ses}/
+#                  with _complete.json last
+#
+# Sessions run independently: one session's failure, retry or deadline does not
+# touch another's. A session with no usable rest runs skips rest, the marker says
+# why, and the n-back analyses still run. subjID may be given with or without its
+# sub- prefix. Submitted by the first-level-queue-manager Prefect flow.
+###########################################################################
+
 spec:
   serviceAccountName: argo-workflows-runner
 
@@ -28,56 +45,22 @@ spec:
   podDisruptionBudget:
     minAvailable: "100%"
 
-  # 2-hour hard cap — matches the Batch job timeout
-  activeDeadlineSeconds: 7200
-
-  retryStrategy:
-    # Sized for spot churn: consecutive reclaims on one long step are routine on
-    # the spot-only nodepools. Note activeDeadlineSeconds above (7200) is the real
-    # ceiling here — retries cannot extend it, so the budget below is an upper
-    # bound that the 2h cap may cut short. See issue #115.
-    limit: "8"
-    # Was OnFailure, which could never honour the spot clause in the expression
-    # below: a reclaimed pod lands in phase Error, not Failed, and OnFailure
-    # retries Failed only. The expression is what filters retries here; the policy
-    # just has to be permissive enough to let it run.
-    retryPolicy: Always
-    # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown,
-    # never emitted by our scripts. 75 = EX_TEMPFAIL, reserved for the "a reclaim
-    # truncated my output, re-run me" guards in the fastsurfer templates. 137 is
-    # deliberately absent: a real OOMKill is deterministic (#120, #129, #134 each
-    # needed a config change, not a retry), so retrying it only burns the enlarged
-    # budget on an identical failure.
-    # The codes are matched in the message too: a pod that dies in its init or wait
-    # container never populates exitCode, so that arm alone is dead for the whole
-    # artifact-staging class (#277). A missing artifact KEY is excluded, though:
-    # its producer was skipped or failed, and a consumer retry cannot re-run the
-    # producer. See the cloudpipe master template for the detail.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
-    backoff:
-      duration: "1m"
-      factor: "2"
-      # cap bounds each individual delay (maxDuration would abort the retries
-      # instead): 1+2+4+5+5+5+5+5 = 32m worst case, vs 7m at the old limit of 3.
-      cap: "5m"
+  # Backstop only. Each step carries its own deadline below; sessions run in
+  # parallel, so this is one session's worst case plus retries, not a sum.
+  activeDeadlineSeconds: 14400
 
   arguments:
     parameters:
       - name: subjID
 
-      # Private ECR registry prefix — set by Terraform in cloudpipe-config,
-      # the same ConfigMap the cloudpipe_minproc templates read. This template
-      # carried the registry host inline until then, which pinned the pipeline
-      # to one account and one region.
+      # Private ECR registry prefix — set by Terraform in cloudpipe-config.
       - name: ecr-registry
         valueFrom:
           configMapKeyRef:
             name: cloudpipe-config
             key: ecr_registry
 
-      # Data bucket — the image's orch_config_final.yaml carries a placeholder
-      # (__CLOUDPIPE_BUCKET__) that the container command below replaces with
-      # this before the orchestrator reads it.
+      # Data bucket: derivatives/func/ is read, derivatives/first_levels/ written.
       - name: bucket
         valueFrom:
           configMapKeyRef:
@@ -89,64 +72,143 @@ spec:
       emptyDir:
         sizeLimit: 300Gi
 
-  entrypoint: first-level-proc-template
+  entrypoint: first-level-subject
 
   templates:
 
-  - name: first-level-proc-template
+  - name: first-level-subject
+    dag:
+      tasks:
+        - name: list-sessions
+          template: list-sessions
+        - name: first-level
+          depends: list-sessions
+          template: first-level-session
+          withParam: "{{tasks.list-sessions.outputs.parameters.sessions}}"
+          arguments:
+            parameters:
+              - name: ses
+                value: "{{item.ses}}"
+
+  - name: list-sessions
     metadata:
       labels:
         cloudpipe.io/phase: first-level
-        cloudpipe.io/step: orchestrate
+        cloudpipe.io/step: list-sessions
+    activeDeadlineSeconds: 900
+    retryStrategy:
+      limit: "4"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: first-level-nodepool
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:fdc7cd4dc2f57dd434d27f188bc1e4350f56f76cd9c2af0c6d006c3ff0cf6848"
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "/app/stage_first_level.py"]
+      args:
+        - list-sessions
+        - --subj
+        - "{{workflow.parameters.subjID}}"
+        - --bucket
+        - "{{workflow.parameters.bucket}}"
+        - --out
+        - /tmp/sessions.json
+      resources:
+        requests:
+          cpu: "250m"
+          memory: 512Mi
+        limits:
+          memory: 1Gi
+    outputs:
+      parameters:
+        - name: sessions
+          valueFrom:
+            path: /tmp/sessions.json
+
+  - name: first-level-session
+    metadata:
+      labels:
+        cloudpipe.io/phase: first-level
+        cloudpipe.io/step: first-level
+    inputs:
+      parameters:
+        - name: ses
+    # One session's staging plus three analyses; the old per-subject cap covered
+    # up to four sessions in sequence.
+    activeDeadlineSeconds: 7200
+    retryStrategy:
+      # Sized for spot churn: consecutive reclaims on one long step are routine on
+      # the spot-only nodepools. activeDeadlineSeconds above is the real ceiling
+      # here — retries cannot extend it. See issue #115.
+      limit: "8"
+      # Was OnFailure, which could never honour the spot clause in the expression
+      # below: a reclaimed pod lands in phase Error, not Failed, and OnFailure
+      # retries Failed only. The expression is what filters retries here; the policy
+      # just has to be permissive enough to let it run.
+      retryPolicy: Always
+      # Infrastructure codes only. 64/143 = executor / SIGTERM on node teardown.
+      # 75 = EX_TEMPFAIL, the stager's exit on an S3 error. 1 (a session failure:
+      # a bad input, a package bug, a tool failure) is deliberately absent, and so
+      # is 137: both are deterministic, so a retry only repeats them.
+      # The codes are matched in the message too: a pod that dies in its init or
+      # wait container never populates exitCode (#277).
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        # cap bounds each individual delay (maxDuration would abort the retries
+        # instead): 1+2+4+5+5+5+5+5 = 32m worst case.
+        cap: "5m"
 
     nodeSelector:
       karpenter.sh/nodepool: first-level-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:f0f2c931e69a05c6c54fa2147245ecad57e85f7f0bfb57e8f995d641d1d89cc4"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:fdc7cd4dc2f57dd434d27f188bc1e4350f56f76cd9c2af0c6d006c3ff0cf6848"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
         - name: scratch
           mountPath: /scratch
 
+      # Thread budget for fmri-first-level-proc (`num_cores: auto` in its
+      # proc_config_final.yaml reads OMP_NUM_THREADS, capped at the cgroup's CPU limit).
+      # Projected from requests.cpu so the resources block below stays the single
+      # source of truth and the thread count can never drift from the reservation.
+      env:
+        - name: OMP_NUM_THREADS
+          valueFrom: &firstLevelCpuRequest
+            resourceFieldRef:
+              containerName: main   # Argo's name for the user container
+              resource: requests.cpu
+              divisor: "1"          # rounds UP to whole cores; keep cpu integral
+        - name: MKL_NUM_THREADS
+          valueFrom: *firstLevelCpuRequest
+        - name: OPENBLAS_NUM_THREADS
+          valueFrom: *firstLevelCpuRequest
+
       resources:
         requests:
-          cpu: "1200m"
+          cpu: "1"          # integral, = limit, = OMP_NUM_THREADS; design.md D10 has the open probe
           memory: 10Gi
           ephemeral-storage: 20Gi
         limits:
-          cpu: "2"
+          cpu: "1"
           memory: 10Gi
 
-      # Override the image ENTRYPOINT to strip the "sub-" prefix before
-      # passing the NDAR ID to orchestrate_first_level.py, which expects
-      # a bare ID (e.g. "NDARABC123") and prepends "sub-" itself.
-      #
-      # The orchestrator is external code that reads its bucket from
-      # orch_config_final.yaml, so the image ships a placeholder there and this
-      # renders it into /scratch (every path in that file is absolute, so the
-      # copy's location does not matter). The grep refuses to start on a config
-      # that still names no bucket. An image built before the placeholder has
-      # nothing to replace and runs unchanged, so the order in which this
-      # template and the re-pinned image reach the cluster does not matter.
-      command: ["/bin/bash", "-c"]
+      command: ["python3", "/app/stage_first_level.py"]
       args:
-        - |
-          set -euo pipefail
-          cd /app/ABCD_fmri_orchestrator_S3
-          sed "s|__CLOUDPIPE_BUCKET__|${CLOUDPIPE_BUCKET}|g" orch_config_final.yaml \
-            > /scratch/orch_config.yaml
-          if grep -q '__CLOUDPIPE_BUCKET__' /scratch/orch_config.yaml; then
-            echo "orch_config.yaml still names no bucket; is cloudpipe-config's bucket set?" >&2
-            exit 1
-          fi
-          python3 orchestrate_first_level.py \
-            --orchestrate_config /scratch/orch_config.yaml \
-            --proc_config proc_config_final.yaml \
-            --subj_id "${SUBJ_ID#sub-}"
-      env:
-        - name: SUBJ_ID
-          value: "{{workflow.parameters.subjID}}"
-        - name: CLOUDPIPE_BUCKET
-          value: "{{workflow.parameters.bucket}}"
+        - run
+        - --subj
+        - "{{workflow.parameters.subjID}}"
+        - --ses
+        - "{{inputs.parameters.ses}}"
+        - --bucket
+        - "{{workflow.parameters.bucket}}"
+        - --workdir
+        - /scratch/first-level

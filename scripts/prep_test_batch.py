@@ -1,6 +1,6 @@
 """
 prep_test_batch.py — Flush S3 derivatives and subject-keyed metrics for a
-cloudpipe test batch run, then check cluster and Globus instance health.
+cloudpipe test batch run, then check cluster health.
 
 Uses boto3 directly (one process, one pooled S3 client) instead of spawning
 the aws CLI per object. The previous shell version spawned ~10 `aws`
@@ -112,6 +112,7 @@ QC_PREFIXES = [
     "metrics/anat-qc/",
     "metrics/fsqc-qc/",
     "metrics/surface-sample/",
+    "metrics/tissue-masks/",
 ]
 
 # Workflow-keyed metric prefixes, flushed ONLY under --flush-qc. Like
@@ -496,26 +497,6 @@ def check_cluster() -> None:
             print(f"[WARN] command failed (check VPN/cluster access): {' '.join(cmd)}")
 
 
-def check_globus(region: str | None) -> None:
-    print("\n=== Globus instance ===")
-    try:
-        iid = boto3.client("ssm", region_name=region).get_parameter(
-            Name="/cloudpipe/globus/instance-id"
-        )["Parameter"]["Value"]
-    except Exception:
-        print("[WARN] Globus instance ID not found in SSM (/cloudpipe/globus/instance-id)")
-        return
-    try:
-        state = boto3.client("ec2", region_name=region).describe_instances(InstanceIds=[iid])[
-            "Reservations"
-        ][0]["Instances"][0]["State"]["Name"]
-    except Exception:
-        state = "unknown"
-    print(f"Instance {iid}: {state}")
-    if state != "running":
-        print("[WARN] Globus instance is not running — it will be started by the first workflow.")
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("subjects_csv", help="Path to CSV with a subject_id column header.")
@@ -662,7 +643,6 @@ def main() -> None:
         sys.exit(1)
 
     check_cluster()
-    check_globus(args.region)
 
     print("\n=== Prep complete. Ready to submit. ===")
 

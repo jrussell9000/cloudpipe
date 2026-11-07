@@ -1,7 +1,23 @@
+# Two levels of `reloader:` on purpose. The outer key is the dependency name in
+# Chart.yaml (values for a subchart go under its name); the inner one is the
+# stakater chart's own top-level key (`helm show values reloader --repo
+# https://stakater.github.io/stakater-charts --version 2.2.11`, line 26).
+#
+# Until 2026-11-06 this file had only one level, so the subchart never saw any
+# of it: the live pod ran the chart defaults — no nodeSelector, no tolerations,
+# reloadStrategy `default` — and landed on the untainted `karpenter` nodegroup
+# node. With that group gone no managed node is untainted, so without the
+# placement below it would have pulled a Karpenter spot node up permanently.
 reloader:
-  reloadStrategy: annotations
-  logFormat: json
-  logLevel: info
-  deployment:
-    nodeSelector:
-      eks.amazonaws.com/nodegroup: backend
+  reloader:
+    reloadStrategy: annotations
+    logFormat: json
+    logLevel: info
+    deployment:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: backend
+      tolerations:
+        - key: CriticalAddonsOnly
+          operator: Equal
+          value: "true"
+          effect: NoSchedule

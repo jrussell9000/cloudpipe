@@ -73,6 +73,7 @@ from step_outcome import (  # noqa: F401 — re-exports
     _EXIT_CODE_REASON,
     _TAXONOMY,
     QC_REJECTED_EXIT_CODE,
+    TOPOLOGY_UNFIXABLE_EXIT_CODE,
     classify_failure,
 )
 from writer import emit_to_s3
@@ -130,8 +131,23 @@ def resolve_run_status(
 # ---------------------------------------------------------------------------
 
 
+# Steps whose output is per BOLD run. A record for one of these at session scope
+# (task=na/run=na) is the fallback recorder's aggregate, and has no single output.
+_RUN_SCOPED_STEPS = frozenset({"bold-to-t1w", "func-preproc", "surface-sample", "surface-resample"})
+
+
 def default_expected_keys(step: str, subject: str, session: str, task: str, run: str) -> list[str]:
-    """Return the canonical S3 key(s) that indicate step completion."""
+    """Return the canonical S3 key(s) that indicate step completion.
+
+    None for a run-scoped step recorded at session scope. The key it would
+    build, `{subj}_{ses}_na_na_...`, never exists, so checking it turned every
+    session-level fallback record into "Failed: expected output not found",
+    even when the pod had ended Error after publishing (2026-10-29: 4 sessions
+    of func-reprocess-05-12-retry). With no key, resolve_run_status keeps the
+    pod's own status, and an Error with no message classifies as infrastructure.
+    """
+    if step in _RUN_SCOPED_STEPS and "na" in (task, run):
+        return []
     prefix = f"{subject}_{session}_{task}_{run}"
     mapping: dict[str, list[str]] = {
         "t1w-to-mni": [
@@ -145,7 +161,7 @@ def default_expected_keys(step: str, subject: str, session: str, task: str, run:
         # The run's exploded MNI BOLD (ADR 017). This is a size-floor backstop,
         # not the completion test: that is the session's _complete.json listing
         # the run, which inventory reads. The only live caller is the session-
-        # level fallback recorder (task=na), whose key never exists anyway.
+        # level fallback recorder, which now returns early above (task=na).
         "func-preproc": [
             f"derivatives/func/{subject}/{session}/{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz",
         ],

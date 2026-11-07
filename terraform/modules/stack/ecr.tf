@@ -66,6 +66,7 @@ locals {
   ecr_images = [
     "afni",
     "diffusion",
+    "equivalence",
     "fastsurfer",
     "fireants",
     "fmriprep",
@@ -111,6 +112,10 @@ locals {
     # destroys two empty repositories and nothing else.
     "diffusion",
     "fsl",
+    # fmriprep: the equivalence benchmark's reference arm (images/fmriprep/),
+    # FROM nipreps/fmriprep, which installs FSL — so the same rule as fsl and
+    # diffusion. The repository was never pushed to, and nothing pins it.
+    "fmriprep",
   ]
 
   # The public set is DERIVED, so a name can only ever leave it by being listed
@@ -134,13 +139,14 @@ locals {
     "fireants",   # 5.35 GB
     "freesurfer", # 6.77 GB
     "fsl",        # unbuilt
-    "fmriprep",   # unbuilt
+    "fmriprep",   # unbuilt; upstream base alone is 2.65 GB compressed
   ]
 
   ecr_images_scan_on_push = [
     "afni",                  # 593 MB
     "cloudpipe-flow-runner", # 380 MB
     "diffusion",             # never built; ubuntu:24.04 + pixi
+    "equivalence",           # unbuilt; pixi + numpy/scipy/nibabel/pandas, no FSL
     "fmri-first-level-proc", # 578 MB
     "fsqc",                  # 215 MB
     "globus",                # 56 MB

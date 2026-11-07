@@ -92,6 +92,19 @@ _TAXONOMY: list[tuple[str, list[str]]] = [
 # every retry expression, since a deterministic registration re-rejects.
 QC_REJECTED_EXIT_CODE = 65
 
+# The exit code fastsurfer-template-parcellation uses when a hemisphere's
+# topology correction ran past its time bound (issue #958). The surface that
+# marching cubes produced is not a brain — a saturated or otherwise unusable
+# T1w gives one defect spanning the whole hemisphere — and neither of
+# FreeSurfer's fixers converges on it; unbounded, the pod sat on the hung
+# hemisphere until the 3 h deadline killed it, with no error anywhere. The
+# bound (images/fastsurfer/topology_bound.sh) turns that into this code. It is
+# `data`, not `algorithm`: the programs did not crash, the anatomy is
+# unusable. 70 is EX_SOFTWARE in sysexits.h and nothing else in the cluster
+# emits it; every retry expression leaves it out, since the input is identical
+# on every attempt.
+TOPOLOGY_UNFIXABLE_EXIT_CODE = 70
+
 # Container exit codes carry the only failure signal a DAG task actually
 # exposes, since {{tasks.<name>.message}} does not exist. 128+N is the shell
 # convention for "killed by signal N".
@@ -101,6 +114,7 @@ _EXIT_CODE_CATEGORY: dict[int, str] = {
     139: "algorithm",  # 128+11 SIGSEGV
     134: "algorithm",  # 128+6  SIGABRT
     QC_REJECTED_EXIT_CODE: "qc_rejected",
+    TOPOLOGY_UNFIXABLE_EXIT_CODE: "data",
 }
 
 # What a known exit code means, spelled out in failure_reason. The panel a
@@ -108,6 +122,10 @@ _EXIT_CODE_CATEGORY: dict[int, str] = {
 # there reads as a crash.
 _EXIT_CODE_REASON: dict[int, str] = {
     QC_REJECTED_EXIT_CODE: "QC gate rejected the registration; no outputs promoted",
+    TOPOLOGY_UNFIXABLE_EXIT_CODE: (
+        "topology correction exceeded its time bound; the hemisphere's surface "
+        "has a defect no fixer closes (unusable T1w)"
+    ),
 }
 
 
@@ -120,7 +138,7 @@ def classify_failure(status: str, message: str, exit_code: object = "") -> str:
       a reason naming a missing input would read as `data` — bad subject data —
       rather than an upstream QC rejection (#222).
     - otherwise the message patterns, then the exit code (65 -> qc_rejected,
-      #368; signal deaths), then "infrastructure" for an Error with nothing to go
+      #368; 70 -> data, #958; signal deaths), then "infrastructure" for an Error with nothing to go
       on (the controller never ran the pod), else "unknown".
 
     `exit_code` may be an int, a numeric string, "" or None — the fallback

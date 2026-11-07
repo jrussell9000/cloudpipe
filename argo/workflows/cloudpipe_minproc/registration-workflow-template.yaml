@@ -22,7 +22,7 @@ spec:
     # artifact-staging class (#277). A missing artifact KEY is excluded, though:
     # its producer was skipped or failed, and a consumer retry cannot re-run the
     # producer. See the master template for the detail.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -487,7 +487,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:9379589c767ccd80fd155a4bd7f885bfad0c9f19a221bd8b814c0cf810de557d"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:a6e850ab91c3e9b9cb7ca15f7b06df35bd9a0d5ed4129414ca2de9fa5a204003"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -650,7 +650,7 @@ spec:
       # inserted `OOMKilled|`. tests/argo/test_retry_expression.py asserts exactly
       # that relationship, so a future edit to the canonical string cannot silently
       # leave this copy behind — the divergence that cost #269.
-      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|OOMKilled|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|OOMKilled|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
       backoff:
         duration: "1m"
         factor: "2"
@@ -832,7 +832,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:3abfd19aa254d7bf340b981ab8ed7d6575140df84168ca399094ba9d4a89fa40"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:87733859a676285e772c1067935685828d9d37e1b65b5f5981625749a8168698"
       imagePullPolicy: IfNotPresent
 
       # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the

@@ -22,27 +22,52 @@ ConfigMap, when ``pixi run prefect-deploy`` registers it.
 """
 
 import boto3
+from botocore.exceptions import ClientError
 from lib.argo import ConcurrencyGate, cap_reader, list_active_names, submit, wait_for_slot
 from lib.subjects import load
 from prefect.variables import Variable
 
 from prefect import flow, get_run_logger, task
 
+FUNC_PREFIX = "derivatives/func"
 S3_UPLOAD_PREFIX = "derivatives/first_levels"
+# The only existence test for an exploded tree (ADR 017): a prefix listing reads
+# the same for a session whose upload died halfway.
+MARKER = "_complete.json"
 
 MAX_CONCURRENT_VARIABLE = "first-level-max-concurrent"
 DEFAULT_MAX_CONCURRENT = 25
 
 
+def _marked_sessions(s3, bucket: str, prefix: str) -> set[str]:
+    """Session names under `prefix` whose `_complete.json` exists."""
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter="/")
+    sessions = set()
+    for cp in resp.get("CommonPrefixes", []):
+        try:
+            s3.head_object(Bucket=bucket, Key=f"{cp['Prefix']}{MARKER}")
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                continue
+            raise
+        sessions.add(cp["Prefix"][len(prefix) :].rstrip("/"))
+    return sessions
+
+
 @task(name="check-first-level-complete")
-def is_completed(subj_id: str, bucket: str) -> bool:
-    """Return True if any first-level output already exists in S3 for this subject."""
-    resp = boto3.client("s3").list_objects_v2(
-        Bucket=bucket,
-        Prefix=f"{S3_UPLOAD_PREFIX}/{subj_id}/",
-        MaxKeys=1,
-    )
-    return resp.get("KeyCount", 0) > 0
+def is_completed(subj_id: str, bucket: str) -> tuple[bool, str]:
+    """(done, why): done when every session with a func `_complete.json` also has a
+    first-level `_complete.json`. A subject with no complete func session has
+    nothing to run, so it is done too, and `why` says which case it is."""
+    subj = subj_id if subj_id.startswith("sub-") else f"sub-{subj_id}"
+    s3 = boto3.client("s3")
+    func = _marked_sessions(s3, bucket, f"{FUNC_PREFIX}/{subj}/")
+    if not func:
+        return True, "no complete func session"
+    missing = func - _marked_sessions(s3, bucket, f"{S3_UPLOAD_PREFIX}/{subj}/")
+    if missing:
+        return False, f"no first-level marker for {sorted(missing)}"
+    return True, f"all {len(func)} session(s) published"
 
 
 @task(name="submit-first-level-workflow", retries=2, retry_delay_seconds=10)
@@ -64,7 +89,8 @@ def first_level_queue_manager(
     Parameters
     ----------
     subjects_file:  local path or s3://bucket/key URI to a CSV of subject IDs.
-    bucket:         the data bucket, checked for existing first-level outputs.
+    bucket:         the data bucket: func sessions and first-level markers are
+                    compared there (is_completed).
                     Stored on the deployment from cloudpipe-config; see prefect/deploy.sh.
     poll_interval:  seconds to wait between running-count checks when at capacity.
     start_index:    skip the first N subjects (resume after a pause).
@@ -114,8 +140,9 @@ def first_level_queue_manager(
     )
 
     for i, subj_id in enumerate(batch):
-        if is_completed(subj_id, bucket):
-            logger.info(f"[{i + 1}/{total}] skipping {subj_id} — outputs already in S3")
+        done, why = is_completed(subj_id, bucket)
+        if done:
+            logger.info(f"[{i + 1}/{total}] skipping {subj_id} — {why}")
             continue
 
         active = wait_for_slot(

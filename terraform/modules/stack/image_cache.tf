@@ -134,7 +134,6 @@ locals {
   image_cache_node_roles = {
     karpenter         = module.karpenter.node_iam_role_name
     backend_nodegroup = "${var.name}-backend-nodegroup-iam-role"
-    karpenter_managed = "${var.name}-karpenter-nodegroup-iam-role"
     argo_nodegroup    = "${var.name}-argo-nodegroup-iam-role"
   }
 }
@@ -145,7 +144,7 @@ resource "aws_iam_role_policy_attachment" "image_cache_pull" {
   role       = each.value
   policy_arn = aws_iam_policy.image_cache_pull[0].arn
 
-  # The three managed node group roles are named here, not read from the module,
+  # The two managed node group roles are named here, not read from the module,
   # so they must exist before the attachment.
   depends_on = [module.eks]
 }

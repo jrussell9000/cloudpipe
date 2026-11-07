@@ -334,23 +334,24 @@ variable "globus_s3_destination_bucket" {
   type = string
 }
 
-# The Globus ingress and the seven inputs it needs.
-#
-# These do have defaults in the module — `globus_enabled` is false and the seven
-# are empty — so by the rule above they would not be declared here at all. They
-# are, because they are the one group of optional inputs a deployer is likely to
-# want and cannot discover from an empty root: turning the ingress on means
-# setting eight values at once, and the module refuses an empty one once the
-# flag is true. Leaving them out would mean editing this file before editing
-# tfvars.
-variable "globus_enabled" {
-  type    = bool
-  default = false
-}
-
+# The HTTPS ingress source. Optional: empty runs `ingress-mode=presynced`.
+# Declared here although it has a module default, because a deployer with a Data
+# Use Certification wants it and cannot discover it from an empty root.
 variable "globus_source_collection_id" {
   type    = string
   default = ""
+}
+
+# The Globus ingress and the six inputs it needs.
+#
+# These do have defaults in the module — `globus_enabled` is false and the six
+# are empty — so by the rule above they would not be declared here at all. They
+# are, because turning the ingress on means setting seven values at once, and
+# the module refuses an empty one once the flag is true. Leaving them out would
+# mean editing this file before editing tfvars.
+variable "globus_enabled" {
+  type    = bool
+  default = false
 }
 
 variable "globus_client_id" {

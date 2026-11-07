@@ -29,7 +29,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .confound_map import CLOUDPIPE
-from .recompute import CALIBRATED_FIELDS, FieldMismatch, RunInputs, calibration_mismatches
+from .recompute import (
+    CALIBRATED_FIELDS,
+    FUNC_QC_SCHEMA_VERSION,
+    FieldMismatch,
+    RunInputs,
+    calibration_mismatches,
+)
 from .recompute import recompute_func_qc as _recompute
 
 #: The legacy per-run archive, rooted at `{task}_{run}/` (the old driver's
@@ -127,27 +133,59 @@ def calibrate(bucket: str, limit: int, region: str | None = None, **filters) -> 
     `filters` are passed to `CloudpipeMetrics.func_qc`, so a window can be scoped
     with `dt_from` / `dt_to` — worth doing, since those are the partition keys
     Athena prunes on.
+
+    Only records at the schema version this harness recomputes are compared. An
+    older record was measured by older code — before 1.3 (#859) its IQMs spanned
+    the non-steady-state frames the recompute now drops — and a reprocessed run
+    keeps its old record in the store beside the new one, while its outputs on S3
+    are the new ones. Comparing across that boundary would fail a correct harness.
     """
     import boto3
 
     from metrics.athena import CloudpipeMetrics
 
     store = CloudpipeMetrics(bucket=bucket, region=region)
+    usable = [r for r in current_records(store, **filters) if iqms_computed(r)][:limit]
+
+    s3 = boto3.client("s3", region_name=region)
+    results = []
+    for i, record in enumerate(usable, 1):
+        # One line per run, as it starts: a run is a ~350 MB download plus a
+        # recompute, so twenty of them are silent for a quarter of an hour
+        # without this. stderr, so the report on stdout stays parseable.
+        print(f"[{i}/{len(usable)}] {_prefix(record)}", file=sys.stderr, flush=True)
+        results.append(calibrate_run(s3, bucket, record))
+    return results
+
+
+def current_records(store, **filters) -> list[dict]:
+    """The newest record per run, at the FuncQC schema version this harness measures.
+
+    Older versions were measured by older code (see `calibrate`), and a run
+    reprocessed twice at the same version has two records, of which only the
+    later describes the outputs now on S3. `func_qc` orders by completed_at DESC,
+    so the first record seen for a run is its newest.
+    """
+    filters.setdefault("schema_version", FUNC_QC_SCHEMA_VERSION)
     records = store.func_qc(**filters)
     if hasattr(records, "to_dict"):
         records = records.to_dict("records")
+    newest, seen = [], set()
+    for r in records:
+        if r.get("schema_version") != FUNC_QC_SCHEMA_VERSION or _prefix(r) in seen:
+            continue
+        seen.add(_prefix(r))
+        newest.append(r)
+    return newest
 
-    # Only runs whose in-pod IQMs were actually computed. 0.0 on gcor/aor/aqi is
-    # the schema default meaning "not computed" (#119), not a value, so such a run
-    # would compare a real number against a placeholder and read as a mismatch.
-    usable = [
-        r
-        for r in records
-        if all(float(r.get(f, 0.0) or 0.0) != 0.0 for f in ("gcor", "aor", "aqi"))
-    ]
 
-    s3 = boto3.client("s3", region_name=region)
-    return [calibrate_run(s3, bucket, record) for record in usable[:limit]]
+def iqms_computed(record: dict) -> bool:
+    """Were the in-pod IQMs actually computed for this run?
+
+    0.0 on gcor/aor/aqi is the schema default meaning "not computed" (#119), not a
+    value, so such a run would compare a real number against a placeholder.
+    """
+    return all(float(record.get(f, 0.0) or 0.0) != 0.0 for f in ("gcor", "aor", "aqi"))
 
 
 def main(argv: list[str] | None = None) -> int:

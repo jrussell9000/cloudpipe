@@ -49,7 +49,7 @@ open('/usr/local/bin/rclone', 'wb').write(zipfile.ZipFile(io.BytesIO(data)).read
 RUN groupadd --gid 1000 cloudpipe && \
     useradd --uid 1000 --gid 1000 --no-create-home cloudpipe
 
-COPY images/globus/transfer.py /app/transfer.py
+COPY images/globus/listing.py /app/listing.py
 COPY images/globus/https_ingress.py /app/https_ingress.py
 
 # The operator CLI's error translation, shared rather than copied: the pod log and

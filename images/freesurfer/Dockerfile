@@ -125,6 +125,13 @@ ENV PYTHONPATH=/app:$FREESURFER_HOME/python/packages
 # bold_to_t1w wrapper and shared QC library
 COPY --chown=1000:1000 images/freesurfer/bold_to_t1w.py /app/bold_to_t1w.py
 COPY --chown=1000:1000 images/shared/registration_qc.py /app/registration_qc.py
+COPY --chown=1000:1000 images/shared/nss.py /app/nss.py
+
+# One-off: recompute past T1w->MNI Jacobian QC with the fixed registration_qc.py
+# (#1020; the jacobian-backfill WorkflowTemplate). Here because this image already
+# ships registration_qc.py, has boto3 on the system python and runs on CPU nodes;
+# the fireANTs image is a CUDA image with no S3 client.
+COPY --chown=1000:1000 images/freesurfer/jacobian_backfill.py /app/jacobian_backfill.py
 
 # Exploded-derivative publish/stage (ADR 017). This image is both a producer
 # (subregion-segmentation's checkpoint_save) and a consumer (bold-to-t1w, and
