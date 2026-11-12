@@ -9,7 +9,9 @@ acquisition failure.
 
 FastSurfer segmentation is the bulk of that GPU demand and runs on CPU with
 `--device cpu`. This module decides, per submission, whether a new workflow carries
-`fastsurfer-device=cpu` (segmentation on cpu-heavy-nodepool) or the default `cuda`.
+`fastsurfer-device=cpu` (segmentation on cpu-heavy-nodepool) or `cuda`. Since
+2026-11-11 the queue manager's default mode is `cpu` (operator: GPU spot scarcity,
+and CPU is cheaper overall); this detector decides only in `auto` mode.
 The signal is the one thing a drought always produces and a healthy pool never
 does: GPU-requesting pods that have been Pending for a long time.
 
@@ -184,7 +186,7 @@ def parse_device_mode(raw: object) -> str:
     instead of submitting a workflow Argo would reject — or worse, one the
     templates would silently treat as cuda.
     """
-    value = str(raw if raw is not None else DEVICE_AUTO).strip().lower()
+    value = str(raw if raw is not None else DEVICE_CPU).strip().lower()
     if value not in DEVICE_MODES:
         raise ValueError(
             f"cloudpipe-fastsurfer-device must be one of {'/'.join(DEVICE_MODES)}, got {raw!r}"

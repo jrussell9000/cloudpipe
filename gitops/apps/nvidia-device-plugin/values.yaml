@@ -21,6 +21,20 @@ nvidia-device-plugin:
                 values:
                   - gpu-nodepool
                   - gpu-dense-nodepool
+                  - gpu-ondemand-nodepool
+  # The chart's two defaults (read off the live DaemonSet, chart 0.19.1), plus the
+  # opt-in on-demand pool's taint. Setting this list REPLACES the defaults, so they
+  # are restated; dropping the last entry strands every gpu-ondemand-nodepool node
+  # with no nvidia.com/gpu, the same failure as a pool missing from the affinity.
+  tolerations:
+    - key: CriticalAddonsOnly
+      operator: Exists
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: cloudpipe.io/gpu-on-demand
+      operator: Exists
+      effect: NoSchedule
   # Explicitly lock to the legacy device plugin API. DRA is not supported with
   # Karpenter per AWS guidance, and auto-detection in v0.16+ can silently switch
   # to DRA on EKS 1.26+ clusters, breaking nvidia.com/gpu resource registration.

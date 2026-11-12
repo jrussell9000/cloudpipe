@@ -226,9 +226,13 @@ def publish(
     prefix: str,
     *,
     source_step: str,
+    extra: dict | None = None,
     s3=None,
 ) -> dict:
     """Upload `tree` under `prefix`, then write `_links.json` and `_complete.json`.
+
+    `extra` is merged into the marker, under the fields below, which it may not
+    replace. First-level records its analyses and inputs there.
 
     Ordering is the contract: any marker a previous publish left is removed,
     then every file object, then any stale objects from a previous publish
@@ -253,6 +257,18 @@ def publish(
     files, link_rows, dir_count, total_bytes = _scan(tree)
     if not files:
         raise PublishError(f"refusing to publish an empty tree: {tree}")
+    reserved = {
+        "schema_version",
+        "file_count",
+        "dir_count",
+        "total_bytes",
+        "link_count",
+        "links_sha256",
+        "written_at",
+        "source_step",
+    }
+    if extra and reserved & extra.keys():
+        raise PublishError(f"extra may not set marker fields {sorted(reserved & extra.keys())}")
 
     # Before the first upload. S3 answers a delete of an absent key with 204, so
     # a first publish needs no existence check.
@@ -287,6 +303,7 @@ def publish(
         client.put_object(Bucket=bucket, Key=f"{prefix}/{LINKS_SIDECAR}", Body=manifest)
 
     marker = {
+        **(extra or {}),
         "schema_version": SUPPORTED_SCHEMA,
         "file_count": len(files),
         "dir_count": dir_count,

@@ -1,0 +1,143 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: dvars-backfill
+  namespace: argo-workflows
+
+###########################################################################
+# One-off (#1016): add the dvars_mean1000 column to every published confounds
+# TSV that predates it. The column is computed from the TSV's own dvars and
+# global_signal (images/shared/confounds_dvars.py, the module preproc.py
+# writes it with), so nothing is re-ingested and nothing but the TSVs is
+# touched. The TSVs are read and rewritten here, in-cluster, never on a
+# workstation.
+#
+# Planned, submitted and verified by scripts/backfill_dvars.py, never by hand:
+# the session list it writes is the contract, and its `verify` is the proof.
+#
+#   sessions-key  the plan's session list, a key in the data bucket
+#   shards        how many pods share the list (each takes every shards-th)
+#   mode          apply | verify | restore (src/dvars_backfill.py)
+#
+# The python image, not afni: this is GETs, PUTs and string splicing, with no
+# numpy, so the small alpine python image on cpu-light spot nodes does it; the afni
+# image would hold cpu-heavy nodes for no compute. Both images COPY the same
+# confounds_dvars.py, and build-images.yaml re-pins both from one commit.
+#
+# The shard count IS the concurrency, as in probseg-backfill: every shard
+# starts at once and runs its share to the end, with deliberately no semaphore
+# (see that template's header for what one did). spec.parallelism is only a
+# runaway backstop; scripts/backfill_dvars.py refuses more shards than it.
+#
+# Every pod is idempotent per run (a TSV that already carries the column reads
+# as `already`, and every write is conditional on the ETag read), so retries
+# are safe.
+###########################################################################
+
+spec:
+  # Runaway backstop, not the working cap (see above). Equals MAX_SHARDS in
+  # scripts/backfill_dvars.py; tests hold the two together.
+  parallelism: 100
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  arguments:
+    parameters:
+      - name: sessions-key
+      - name: shards
+      - name: mode
+        enum: [apply, verify, restore]
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  entrypoint: backfill
+
+  templates:
+  - name: backfill
+    steps:
+    - - name: shard
+        template: backfill-shard
+        withSequence:
+          count: "{{workflow.parameters.shards}}"
+        arguments:
+          parameters:
+            - name: shard
+              value: "{{item}}"
+
+  - name: backfill-shard
+    metadata:
+      labels:
+        cloudpipe.io/phase: functional
+        cloudpipe.io/step: dvars-backfill
+    inputs:
+      parameters:
+        - name: shard
+    # Spot reclaims and S3 errors only: 64/143 executor or SIGTERM, 75 the
+    # module's own S3-error exit. A TSV it cannot parse is recorded and
+    # skipped, never a pod failure, so a deterministic error cannot loop.
+    retryStrategy:
+      limit: "8"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:302613557e5fbad1e0d4ec0ede67503f2cb5012e2be000ee92fb28ba70b52739"
+      imagePullPolicy: IfNotPresent
+      command: [python, -u, /app/dvars_backfill.py]
+      args:
+        - --sessions-key
+        - "{{workflow.parameters.sessions-key}}"
+        - --shard
+        - "{{inputs.parameters.shard}}"
+        - --shards
+        - "{{workflow.parameters.shards}}"
+        - --mode
+        - "{{workflow.parameters.mode}}"
+        - --data-bucket
+        - "{{workflow.parameters.bucket}}"
+        - --region
+        - "{{workflow.parameters.region}}"
+      # A retried attempt resumes after the sessions an earlier attempt of this
+      # workflow finished, rather than starting the shard over (a spot reclaim
+      # restarted 30 of 50 shards of dvars-1's verify from their first session).
+      # An env var, not an arg: ArgoCD syncs this template before the pin job
+      # repoints the image, and an older image ignores an unknown variable.
+      env:
+        - name: WORKFLOW_UID
+          value: "{{workflow.uid}}"
+      resources:
+        # One TSV (well under 2 MB) at a time, plus the shard's outcome lines.
+        requests:
+          cpu: 250m
+          memory: 256M
+        limits:
+          memory: 512M

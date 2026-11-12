@@ -5,7 +5,21 @@ Day-2 reference for submitting pipelines, monitoring progress, handling failures
 **Prerequisite**: connect **Cloudflare WARP** before using any CLI or web UI listed below — `kubectl`, `argo`, every Service URL, `pixi run prefect-deploy` and any other `prefect` CLI call, and the Kubecost scripts (`scripts/kubecost_data_harvest.py`, `scripts/cloudpipe_minproc_costs.py`, `src/validate_test_batch.py`). The EKS API endpoint and the web-UI load balancer are both private; without WARP every hostname resolves but **times out**. See [infrastructure.md → Remote access](infrastructure.md#remote-access-cloudflare-warp).
 
 - WARP's session lasts 24h. A *TLS handshake timeout* (kubectl) or a hanging page usually means it lapsed: `warp-cli debug access-reauth` (PowerShell: `& "C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe" debug access-reauth`).
-- The AWS Client VPN still works as a fallback until it is decommissioned. For VPN-specific trouble, see `docs-internal/investigations/2026-07-16-vpn-remote-access-troubleshooting.md` (internal).
+- There is no other path. The AWS Client VPN was removed on 2026-11-06. If WARP itself is broken, use the break-glass procedure below.
+
+### Break-glass: API access without WARP
+
+Use this only when the tunnel, `cloudflared` or Cloudflare Access is down and `kubectl` cannot connect. It opens the EKS public endpoint to **one address**. The endpoint still requires IAM authentication and an EKS access entry, so it widens reachability, not authorization. It uses the AWS API, so it needs neither the cluster nor WARP. Disconnect WARP first, so your traffic leaves from your real address.
+
+```bash
+MYIP=$(curl -s https://checkip.amazonaws.com)
+aws eks update-cluster-config --name cloudpipe --region <region> \
+  --resources-vpc-config endpointPublicAccess=true,endpointPrivateAccess=true,publicAccessCidrs=${MYIP}/32
+aws eks wait cluster-active --name cloudpipe --region <region>   # several minutes
+kubectl get nodes
+```
+
+Fix the tunnel, confirm `kubectl` works over WARP again, then close the endpoint the same way. Use `endpointPublicAccess=false`, or a `terraform apply`, since `endpoint_public_access` defaults to `false`. A later plan may show `public_access_cidrs` drift; the next apply resets it. Record the window (start, end, address) — it is an exception to the private-only API that the SSP describes.
 
 ---
 
@@ -67,8 +81,8 @@ Common optional parameters:
 | `globus_scan_types` | `'["T1w","T2w","rest","nback"]'` | BIDS scan types to transfer |
 | `globus_source_collection_id` | (from SSM) | Override source Globus collection UUID |
 | `globus_source_base_path` | (from SSM) | Override source base path |
-| `globus_dest_base_path` | `/mmps_mproc` | Destination path within GCS collection |
-| `ingress_mode` | `globus` | `https` reads the source collection over its HTTPS server on the ingress node pool, with no Globus endpoint — see [data-ingress.md](data-ingress.md#reading-the-source-over-https-ingress-modehttps). The batch is refused if the last `pixi run globus login` would pass 30 days within the safety margin. `presynced` skips Globus and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else fails the flow at start |
+| `globus_dest_base_path` | `/mmps_mproc` | Destination prefix in the data bucket |
+| `ingress_mode` | `https` | `https` reads the source collection over its HTTPS server on the ingress node pool — see [data-ingress.md](data-ingress.md#reading-the-source-over-https-ingress-modehttps). The batch is refused if the last `pixi run globus login` would pass 30 days within the safety margin. `presynced` skips ingress and processes data already under `mmps_mproc/` — see [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced). Anything else, including the retired `globus`, fails the flow at start |
 
 `ingress_mode` (like `batch_label`) exists only once the deployment has been re-registered with `pixi run prefect-deploy`; until then `-p ingress_mode=…` fails with "parameters were specified but not found on the deployment".
 
@@ -125,12 +139,19 @@ Always use `submit --from workflowtemplate/` — never `resubmit` (resubmit snap
 
 For data already staged in S3, add `-p ingress-mode=presynced` and pass the `globus-*` parameters empty — the full command is in [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced).
 
+To keep one session's T1w out of a subject's longitudinal template, add `-p exclude-sessions=ses-00A` (comma-separated for several). Inventory reports the session `t1w_available: false`, so it is left out of template-build and, by the published-sessions filter, out of functional processing — the same as a session that never had a T1w. The staged input is untouched, and the inventory log carries an `EXCLUDED` line. This is for a T1w that is unusable and would otherwise break the whole subject: a saturated volume with no grey/white contrast, or a field of view that missed the head (both seen 2026-10-30, each failing or hanging FastSurfer's template stage). Look at the image first; the queue manager does not set this, so such a subject is submitted on its own.
+
+If a subject's template stage ends with exit 70 (`topology correction exceeded its bound`, issue #958) and its T1w images look normal, resubmit it with `-p template-qsphere=freesurfer`. The template's surface stage then builds the quick sphere with FreeSurfer's `mris_sphere -q` (`--fsqsphere`) instead of FastSurfer's spectral projection; `mris_fix_topology` only uses that sphere to locate defects, and the surface that is kept is the corrected one, so nothing else about the run changes. Three subjects whose merged template looped for ever in `mris_fix_topology` under the default (every seed, every leave-one-session-out subset but one) finished with closed surfaces this way on 2026-11-02. The workflow carries the label `cloudpipe.io/template-qsphere`, and the tree's `scripts/recon-surf.log` records the `mris_sphere -q` command. Like `exclude-sessions`, this is set by the operator per submission, never by the queue manager.
+
 ### fmri-first-level-proc (via Prefect)
 
 ```bash
-prefect deployment run first-level-queue-manager/first-level-queue-manager \
-  -p subjects_file="s3://$CLOUDPIPE_BUCKET/first-level-subjects.csv"
+prefect deployment run first-level-queue-manager/first-level-queue-manager
 ```
+
+With no `subjects_file`, the flow walks every subject with a folder under `derivatives/func/`, in sorted order, and submits each one with a func-marked session that has no first-level marker. So first-level covers exactly what cloudpipe produced. Pass `subjects_file` only for a deliberate subset, such as a reprocess slice's ready subjects (`s3://$CLOUDPIPE_BUCKET/config/first-level/<slice>.csv`). Don't rebuild a cohort list from another pipeline's outputs: the old `first-level-subjects.csv` was the subjects ABCC's fMRIPrep covered, and it left out 117 subjects with cloudpipe func output (run on 2026-11-11 from `config/first-level/not-in-abcc-list.csv`). It was deleted on 2026-11-11 from `tools/` and both data buckets, so no ABCC coverage list remains to be picked up; `make_test_sample.py` draws from `tools/nss_volumes.csv` instead.
+
+By default, a submitted subject's workflow refits every session that has complete func outputs. Add `-p missing_only=true` to refit only the sessions with no first-level `_complete.json`. Use it after a session-scoped reprocess, which flushes only the sessions it replaced.
 
 Like `cloudpipe-queue-manager`, `max_concurrent` is not a flow parameter. Concurrency is controlled via the Prefect Variable `first-level-max-concurrent` (default `25`):
 
@@ -239,6 +260,30 @@ aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/registration/NDARINVXXXXXXXX/" --r
 # FastSurfer derivatives
 aws s3 ls "s3://$CLOUDPIPE_BUCKET/derivatives/fastsurfer/NDARINVXXXXXXXX/" --recursive
 ```
+
+### Auditing func outputs: content, not presence
+
+`reprocess_func.py verify` proves that every run's outputs exist and are fresh, and that the in-pod read-back guard passed. It never opens a file. `scripts/audit_func_outputs.py` does. It samples subjects at random (seeded), picks one session and one run of each (`--all-runs` for every run), and downloads that run's outputs into a scratch directory. It checks them against each other, against the MNI template and against the run's FuncQC record, then deletes them before the next subject. It is read-only on S3.
+
+```bash
+pixi run -e ops python scripts/audit_func_outputs.py \
+    --subjects data/reprocess/func_reprocess_03_04.csv --sample 50 \
+    --data-bucket "$CLOUDPIPE_BUCKET" --metrics-bucket "$CLOUDPIPE_METRICS_BUCKET" \
+    --out audit_03_04.jsonl --mosaics audit_03_04_png
+```
+
+| Area | Checks | The defect it would have caught |
+|---|---|---|
+| MNI BOLD header | float32, identity scaling, template grid and affine, 2 mm, TR and frame count match the record | |
+| MNI BOLD values | finite, zero outside the mask, not whole numbers, no constant in-mask voxels | float16 bit patterns stored as integers (2026-05-25 to 10-06) |
+| Orientation | the mean image is most symmetric under an x flip; the mask matches the template brain | the x↔z transpose (same period) |
+| Time axis | the MNI global signal tracks the confounds' column at lag 0 | a shuffled, dropped or shifted frame |
+| Confounds | one row per frame, n/a only where expected, NSS indicators match `n_nss_frames`, CompCor zero on NSS rows, FD recomputes from the motion columns, cosine count | |
+| dtseries | frame count, step = TR, 29,696 + 29,716 cortical vertices, subcortical count matches the record, each subcortical grayordinate equals its MNI BOLD voxel, the cortex tracks the global signal | a missing or corrupt surface output (#884) |
+| Tissue maps | template grid, the masks equal the dseg, the dseg matches the template brain, probseg sums to 1, and its classes agree with the dseg | the collapsed probseg classes (found 2026-10-26) |
+| QC record | present, schema 1.3, and FuncQC recomputed from the published file equals the in-pod record | a record that does not describe the file |
+
+It takes about 2.5 minutes and 0.5 GB of download per run. Look at the mosaics as well: one image per run (the mean BOLD over the template outline) and one per session (dseg above probseg, coloured alike). Each threshold's comment in the script says what a good run measures and what the defect measured.
 
 ### Prefect flow run status
 
@@ -356,6 +401,37 @@ aws s3 ls s3://cloudpipe-metrics/metrics/workflow-runs/ \
 Or run `scripts/prep_test_batch.py` with a one-subject CSV, which handles this (plus orphaned cost
 records whose run summary is already gone) — use `--dry-run` first.
 
+### Replace the T1w→MNI registration of listed sessions
+
+`scripts/reprocess_t1w_mni.py` re-registers chosen **sessions** and regenerates everything that was resampled through their old transform. Use it for sessions whose affine fails the talairach cross-check (#1105). For each session in a `subject_id,session_id` CSV it flushes:
+- `t1w_to_mni/`;
+- `func/`, `func_surf/` and `first_levels/`;
+- the session's metrics and step outcomes.
+
+It then submits the subjects. The pipeline's exists-gates work per session, so a subject's other sessions are not touched.
+
+```bash
+cp-prod && git pull --ff-only && pixi run -e ops python scripts/reprocess_t1w_mni.py launch \
+  --sessions <csv> --data-bucket "$CLOUDPIPE_BUCKET" --metrics-bucket "$CLOUDPIPE_METRICS_BUCKET" \
+  --batch-label func-reprocess-t1w-NN            # dry run; add --write to flush and submit
+# after the slice's workflows finish:
+cp-prod && pixi run -e ops python scripts/reprocess_t1w_mni.py verify --sessions <csv> \
+  --data-bucket "$CLOUDPIPE_BUCKET" --metrics-bucket "$CLOUDPIPE_METRICS_BUCKET" \
+  --batch-label func-reprocess-t1w-NN
+```
+
+**What launch refuses:**
+- a session with a running workflow;
+- a session with no talairach transform or no affine to replace;
+- any session at all if the deployed `registration` template does not pass `--talairach`. Re-registering without the gate reproduces the same affine.
+
+**What verify writes:**
+- `_retry.csv`;
+- `_regfail.csv`: sessions where every attempt failed the gate, so rerunning won't help;
+- `_first_level_ready.csv`.
+
+Upload the ready sessions' subjects and run the first-level flow with `missing_only=true`, so only the flushed sessions are refitted. `reprocess_func.py reconcile` stays the cohort-wide cleanup afterwards: this tool's labels start with `func-reprocess`.
+
 ### Flush all metric data (start fresh dashboards)
 
 > **Destructive.** This deletes every per-scan QC record ever produced, which cannot be
@@ -396,7 +472,7 @@ SubjectManifest, WorkflowRun) and Kubecost cost attribution — before committin
 run. The canonical subject list is `tools/cloudpipe_test_sample.csv` (100 subjects);
 `tools/cloudpipe_test_sample_200.csv` (200 subjects) is the concurrency-scaling batch.
 
-**Prerequisites:** VPN connected, AWS SSO active, `kubectl` context set to `cloudpipe`.
+**Prerequisites:** WARP connected, AWS SSO active, `kubectl` context set to `cloudpipe`.
 
 **Also check the age of the Globus refresh token, before Step 1 and not after Step 2:**
 
@@ -712,7 +788,13 @@ whose outcome recording failed entirely would look the same from here.
 The nightly scraper fires at **02:00 UTC** and writes the previous day's costs to S3. Because a
 batch submitted in the evening CDT crosses the UTC midnight boundary (e.g. submitted 20:30 CDT =
 01:30 UTC next day), most workflow costs land on the *following* UTC day. Wait for 02:00 UTC or
-trigger manually:
+trigger manually.
+
+A second deployment, `kubecost-day1-refresh`, re-reads the same day at **12:00 UTC** and rewrites
+it. At 02:00 Kubecost has not finished building the day's node data, so the 02:00 read cannot
+match every pod to the EC2 instance it ran on: its `node_instance_id` and node rates are blank on
+pods it could not prove. The 12:00 read fills most of those in. Per-pod node rates for yesterday
+are complete only after 12:00 UTC; workflow totals are usable from 02:00.
 
 ```bash
 prefect deployment run kubecost-cost-scraper/kubecost-cost-scraper
@@ -849,7 +931,7 @@ Any FAIL on the first six checks requires investigation before proceeding to a p
 
 ### Retries
 
-All spot-exposed workflow templates retry automatically on spot interruption (`pod deleted`, `imminent node shutdown`, exit codes 64/143) and on exit 75, the `EX_TEMPFAIL` guard the fastsurfer templates raise when a reclaim truncated their output. The budget is 8 attempts with exponential backoff from 1 minute, each delay capped at 5 minutes.
+All spot-exposed workflow templates retry automatically on spot interruption (`pod deleted`, `imminent node shutdown`, exit codes 64/143) and on exit 75, the `EX_TEMPFAIL` guard the fastsurfer templates raise when a reclaim truncated their output. That guard is gated on `run_fastsurfer.sh` exiting 0 (#961): a non-zero exit — every `recon-all` error — propagates as its own code and is not retried. They also retry a pod that failed after its main container exited 0 (exitCode `"0"`): whatever failed is then the wait container, teardown, or the pod itself, never the step's own work. Argo v4.1 can decide the retry on an early verdict and only later relabel the node `pod deleted`, so without the `"0"` code these finished pods got one attempt (#404). The budget is 8 attempts with exponential backoff from 1 minute, each delay capped at 5 minutes.
 
 **The budget is sized for infrastructure, not for the workload.** Every nodepool is spot-only, so consecutive reclaims on a single long step are routine and 8 attempts exist to absorb them. Exit **137 is deliberately not retried**: a genuine OOMKill in this pipeline has always been deterministic (#120, #129, #134 each needed a memory or partitioning change, and no number of retries would have helped), so retrying it would burn the budget re-running an identical failure. If you find yourself wanting 137 back in the expression, the real fix is almost certainly a memory request or a step split. See issue #115.
 

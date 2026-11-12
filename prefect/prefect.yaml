@@ -61,7 +61,9 @@ deployments:
         finished_job_ttl: 60
     schedules: []
     parameters:
-      subjects_file: "s3://{{ $CLOUDPIPE_BUCKET }}/first-level-subjects.csv"
+      # No subjects_file: the flow walks every subject with func output. The stored
+      # default used to be first-level-subjects.csv, ABCC fMRIPrep's coverage, which
+      # left 117 of cloudpipe's subjects out. Pass a list only for a deliberate subset.
       bucket: "{{ $CLOUDPIPE_BUCKET }}"
       start_index: 0
 
@@ -87,6 +89,37 @@ deployments:
       bucket: "{{ $CLOUDPIPE_METRICS_BUCKET }}"
       pipeline: cloudpipe_minproc
 
+  # The same flow, re-reading YESTERDAY at 12:00 UTC, so each pod's instance is
+  # proven from complete data (#1060). At 02:00 Kubecost has not finished
+  # building the day's node assets and labels: on 2026-11-07 the 02:00 read
+  # proved the instance of 7,849 of 10,358 pods and a later read 10,032. Every
+  # one the 02:00 read proved, the later read proved to be the same instance,
+  # and the later read carries them forward, so this pass only adds. 12:00 is
+  # 36 h after the window opens, inside Kubecost's 49 h of hourly data
+  # (retention1h); past that, reused hostnames merge and cannot be told apart.
+  # The day stays scrape_age_days = 1. The settled re-scrape, the drift probe
+  # and the gap detector are left to the 02:00 run.
+  - name: kubecost-day1-refresh
+    entrypoint: ./flows/cost_scraper.py:kubecost_cost_scraper
+    work_pool:
+      name: cloudpipe-k8s-pool
+      job_variables:
+        namespace: prefect
+        service_account_name: prefect-worker
+        image: "{{ $CLOUDPIPE_ECR_REGISTRY }}/cloudpipe/cloudpipe-flow-runner:latest"
+        image_pull_policy: Always
+        finished_job_ttl: 60
+    schedules:
+      - cron: "0 12 * * *"
+        timezone: UTC
+        active: true
+    parameters:
+      bucket: "{{ $CLOUDPIPE_METRICS_BUCKET }}"
+      pipeline: cloudpipe_minproc
+      settled_rescrape: false
+      drift_probe_lookback_days: 0
+      detect_gaps: false
+
   - name: metrics-compactor
     entrypoint: ./flows/metrics_compactor_flow.py:metrics_compactor
     work_pool:
@@ -101,6 +134,11 @@ deployments:
       # 30 min after kubecost-cost-scraper's 0 2 * * * run, so yesterday's
       # costs records exist before that day is ever compacted.
       - cron: "30 2 * * *"
+        timezone: UTC
+        active: true
+      # And 30 min after kubecost-day1-refresh's 0 12 * * * run, so the Parquet
+      # copy of yesterday does not keep the 02:00 read for a day.
+      - cron: "30 12 * * *"
         timezone: UTC
         active: true
     parameters:

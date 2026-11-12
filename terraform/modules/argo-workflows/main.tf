@@ -196,6 +196,9 @@ resource "kubernetes_config_map_v1" "cloudpipe_config" {
     },
     # Read by the HTTPS ingress pod as an optional env var (User-Agent contact).
     var.ingress_contact == "" ? {} : { ingress_contact = var.ingress_contact },
+    # Read by the newmsm step's image parameter (openspec add-newmsm-surface-registration,
+    # design D7b). Unset unless this deployment built the FSL-carrying image itself.
+    var.newmsm_image == "" ? {} : { newmsm_image = var.newmsm_image },
   )
 
   depends_on = [data.kubernetes_namespace_v1.ready]

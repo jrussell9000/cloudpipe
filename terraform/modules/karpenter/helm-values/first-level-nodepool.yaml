@@ -8,9 +8,13 @@ spec:
     consolidateAfter: 10m
     budgets:
     - nodes: "10"
+  # Each first-level session is one pod at 1 CPU / 10Gi, so memory binds first: about
+  # 1,200 pods, or about 400 subjects at the queue manager's cap. Raised from 512 / 4096Gi
+  # for the cohort waves (2026-11-07). The account's spot vCPU quota (5,595) is shared
+  # with cpu-heavy-nodepool, so 1,536 leaves it about 4,000 vCPU.
   limits:
-    cpu: 512
-    memory: 4096Gi
+    cpu: 1536
+    memory: 12288Gi
   template:
     spec:
       expireAfter: 720h

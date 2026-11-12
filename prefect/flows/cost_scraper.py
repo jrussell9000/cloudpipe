@@ -3,6 +3,10 @@ Prefect flow: kubecost-cost-scraper
 
 Runs nightly at 02:00 UTC to fetch yesterday's per-subject cost allocations
 from the in-cluster Kubecost API and write CostAllocation JSON records to S3.
+A second deployment of this flow, kubecost-day1-refresh, re-reads yesterday at
+12:00 UTC with the settled re-scrape, drift probe and gap detector off: by then
+Kubecost has finished building the day's node assets, so far more pods can be
+matched to their EC2 instance (#1060; see prefect/prefect.yaml).
 
 Scrapes the same window at two grains: CostAllocation per workflow into
 metrics/costs/, and PodCost per pod into metrics/pod-costs/ — the latter
@@ -49,6 +53,7 @@ if _METRICS_PATH not in sys.path:
     sys.path.insert(0, _METRICS_PATH)
 
 # E402 is expected and required: these resolve only via the sys.path insert above.
+import audit_pairs  # type: ignore[import-not-found]  # noqa: E402
 from cost_gaps import (  # type: ignore[import-not-found]  # noqa: E402
     DEFAULT_MIN_CAPTURE,
     DEFAULT_MIN_CORE_HOURS,
@@ -68,6 +73,32 @@ from kubecost_scraper import (  # type: ignore[import-not-found]  # noqa: E402
 log = logging.getLogger(__name__)
 
 
+def read_audit_pairs(read=None) -> dict:
+    """The reprocess audit's bucket pairs from Prefect, or {} when unset or unreadable.
+
+    Never raises: a missing or malformed value must not cost production its
+    night's scrape. With {} the scraper DROPS any audit-prefixed workflow (it
+    never writes one to production), and logs it as an error, so the cost is
+    lost for that read but recoverable by a later re-scrape once the variable
+    is fixed (openspec add-reprocess-audit, audit-isolation).
+    """
+    if read is None:
+        from prefect.variables import Variable
+
+        def read() -> object:
+            return Variable.get(audit_pairs.PAIRS_VARIABLE, default="")
+
+    try:
+        return audit_pairs.parse_pairs(read())
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        log.error(
+            "Could not read %s (%s); audit workflows will be dropped",
+            audit_pairs.PAIRS_VARIABLE,
+            exc,
+        )
+        return {}
+
+
 @task(name="scrape-kubecost", retries=2, retry_delay_seconds=60)
 def scrape_task(
     bucket: str,
@@ -75,6 +106,7 @@ def scrape_task(
     base_url: str,
     pipeline: str,
     report_date: _date | None,
+    pairs: dict | None = None,
 ) -> int:
     logger = get_run_logger()
     n = scrape_and_upload(
@@ -83,6 +115,7 @@ def scrape_task(
         base_url=base_url,
         pipeline=pipeline,
         report_date=report_date,
+        pairs=pairs,
     )
     logger.info("Wrote %d cost allocation record(s)", n)
     return n
@@ -95,6 +128,7 @@ def scrape_pods_task(
     base_url: str,
     pipeline: str,
     report_date: _date | None,
+    pairs: dict | None = None,
 ) -> int:
     """Write the per-pod grain of the same window to metrics/pod-costs/.
 
@@ -111,6 +145,7 @@ def scrape_pods_task(
         base_url=base_url,
         pipeline=pipeline,
         report_date=report_date,
+        pairs=pairs,
     )
     logger.info("Wrote %d pod cost record(s)", n)
     return n
@@ -124,6 +159,7 @@ def settled_rescrape_task(
     pipeline: str,
     report_date: _date,
     scrape_pod_costs: bool,
+    pairs: dict | None = None,
 ) -> int:
     """Re-read a report-date whose Kubecost reconciliation has settled.
 
@@ -149,6 +185,7 @@ def settled_rescrape_task(
         base_url=base_url,
         pipeline=pipeline,
         report_date=report_date,
+        pairs=pairs,
     )
     logger.info("Settled re-scrape of %s rewrote %d cost allocation record(s)", report_date, n)
 
@@ -159,6 +196,7 @@ def settled_rescrape_task(
             base_url=base_url,
             pipeline=pipeline,
             report_date=report_date,
+            pairs=pairs,
         )
         logger.info("Settled re-scrape of %s rewrote %d pod cost record(s)", report_date, n_pods)
 
@@ -298,6 +336,7 @@ def kubecost_cost_scraper(
     """
     region = region or deployment_region()
     report_date = _date.fromisoformat(date) if date else None
+    pairs = read_audit_pairs()
 
     # return_state=True so a failure here does NOT abort the rest of the flow.
     #
@@ -319,6 +358,7 @@ def kubecost_cost_scraper(
         base_url=base_url,
         pipeline=pipeline,
         report_date=report_date,
+        pairs=pairs,
         return_state=True,
     )
 
@@ -329,6 +369,7 @@ def kubecost_cost_scraper(
             base_url=base_url,
             pipeline=pipeline,
             report_date=report_date,
+            pairs=pairs,
             return_state=True,
         )
 
@@ -342,6 +383,7 @@ def kubecost_cost_scraper(
             pipeline=pipeline,
             report_date=_date.today() - timedelta(days=SETTLED_AGE_DAYS),
             scrape_pod_costs=scrape_pod_costs,
+            pairs=pairs,
             return_state=True,
         )
 

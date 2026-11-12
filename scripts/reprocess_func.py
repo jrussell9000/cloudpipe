@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import hashlib
 import json
 import os
@@ -47,6 +48,7 @@ from pathlib import Path
 
 import boto3
 from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 from tqdm import tqdm
 
 REPO = Path(__file__).resolve().parent.parent
@@ -72,6 +74,12 @@ from prep_test_batch import (  # noqa: E402
 FUNC_DERIV_PREFIXES = ["derivatives/func/{subj}/", "derivatives/func_surf/{subj}/"]
 # Per-scan QC computed from the func derivatives, keyed {subject}_{session}_...
 FUNC_QC_PREFIXES = ["metrics/func-preproc/", "metrics/surface-sample/"]
+# Per-session QC of the session's MNI tissue maps, keyed {subject}_{session}_...
+# Flushed with the per-scan QC (a reprocess rewrites the maps, so the old row no
+# longer describes them) but kept out of FUNC_QC_PREFIXES, whose two entries
+# verify pairs positionally with the per-run evidence it checks.
+TISSUE_QC_PREFIX = "metrics/tissue-masks/"
+FLUSHED_QC_PREFIXES = [*FUNC_QC_PREFIXES, TISSUE_QC_PREFIX]
 # step_outcomes steps whose rows describe the func derivatives (all eras deleted).
 FUNC_STEPS = ("func-preproc", "surface-sample", "surface-resample")
 # T1w is required: inventory sets t1w_available from the staged T1w and the
@@ -113,13 +121,24 @@ READBACK_ERROR = "MNIBoldReadbackError"
 # (tests/test_reprocess_func.py holds them together). FuncQC 1.3 / SurfaceSampleQC
 # 1.1 since #859 (summaries exclude the NSS frames); a 1.2 / 1.0 record was
 # written by an image from before it, so the run is redone, not accepted.
-FUNC_QC_SCHEMA = "1.3"
+# FuncQC 1.4 (nipype-equivalent CompCor and cosines) is the schemas.py default;
+# 1.3 is ALSO accepted here, because 1.3 and 1.4 runs have identical BOLD, dtseries
+# and IQMs, and their confounds are rewritten by the confounds-only repair, which
+# checks for 1.4 itself. So func-reprocess-05-12, split across the pin, verifies.
+# FuncQC 1.5 adds only the tissue-mask fields (add-tissue-confound-columns), with
+# the same BOLD and IQMs, so 1.4 stays accepted; the tissue backfill brings it to 1.5.
+FUNC_QC_SCHEMA = "1.5"
+FUNC_QC_SCHEMAS_ACCEPTED = ("1.3", "1.4", "1.5")
 SURFACE_QC_SCHEMA = "1.1"
 
 # Producer window slack, the same rule data/census/cost_cleanup.py attributes
 # terminal outputs by: an output belongs to the workflow whose
 # [started_at - 2 min, finished_at + 2 min] contains its LastModified.
 PRODUCER_SLACK = timedelta(minutes=2)
+# A row whose workflow has no run record yet (the record is written at exit) is
+# held while it is younger than this: the template's activeDeadlineSeconds is 12 h,
+# so a workflow running when reconcile began finishes within it.
+IN_FLIGHT_WINDOW = timedelta(hours=24)
 
 # Subject IDs are matched as whole key segments, never substrings; refusing
 # anything outside this shape keeps a malformed ID from widening a match.
@@ -142,9 +161,13 @@ EVENTS_RE = re.compile(
 # n-back run it releases, and none for rest. verify reports a missing one; it
 # does not retry for it.
 EVENTS_TASKS = ("task-nback",)
+# Either surface route's CIFTI. A newMSM run REPLACES the FS-route file (openspec
+# add-newmsm-surface-registration), so missing `desc-newmsm` here would read an
+# upgraded run as having no surface derivative, and reconcile would delete its
+# surface metrics as orphans.
 DTSERIES_RE = re.compile(
     r"^derivatives/func_surf/(sub-[^/]+)/(ses-[^/]+)/fsLR32k/\1_\2_(task-[^_]+)_(run-[^_]+)"
-    r"_space-fsLR32k_bold\.dtseries\.nii$"
+    r"_space-fsLR32k(?:_desc-newmsm)?_bold\.dtseries\.nii$"
 )
 QC_BASENAME_RE = re.compile(
     r"^(sub-[^_]+)_(ses-[^_]+)_(task-[^_]+)_(run-[^_]+)_(?:surf_)?qc\.json$"
@@ -333,10 +356,27 @@ def list_keys_parallel(
     return {prefix: sorted(keys) for prefix, keys in out.items()}
 
 
+#: S3 error codes that mean "no such object" (GetObject, and HeadObject's bare 404).
+ABSENT_CODES = ("NoSuchKey", "404")
+
+
 def get_json(s3, bucket: str, key: str) -> dict | None:
+    """The object as a dict; None if the key is absent or does not hold a JSON object.
+
+    Every other error raises. This used to return None for any exception, so an
+    expired SSO token read as missing data: `rerun_confounds.py verify` printed
+    "no plan at ..." for a plan that was there (2026-10-29), and a flush or
+    verify would have drawn conclusions from an S3 it could not read.
+    """
     try:
-        doc = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
-    except Exception:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ABSENT_CODES:
+            return None
+        raise
+    try:
+        doc = json.loads(body)
+    except ValueError:
         return None
     return doc if isinstance(doc, dict) else None
 
@@ -636,15 +676,50 @@ def check_prefect_target() -> str:
 
 
 def create_flow_run(parameters: dict, idempotency_key: str):
-    """Create the queue-manager flow run and return it without waiting."""
+    """Create the queue-manager flow run and return it without waiting.
+
+    The idempotency key makes a repeated launch of the same slice hand back the
+    flow run that already exists instead of starting a second one. Prefect does
+    that whatever state the run is in, though: after the queue manager's
+    preflight refused (`Refusing to submit`, a dead NBDC listing), the next
+    `submit --write` got the same Failed run back and printed "Submitted" for it
+    — nothing ran, and the audit log carried two `submitted` lines with one id
+    (confounds-2, 2026-11-04). So a run that comes back already over, in any
+    state but Completed, is spent: the key gets a numbered suffix (`:1`, `:2`,
+    …) until a live or fresh run comes back. A Completed run is still returned
+    as-is — that slice ran, and a second pass is the caller's decision.
+    """
     from prefect.deployments import run_deployment
 
-    return run_deployment(
-        DEPLOYMENT,
-        parameters=parameters,
-        timeout=0,
-        idempotency_key=idempotency_key,
-        as_subflow=False,
+    def create(key: str):
+        return run_deployment(
+            DEPLOYMENT,
+            parameters=parameters,
+            timeout=0,
+            idempotency_key=key,
+            as_subflow=False,
+        )
+
+    return _create_past_dead_runs(create, idempotency_key)
+
+
+def _create_past_dead_runs(create, idempotency_key: str, limit: int = 20):
+    """Call `create(key)` with `idempotency_key`, then `:1`, `:2`, … past dead runs."""
+    for attempt in range(limit):
+        key = idempotency_key if attempt == 0 else f"{idempotency_key}:{attempt}"
+        run = create(key)
+        state = getattr(run, "state", None)
+        if state is None or not state.is_final() or state.is_completed():
+            if attempt:
+                print(f"idempotency key {idempotency_key!r} belonged to a dead run; used {key!r}")
+            return run
+        print(
+            f"flow run {run.name} ({run.id}) under key {key!r} already ended "
+            f"{state.name}; not reusing it"
+        )
+    raise RuntimeError(
+        f"{limit} dead flow runs under idempotency key {idempotency_key!r}; "
+        "delete them in Prefect before launching again"
     )
 
 
@@ -706,13 +781,13 @@ def plan_flush(s3, data_bucket, metrics_bucket, subjects, workers) -> FlushPlan:
         deriv = dict(progress(pool.map(deriv_of, subjects), "derivatives", len(subjects), "subj"))
 
     listed = list_keys_parallel(
-        s3, metrics_bucket, [*FUNC_QC_PREFIXES, STEP_OUTCOME_PREFIX], workers, "metrics listing"
+        s3, metrics_bucket, [*FLUSHED_QC_PREFIXES, STEP_OUTCOME_PREFIX], workers, "metrics listing"
     )
     # The basename's first `_` field is the whole subject ID (IDs contain no `_`),
     # so this is an exact match — sub-AB never catches sub-ABC's records.
     qc_raw = [
         k
-        for prefix in FUNC_QC_PREFIXES
+        for prefix in FLUSHED_QC_PREFIXES
         for k in listed[prefix]
         if k.rsplit("/", 1)[-1].split("_", 1)[0] in subject_set
     ]
@@ -865,7 +940,7 @@ def flush_func_compacted(s3, args, subjects, write: bool) -> tuple[int, int, lis
         s3,
         args.metrics_bucket,
         subjects,
-        compacted_tables(FUNC_QC_PREFIXES),
+        compacted_tables(FLUSHED_QC_PREFIXES),
         not write,
         args.workers,
     )
@@ -1021,14 +1096,19 @@ def dates_since(start: datetime, end: datetime) -> list[str]:
     return [(start.date() + timedelta(days=i)).isoformat() for i in range(days + 1)]
 
 
-def fresh_single(records: list[dict], after: datetime, schema_version: str | None) -> bool:
-    """Exactly one record, completed after `after` (and at `schema_version`, if given)."""
+def fresh_single(
+    records: list[dict], after: datetime, schema_version: str | tuple[str, ...] | None
+) -> bool:
+    """Exactly one record, completed after `after` (and at `schema_version`, or one of them)."""
     if len(records) != 1:
         return False
     done = parse_instant(records[0].get("completed_at"))
     if done is None or done <= after:
         return False
-    return schema_version is None or records[0].get("schema_version") == schema_version
+    if schema_version is None:
+        return True
+    accepted = (schema_version,) if isinstance(schema_version, str) else schema_version
+    return records[0].get("schema_version") in accepted
 
 
 def raw_problems(ev: Evidence, units: set) -> list[str]:
@@ -1051,7 +1131,7 @@ def raw_problems(ev: Evidence, units: set) -> list[str]:
         reasons.append(f"{len(no_surf)} run(s) have no new fsLR32k dtseries")
     # A record below the current version was written by an image from before #859.
     for name, raw, version in (
-        ("func_preproc", ev.qc_raw, FUNC_QC_SCHEMA),
+        ("func_preproc", ev.qc_raw, FUNC_QC_SCHEMAS_ACCEPTED),
         ("surface_sample", ev.surf_raw, SURFACE_QC_SCHEMA),
     ):
         bad = [u for u in units if not fresh_single(raw.get(u, []), ev.flushed_at, version)]
@@ -1372,10 +1452,15 @@ def is_producer(producers, subject: str, name: str, uid: str) -> bool:
     return name in {n for n, _ in mine}
 
 
-def list_func_units(s3, data_bucket: str):
-    """(MNI BOLD units, dtseries units, subject -> MNI BOLD LastModifieds)."""
+def list_func_units(s3, data_bucket: str, with_dtseries_times: bool = False):
+    """(MNI BOLD units, dtseries units, subject -> MNI BOLD LastModifieds).
+
+    With `with_dtseries_times`, a fourth item: subject -> dtseries LastModifieds,
+    for attributing the surface steps (Attribution).
+    """
     func_units, surf_units = set(), set()
     bold_times: dict[str, list[datetime]] = defaultdict(list)
+    dtseries_times: dict[str, list[datetime]] = defaultdict(list)
     for o in list_objects(s3, data_bucket, "derivatives/func/"):
         if u := unit_of_bold(o["Key"]):
             func_units.add(u)
@@ -1383,7 +1468,17 @@ def list_func_units(s3, data_bucket: str):
     for o in list_objects(s3, data_bucket, "derivatives/func_surf/"):
         if u := unit_of_dtseries(o["Key"]):
             surf_units.add(u)
+            dtseries_times[u[0]].append(o["LastModified"])
+    if with_dtseries_times:
+        return func_units, surf_units, bold_times, dtseries_times
     return func_units, surf_units, bold_times
+
+
+#: The steps whose output is the run's fsLR dense time series, not its MNI BOLD.
+#: A surface-only reprocess (openspec add-newmsm-surface-registration: the
+#: `--emit grayordinate` short path) rewrites the dtseries from a later workflow
+#: than the one that wrote the BOLD, so these are attributed by the dtseries.
+SURFACE_STEPS = ("surface-sample", "surface-resample")
 
 
 @dataclass
@@ -1394,27 +1489,90 @@ class Attribution:
     unattributed: set
     reprocess: dict  # (name, uid) -> Run, every func-reprocess* workflow
     idle: dict  # (name, uid) -> Run, the reprocess workflows that produced nothing
+    # The workflows that wrote each subject's stored dtseries, and the subjects
+    # with a dtseries no workflow window covers. A subject with no dtseries at all
+    # is in neither: its surface rows follow `producers`, as before.
+    surf_producers: dict = field(default_factory=dict)
+    surf_unattributed: set = field(default_factory=set)
+    # When the derivative listing began, and every workflow with a run record. A
+    # workflow still running then may write its derivatives after the listing, so
+    # its rows would read as non-producing: see in_flight.
+    listed_at: datetime | None = None
+    runs_by_id: dict = field(default_factory=dict)
 
     @classmethod
-    def build(cls, runs: list[Run], bold_times) -> Attribution:
+    def build(
+        cls, runs: list[Run], bold_times, dtseries_times=None, listed_at: datetime | None = None
+    ) -> Attribution:
         producers, unattributed = find_producers(runs, bold_times)
+        surf_producers, surf_unattributed = find_producers(runs, dtseries_times or {})
         reprocess = {
             (r.name, r.uid): r for r in runs if r.batch_label.startswith(BATCH_LABEL_PREFIX)
         }
+        runs_by_id = {(r.name, r.uid): r for r in runs}
+
+        def finished_late(r: Run) -> bool:
+            return bool(listed_at and r.finished_at and r.finished_at >= listed_at - PRODUCER_SLACK)
+
         # Never idle on an unattributed subject: its producer is unknown, so any of
-        # its workflows might be it.
+        # its workflows might be it. A workflow that wrote only a dtseries produced
+        # something, so it is not idle either; nor is one that finished after the
+        # listing began, whose outputs the listing may have missed.
         idle = {
             k: r
             for k, r in reprocess.items()
-            if r.subject not in unattributed
+            if r.subject not in unattributed | surf_unattributed
             and not is_producer(producers, r.subject, r.name, r.uid)
+            and not is_producer(surf_producers, r.subject, r.name, r.uid)
+            and not finished_late(r)
         }
-        return cls(producers, unattributed, reprocess, idle)
+        return cls(
+            producers,
+            unattributed,
+            reprocess,
+            idle,
+            dict(surf_producers),
+            surf_unattributed,
+            listed_at,
+            runs_by_id,
+        )
 
-    def step_row_goes(self, name: str, uid: str, step: str, subject: str, status) -> bool | None:
+    def in_flight(self, name: str, uid: str, row_time: datetime | None) -> bool:
+        """Whether a row's workflow may have been running when the listing began.
+
+        Such a workflow can write its BOLD or dtseries after the derivative listing,
+        so the listing does not show it as their producer, and deleting its rows
+        would delete current records. It is one that finished after the listing
+        began, or one with no run record yet (written at exit) whose row is younger
+        than IN_FLIGHT_WINDOW. A held row is only deferred to the next reconcile.
+        """
+        if self.listed_at is None:
+            return False
+        run = self.runs_by_id.get((name, uid))
+        if run is None and not uid:
+            run = next((r for (n, _), r in self.runs_by_id.items() if n == name), None)
+        if run is not None:
+            return bool(run.finished_at and run.finished_at >= self.listed_at - PRODUCER_SLACK)
+        return row_time is not None and row_time >= self.listed_at - IN_FLIGHT_WINDOW
+
+    def step_row_goes(
+        self, name: str, uid: str, step: str, subject: str, status, row_time: datetime | None = None
+    ) -> bool | None:
         """True/False for a step row; None when the answer needs the row's status."""
+        if self.in_flight(name, uid, row_time):
+            return False
         if (name, uid) in self.idle:
             return True
+        if step in SURFACE_STEPS and subject in self.surf_unattributed:
+            # A dtseries no window covers (its workflow still running, say): the
+            # writer is unknown, so none of the subject's surface rows go.
+            return False
+        if step in SURFACE_STEPS and self.surf_producers.get(subject):
+            # The workflow that wrote the stored dtseries keeps its surface rows,
+            # whether or not it wrote the BOLD: after a surface-only reprocess it
+            # did not, and the BOLD's producer's surface rows describe a CIFTI that
+            # was replaced.
+            return not is_producer(self.surf_producers, subject, name, uid)
         if step in FUNC_STEPS:
             return subject not in self.unattributed and not is_producer(
                 self.producers, subject, name, uid
@@ -1424,14 +1582,19 @@ class Attribution:
         return None if status is None else status == "skipped"
 
 
-def plan_step_rows(s3, mb: str, workers: int, attr: Attribution) -> list[str]:
-    """Raw step-outcome keys to delete under Attribution.step_row_goes."""
+def plan_step_rows(
+    s3, mb: str, workers: int, attr: Attribution, only_steps: tuple[str, ...] | None = None
+) -> list[str]:
+    """Raw step-outcome keys to delete under Attribution.step_row_goes (only `only_steps`, if given)."""
     drop, need_status = [], []
-    for k in list_keys(s3, mb, STEP_OUTCOME_PREFIX):
+    for o in list_objects(s3, mb, STEP_OUTCOME_PREFIX):
+        k = o["Key"]
         p = parse_step_outcome_key(k)
-        if not p:
+        if not p or (only_steps is not None and p.step not in only_steps):
             continue
-        verdict = attr.step_row_goes(p.workflow_name, p.workflow_uid, p.step, p.subject, None)
+        verdict = attr.step_row_goes(
+            p.workflow_name, p.workflow_uid, p.step, p.subject, None, o["LastModified"]
+        )
         if verdict:
             drop.append(k)
         elif verdict is None:
@@ -1476,24 +1639,41 @@ def plan_reconcile(s3, args, func_units, surf_units, attr: Attribution) -> dict[
 STEP_IDENTITY = ("workflow_name", "step", "subject", "session", "task", "run", "recorded_at")
 
 
-def compacted_jobs(s3, mb: str, func_units, surf_units, attr: Attribution) -> list[tuple]:
+def compacted_jobs(
+    s3,
+    mb: str,
+    func_units,
+    surf_units,
+    attr: Attribution,
+    only_steps: tuple[str, ...] | None = None,
+) -> list[tuple]:
     """(table, columns, values_for, complement) per compacted table reconcile filters.
 
     Per-scan QC keeps only units with a derivative (complement). step_outcomes is
     read file by file to select exactly the rows the raw rule selects; its identity
-    leaves out workflow_uid, which older files do not carry.
+    leaves out workflow_uid, which older files do not carry. With `only_steps`,
+    only step_outcomes is filtered, and only those steps' rows.
     """
 
     def step_rows_to_drop(key: str) -> set[tuple]:
         drop = set()
         for r in read_parquet_rows(s3, mb, key, (*STEP_IDENTITY, "workflow_uid", "status")):
+            if only_steps is not None and r["step"] not in only_steps:
+                continue
             goes = attr.step_row_goes(
-                r["workflow_name"], r["workflow_uid"] or "", r["step"], r["subject"], r["status"]
+                r["workflow_name"],
+                r["workflow_uid"] or "",
+                r["step"],
+                r["subject"],
+                r["status"],
+                parse_instant(r["recorded_at"]),
             )
             if goes and all(r[c] is not None for c in STEP_IDENTITY):
                 drop.add(tuple(str(r[c]) for c in STEP_IDENTITY))
         return drop
 
+    if only_steps is not None:
+        return [("step_outcomes", STEP_IDENTITY, step_rows_to_drop, False)]
     unit = ("subject", "session", "task", "run")
     run_id = ("workflow_name", "workflow_uid", "subject")
     idle_ids = {(n, u, r.subject) for (n, u), r in attr.idle.items()}
@@ -1534,26 +1714,55 @@ def run_purges(args) -> list[str]:
     return failed
 
 
-def reconcile(s3, args) -> int:
-    audit = Audit(Path(args.audit_dir) / f"reconcile_{now_utc():%Y%m%dT%H%M%SZ}.jsonl")
-    tag = "write" if args.write else "dry-run"
-
+def reconcile_attribution(s3, args, audit: Audit, surface_only: bool):
+    """(func units, surf units, Attribution) for reconcile, with its holds reported."""
     print("Listing derivatives and workflow runs ...")
-    func_units, surf_units, bold_times = list_func_units(s3, args.data_bucket)
-    runs = load_runs(s3, args.metrics_bucket, args.workers)
-    attr = Attribution.build(runs, bold_times)
-    print(
-        f"  {len(runs)} runs; {len(attr.reprocess)} from {BATCH_LABEL_PREFIX}*, "
-        f"{len(attr.idle)} of those produced nothing"
+    listed_at = now_utc()
+    func_units, surf_units, bold_times, dtseries_times = list_func_units(
+        s3, args.data_bucket, with_dtseries_times=True
     )
+    runs = load_runs(s3, args.metrics_bucket, args.workers)
+    attr = Attribution.build(runs, bold_times, dtseries_times, listed_at)
+    if surface_only:
+        # Only the surface rows the dtseries attribution rejects: no idle
+        # workflows, no orphan QC, no purges.
+        attr = dataclasses.replace(attr, idle={})
+        print(f"  {len(runs)} runs; --surface-only: {', '.join(SURFACE_STEPS)} rows only")
+    else:
+        print(
+            f"  {len(runs)} runs; {len(attr.reprocess)} from {BATCH_LABEL_PREFIX}*, "
+            f"{len(attr.idle)} of those produced nothing"
+        )
     if attr.unattributed:
         print(
             f"  [hold] {len(attr.unattributed)} subject(s) have an MNI BOLD no workflow window "
             "covers; their func step rows and workflows are left alone"
         )
         audit.write("unattributed", subjects=sorted(attr.unattributed))
+    if attr.surf_unattributed:
+        print(
+            f"  [hold] {len(attr.surf_unattributed)} subject(s) have a dtseries no workflow "
+            "window covers; their surface step rows are left alone"
+        )
+        audit.write("surf_unattributed", subjects=sorted(attr.surf_unattributed))
+    return func_units, surf_units, attr
 
-    plans = plan_reconcile(s3, args, func_units, surf_units, attr)
+
+def reconcile(s3, args) -> int:
+    audit = Audit(Path(args.audit_dir) / f"reconcile_{now_utc():%Y%m%dT%H%M%SZ}.jsonl")
+    tag = "write" if args.write else "dry-run"
+    surface_only = getattr(args, "surface_only", False)
+    only_steps = SURFACE_STEPS if surface_only else None
+    func_units, surf_units, attr = reconcile_attribution(s3, args, audit, surface_only)
+
+    if surface_only:
+        plans = {
+            "step-outcomes, surface": plan_step_rows(
+                s3, args.metrics_bucket, args.workers, attr, only_steps
+            )
+        }
+    else:
+        plans = plan_reconcile(s3, args, func_units, surf_units, attr)
     for name, keys in plans.items():
         print(f"  [{tag}] raw {name}: {len(keys)}")
         if not args.write:
@@ -1568,7 +1777,7 @@ def reconcile(s3, args) -> int:
             return 1
     failed: list[str] = []
     for table, cols, values_for, complement in compacted_jobs(
-        s3, args.metrics_bucket, func_units, surf_units, attr
+        s3, args.metrics_bucket, func_units, surf_units, attr, only_steps
     ):
         n, f = drop_compacted(
             s3, args.metrics_bucket, table, cols, values_for, args.write, args.workers, complement
@@ -1576,7 +1785,8 @@ def reconcile(s3, args) -> int:
         failed += f
         print(f"  [{tag}] compacted {table}: {n} rows")
         audit.write("compacted", table=table, rows=n, failed=f, write=args.write)
-    failed += run_purges(args)
+    if not surface_only:
+        failed += run_purges(args)
 
     print(f"\nAudit: {audit.path}")
     if failed:
@@ -1609,9 +1819,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("launch", help="flush one slice's func outputs and submit it")
     common(sp, subjects=True)
     sp.add_argument("--batch-label", required=True)
-    # Required, never defaulted: https is the fast path, globus the rollback, and a
-    # launch should say which it is rather than inherit the queue manager's default.
-    sp.add_argument("--ingress-mode", required=True, choices=("https", "globus"))
+    # The queue manager's modes and default. `globus` left with the Globus host
+    # (openspec retire-globus-host), so https is the only network ingress; it is
+    # still passed to the flow explicitly, and into the recovery command and audit.
+    sp.add_argument("--ingress-mode", default="https", choices=("https", "presynced"))
     sp.add_argument("--write", action="store_true", help="Delete and submit (default: dry run).")
     sp.add_argument("--yes", action="store_true", help="Skip the typed confirmation.")
     sp.add_argument(
@@ -1627,6 +1838,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("reconcile", help="delete func metrics that describe nothing stored")
     common(sp, subjects=False)
     sp.add_argument("--all", action="store_true", required=True, help="Cohort-wide; required.")
+    sp.add_argument(
+        "--surface-only",
+        action="store_true",
+        help="Only surface-sample/surface-resample step rows whose workflow did not write the "
+        "run's stored dtseries (after a surface-only reprocess); nothing else.",
+    )
     sp.add_argument("--write", action="store_true", help="Apply (default: dry run).")
     return p
 

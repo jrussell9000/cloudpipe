@@ -60,7 +60,7 @@ variable "secondary_cidr_blocks" {
 #################
 
 # Short enough for every name built from it: `<name>-<suffix>-logging-access` is
-# an S3 bucket (63), `<name>-karpenter-nodegroup-iam-role` an IAM role (64).
+# an S3 bucket (63), `<name>-backend-nodegroup-iam-role` an IAM role (64).
 variable "name" {
   default = "cloudpipe"
   type    = string
@@ -129,7 +129,7 @@ variable "kubernetes_version" {
 }
 
 variable "endpoint_public_access" {
-  description = "Enable public access to the EKS API server. Set to true during initial install for bootstrapping, then flipped to false at the end of install.sh once the VPN is in place."
+  description = "Enable public access to the EKS API server. Set to true during initial install for bootstrapping, then flipped to false at the end of install.sh (phase 8) once kubectl is proven through the Cloudflare tunnel."
   type        = bool
   default     = false
 }
@@ -379,7 +379,7 @@ variable "public_ami_regions" {
 #######################
 
 # Whether this deployment stands up the Globus ingress at all, and therefore
-# whether the seven variables below are required. See the header of
+# whether the six variables below are required. See the header of
 # `globus.tf` for what enabling it costs the deployer, and the Globus
 # section of docs/deployer-first-hour.md for how to turn it on later.
 variable "globus_enabled" {
@@ -405,7 +405,9 @@ variable "globus_s3_destination_bucket" {
   }
 }
 
-# The seven variables below are required only when `globus_enabled` is true.
+# The six variables below are required only when `globus_enabled` is true.
+# (There were seven until `globus_source_collection_id` stopped being ingress-
+# gated; see its declaration further down.)
 #
 # Each one defaults to the empty string and each validation refuses the empty
 # string once the ingress is on, which keeps #526's rule — a default must not be
@@ -501,14 +503,19 @@ variable "globus_client_id" {
   }
 }
 
+# The two source variables below are not ingress-gated: HTTPS ingress reads them
+# from SSM whether or not `module.globus` exists (ingress_session.tf). They keep
+# their `globus_` names because Terraform only warns about an undeclared tfvars
+# value and then drops it, so a rename would quietly turn a configured source
+# into the placeholder.
 variable "globus_source_collection_id" {
-  description = "Globus source collection UUID (NBDC Data Hub collection). Required when globus_enabled is true."
+  description = "Globus source collection UUID (NBDC Data Hub collection) that `ingress-mode=https` copies from. Empty is a complete deployment that ingresses nothing itself (`ingress-mode=presynced`); the SSM parameter then holds a placeholder the queue manager refuses."
   type        = string
   default     = ""
 
   validation {
-    condition     = !var.globus_enabled || can(regex("^[0-9a-f-]{36}$", var.globus_source_collection_id))
-    error_message = "globus_source_collection_id must be a Globus collection UUID."
+    condition     = var.globus_source_collection_id == "" || can(regex("^[0-9a-f-]{36}$", var.globus_source_collection_id))
+    error_message = "globus_source_collection_id must be empty or a Globus collection UUID."
   }
 }
 
@@ -516,6 +523,12 @@ variable "globus_source_base_path" {
   description = "Root path on the Globus source collection containing subject data. Subject ID is appended automatically."
   type        = string
   default     = "/abcd/derivatives/mmps_mproc"
+}
+
+variable "fasttrack_source_base_path" {
+  description = "Root path on the same source collection holding the ABCD FastTrack DICOMs (BIDS-named, one directory per subject), read by cloudpipe_fasttrack's convert job. Subject ID is appended automatically."
+  type        = string
+  default     = "/abcd/sourcedata"
 }
 
 # `globus_dest_base_path` and `globus_scan_types` were declared here and read by
@@ -555,17 +568,13 @@ variable "globus_production_managed" {
 }
 
 
-
 ####################
-# VPN Variables    #
+# Remote access    #
 ####################
 
-
-variable "certificate_validity_period_hours" {
-  description = "Validity period for client certificates in hours (default is 1 year)"
-  type        = number
-  default     = 8760
-}
+# Operator access is the Cloudflare Zero Trust tunnel only (cloudflare.tf, ADR
+# 014). The AWS Client VPN and its variables (client_cidr_block, split_tunnel,
+# certificate_validity_period_hours) were removed 2026-11-06 (plan 012 §6).
 
 # Not a credential — an account identifier, and this file is not part of the
 # public mirror (only terraform/modules/** is). The Cloudflare API TOKEN is a
@@ -585,23 +594,6 @@ variable "grafana_namespace" {
   description = "Kubernetes namespace where Grafana is deployed (must match the gitops/apps/grafana ArgoCD Application namespace)."
   type        = string
   default     = "grafana"
-}
-
-variable "client_cidr_block" {
-  description = "CIDR block from which client IP addresses will be assigned when connected to VPN"
-  type        = string
-  default     = "10.3.0.0/22"
-}
-
-variable "split_tunnel" {
-  description = "Whether to enable split tunnel mode. This allows client to access public internet and private resources."
-  type        = bool
-  # Full-tunnel: split-tunnel only routes the VPN's authorized routes (the
-  # private VPC CIDRs) through the tunnel, so traffic to the web apps' public
-  # ALB IPs never enters the tunnel and never gets NAT'd into the client CIDR
-  # the ALB security groups trust (see terraform/modules/stack/vpn.tf, terraform/modules/stack/grafana.tf,
-  # terraform/modules/stack/argocd.tf). Full-tunnel is required for those SG rules to work.
-  default = false
 }
 
 ###################
@@ -936,4 +928,31 @@ variable "cloudflare_team_name" {
     organization had, including the placeholder Cloudflare generated.
   EOT
   type        = string
+}
+
+variable "reprocess_audit" {
+  description = "Create the reprocess-audit bucket pairs (<data bucket>-audit-{data,metrics} and <data bucket>-audit-repeat-{data,metrics}) and grant the Argo and Prefect roles on them. See audit_buckets.tf and openspec/changes/add-reprocess-audit. Teardown: empty the buckets, then set false."
+  type        = bool
+  default     = false
+}
+
+variable "newmsm_image" {
+  description = <<-EOT
+    The newMSM image for the opt-in newmsm surface-registration step
+    (openspec add-newmsm-surface-registration), pinned by digest:
+    `<registry>/cloudpipe/newmsm@sha256:...`. Written to the cloudpipe-config
+    ConfigMap as `newmsm_image`, which the step's template reads; no template names
+    the image, because it carries FSL libraries and cannot be published. Build it
+    yourself from the newMSM fork's docker/Dockerfile (jrussell9000/newMSM, branch
+    cloudpipe/image) under FSL's licence: non-commercial use only. Empty (the
+    default) leaves the key unset; workflows on the default `fs` route never read
+    it, and a newmsm-route workflow fails that step with a message naming the key.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.newmsm_image == "" || can(regex("@sha256:[a-f0-9]{64}$", var.newmsm_image))
+    error_message = "newmsm_image must be pinned by digest (…/cloudpipe/newmsm@sha256:<64 hex>), or empty."
+  }
 }

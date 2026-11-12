@@ -35,6 +35,35 @@ data "aws_iam_policy_document" "controller" {
     actions   = ["s3:PutObject", "s3:GetObject"]
     resources = ["arn:aws:s3:::${var.metrics_bucket}/*"]
   }
+
+  # Reprocess-audit pairs (stack/audit_buckets.tf): the same grants as the
+  # production pair, on the audit's own buckets. Absent unless the audit is on.
+  dynamic "statement" {
+    for_each = length(var.audit_data_buckets) > 0 ? [1] : []
+    content {
+      sid       = "AuditListBuckets"
+      actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+      resources = [for b in concat(var.audit_data_buckets, var.audit_metrics_buckets) : "arn:aws:s3:::${b}"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = length(var.audit_data_buckets) > 0 ? [1] : []
+    content {
+      sid       = "AuditS3ReadWrite"
+      actions   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
+      resources = [for b in var.audit_data_buckets : "arn:aws:s3:::${b}/*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = length(var.audit_metrics_buckets) > 0 ? [1] : []
+    content {
+      sid       = "AuditS3MetricsReadWrite"
+      actions   = ["s3:PutObject", "s3:GetObject"]
+      resources = [for b in var.audit_metrics_buckets : "arn:aws:s3:::${b}/*"]
+    }
+  }
 }
 
 resource "aws_iam_policy" "controller" {
@@ -104,6 +133,34 @@ data "aws_iam_policy_document" "runner" {
     sid       = "S3MetricsListBucket"
     actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
     resources = ["arn:aws:s3:::${var.metrics_bucket}"]
+  }
+
+  # Reprocess-audit pairs: as the controller's, above.
+  dynamic "statement" {
+    for_each = length(var.audit_data_buckets) > 0 ? [1] : []
+    content {
+      sid       = "AuditListBuckets"
+      actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+      resources = [for b in concat(var.audit_data_buckets, var.audit_metrics_buckets) : "arn:aws:s3:::${b}"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = length(var.audit_data_buckets) > 0 ? [1] : []
+    content {
+      sid       = "AuditS3ReadWrite"
+      actions   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
+      resources = [for b in var.audit_data_buckets : "arn:aws:s3:::${b}/*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = length(var.audit_metrics_buckets) > 0 ? [1] : []
+    content {
+      sid       = "AuditS3MetricsReadWrite"
+      actions   = ["s3:PutObject", "s3:GetObject"]
+      resources = [for b in var.audit_metrics_buckets : "arn:aws:s3:::${b}/*"]
+    }
   }
 }
 

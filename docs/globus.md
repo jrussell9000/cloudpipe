@@ -50,6 +50,7 @@ placeholder in the last column.
 | Collection name | Terraform `globus_collection_name` (`cloudpipe-s3`) | |
 | Source collection (NBDC Data Hub) | Terraform `globus_source_collection_id`, mirrored to SSM `/cloudpipe/globus/source-collection-id` | `<source-collection-id>` |
 | Source base path | Terraform `globus_source_base_path` (`/abcd/derivatives/mmps_mproc`) | |
+| FastTrack source base path | Terraform `fasttrack_source_base_path` (`/abcd/sourcedata`), mirrored to SSM `/cloudpipe/globus/fasttrack-source-base-path`. Read by `cloudpipe_fasttrack` (planned) | |
 | Native app client ID | Secrets Manager `globus/refresh-token`, property `native-app-client-id` | |
 | IAM credential identity | The admin's own Globus identity | `<username>@<institution_domain>` |
 | HA subscription ID | Issued by the institution's Globus subscription administrators | `<subscription-id>` |

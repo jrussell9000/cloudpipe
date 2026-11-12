@@ -13,7 +13,8 @@ SQL see both — and an exported metrics dataset has to describe the data that w
 actually processed, not every attempt at it. The 2026-09-11 census found ~2.5% of
 every per-scan table superseded (raw rows: registration t1w_to_mni 826 of 31,965,
 bold_to_t1w 4,290, anat_qc 803, fsqc_qc 932, func_preproc 4,113). Every per-scan
-QC table is in TABLES: registration, func_preproc, surface_sample, anat_qc, fsqc_qc.
+QC table is in TABLES: registration, func_preproc, surface_sample, anat_qc, fsqc_qc,
+tissue_masks.
 
 Step outcomes are deliberately NOT touched. They are an event log — a failure
 happened — not a measurement, and the failure-triage dashboard counts them over time.
@@ -125,9 +126,29 @@ def _surface_marker(scan: tuple) -> str:
     )
 
 
+def _surface_newmsm_marker(scan: tuple) -> str:
+    """The run's newMSM-route CIFTI (openspec add-newmsm-surface-registration).
+
+    A newMSM run REPLACES the FS-route dtseries, so for an upgraded run this is the
+    only CIFTI left. Without it every upgraded run's final surface_sample record
+    would read as "derivative is missing" and be held forever.
+    """
+    subj, ses, task, run = scan
+    return (
+        f"derivatives/func_surf/{subj}/{ses}/fsLR32k/"
+        f"{subj}_{ses}_{task}_{run}_space-fsLR32k_desc-newmsm_bold.dtseries.nii"
+    )
+
+
 def _fastsurfer_marker(scan: tuple) -> str:
     subj, ses = scan
     return f"derivatives/fastsurfer/{subj}/{ses}/_complete.json"
+
+
+def _tissue_marker(scan: tuple) -> str:
+    """The session's dseg: written whether or not the probseg passed its guard."""
+    subj, ses = scan
+    return f"derivatives/func/{subj}/{ses}/{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_dseg.nii.gz"
 
 
 @dataclass(frozen=True)
@@ -148,7 +169,9 @@ class TableSpec:
     # far below the days a flush-and-rebuild takes.
     stale_margin_min: float
     verdict: str | None = None  # a pass/fail column, if the table has one
-    # Asked only when `marker` is absent: the same output in an older layout.
+    # Asked only when `marker` is absent: the same output under another name — an
+    # older layout (func_preproc's tarball) or the other surface route
+    # (surface_sample's newMSM CIFTI, which replaces the FS-route one).
     legacy_marker: Callable[[tuple], str] | None = None
     type_column: str | None = None  # registration_type: one table, two scan kinds
     # A rejected scan withholds its marker. True for both registration types
@@ -187,6 +210,7 @@ TABLES = {
         compacted="surface_sample_compacted",
         scan=("subject", "session", "task", "run"),
         marker=_surface_marker,
+        legacy_marker=_surface_newmsm_marker,
         stale_margin_min=720,
     ),
     "anat_qc": TableSpec(
@@ -203,6 +227,18 @@ TABLES = {
         scan=("subject", "session"),
         marker=_fastsurfer_marker,
         stale_margin_min=0,
+    ),
+    # TissueQC (2026-10-26). A func reprocess flushes the old row, but a re-run
+    # backfill or a retried session can still leave two. NOT measured like the
+    # margins above (no cohort yet): tissue_masks.py writes the record minutes
+    # before the same pod publishes the dseg, so 120 min is the func_preproc
+    # margin reused, to be re-measured once the backfill has run.
+    "tissue_masks": TableSpec(
+        raw="tissue_masks",
+        compacted="tissue_masks_compacted",
+        scan=("subject", "session"),
+        marker=_tissue_marker,
+        stale_margin_min=120,
     ),
 }
 REGISTRATION_TYPES = ("t1w_to_mni", "bold_to_t1w")

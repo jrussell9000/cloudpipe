@@ -348,7 +348,7 @@ def watch(output_path: str) -> list[dict[str, Any]]:
             proc.terminate()
             proc.wait()
             # A watch that ends immediately means kubectl cannot reach the API
-            # server at all — VPN dropped, SSO expired, context gone. Without a
+            # server at all — WARP dropped, SSO expired, context gone. Without a
             # backoff that is a hot relaunch loop; with one, the collector simply
             # waits out the outage and picks the batch back up. A watch that ran
             # for a while ended normally, so reconnect at once.

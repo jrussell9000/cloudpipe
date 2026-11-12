@@ -40,6 +40,14 @@ NO-SPOT COUNTERFACTUAL
     ever observed directly. This third call is best-effort — it can only ever
     NULL three columns, never fail the scrape.
 
+    Pods are matched to an INSTANCE, not a hostname (#1060): private IPs are
+    reused within a day, so a hostname can name several instances. A pod whose
+    instance cannot be proven gets NULL rates — see resolve_node, and why
+    the settled day+3 read proves fewer than the day+1 read. The day+1 read
+    records the instance (node_instance_id, schema 1.2), and the settled read
+    carries it forward with the drift-free columns where it cannot prove one
+    itself (_node_columns).
+
 SETTLED RE-SCRAPE
     The nightly pass reads each report-date at day+1, before Kubecost has
     finished reconciling it against the AWS CUR, so it overstates settled cost
@@ -64,10 +72,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections import Counter
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from itertools import pairwise
 from typing import Any
 
+import audit_pairs  # type: ignore[import-not-found]
 import requests
 from ec2_pricing import ondemand_hourly_usd  # type: ignore[import-not-found]
 from schemas import CostAllocation, PodCost  # type: ignore[import-not-found]
@@ -122,6 +133,19 @@ LABEL_SUBJECT = "subjectid"
 # the EKS managed nodegroup nodes, which Karpenter did not create — see
 # _capacity_type, which falls back to the `preemptible` field for those.
 LABEL_CAPACITY_TYPE = "karpenter_sh_capacity_type"
+
+# Workflows whose cost is deliberately not recorded, by name prefix (Argo names a
+# workflow `{template}-{suffix}`). The confounds-only re-run (confounds-rerun,
+# 2026-10-28) only repairs TSVs a cloudpipe workflow already produced and was
+# costed for, and writes no WorkflowRun row; operator decision: drop its cost
+# rather than add it to the subject's. Both scrape grains skip these, and
+# cost_gaps does not count them as unbilled.
+UNRECORDED_WORKFLOW_PREFIXES = ("confounds-rerun-",)
+
+
+def cost_is_recorded(workflow_name: str) -> bool:
+    return not workflow_name.startswith(UNRECORDED_WORKFLOW_PREFIXES)
+
 
 _BYTES_PER_GB = 1024**3
 
@@ -242,6 +266,8 @@ def parse_allocations(
     for workflow_name, alloc in allocation_set.items():
         if not workflow_name or workflow_name.startswith("__"):
             continue
+        if not cost_is_recorded(workflow_name):
+            continue
 
         subject = alloc.get("properties", {}).get("labels", {}).get("subjectid", "")
         adjustment = sum(alloc.get(f, 0) or 0 for f in ADJUSTMENT_FIELDS)
@@ -295,6 +321,83 @@ class NodeRate:
     ondemand_usd_per_hour: float | None
 
 
+@dataclass(frozen=True)
+class NodeAsset:
+    """One EC2 instance from the Assets API, and the window it was up in.
+
+    A hostname is NOT an instance. EC2 hostnames are private IPs, the cluster
+    reuses them, and one daily window routinely holds several instances under
+    one name (#1060: up to 133 hostnames a day in 2026-10, about a quarter of
+    workflow pods on a reused name). So the node table keeps every instance a
+    hostname had, and a pod is matched to one by time (resolve_node).
+    """
+
+    provider_id: str  # EC2 instance ID, from properties.providerID
+    start: datetime | None
+    end: datetime | None
+    instance_type: str  # the asset's nodeType
+    labelled_instance_type: str  # the asset's own node.kubernetes.io/instance-type label
+    rate: NodeRate
+
+
+# hostname -> every instance that held it in the window
+NodeIndex = dict[str, list[NodeAsset]]
+
+# Why a pod did or did not get its node's rates. Logged as a tally per scrape.
+MATCHED = "matched"
+NO_ASSET = "no_asset"
+AMBIGUOUS = "ambiguous"
+INCONSISTENT_ASSET = "inconsistent_asset"
+TYPE_MISMATCH = "type_mismatch"
+# Not proven by this read, but by the stored day+1 record of the same pod.
+CARRIED = "carried"
+
+
+@dataclass(frozen=True)
+class CarriedNode:
+    """What a stored (day+1) PodCost record proved about its pod's instance.
+
+    Only records that name an instance (node_instance_id, schema 1.2+) carry
+    anything: a 1.1 record's rates came from the hostname table #1060 fixed,
+    and are exactly what must not be carried forward.
+    """
+
+    instance_id: str
+    instance_type: str
+    capacity_type: str
+    ondemand_usd_per_hour: float | None
+
+
+# (workflow_name, pod) -> what the stored record of that pod proved
+CarriedIndex = dict[tuple[str, str], CarriedNode]
+
+
+def carried_from_records(records: list[dict[str, Any]]) -> CarriedIndex:
+    """Index stored PodCost dicts by (workflow_name, pod), keeping only proven ones."""
+    index: CarriedIndex = {}
+    for rec in records:
+        instance_id = rec.get("node_instance_id") or ""
+        if not instance_id:
+            continue
+        index[(rec.get("workflow_name", ""), rec.get("pod", ""))] = CarriedNode(
+            instance_id=instance_id,
+            instance_type=rec.get("node_instance_type") or "",
+            capacity_type=rec.get("node_capacity_type") or "",
+            ondemand_usd_per_hour=rec.get("node_ondemand_usd_per_hour"),
+        )
+    return index
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """Kubecost's RFC 3339 `start`/`end` ("2026-11-05T21:46:00Z") -> aware datetime."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _capacity_type(asset: dict[str, Any]) -> str:
     """Classify a node asset as spot or on-demand.
 
@@ -316,8 +419,8 @@ def _capacity_type(asset: dict[str, Any]) -> str:
 def parse_node_assets(
     assets_response: dict[str, Any],
     region: str | None = None,
-) -> dict[str, NodeRate]:
-    """Build {node_hostname: NodeRate} from an Assets API response.
+) -> NodeIndex:
+    """Build {node_hostname: [NodeAsset, ...]} from an Assets API response.
 
     The effective rate is the node's reconciled cost divided by the node-hours
     it was actually up for, which is the rate Kubecost priced this window's pod
@@ -325,13 +428,17 @@ def parse_node_assets(
     reconciliation, so a node read at day+1 and again at day+3 gives two
     different effective rates, and the settled one is the one to trust.
 
-    Nodes with zero recorded minutes are skipped rather than divided by zero.
+    Nodes with zero recorded minutes keep a NULL effective rate rather than a
+    division by zero.
 
-    Keyed on `properties.name` (the hostname), not on the response's own key —
-    that key is a compound
+    Grouped on `properties.name` (the hostname), because that is all the pod
+    side has (its kubernetes.io/hostname label), but every instance under a
+    hostname is kept: the response key is a compound
     `AWS/<account>/Compute/<cluster>/Node/Kubernetes/<instance-id>/<hostname>`
-    path, while the pod side only ever has the bare hostname from its
-    kubernetes.io/hostname label.
+    path and `properties.providerID` is the instance ID, so two instances that
+    reused one private IP are two assets here. Until #1060 this was a plain
+    {hostname: NodeRate}, and the later instance silently overwrote the
+    earlier one's rates for every pod on either.
     """
     sets = assets_response.get("data", [])
     asset_set = sets[0] if isinstance(sets, list) else sets
@@ -339,9 +446,10 @@ def parse_node_assets(
         log.warning("Kubecost returned no node assets for window")
         return {}
 
-    rates: dict[str, NodeRate] = {}
-    for asset in asset_set.values():
-        name = (asset.get("properties") or {}).get("name", "")
+    index: NodeIndex = {}
+    for key, asset in asset_set.items():
+        props = asset.get("properties") or {}
+        name = props.get("name", "")
         if not name:
             continue
 
@@ -350,13 +458,157 @@ def parse_node_assets(
         effective = round(total_cost / (minutes / 60.0), 6) if minutes > 0 else None
 
         instance_type = asset.get("nodeType") or ""
-        rates[name] = NodeRate(
-            capacity_type=_capacity_type(asset),
-            effective_usd_per_hour=effective,
-            ondemand_usd_per_hour=ondemand_hourly_usd(instance_type, region=region),
+        index.setdefault(name, []).append(
+            NodeAsset(
+                provider_id=props.get("providerID") or key,
+                start=_parse_ts(asset.get("start")),
+                end=_parse_ts(asset.get("end")),
+                instance_type=instance_type,
+                labelled_instance_type=(asset.get("labels") or {}).get(
+                    "node_kubernetes_io_instance_type", ""
+                )
+                or "",
+                rate=NodeRate(
+                    capacity_type=_capacity_type(asset),
+                    effective_usd_per_hour=effective,
+                    ondemand_usd_per_hour=ondemand_hourly_usd(instance_type, region=region),
+                ),
+            )
         )
 
-    return rates
+    reused = sum(1 for assets in index.values() if len(assets) > 1)
+    if reused:
+        log.info(
+            "%d hostname(s) were held by more than one instance in this window; "
+            "their pods are matched to an instance by time",
+            reused,
+        )
+    return index
+
+
+def _windows_overlap(candidates: list[NodeAsset]) -> bool:
+    """True when any two instances under one hostname claim overlapping time.
+
+    A window that is missing counts as overlapping: it cannot be ruled out.
+    """
+    windows = sorted((c.start, c.end) for c in candidates if c.start and c.end)
+    if len(windows) < len(candidates):
+        return True
+    return any(later[0] < earlier[1] for earlier, later in pairwise(windows))
+
+
+def resolve_node(
+    candidates: list[NodeAsset],
+    pod_start: datetime | None,
+    pod_end: datetime | None,
+    pod_instance_type: str,
+) -> tuple[NodeAsset | None, str]:
+    """Pick the instance a pod ran on from its hostname's instances, or none.
+
+    Returns (instance, reason). An instance comes back only when it is proven;
+    otherwise None, so the row is unpriced (NULL) rather than priced against an
+    instance it never ran on — unless the stored day+1 record proved it (see
+    _node_columns).
+
+    - One instance under the hostname: that one.
+    - Several: the one whose up-window contains the pod's window. Two
+      instances cannot hold one private IP at once, so on the day+1 read,
+      which Kubecost serves from hourly data, exactly one does (2026-11-06:
+      91/91 pods). Zero or several is AMBIGUOUS, and so is every pod on a
+      hostname whose instances' windows overlap: that is physically
+      impossible, so those windows — and the minutes, and so the effective
+      rates, computed over them — are not real.
+    - Either way, the instance is refused if its nodeType disagrees with its
+      own instance-type label (INCONSISTENT_ASSET), or with the pod's
+      (TYPE_MISMATCH).
+
+    The last two exist for the settled re-scrape. Kubecost keeps hourly data
+    for 49 h (retention1h, chart default) and answers older windows from daily
+    rollups, and the rollups merge the instances that shared a hostname: their
+    up-windows overlap, often from the same minute, and one instance's
+    nodeType is stamped on both (2026-10-29: 123 of 202 instances on a reused
+    hostname disagree with their own label; about half the pods on reused
+    hostnames sit inside two windows). A day+3 read therefore cannot tell
+    those instances apart by itself.
+    """
+    if not candidates:
+        return None, NO_ASSET
+
+    if len(candidates) == 1:
+        chosen = candidates[0]
+    else:
+        if pod_start is None or pod_end is None or _windows_overlap(candidates):
+            return None, AMBIGUOUS
+        containing = [
+            c
+            for c in candidates
+            if c.start is not None
+            and c.end is not None
+            and c.start <= pod_start
+            and pod_end <= c.end
+        ]
+        if len(containing) != 1:
+            return None, AMBIGUOUS
+        chosen = containing[0]
+
+    if chosen.labelled_instance_type and chosen.labelled_instance_type != chosen.instance_type:
+        return None, INCONSISTENT_ASSET
+    if pod_instance_type and chosen.instance_type and pod_instance_type != chosen.instance_type:
+        return None, TYPE_MISMATCH
+    return chosen, MATCHED
+
+
+@dataclass(frozen=True)
+class _NodeColumns:
+    instance_id: str
+    instance_type: str
+    capacity_type: str
+    effective_usd_per_hour: float | None
+    ondemand_usd_per_hour: float | None
+
+
+def _node_columns(
+    asset: NodeAsset | None,
+    reason: str,
+    prior: CarriedNode | None,
+    pod_instance_type: str,
+) -> tuple[_NodeColumns, str]:
+    """The node columns for one pod, from this read and the stored record.
+
+    The day+1 read is the authority on WHICH instance (hourly data keeps them
+    apart); the read being written is the authority on the effective rate,
+    which only settles at day+3. So:
+
+    - proven here, and no stored instance or the same one: this read's columns.
+    - stored instance, and this read cannot prove one, or proves another: the
+      stored instance, type, capacity type and on-demand rate, all drift-free,
+      with the effective rate NULL. Pairing an unreconciled day+1 rate with
+      settled dollars would break the cancellation spot_savings() relies on.
+    - neither: everything NULL / "".
+    """
+    if asset is not None and (prior is None or prior.instance_id == asset.provider_id):
+        return (
+            _NodeColumns(
+                instance_id=asset.provider_id,
+                instance_type=pod_instance_type or asset.instance_type,
+                capacity_type=asset.rate.capacity_type,
+                effective_usd_per_hour=asset.rate.effective_usd_per_hour,
+                ondemand_usd_per_hour=asset.rate.ondemand_usd_per_hour,
+            ),
+            reason,
+        )
+    if prior is not None:
+        return (
+            _NodeColumns(
+                instance_id=prior.instance_id,
+                instance_type=prior.instance_type,
+                capacity_type=prior.capacity_type,
+                effective_usd_per_hour=None,
+                ondemand_usd_per_hour=prior.ondemand_usd_per_hour,
+            ),
+            CARRIED,
+        )
+    return _NodeColumns("", pod_instance_type, "", None, None), reason
 
 
 def parse_pod_allocations(
@@ -364,7 +616,8 @@ def parse_pod_allocations(
     report_date: date,
     pipeline: str = "cloudpipe_minproc",
     scrape_date: date | None = None,
-    node_rates: dict[str, NodeRate] | None = None,
+    node_rates: NodeIndex | None = None,
+    carried: CarriedIndex | None = None,
 ) -> list[PodCost]:
     """Convert an `aggregate=pod` allocation response to PodCost records.
 
@@ -378,16 +631,27 @@ def parse_pod_allocations(
     to GB-hours here so the column is directly comparable to a pod's memory
     request without a 2**30 in every query.
 
-    node_rates, when given, is the parse_node_assets() lookup that fills the
-    capacity-type and rate columns. Omitting it leaves those NULL rather than
-    failing — the counterfactual is an addition to this table, not a
-    precondition for it.
+    node_rates, when given, is the parse_node_assets() index that fills the
+    node columns, matched per pod by resolve_node(). Omitting it leaves those
+    NULL rather than failing — the counterfactual is an addition to this
+    table, not a precondition for it.
+
+    carried, when given, is what the stored records for this date proved
+    (load_carried_nodes): on a re-scrape it supplies the instance for pods this
+    read cannot prove. See _node_columns for which read wins which column.
+
+    node_instance_type is Kubecost's own label, which Kubecost joins onto the
+    pod by hostname too, so on a reused hostname it can name the other
+    instance. Trust it where node_instance_id is set: a pod is only matched
+    when the instance's type equals it, and a carried pod takes the type its
+    day+1 record verified.
     """
     allocation_set = _first_allocation_set(api_response, "pod")
     if allocation_set is None:
         return []
 
     records: list[PodCost] = []
+    match_reasons: Counter[str] = Counter()
 
     date_str = report_date.isoformat()
     scrape_age_days = ((scrape_date or (report_date + timedelta(days=1))) - report_date).days
@@ -397,21 +661,36 @@ def parse_pod_allocations(
             continue
 
         workflow_name = _label(alloc, LABEL_WORKFLOW)
-        if not workflow_name:
+        if not workflow_name or not cost_is_recorded(workflow_name):
             continue
 
         props = alloc.get("properties", {})
         adjustment = sum(alloc.get(f, 0) or 0 for f in ADJUSTMENT_FIELDS)
         ram_byte_hours = alloc.get("ramByteHours", 0.0) or 0.0
 
+        pod = props.get("pod") or pod_name
         node_name = _label(alloc, "kubernetes_io_hostname")
-        rate = (node_rates or {}).get(node_name)
+        node_instance_type = _label(alloc, "node_kubernetes_io_instance_type")
+        asset: NodeAsset | None = None
+        reason = NO_ASSET
+        if node_rates is not None:
+            asset, reason = resolve_node(
+                node_rates.get(node_name, []),
+                _parse_ts(alloc.get("start")),
+                _parse_ts(alloc.get("end")),
+                node_instance_type,
+            )
+        cols, reason = _node_columns(
+            asset, reason, (carried or {}).get((workflow_name, pod)), node_instance_type
+        )
+        if node_rates is not None or reason == CARRIED:
+            match_reasons[reason] += 1
 
         records.append(
             PodCost(
                 date=date_str,
                 workflow_name=workflow_name,
-                pod=props.get("pod") or pod_name,
+                pod=pod,
                 step=_label(alloc, LABEL_STEP),
                 phase=_label(alloc, LABEL_PHASE),
                 subject=_label(alloc, LABEL_SUBJECT),
@@ -438,20 +717,36 @@ def parse_pod_allocations(
                 # node label that Kubecost propagates onto the allocation (same mechanism
                 # node_instance_type below already relies on).
                 node=node_name,
-                node_instance_type=_label(alloc, "node_kubernetes_io_instance_type"),
+                node_instance_type=cols.instance_type,
                 # Node-grain facts, denormalized onto the pod row from the
                 # Assets pass so the no-spot counterfactual is a single-table
                 # query. They repeat across every pod on a node, which Parquet
                 # compresses to nothing — cheaper than making every consumer
                 # join a node table.
-                node_capacity_type=rate.capacity_type if rate else "",
-                node_effective_usd_per_hour=rate.effective_usd_per_hour if rate else None,
-                node_ondemand_usd_per_hour=rate.ondemand_usd_per_hour if rate else None,
+                node_capacity_type=cols.capacity_type,
+                node_effective_usd_per_hour=cols.effective_usd_per_hour,
+                node_ondemand_usd_per_hour=cols.ondemand_usd_per_hour,
+                node_instance_id=cols.instance_id,
                 scrape_age_days=scrape_age_days,
                 pipeline=pipeline,
             )
         )
 
+    if match_reasons[CARRIED]:
+        log.info(
+            "%d pod(s) took their instance from the stored day+1 record "
+            "(effective rate left NULL); see _node_columns",
+            match_reasons[CARRIED],
+        )
+    unproven = {r: n for r, n in match_reasons.items() if r not in (MATCHED, NO_ASSET, CARRIED)}
+    if unproven:
+        log.warning(
+            "%d pod(s) left unpriced because their node could not be proven (%s); "
+            "see resolve_node — expected on a settled read of reused hostnames whose "
+            "day+1 record predates schema 1.2",
+            sum(unproven.values()),
+            ", ".join(f"{r}={n}" for r, n in sorted(unproven.items())),
+        )
     return records
 
 
@@ -504,6 +799,53 @@ def count_stored_workflows(
     )
 
 
+def load_carried_nodes(
+    bucket: str,
+    report_date: date,
+    region: str | None = None,
+) -> CarriedIndex:
+    """What the pod-cost records already stored for report_date proved.
+
+    Read before a re-scrape overwrites them, so the settled pass can keep the
+    instance its day+1 read proved (see _node_columns). On the day+1 pass
+    nothing is stored yet and this is one empty listing. Best-effort, like the
+    whole counterfactual: a failed read means nothing is carried, and the
+    affected pods are left NULL as they would have been anyway.
+    """
+    import boto3
+    import deployment_env
+    from compactor import (  # type: ignore[import-not-found]
+        list_raw_keys,
+        read_raw_records_counting_skips,
+    )
+
+    try:
+        s3 = boto3.client("s3", region_name=region or deployment_env.region())
+        keys = list_raw_keys(s3, bucket, "metrics/pod-costs/", report_date.isoformat())
+        if not keys:
+            return {}
+        records, skipped = read_raw_records_counting_skips(s3, bucket, keys)
+    except Exception as exc:  # noqa: BLE001 — enrichment must not fail the scrape
+        log.warning(
+            "Could not read stored pod costs for %s (%s); carrying nothing", report_date, exc
+        )
+        return {}
+    if skipped:
+        log.warning(
+            "%d stored pod-cost object(s) for %s were unreadable; their pods carry nothing",
+            skipped,
+            report_date,
+        )
+    carried = carried_from_records(records)
+    log.info(
+        "Stored records for %s prove the instance of %d of %d pod(s)",
+        report_date,
+        len(carried),
+        len(records),
+    )
+    return carried
+
+
 def _guard_partial_read(
     bucket: str,
     region: str | None,
@@ -530,6 +872,38 @@ def _guard_partial_read(
         )
 
 
+def route_workflows(
+    workflow_names: set[str], bucket: str, pairs: dict[str, dict[str, str]] | None
+) -> dict[str, set[str]]:
+    """{metrics bucket: workflows} — production to `bucket`, audit runs to their pair's.
+
+    An audit workflow whose pair is not configured is DROPPED with an error,
+    never written to production (openspec add-reprocess-audit, audit-isolation):
+    QC and cost keys carry no batch identity, so an audit row in the production
+    store could not be told apart afterwards.
+    """
+    routed: dict[str, set[str]] = {}
+    dropped: list[str] = []
+    for wf in workflow_names:
+        target = audit_pairs.metrics_bucket_for(wf, bucket, pairs or {})
+        if target is None:
+            dropped.append(wf)
+        else:
+            routed.setdefault(target, set()).add(wf)
+    if dropped:
+        log.error(
+            "%d audit workflow(s) have no configured bucket pair (Prefect Variable %s) and were "
+            "NOT recorded anywhere: %s",
+            len(dropped),
+            audit_pairs.PAIRS_VARIABLE,
+            ", ".join(sorted(dropped)[:10]),
+        )
+    for target, names in sorted(routed.items()):
+        if target != bucket:
+            log.info("Routing %d audit workflow(s) to %s", len(names), target)
+    return routed
+
+
 def scrape_and_upload(
     bucket: str,
     region: str | None = None,
@@ -538,6 +912,7 @@ def scrape_and_upload(
     report_date: date | None = None,
     verify_ssl: bool = True,
     partial_read_fraction: float = PARTIAL_READ_FRACTION,
+    pairs: dict[str, dict[str, str]] | None = None,
 ) -> int:
     """Fetch allocations for report_date (default: yesterday) and write to S3.
 
@@ -545,6 +920,10 @@ def scrape_and_upload(
     written nothing, when the response is too small to be a credible rewrite of
     what is already stored for the date (see _guard_partial_read; pass
     partial_read_fraction=0 to disable).
+
+    `pairs` is the reprocess audit's parsed bucket pairs (audit_pairs.parse_pairs):
+    each workflow is written to the metrics bucket route_workflows gives it, and
+    the partial-read guard runs per bucket, all of them before any write.
     """
     scrape_date, report_date, window = _resolve_window(report_date)
 
@@ -555,16 +934,31 @@ def scrape_and_upload(
     )
     log.info("Found %d subject allocation(s)", len(records))
 
-    _guard_partial_read(
-        bucket, region, report_date, "metrics/costs/", len(records), partial_read_fraction
-    )
+    routed = route_workflows({r.workflow_name for r in records}, bucket, pairs)
+    # Production is always guarded, even with none of its workflows in the
+    # response: an empty read is exactly the partial-read signature.
+    for target in {bucket} | set(routed):
+        _guard_partial_read(
+            target,
+            region,
+            report_date,
+            "metrics/costs/",
+            len(routed.get(target, ())),
+            partial_read_fraction,
+        )
 
+    target_of = {wf: target for target, names in routed.items() for wf in names}
+    written = 0
     for rec in records:
+        dest = target_of.get(rec.workflow_name)
+        if dest is None:  # an unconfigured audit workflow, dropped above
+            continue
         key = CostAllocation.s3_key(rec.date, rec.workflow_name)
-        emit_to_s3(rec.to_dict(), bucket=bucket, key=key, region=region)
-        log.debug("Wrote %s", key)
+        emit_to_s3(rec.to_dict(), bucket=dest, key=key, region=region)
+        written += 1
+        log.debug("Wrote s3://%s/%s", dest, key)
 
-    return len(records)
+    return written
 
 
 def scrape_pod_costs_and_upload(
@@ -575,6 +969,7 @@ def scrape_pod_costs_and_upload(
     report_date: date | None = None,
     verify_ssl: bool = True,
     partial_read_fraction: float = PARTIAL_READ_FRACTION,
+    pairs: dict[str, dict[str, str]] | None = None,
 ) -> int:
     """Fetch pod-grain allocations for report_date and write them to S3.
 
@@ -585,6 +980,10 @@ def scrape_pod_costs_and_upload(
 
     Returns the number of pod records written (not the number of S3 keys —
     each key holds one workflow's pods as JSONL).
+
+    `pairs` routes audit workflows as in scrape_and_upload. The carry-forward
+    source is read from every bucket written to, so an audit pod's day+1
+    identity is found where its day+1 record was written.
     """
     scrape_date, report_date, window = _resolve_window(report_date)
 
@@ -597,15 +996,23 @@ def scrape_pod_costs_and_upload(
     # flow: the counterfactual columns are an enrichment. A failing Assets call
     # or a missing pricing:GetProducts grant must cost us three NULL columns,
     # not the pod-cost table for that night.
-    node_rates: dict[str, NodeRate] = {}
+    node_rates: NodeIndex = {}
     try:
         node_rates = parse_node_assets(
             fetch_node_assets(base_url=base_url, window=window, verify_ssl=verify_ssl),
             region=region,
         )
-        log.info("Resolved rates for %d node(s)", len(node_rates))
+        log.info(
+            "Resolved rates for %d instance(s) under %d hostname(s)",
+            sum(len(v) for v in node_rates.values()),
+            len(node_rates),
+        )
     except Exception as exc:  # noqa: BLE001 — enrichment must not fail the scrape
         log.warning("Node asset pass failed (%s); rate columns will be NULL", exc)
+
+    carried: CarriedIndex = {}
+    for source in [bucket] + sorted(audit_pairs.audit_metrics_buckets(pairs or {})):
+        carried.update(load_carried_nodes(source, report_date, region=region))
 
     records = parse_pod_allocations(
         api_resp,
@@ -613,16 +1020,26 @@ def scrape_pod_costs_and_upload(
         pipeline=pipeline,
         scrape_date=scrape_date,
         node_rates=node_rates,
+        carried=carried,
     )
 
-    grouped = _group_by_workflow(records)
-    log.info("Found %d pod allocation(s) across %d workflow(s)", len(records), len(grouped))
+    all_grouped = _group_by_workflow(records)
+    routed = route_workflows(set(all_grouped), bucket, pairs)
+    log.info("Found %d pod allocation(s) across %d workflow(s)", len(records), len(all_grouped))
 
     # Guarded on workflow count, not pod count, so the threshold means the same
-    # thing here as in the workflow pass.
-    _guard_partial_read(
-        bucket, region, report_date, "metrics/pod-costs/", len(grouped), partial_read_fraction
-    )
+    # thing here as in the workflow pass. Every bucket before any write, and
+    # production always (an empty read is the partial-read signature).
+    for target in {bucket} | set(routed):
+        _guard_partial_read(
+            target,
+            region,
+            report_date,
+            "metrics/pod-costs/",
+            len(routed.get(target, ())),
+            partial_read_fraction,
+        )
+    grouped = {wf: all_grouped[wf] for wf in routed.get(bucket, ())}
 
     # Cross-grain check. Both passes query the identical window (_resolve_window),
     # so they must see the same workflows; a large disagreement means one of the
@@ -667,12 +1084,16 @@ def scrape_pod_costs_and_upload(
             len(records),
         )
 
-    for workflow_name, pods in grouped.items():
-        key = PodCost.s3_key(report_date.isoformat(), workflow_name)
-        emit_jsonl_to_s3([p.to_dict() for p in pods], bucket=bucket, key=key, region=region)
-        log.debug("Wrote %s (%d pods)", key, len(pods))
+    written = 0
+    for target, names in routed.items():
+        for workflow_name in sorted(names):
+            pods = all_grouped[workflow_name]
+            key = PodCost.s3_key(report_date.isoformat(), workflow_name)
+            emit_jsonl_to_s3([p.to_dict() for p in pods], bucket=target, key=key, region=region)
+            written += len(pods)
+            log.debug("Wrote s3://%s/%s (%d pods)", target, key, len(pods))
 
-    return len(records)
+    return written
 
 
 def main() -> None:

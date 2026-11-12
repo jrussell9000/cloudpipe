@@ -104,6 +104,12 @@ variable "ingress_contact" {
   default     = ""
 }
 
+variable "newmsm_image" {
+  description = "The newMSM image, by digest, for the newmsm step (cloudpipe-config `newmsm_image`). Empty leaves the key unset."
+  type        = string
+  default     = ""
+}
+
 ################################################################################
 # Argo Workflows — service account names
 ################################################################################
@@ -218,4 +224,16 @@ variable "tags" {
   description = "Map of tags to apply to all taggable resources."
   type        = map(string)
   default     = {}
+}
+
+variable "audit_data_buckets" {
+  description = "Reprocess-audit data buckets the controller and runner may use like `bucket` (stack/audit_buckets.tf). Empty unless the audit is enabled."
+  type        = list(string)
+  default     = []
+}
+
+variable "audit_metrics_buckets" {
+  description = "Reprocess-audit metrics buckets the controller and runner may use like `metrics_bucket` (no DeleteObject). Empty unless the audit is enabled."
+  type        = list(string)
+  default     = []
 }

@@ -19,3 +19,7 @@ COPY src/inventory.py /app/
 # outcome_recorder.py imports its failure taxonomy from here (#646) — the same
 # module the in-pod drivers record with, so there is one taxonomy.
 COPY images/shared/step_outcome.py /app/
+# The one-off dvars-backfill (dvars-backfill WorkflowTemplate): adds dvars_mean1000
+# to published confounds TSVs with the module preproc.py writes it with, so a
+# backfilled TSV and a freshly written one carry the same bytes.
+COPY images/shared/confounds_dvars.py src/dvars_backfill.py /app/

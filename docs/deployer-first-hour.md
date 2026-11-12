@@ -261,10 +261,10 @@ pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/seed
 pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/seed_reference_files.py --bucket <data bucket>
 ```
 
-Build `nss_volumes.csv` from the ABCD release your data use agreement gives you: the `mr_y_adm__info` table and its data dictionary (`mr_y_adm__info.tsv` and `.json`). The number of non-steady-state frames depends on the scanner, which the images don't record: GE DV25 → 5, GE DV26 and later → 16, Philips and Siemens → 8. A session that matches no rule stops the script; it never guesses. The reference deployment's own table is keyed by subject ID and is never published.
+Build `nss_volumes.csv` from the ABCD release your data use agreement gives you: the `mr_y_adm__info` table and its data dictionary (`mr_y_adm__info.tsv` and `.json`), and `mr_y_qc__raw__tfmri__nback.tsv`. The number of non-steady-state frames depends on the scanner, which the images don't record: GE DV25 → 5, GE DV26 and later → 16, Philips and Siemens → 8. Because the recorded software version is occasionally wrong, a GE session's n-back run length overrides it: 367 frames → 5, 378 → 16. The pipeline then checks every GE run's own length as it processes it (`images/shared/nss.py`), because a few sessions scanned rest and n-back on software that drops different numbers of frames. So a GE row only has to say 5 or 16; each run gets the count its length implies. A session that matches no rule stops the script; it never guesses. The reference deployment's own table is keyed by subject ID and is never published.
 
 ```bash
-pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/make_nss_volumes.py --mr-info /path/to/mr_y_adm__info --out nss_volumes.csv
+pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/make_nss_volumes.py --mr-info /path/to/mr_y_adm__info --mr-qc-nback /path/to/mr_y_qc__raw__tfmri__nback.tsv --out nss_volumes.csv
 aws s3 cp nss_volumes.csv s3://<data bucket>/config/nss_volumes.csv
 ```
 
@@ -580,6 +580,10 @@ Run it from a shell set up the way the install's was:
 - with WARP connected to this deployment's Zero Trust team, because after the install's last phase the cluster can be reached only through WARP. Check with `kubectl get nodes`.
 
 It checks the last one before asking you to type `destroy`, and stops with nothing destroyed if the cluster cannot be reached. Without that, the teardown would leave the web dashboards' load balancer behind and then fail partway through.
+
+Before it removes the cluster's add-ons, it scales the workloads that hold disks (Prometheus, Grafana, Kubecost) to zero. It then deletes their volume claims and waits up to ten minutes for each EBS volume to go. A volume that will not go stops the teardown with its ID, and running the script again carries on from there. Earlier versions skipped this step and left every disk behind, still billed.
+
+It also names, at the end, any **image-cache repositories** in this account's ECR. ECR creates those itself on each image's first pull, so Terraform never managed them and the teardown cannot delete them. They hold only copies of published images. The teardown prints one `aws ecr delete-repository` command for each.
 
 That is deliberate in three independent ways, because deleting a cohort by accident is not a recoverable mistake: those buckets live in a Terraform state the teardown never touches, each carries `prevent_destroy`, and none sets `force_destroy` — so S3 refuses to delete a non-empty one even if the other two safeguards were gone.
 

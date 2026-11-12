@@ -1,0 +1,160 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: audit-compare
+  namespace: argo-workflows
+
+###########################################################################
+# The reprocess audit's comparison, in-cluster (openspec/changes/add-reprocess-audit,
+# task 3.6). Each shard runs `python -m audit.compare` over every shards-th subject
+# of the sample and writes one rows object per subject:
+#
+#   s3://{out-bucket}/audit/compare/{label}/{subject}.jsonl
+#
+# Root A is read from a-bucket, root B from b-bucket: production vs the primary
+# audit pair for fresh-vs-stored, or the two audit data buckets for the noise
+# floor. READ-ONLY on both; the only write is the rows object, and out-bucket is
+# an AUDIT metrics bucket (never production's: outside metrics/, so no Glue table
+# reads it, but it is still not production's to hold). From a workstation a
+# session took ~30 min; next to S3 the shard count is the concurrency.
+#
+# Idempotent per subject: a subject whose rows object exists is skipped, so a
+# retried pod or a resubmit with the same label resumes rather than redoes.
+###########################################################################
+
+spec:
+  # Runaway backstop, not the working cap: the shard count is the concurrency.
+  parallelism: 200
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  arguments:
+    parameters:
+      - name: label
+      - name: shards
+      - name: subjects
+        description: "s3:// URI of the sample (sample.jsonl) or a subject_id CSV"
+      - name: a-bucket
+      - name: b-bucket
+      # Key prefixes before `derivatives/` in each bucket. Empty for every real
+      # comparison. Set only for a fixture: a copy kept under its own prefix,
+      # where no pipeline step reads, such as task 4.1's one-voxel positive control.
+      - name: a-prefix
+        value: ""
+      - name: b-prefix
+        value: ""
+      - name: out-bucket
+        description: "an audit metrics bucket; never production's"
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  entrypoint: compare
+
+  templates:
+  - name: compare
+    steps:
+    - - name: shard
+        template: compare-shard
+        withSequence:
+          count: "{{workflow.parameters.shards}}"
+        arguments:
+          parameters:
+            - name: shard
+              value: "{{item}}"
+
+  - name: compare-shard
+    metadata:
+      labels:
+        cloudpipe.io/phase: audit
+        cloudpipe.io/step: audit-compare
+    inputs:
+      parameters:
+        - name: shard
+    # The canonical expression (tests/argo/test_retry_expression.py): spot
+    # reclaims, pod deletion, executor and S3-error exits. A comparison that fails
+    # on a file is a row in that subject's object, not a pod failure.
+    retryStrategy:
+      limit: "6"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+    container:
+      # Re-pinned to the digest of every audit build by build-images.yaml. First
+      # pinned by hand to the first build (sha-8a81fb99, #1088).
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/audit@sha256:1e7d218f9a6f3c430b57ee250ea51cf0bfcdd8aa278739ac39835ad51d8599d8"
+      imagePullPolicy: IfNotPresent
+      command: [/entrypoint.sh, python, -u, -m, audit.compare]
+      args:
+        - --a-bucket
+        - "{{workflow.parameters.a-bucket}}"
+        - --a-prefix
+        - "{{workflow.parameters.a-prefix}}"
+        - --b-bucket
+        - "{{workflow.parameters.b-bucket}}"
+        - --b-prefix
+        - "{{workflow.parameters.b-prefix}}"
+        - --subjects
+        - "{{workflow.parameters.subjects}}"
+        - --template-mask
+        - /app/tpl-MNI152NLin2009cAsym_res-02_desc-brain_mask.nii.gz
+        - --shard
+        - "{{inputs.parameters.shard}}"
+        - --shards
+        - "{{workflow.parameters.shards}}"
+        - --out-prefix
+        - "s3://{{workflow.parameters.out-bucket}}/audit/compare/{{workflow.parameters.label}}/"
+        - --region
+        - "{{workflow.parameters.region}}"
+      env:
+        - name: TMPDIR
+          value: /scratch
+        - name: OMP_NUM_THREADS
+          value: "2"
+        - name: OPENBLAS_NUM_THREADS
+          value: "2"
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+      resources:
+        # Measured 2026-11-08 on one 6-run session self-compared: 5.1 GB peak (a
+        # 2 mm MNI BOLD run is ~1.6 GB as float32, held for both roots during
+        # tier-1, whose tSNR adds full-size temporaries). On the noise floor
+        # (2026-11-10), 13 of 55 pods were OOM-killed at the 8G limit, so the
+        # request is 10G and the limit 16G. Scratch was the other failure: it held
+        # a whole subject's downloads (30 pods evicted at 16G, no 4-session
+        # subject finished). compare.py now keeps one session's anatomy and one
+        # run at a time (_drop_run), so 12G covers it.
+        requests:
+          cpu: "2"
+          memory: 10G
+          ephemeral-storage: 12G
+        limits:
+          memory: 16G
+          ephemeral-storage: 16G
+    volumes:
+      - name: scratch
+        emptyDir: {}

@@ -714,7 +714,9 @@ def _check_config_objects(
     if identity is None:
         return _no_credentials(CHECK_CONFIG_OBJECTS, title)
 
-    required = config_objects.required_keys(repo)
+    # Optional keys (an opt-in route's, like config/newmsm) are left out: a bucket
+    # without them runs every default workflow.
+    required = config_objects.mandatory_keys(repo)
     if not required:
         return _skipped(
             CHECK_CONFIG_OBJECTS,

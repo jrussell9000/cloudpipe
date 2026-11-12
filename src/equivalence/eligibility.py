@@ -35,6 +35,7 @@ COMPLETE_MARKER = "_complete.json"
 
 #: Exclusion reasons. `missing_in_arm_<arm>` is formatted per arm (spec).
 ANATOMY_UNAVAILABLE = "anatomy_unavailable"
+CLOUDPIPE_OUTPUT_SUPERSEDED = "cloudpipe_output_superseded"
 FRAME_COUNT_MISMATCH = "frame_count_mismatch"
 NOT_ATTEMPTED = "not_attempted"
 
@@ -70,20 +71,48 @@ class Exclusion:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class SessionExclusion:
+    """A whole session kept out of the frame before any run was a candidate."""
+
+    subject: str
+    session: str
+    reason: str
+    detail: str = ""
+
+
 @dataclass
 class Census:
     """Counts per exclusion reason and the surviving count.
 
     Published with the results and cited in the write-up (spec). `eligible` is
     the surviving population, not a sample — sampling happens after this.
+    `population` is the number of sessions the frame was drawn over (ABCD's
+    manifest, D21); `session_exclusions` are those with no run to evaluate.
     """
 
     eligible: list[RunKey] = field(default_factory=list)
     exclusions: list[Exclusion] = field(default_factory=list)
+    session_exclusions: list[SessionExclusion] = field(default_factory=list)
+    population: int = 0
+
+    def exclude_session(self, subject: str, session: str, reason: str, detail: str = "") -> None:
+        self.session_exclusions.append(SessionExclusion(subject, session, reason, detail))
 
     @property
     def counts(self) -> dict[str, int]:
         return dict(sorted(Counter(e.reason for e in self.exclusions).items()))
+
+    @property
+    def session_counts(self) -> dict[str, int]:
+        return dict(sorted(Counter(e.reason for e in self.session_exclusions).items()))
+
+    @property
+    def session_details(self) -> dict[str, dict[str, int]]:
+        out: dict[str, Counter] = {}
+        for e in self.session_exclusions:
+            out.setdefault(e.reason, Counter())[e.detail] += 1
+        return {r: dict(sorted(c.items())) for r, c in sorted(out.items())}
 
     @property
     def candidates(self) -> int:
@@ -91,6 +120,10 @@ class Census:
 
     def to_dict(self) -> dict:
         return {
+            "population_sessions": self.population,
+            "sessions_excluded_whole": len(self.session_exclusions),
+            "session_counts_by_reason": self.session_counts,
+            "session_details_by_reason": self.session_details,
             "candidates": self.candidates,
             "eligible": len(self.eligible),
             "excluded": len(self.exclusions),
@@ -99,6 +132,12 @@ class Census:
             "exclusions": [
                 {"run": e.key.prefix, "reason": e.reason, "detail": e.detail}
                 for e in sorted(self.exclusions, key=lambda e: (e.reason, e.key))
+            ],
+            "excluded_sessions": [
+                {"session": f"{e.subject}_{e.session}", "reason": e.reason, "detail": e.detail}
+                for e in sorted(
+                    self.session_exclusions, key=lambda e: (e.reason, e.subject, e.session)
+                )
             ],
         }
 
@@ -109,7 +148,14 @@ class Census:
 
     def render(self) -> str:
         """The census as the write-up quotes it: one line per reason, then totals."""
-        lines = [f"candidates at (subject, session, task, run) grain: {self.candidates}"]
+        lines = []
+        if self.population:
+            lines.append(f"population: {self.population} sessions")
+            for reason, details in self.session_details.items():
+                lines.append(f"  excluded whole, {reason}: {sum(details.values())}")
+                for detail, count in details.items():
+                    lines.append(f"    {detail}: {count}")
+        lines.append(f"candidates at (subject, session, task, run) grain: {self.candidates}")
         for reason, count in self.counts.items():
             lines.append(f"  excluded, {reason}: {count}")
         lines.append(f"eligible: {len(self.eligible)}")
@@ -133,14 +179,19 @@ def _listed(s3, bucket: str, object_key: str) -> bool:
     return any(obj["Key"] == object_key for obj in response.get("Contents", []))
 
 
-def cloudpipe_output_exists(s3, bucket: str, key: RunKey) -> bool:
-    """Is cloudpipe's volumetric derivative present for this run?
+#: `cloudpipe_output` results.
+CURRENT, SUPERSEDED, ABSENT = "current", "superseded", "absent"
 
-    The same test `inventory.py` gates func-preproc on: the session's
-    `_complete.json` lists the run (ADR 017; the driver writes the marker after
-    every file it names), or, for a session not yet republished in the exploded
-    layout, the run's legacy tarball exists — a single PUT, so its key alone is
-    a whole run.
+
+def cloudpipe_output(s3, bucket: str, key: RunKey) -> str:
+    """Is cloudpipe's volumetric derivative present for this run, and is it current?
+
+    `CURRENT` when the session's `_complete.json` lists the run (ADR 017; the
+    driver writes the marker after every file it names). `SUPERSEDED` when only
+    the run's legacy tarball exists: `inventory.py` still counts that as done, but
+    it predates the func reprocess (plan 017), and its MNI BOLD holds float16 bit
+    patterns on transposed axes (#629, #630) — not a cloudpipe arm worth
+    comparing. `ABSENT` otherwise.
     """
     session_prefix = f"derivatives/func/{key.subject}/{key.session}/"
     marker_key = session_prefix + COMPLETE_MARKER
@@ -149,10 +200,10 @@ def cloudpipe_output_exists(s3, bucket: str, key: RunKey) -> bool:
         if marker.get("kind") == "func-session" and (
             f"{key.task}_{key.run}" in (marker.get("runs") or {})
         ):
-            return True
-    return _listed(
-        s3, bucket, f"{session_prefix}{key.prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"
-    )
+            return CURRENT
+    if _listed(s3, bucket, f"{session_prefix}{key.prefix}_space-MNI152NLin2009cAsym_bold.tar.gz"):
+        return SUPERSEDED
+    return ABSENT
 
 
 def sampling_frame(s3, bucket: str, candidates: list[RunKey]) -> Census:
@@ -179,7 +230,18 @@ def sampling_frame(s3, bucket: str, candidates: list[RunKey]) -> Census:
             )
             continue
 
-        if not cloudpipe_output_exists(s3, bucket, key):
+        output = cloudpipe_output(s3, bucket, key)
+        if output == SUPERSEDED:
+            census.exclusions.append(
+                Exclusion(
+                    key,
+                    CLOUDPIPE_OUTPUT_SUPERSEDED,
+                    "legacy tarball only; predates the func reprocess, so not yet a "
+                    "current cloudpipe output",
+                )
+            )
+            continue
+        if output == ABSENT:
             census.exclusions.append(
                 Exclusion(key, missing_in_arm("cloudpipe"), "no derivatives/func/ output")
             )

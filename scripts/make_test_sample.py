@@ -5,8 +5,13 @@ Why stratified rather than random: cost and wall-clock scale near-linearly in a
 subject's session count k ($0.096 at k=1 to $0.305 at k=4, issue #133), and k is
 also what drives per-workflow footprint on cpu-light-nodepool (2 + 2k cpu,
 5G + 4G*k memory). A random draw's k-mix drifts from the corpus, so extrapolating
-its cost and duration to the full 11,628 is unreliable. Matching the corpus
+its cost and duration to the full cohort is unreliable. Matching the corpus
 proportions makes the batch's mean directly scalable.
+
+The pool is every subject in nss_volumes.csv, the pipeline's own record of the ABCD
+7.0 sessions (11,830 subjects). It used to be narrowed to first-level-subjects.csv,
+ABCC fMRIPrep's subject coverage, which left out 209 subjects for reasons of ABCC's
+own; that list is gone.
 
 Prior test subjects are re-usable, but ONLY after a flush. Once a subject has been
 processed its FastSurfer derivatives exist under `derivatives/fastsurfer/{subj}/`,
@@ -49,7 +54,6 @@ sys.path.insert(0, str(REPO / "src"))
 from metrics import deployment_env  # noqa: E402
 
 NSS = REPO / "tools/nss_volumes.csv"
-ELIGIBLE = REPO / "tools/first-level-subjects.csv"
 # The previous batch, carried into the new draw by default so the two runs differ
 # only in concurrency. Requires a flush before submitting.
 SEED_DEFAULT = "tools/cloudpipe_test_sample_300_fresh.csv"
@@ -226,8 +230,7 @@ def main() -> int:
     if args.exclude_derivatives and not args.bucket:
         args.bucket = deployment_env.required("CLOUDPIPE_BUCKET", "the data bucket")
 
-    k_by_subject = sessions_by_subject()
-    eligible = _read_ids(ELIGIBLE)
+    k_by_subject = sessions_by_subject()  # also the pool: every subject with sessions
 
     excluded, seeded = _resolve_prior(args, k_by_subject)
     if len(seeded) > args.n:
@@ -237,7 +240,7 @@ def main() -> int:
         )
         return 1
 
-    pool = {s: k for s, k in k_by_subject.items() if s in eligible and s not in excluded}
+    pool = {s: k for s, k in k_by_subject.items() if s not in excluded}
     if len(pool) < args.n:
         print(f"error: pool has {len(pool)} subjects, need {args.n}", file=sys.stderr)
         return 1

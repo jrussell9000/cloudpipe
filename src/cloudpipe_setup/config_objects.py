@@ -21,6 +21,10 @@ Each key has exactly one provider, because each kind has a different owner:
 * `nss_volumes.csv` is derived from the deployer's own ABCD scanner table by
   `scripts/make_nss_volumes.py`. This deployment's copy is keyed by subject ID and
   is never published.
+* `newmsm/` is smriprep's MSM config and atlases, staged only by the opt-in newMSM
+  surface route (openspec add-newmsm-surface-registration). Public reference data,
+  seeded by the same script, but OPTIONAL: a bucket without it runs every default
+  workflow, so its absence is not an install failure.
 """
 
 from __future__ import annotations
@@ -47,6 +51,9 @@ class Provider:
 
     name: str
     remedy: str
+    # Staged only by an opt-in route, never by a default workflow: preflight does
+    # not fail an install that lacks it.
+    optional: bool = False
 
 
 LICENSE = Provider(
@@ -79,10 +86,24 @@ REFERENCE = Provider(
 )
 NSS = Provider(
     "your NSS table",
-    f"Run `{_script('make_nss_volumes.py')} --mr-info <path>/mr_y_adm__info` on the "
-    "ABCD table from your own data access, then upload the result to config/nss_volumes.csv. "
+    f"Run `{_script('make_nss_volumes.py')} --mr-info <path>/mr_y_adm__info "
+    "--mr-qc-nback <path>/mr_y_qc__raw__tfmri__nback.tsv` on the "
+    "ABCD tables from your own data access, then upload the result to config/nss_volumes.csv. "
     "This deployment's table is keyed by subject ID and is never published.",
 )
+
+NEWMSM = Provider(
+    "the opt-in newMSM route's reference files",
+    "Needed only with `surface-registration=newmsm`. "
+    f"Run `{_script('seed_reference_files.py')} --bucket <your data bucket>`, which seeds "
+    "config/newmsm/ (smriprep 0.19.2's MSM config and the HCPpipelines atlases it "
+    "registers against, each checked against a pinned checksum) with the other "
+    "reference files.",
+    optional=True,
+)
+
+# The providers scripts/seed_reference_files.py writes.
+SEEDED_PROVIDERS = (REFERENCE, NEWMSM)
 
 PROVIDERS: dict[str, Provider] = {
     "config/fslicense": LICENSE,
@@ -90,6 +111,7 @@ PROVIDERS: dict[str, Provider] = {
     "config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii": REFERENCE,
     "config/fsLR": REFERENCE,
     "config/nss_volumes.csv": NSS,
+    "config/newmsm": NEWMSM,
 }
 
 
@@ -105,15 +127,43 @@ def required_keys(repo: Path) -> dict[str, list[str]]:
             found[key].append(rel)
 
     for top in TEMPLATE_ROOTS:
-        for path in sorted((repo / top).rglob("*.yaml")):
+        for path in _tracked(repo, top, "*.yaml"):
             for key in _ARTIFACT_KEY.findall(path.read_text(encoding="utf-8")):
                 add(key, path)
     for top in CODE_ROOTS:
-        for path in sorted((repo / top).rglob("*.py")):
+        for path in _tracked(repo, top, "*.py"):
             for key in _CODE_KEY.findall(path.read_text(encoding="utf-8")):
                 add(key, path)
     return dict(sorted(found.items()))
 
 
+def _tracked(repo: Path, top: str, pattern: str) -> list[Path]:
+    """Files under `top` matching `pattern`, outside any hidden directory.
+
+    A hidden directory is never ours: an image's local pixi environment
+    (`images/afni/.pixi/`) holds a whole site-packages, one of whose test files
+    is deliberately not UTF-8, so reading it failed every caller.
+    """
+    root = repo / top
+    return sorted(
+        p
+        for p in root.rglob(pattern)
+        if not any(part.startswith(".") for part in p.relative_to(root).parts[:-1])
+    )
+
+
 def provider(key: str) -> Provider | None:
     return PROVIDERS.get(key.rstrip("/"))
+
+
+def mandatory_keys(repo: Path) -> dict[str, list[str]]:
+    """required_keys without the optional ones: what every default workflow stages.
+
+    A key with no provider stays in: an unknown source is a gap to report, not a
+    reason to stop checking.
+    """
+    return {
+        key: files
+        for key, files in required_keys(repo).items()
+        if not (p := provider(key)) or not p.optional
+    }

@@ -17,8 +17,8 @@
 #     routes the private subnets, and the Access application gates who);
 #   - in-cluster callers — Argo Workflows, Prefect and Grafana reaching Dex at
 #     argocd.<domain> — are pods on VPC-CIDR IPs (no custom pod networking).
-# The Client VPN also source-NATs into the VPC CIDR, which keeps it a working
-# fallback until it is decommissioned.
+# (The Client VPN source-NATed into the VPC CIDR too, until its removal on
+# 2026-11-06.)
 #
 # No campus prefix list and no NAT EIP rules, unlike the five per-app ALB SGs
 # this replaced: nothing reaches a private address over the internet or hairpins
@@ -74,7 +74,7 @@
 # ECDHE-{ECDSA,RSA}-AES{128,256}-SHA{256,384} — leaving AEAD-only (GCM and
 # ChaCha20-Poly1305). So "restricted" here means AEAD-only, NOT "adds forward
 # secrecy". Every client on this internal ALB (cloudflared, in-cluster Go/Python
-# pods reaching Dex, browsers over the Client VPN) negotiates AEAD by preference;
+# pods reaching Dex) negotiates AEAD by preference;
 # CBC is the fallback for stacks a decade older than anything on this path.
 #
 # Published mode only. Without a domain there is no ALB and no member to carry
@@ -106,7 +106,7 @@ resource "aws_vpc_security_group_ingress_rule" "ui_alb_https" {
   count = local.publish_uis ? 1 : 0
 
   security_group_id = aws_security_group.ui_alb[0].id
-  description       = "HTTPS from the VPC (WARP via cloudflared, in-cluster Dex callers, Client VPN)"
+  description       = "HTTPS from the VPC (WARP via cloudflared, in-cluster Dex callers)"
   cidr_ipv4         = var.vpc_cidr
   from_port         = 443
   ip_protocol       = "tcp"

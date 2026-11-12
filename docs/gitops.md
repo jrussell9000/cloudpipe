@@ -425,4 +425,4 @@ kubectl patch application <name> -n argocd \
   --type=merge -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
 ```
 
-Use the ArgoCD UI at `https://argocd.<domain>` for a visual diff between live state and git (requires VPN + an SSO login).
+Use the ArgoCD UI at `https://argocd.<domain>` for a visual diff between live state and git (requires WARP + an SSO login).

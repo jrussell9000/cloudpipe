@@ -192,9 +192,8 @@ def cluster_error(detail: str) -> CliError:
 
     The private endpoint is reached over Cloudflare WARP, and a lapsed WARP
     session (24 hours) surfaces as a TLS handshake timeout rather than an
-    authorization error. Nothing here reasons about the AWS Client VPN: it is a
-    fallback pending removal (#359), and code that knows about it would have to
-    be unpicked when it goes.
+    authorization error. Nothing here reasons about the AWS Client VPN: it was
+    removed on 2026-11-06 (#359), and WARP is the only path.
     """
     lowered = detail.lower()
     handshake = "handshake timeout" in lowered or "tls handshake" in lowered

@@ -111,11 +111,53 @@ RESCUE_SEEDS = (42, 43, 44)
 RESCUE_ITK_THREADS = 1
 RESCUE_SAMPLING_PERCENTAGE = 0.1
 
+# THE TALAIRACH CROSS-CHECK (#1105). In ~3% of the cohort the moments-initialised
+# Mattes-MI affine lands ~1 cm off along the superior-inferior axis. SyN half-repairs
+# it with strong local compression and lncc ends at 0.66-0.75, which PASSES the 0.65
+# lncc bound, so the ladder above never runs and the deterministic NONE path lands in
+# the same basin on every rerun.
+#
+# FastSurfer already fits an independent affine to MNI305 (mri/transforms/
+# talairach.xfm.lta). Composing ours with it, T_tal o A (2009c RAS -> MNI305 RAS),
+# should give the same fixed template-to-template map in every session. Its cohort
+# median, over all 33,468 passing t1w_to_mni registrations on 2026-11-09, is below —
+# within 2.3 mm (mean over the template brain) of the inverse of FreeSurfer's
+# published MNI305->MNI152 matrix, which is for the 6th-generation template, not 2009c.
+# `affine_tal_dev_mm` is the mean displacement, over template-brain points, between a
+# session's composite and this map. Cohort: median 3.4 mm, 95th percentile 7.8; lncc
+# median 0.791 below 2 mm and 0.674 above 15 mm; 83% of the sessions under lncc 0.70
+# deviate by more than 10 mm. The gate bound lives in registration_qc's threshold table.
+#
+# A gate failure runs the SAME RANDOM ladder as an lncc failure. A talairach-STARTED
+# ticket (Mattes MI refined from FastSurfer's affine) was built and probed instead
+# (t1w-mni-talairach-validate-pr5zw, 58 sessions x 4 arms, 2026-11-09) and dropped: on
+# the displaced sessions it tied RANDOM seed 42 (median same-card lncc +0.001, n=22),
+# and on healthy controls it drifted ~11 mm from its own start and lost 0.21 lncc — a
+# behaviour nobody could explain, so it does not ship.
+MNI2009C_TO_MNI305 = np.array(
+    [
+        [0.98252, -0.00234, -0.00447, 0.45546],
+        [-0.00498, 0.96884, 0.01897, -1.67785],
+        [0.00522, 0.03190, 0.96612, 0.32816],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+)
+# Every 4th template voxel along each axis (~29.5k points in the 1 mm brain): an affine
+# displacement is linear, so a coarse lattice gives the mean to well under 0.01 mm.
+TAL_DEV_POINT_STRIDE = 4
+# Two grids agreeing to this many mm in every vox2ras entry are taken to be the same
+# grid. The talairach transform is fitted in its source volume's scanner RAS; if that
+# volume is not the T1w we register, the composite means nothing and the check is skipped.
+TAL_GEOMETRY_TOL = 1e-3
+
+# ITK stores physical points in LPS; FreeSurfer and nibabel use RAS. Flip x and y.
+_LPS = np.diag([-1.0, -1.0, 1.0])
+
 # RegistrationQC schema_version this script emits. A module constant rather than a
 # literal in main() so the tests can check it against the Glue partition enum —
 # a version missing from that enum is written to S3 and never returned by a query,
 # which is exactly what happened to schema 2.4.
-SCHEMA_VERSION = '2.7'
+SCHEMA_VERSION = '2.8'
 
 
 def parse_args():
@@ -132,6 +174,13 @@ def parse_args():
         help='Brain mask (NIfTI or MGZ, e.g. FastSurfer brainmask.mgz). '
         'Applied to T1w before registration; improves alignment by removing skull signal.',
     )
+    p.add_argument(
+        '--talairach',
+        default=None,
+        help="FastSurfer's mri/transforms/talairach.xfm.lta for this T1w. Enables the "
+        'talairach cross-check gate (#1105). Omitted, unstaged, unreadable, or fitted on '
+        'another grid: the check is skipped, never failed.',
+    )
     p.add_argument('--subj', default='', help='Subject ID written into RegistrationQC metrics JSON')
     p.add_argument(
         '--ses', default='', help='Session label written into RegistrationQC metrics JSON'
@@ -145,15 +194,13 @@ def parse_args():
     # Registration tuning. The affine stage is SimpleITK (self-tuning via
     # SetOptimizerScalesFromPhysicalShift), so only the SyN stage is exposed.
     # Defaults validated offline (10-subject 1mm sample): lr 0.25 + [100,100,100]
-    # give lncc ~0.80 with jac_det_frac_negative ~0.0004-0.0013 (diffeomorphic);
-    # higher lr / fewer smoothing folds the warp.
+    # give lncc ~0.80 and a diffeomorphic warp: on the corrected Jacobian (#1020)
+    # no production registration with these defaults folds a single brain voxel.
+    # Higher lr / less smoothing may fold it. (The 0.0004-0.0013 folding this
+    # comment used to quote was the pre-#1020 artefact, not real folding.)
     #
-    # The gate is jac_det_frac_negative > 0.005 (registration_qc.py). This comment
-    # used to cite 0.001 as the bound, which is the value the 2026-07-23
-    # recalibration REMOVED for sitting inside the healthy distribution — a normal
-    # registration tripped it ~17% of the time. Quoting it here made the fused_ops
-    # A/B (2026-08-05) look marginal when it was 2.6-3.8x over the real bound;
-    # registration_qc.py is the source of truth for every threshold.
+    # The folding gate fails on ANY folded brain voxel; registration_qc.py is the
+    # source of truth for every threshold, so no bound is quoted here.
     p.add_argument('--syn-scales', nargs='+', type=int, default=[4, 2, 1])
     p.add_argument('--syn-iterations', nargs='+', type=int, default=[100, 100, 100])
     p.add_argument(
@@ -191,6 +238,137 @@ def to_nifti(src: str, dest: str) -> None:
     # with sform_code=2 and qform_code=1 from the affine.
     nib.save(nib.Nifti1Image(np.asarray(img.dataobj, dtype=np.float32), img.affine), dest)
     log.info(f'Converted {src} → {dest}')
+
+
+def read_lta(path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Read a FreeSurfer LTA: ``(ras2ras, src_vox2ras)``, both 4x4.
+
+    Handles LINEAR_VOX_TO_VOX (type 0, what FastSurfer writes for talairach.xfm.lta)
+    by rebuilding RAS->RAS from the src/dst volume-info blocks, and LINEAR_RAS_TO_RAS
+    (type 1) as stored. Raises ValueError on anything else.
+    """
+    lines = Path(path).read_text().splitlines()
+    typ = next(int(x.split('=')[1].split()[0]) for x in lines if x.strip().startswith('type'))
+    i = next(n for n, x in enumerate(lines) if x.strip() == '1 4 4')
+    mat = np.array([[float(v) for v in lines[i + 1 + r].split()] for r in range(4)])
+    geo: dict = {}
+    cur = None
+    for x in lines:
+        s = x.strip()
+        if s.startswith('src volume info'):
+            cur = geo.setdefault('src', {})
+        elif s.startswith('dst volume info'):
+            cur = geo.setdefault('dst', {})
+        elif cur is not None and '=' in s:
+            key, val = (t.strip() for t in s.split('=', 1))
+            cur[key] = val.split('#')[0].strip()
+
+    def vox2ras(g: dict) -> np.ndarray:
+        # FreeSurfer convention: c_ras is the RAS of voxel dims/2.
+        dims = np.array([float(t) for t in g['volume'].split()[:3]])
+        size = np.array([float(t) for t in g['voxelsize'].split()[:3]])
+        cols = [np.array([float(t) for t in g[a].split()[:3]]) for a in ('xras', 'yras', 'zras')]
+        mdir = np.column_stack(cols) * size
+        out = np.eye(4)
+        out[:3, :3] = mdir
+        out[:3, 3] = np.array([float(t) for t in g['cras'].split()[:3]]) - mdir @ (dims / 2)
+        return out
+
+    src = vox2ras(geo['src'])
+    if typ == 0:
+        return vox2ras(geo['dst']) @ mat @ np.linalg.inv(src), src
+    if typ == 1:
+        return mat, src
+    raise ValueError(f'unsupported LTA type {typ} in {path}')
+
+
+def sitk_affine_to_ras(tf: 'sitk.AffineTransform') -> np.ndarray:
+    """An ITK affine (fixed->moving pullback, LPS) as a 4x4 fixed-RAS -> moving-RAS map."""
+    m = np.array(tf.GetMatrix()).reshape(3, 3)
+    c = np.array(tf.GetCenter())
+    offset = np.array(tf.GetTranslation()) + c - m @ c
+    out = np.eye(4)
+    out[:3, :3] = _LPS @ m @ _LPS
+    out[:3, 3] = _LPS @ offset
+    return out
+
+
+def template_brain_points(template_path: str, stride: int = TAL_DEV_POINT_STRIDE) -> np.ndarray:
+    """Homogeneous RAS coordinates (n, 4) of every ``stride``-th template-brain voxel."""
+    img = nib.load(template_path)
+    ijk = np.argwhere(np.asarray(img.dataobj)[::stride, ::stride, ::stride] > 0) * stride
+    return (img.affine @ np.c_[ijk, np.ones(len(ijk))].T).T
+
+
+def affine_tal_deviation_mm(a_ras: np.ndarray, tal_ras2ras: np.ndarray, pts: np.ndarray) -> float:
+    """Mean |T_tal(A(p)) - MNI2009C_TO_MNI305(p)| over template-brain points ``pts``.
+
+    ``a_ras`` is our affine (2009c RAS -> T1w RAS); ``tal_ras2ras`` is FastSurfer's
+    talairach transform (T1w RAS -> MNI305 RAS). Zero when the two affines agree up to
+    the fixed template-to-template map; see MNI2009C_TO_MNI305 for the calibration.
+    """
+    ours = (tal_ras2ras @ a_ras @ pts.T).T[:, :3]
+    ref = (MNI2009C_TO_MNI305 @ pts.T).T[:, :3]
+    return float(np.linalg.norm(ours - ref, axis=1).mean())
+
+
+def load_talairach(lta_path: 'str | None', t1w_vox2ras: np.ndarray) -> 'np.ndarray | None':
+    """The talairach RAS->RAS map when it is usable for this T1w, else None (check skipped).
+
+    Usable means the LTA exists, parses, and was fitted on the grid we register: its
+    source vox2ras matches the T1w's to TAL_GEOMETRY_TOL. Anything else is logged and
+    skipped rather than failed — a missing cross-check must never fail a registration.
+    """
+    if not lta_path:
+        return None
+    if not Path(lta_path).exists():
+        log.warning(f'talairach cross-check skipped: {lta_path} not staged')
+        return None
+    try:
+        ras2ras, src = read_lta(lta_path)
+    except (ValueError, KeyError, StopIteration, IndexError) as e:
+        log.warning(f'talairach cross-check skipped: cannot read {lta_path} ({e!r})')
+        return None
+    gap = float(np.abs(src - t1w_vox2ras).max())
+    if gap > TAL_GEOMETRY_TOL:
+        log.warning(
+            f'talairach cross-check skipped: the LTA source grid differs from the T1w '
+            f'(max vox2ras difference {gap:.4g})'
+        )
+        return None
+    return ras2ras
+
+
+class TalairachCheck:
+    """A usable talairach transform and the template-brain points the gate measures over."""
+
+    def __init__(self, ras2ras: np.ndarray, pts: np.ndarray):
+        self.ras2ras, self.pts = ras2ras, pts
+
+    @classmethod
+    def prepare(cls, lta_path, t1w_path, template_path) -> 'TalairachCheck | None':
+        """None when the check cannot run (see load_talairach); never raises for that."""
+        ras2ras = load_talairach(lta_path, nib.load(t1w_path).affine)
+        if ras2ras is None:
+            return None
+        pts = template_brain_points(template_path)
+        log.info(f'Talairach cross-check: on ({len(pts)} template-brain points)')
+        return cls(ras2ras, pts)
+
+    def deviation_mm(self, affine_tf: 'sitk.AffineTransform') -> float:
+        dev = affine_tal_deviation_mm(sitk_affine_to_ras(affine_tf), self.ras2ras, self.pts)
+        log.info(f'Affine vs talairach: {dev:.2f} mm mean over the template brain')
+        return dev
+
+    @staticmethod
+    def fields(tal: 'TalairachCheck | None', affine_tf) -> dict:
+        """The QC fields one attempt contributes: ``{'affine_tal_dev_mm': ...}`` or ``{}``.
+
+        EMPTY, not ``{'affine_tal_dev_mm': None}``, when the check cannot run:
+        verdict() FAILS a gated key that is present but None, so an unusable
+        talairach must leave the key out entirely.
+        """
+        return {} if tal is None else {'affine_tal_dev_mm': tal.deviation_mm(affine_tf)}
 
 
 def sitk_scale_affine(
@@ -334,7 +512,12 @@ def resolve_syn_loss(use_ffo: bool, env: dict) -> tuple[str, dict]:
     the spatial smoothing that keeps a deformation locally consistent, and dropping
     it is the measured cause of the 2026-08-05 A/B failure: `jac_det_frac_negative`
     0.0129-0.0191 against a 0.005 fail bound, i.e. 1.3-1.9% of brain voxels folded,
-    while `lncc` went UP by +0.078 (#163, #165). Defaulting it off makes
+    while `lncc` went UP by +0.078 (#163, #165). THAT VERDICT WAS AN ARTEFACT: those
+    folding figures came from the pre-#1020 Jacobian. Re-measured 2026-11-06 on the
+    corrected one (and on ANTs' own), neither fused gradient path folds a voxel; the
+    fused warps do deform far harder (10-100x more voxels beyond a 4.5x local volume
+    change) for ~8% of the step. See scripts/investigations/fused_ops_ab/README.md.
+    Defaulting it off makes
     'cc' -> 'fusedcc' a like-for-like swap of the GRADIENT as well as the metric —
     which is what the fused arm has to be before it can be considered for adoption.
 
@@ -425,6 +608,10 @@ def run_with_rescue(run_attempt, rescue_seeds) -> tuple[int, list]:
     ``seed=None`` and the process's own thread count — byte-for-byte the pre-rescue
     production path. Each RANDOM ticket gets the next seed from ``rescue_seeds``.
 
+    "Fails the gate" includes the schema-2.8 talairach cross-check (#1105): a NONE
+    affine displaced from FastSurfer's runs the same tickets an lncc failure does,
+    and each ticket must clear that bound too.
+
     Returns ``(chosen, attempts)``: ``attempts`` is ``[(sampling, seed, qc), ...]`` in
     the order run, and ``chosen`` is the index of the FIRST non-fail attempt.
 
@@ -448,10 +635,12 @@ def run_with_rescue(run_attempt, rescue_seeds) -> tuple[int, list]:
         if qc['verdict'] != 'fail':
             return i, attempts
         if i + 1 < len(plan):
+            dev = qc.get('affine_tal_dev_mm')
             log.warning(
                 f'Attempt {i} ({sampling}{"" if seed is None else f" seed={seed}"}) failed '
                 f'the QC gate (lncc={qc["lncc"]:.4f} '
-                f'jac_neg={qc["jac_det_frac_negative"]:.5f}); '
+                f'jac_neg={qc["jac_det_frac_negative"]:.5f}'
+                f'{"" if dev is None else f" affine_tal_dev={dev:.2f}mm"}); '
                 f'trying rescue ticket {i + 1} of {len(plan) - 1}'
             )
     return 0, attempts
@@ -477,10 +666,15 @@ def rescue_provenance(chosen: int, attempts: list, default_threads: int) -> dict
     ``rescue_ticket`` — a future change to RESCUE_SEEDS must not silently reinterpret
     historical rows. ``default_threads`` resolves the NONE attempt's unpinned count to
     the number actually in effect, so neither field is ever a JSON null.
+
+    Schema 2.8 (#1105): ``none_affine_tal_dev_mm`` is the NONE attempt's talairach
+    deviation — the third gated metric, beside ``none_lncc`` and
+    ``none_jac_det_frac_negative``. Emitted only when the check ran: absent, not null,
+    when no usable talairach transform was staged (the same no-null rule as above).
     """
     sampling, seed, _ = attempts[chosen]
     none_qc = attempts[0][2]
-    return {
+    rec = {
         'sampling_strategy': sampling,
         'rescue_ticket': chosen,
         'sampling_seed': NO_SAMPLING_SEED if seed is None else seed,
@@ -489,6 +683,9 @@ def rescue_provenance(chosen: int, attempts: list, default_threads: int) -> dict
         'none_lncc': none_qc['lncc'],
         'none_jac_det_frac_negative': none_qc['jac_det_frac_negative'],
     }
+    if 'affine_tal_dev_mm' in none_qc:
+        rec['none_affine_tal_dev_mm'] = none_qc['affine_tal_dev_mm']
+    return rec
 
 
 def main():
@@ -548,6 +745,10 @@ def main():
 
     template_sitk_in = sitk.Cast(sitk.ReadImage(args.template), sitk.sitkFloat32)
     moving_sitk_in = sitk.Cast(sitk.ReadImage(t1w_path), sitk.sitkFloat32)
+
+    # Talairach cross-check (#1105): None when not usable, which skips both the gate
+    # (the key is never emitted, and verdict() ignores absent keys) and the ticket.
+    tal = TalairachCheck.prepare(args.talairach, t1w_path, args.template)
 
     # ------------------------------------------------------------------
     # fused_ops sanity check — hoisted ABOVE the attempt loop. It does not depend on
@@ -703,6 +904,7 @@ def main():
         )
         sitk.WriteTransform(affine_tf, affine_path)
         log.info(f'Affine saved: {affine_path}')
+        tal_fields = TalairachCheck.fields(tal, affine_tf)
 
         # Pre-resample the masked moving brain onto the template grid so SyN sees a
         # well-overlapping, matched-resolution pair (this is what makes the SyN warp
@@ -736,7 +938,9 @@ def main():
         centroid_disp = centroid_displacement_mm(template_data, warped_data, affine_zyx, brain_mask)
 
         qc = {
-            # 2.7 adds the rescue provenance fields (see rescue_provenance). 2.1 added
+            # 2.8 adds the talairach cross-check (affine_tal_dev_mm, and
+            # none_affine_tal_dev_mm in the provenance; #1105). 2.7 added the rescue
+            # provenance fields (see rescue_provenance). 2.1 added
             # the log-Jacobian distribution (log_jac_*) AND restricted every Jacobian
             # statistic to brain voxels via the template mask, so jac_det_* is not
             # comparable across the 2.0/2.1 boundary: 2.0 values are whole-field and
@@ -763,6 +967,7 @@ def main():
         if args.brainmask is not None:
             warped_mask = sitk.GetArrayFromImage(sitk.ReadImage(warped_mask_path)) > 0.5
             qc['mask_dice'] = dice(brain_mask.astype(np.float32), warped_mask.astype(np.float32))
+        qc.update(tal_fields)
 
         qc['verdict'] = verdict(qc)
 

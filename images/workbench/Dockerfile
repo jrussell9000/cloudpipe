@@ -1,4 +1,4 @@
-FROM ghcr.io/prefix-dev/pixi:0.82.0 AS build
+FROM ghcr.io/prefix-dev/pixi:0.84.1 AS build
 
 # Same-release security upgrade (NIST SP 800-171 SI-2, finding N1) — same treatment,
 # and for the same reason, as images/afni/Dockerfile: the Ubuntu 24.04 pixi base ships
@@ -28,5 +28,12 @@ COPY images/workbench/cifti_assemble.py ./
 # The StepOutcome taxonomy and writer the surface-resample driver records with
 # (#646). Standard-library only.
 COPY images/shared/step_outcome.py ./
+
+# The newmsm step's prep and publish containers (openspec
+# add-newmsm-surface-registration, design D7): the registration itself runs in the
+# distroless cloudpipe/newmsm image, which has no Python. publish() writes the
+# exploded tree with `_complete.json` last (ADR 017).
+COPY images/workbench/newmsm_prep.py ./
+COPY images/shared/fs_derivatives.py images/shared/restore_links.py ./
 
 ENTRYPOINT ["/entrypoint.sh"]

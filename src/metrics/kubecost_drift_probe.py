@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
+import audit_pairs  # type: ignore[import-not-found]
 from kubecost_scraper import (  # type: ignore[import-not-found]
     ADJUSTMENT_FIELDS as _ADJ_FIELDS,
 )
@@ -99,7 +100,9 @@ def _probe_one(base_url: str, d: _date, verify_ssl: bool) -> dict[str, Any]:
     total = adj = 0.0
     n = 0
     for name, a in allocs.items():
-        if name == "__idle__" or not name.startswith("cloudpipe-"):
+        # Reprocess-audit runs share the "cloudpipe-" prefix but not production's
+        # cost store, so they are not part of the production drift series.
+        if name == "__idle__" or not name.startswith("cloudpipe-") or audit_pairs.is_audit(name):
             continue
         n += 1
         total += a.get("totalCost", 0) or 0

@@ -59,7 +59,6 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 |---|---|
 | `eks.tf` | EKS cluster, managed node groups, KMS keys, CloudWatch log group |
 | `vpc.tf` | VPC, subnets, NAT gateway, S3 VPC endpoint, VPC flow logs |
-| `vpn.tf` | AWS Client VPN endpoint, client certificates |
 | `addons.tf` | Pod Identity associations for EBS CSI, External DNS, CloudWatch agent |
 | `karpenter.tf` | Karpenter Helm release (via module) |
 | `storage.tf` | StorageClass (`ebs-sc`) |
@@ -101,7 +100,7 @@ This replaced a local-only backend (no remote state at all) after a 2026-07 inci
 
 | Resource | Value |
 |---|---|
-| Primary CIDR | `10.0.0.0/16` — the only CIDR in use. `var.secondary_cidr_blocks` is declared, and the VPN has routes/auth rules that iterate over it, but `vpc.tf` never associates it, so it is empty in practice. |
+| Primary CIDR | `10.0.0.0/16` — the only CIDR in use. `var.secondary_cidr_blocks` is declared, but `vpc.tf` never associates it, so it is empty in practice. |
 | Private subnets | Three AZs (`a`/`b`/`c` in the deployment region), `/20` each — EKS nodes. Upper 3/4 of each is a `prefix` CIDR reservation for pod prefix delegation, see [pod IP address space](#pod-ip-address-space) |
 | Public subnets | Three AZs, `/24` each — ALBs, Globus EC2 |
 | NAT gateway | Single (cost optimisation) — private subnets route through it |
@@ -136,7 +135,7 @@ while hundreds of addresses are free, because none of them form an aligned block
    #220, `aws_ec2_subnet_cidr_reservation.pod_prefixes` in `vpc.tf`), which stop
    AWS assigning single addresses out of the reserved range. Each private `/20` is
    split into a **lower `/22` left unreserved** for single addresses (node primary
-   ENIs, secondary-ENI primaries, VPC endpoint / RDS / Client VPN ENIs, the CNI's
+   ENIs, secondary-ENI primaries, VPC endpoint / RDS ENIs, the CNI's
    single-IP fallback) and the **remaining 3/4 reserved** for delegation — 3,072
    addresses = **192 `/28` slots per AZ**, against the 113 nodes the 300-concurrent
    batch peaked at in one AZ.
@@ -183,13 +182,11 @@ The EKS API (no public endpoint in steady state) and all five web UIs are **priv
 - **Session:** the WARP identity lasts 24h. When it lapses, `kubectl` shows a *TLS handshake timeout* → `warp-cli debug access-reauth`.
 - **Web UIs:** served by one internal ALB — see [DNS and TLS](#dns-and-tls).
 
-### Client VPN (fallback, pending decommission)
+### No Client VPN; break-glass is the public endpoint
 
-AWS Client VPN predates WARP and still works as a fallback: it source-NATs clients into the VPC CIDR, which the EKS API and the shared UI ALB's security groups trust. It is scheduled for removal after a soak with the VPN disconnected (#359, plan 012 §6).
+WARP is the only operator path. The AWS Client VPN that ran alongside it was removed on 2026-11-06 (#359, plan 012 §6): it had logged no connections since September and cost ~$216/mo for its three subnet associations. Its VPC-wide 443 rule on the cluster security group went with it; nodes and pods reach the API server through the node and ingress security groups, which the cluster SG admits by reference.
 
-- Client CIDR: `10.3.0.0/22`
-- **Full tunnel** (`var.split_tunnel` defaults to `false`). This was load-bearing while the web UIs had **public** ALBs: with split tunnel, traffic to their public IPs never entered the VPN, so it was never NAT'd into an address the ALB security groups trusted. With the UIs on an internal ALB, split tunnel would also work, but the setting is left alone until the VPN is removed.
-- Certificates: managed by Terraform (`certificate_validity_period_hours = 8760`, i.e. 1 year)
+If the tunnel or Cloudflare Access is down and `kubectl` cannot connect, reopen the public endpoint to your own address. This uses the AWS API, so it needs neither the cluster nor WARP. See [operations.md → Break-glass](operations.md#break-glass-api-access-without-warp).
 
 ---
 
@@ -224,11 +221,12 @@ These run system services and are not used for pipeline workloads.
 
 | Node group | Instance | AMI | Size | Taint | Purpose |
 |---|---|---|---|---|---|
-| `backend` | `m7g.xlarge` | Bottlerocket ARM64 | 1 node, pinned to the region's `a` zone | `CriticalAddonsOnly=true:NoSchedule` | CoreDNS, metrics-server, CloudWatch agent, Kubecost |
-| `karpenter` | `m7g.xlarge` | Bottlerocket ARM64 | 1 node | — | Karpenter controller |
-| `argo` | `m7g.xlarge` | Bottlerocket ARM64 | 1 node | `argoproj.io/backend=true:NoSchedule` | ArgoCD, Argo server, Prefect |
+| `backend` | `m7g.2xlarge` | Bottlerocket ARM64 | 2 nodes, pinned to the region's `a` zone | `CriticalAddonsOnly=true:NoSchedule` | Karpenter controller, CoreDNS, metrics-server, Kubecost, Prometheus, Grafana, Prefect, cloudflared, reloader |
+| `argo` | `m7g.xlarge` | Bottlerocket ARM64 | 1 node | `argoproj.io/backend=true:NoSchedule` | ArgoCD, Argo server and controller, cloudflared |
 
 The `backend` group is pinned to the `a` zone so it is always co-located with the EBS PVCs (Kubecost, Prefect) provisioned in that AZ.
+
+There is no untainted managed node. Anything that must stay off Karpenter's spot capacity needs a toleration for one of the two taints above, or it lands on a Karpenter node and keeps that node up indefinitely. A third group, `karpenter`, ran the Karpenter controller alone on an untainted m7g.xlarge until 2026-11-06; the controller moved to `backend`, which also lets both of its replicas run (the chart's anti-affinity needs two nodes).
 
 ### Karpenter node pools (on-demand provisioning for pipeline workloads)
 
@@ -238,15 +236,16 @@ There are **five** node pools. All are **spot-only** — no pool allows on-deman
 |---|---|---|---|---|
 | `cpu-light-nodepool` | category `t` | spot | 160 CPU / 640 Gi | Globus control, inventory, S3 sync |
 | `cpu-heavy-nodepool` | category `c`,`m`; sizes 2xlarge, 4xlarge; nitro | spot | 2560 CPU / 10240 Gi | BOLD→T1w registration, functional preprocessing |
-| `first-level-nodepool` | families `m6gd`/`m7gd`/`r6gd`/`r7gd`/`c6gd`/`c7gd` (**Graviton/ARM64**, local NVMe); sizes xlarge–4xlarge | spot | 512 CPU / 4096 Gi | First-level (task-based) analysis |
+| `first-level-nodepool` | families `m6gd`/`m7gd`/`r6gd`/`r7gd`/`c6gd`/`c7gd` (**Graviton/ARM64**, local NVMe); sizes xlarge–4xlarge | spot | 1536 CPU / 12288 Gi | First-level (task-based) analysis; about 1,200 session pods at 1 CPU / 10 Gi |
 | `gpu-nodepool` | families `g4dn`/`g5`/`g6`/`g6e`; sizes xlarge, 2xlarge, **except** `g5`/`g6`/`g6e.2xlarge`; nitro; zones `a`/`b`/`c`; weight 10 (preferred) | spot | 512 CPU / 2048 Gi | T1w→MNI registration (FireANTs), FastSurfer template-build + long-segmentation |
 | `gpu-dense-nodepool` | types `g5.2xlarge`/`g6.2xlarge`/`g6e.2xlarge`; nitro; zones `a`/`b`/`c`; no weight (fallback) | spot | 512 CPU / 2048 Gi | The same three GPU steps, when every `gpu-nodepool` offering is out of capacity |
+| `gpu-ondemand-nodepool` | `gpu-nodepool`'s five reachable types; nitro; zones `a`/`b`/`c`; tainted `cloudpipe.io/gpu-on-demand` (opt-in) | on-demand | 64 CPU / 256 Gi | Only templates that tolerate the taint, for runs that cannot wait out a GPU spot drought. The pipeline's own GPU steps never land here |
 
 The `Pool limits` column is the Karpenter `spec.limits` ceiling on aggregate provisioned capacity — a safety stop, not a reservation and not a statement of what a pool typically runs.
 
 `first-level-nodepool` is the only ARM64 pipeline pool; the `*gd` families are chosen for their local NVMe scratch. Images that run there must be built for ARM64 (see [images.md](images.md)).
 
-**GPU time-slicing.** Slice counts are set per GPU pool. `gpu-nodepool` nodes carry **3** schedulable GPU slices per physical GPU: its smallest card, the g4dn's T4, has 15 GiB, and an xlarge has only ~3920m of CPU for `cpu: 1` pods. `gpu-dense-nodepool` nodes carry **4**. Those are 2xlarge nodes with a 22–45 GiB card, and 4 is the most that fits the largest per-pod VRAM: t1w-to-mni, measured at 4903 MiB per process. The pool shipped at 5, sized from an estimate of ~4.4 GiB, and was cut to 4 once the measurement showed four t1w-to-mni pods on one card would overflow. The count reaches Karpenter through a `NodeOverlay` per pool's types (`gpu-timeslice-3x`, and `gpu-dense-timeslice-4x` at weight 10). It reaches each node through the device-plugin profile selected by the `nvidia.com/device-plugin.config` label, which only the dense pool sets. Because overlays match instance types in every pool, the two pools must never admit the same type; `tests/argo/test_gpu_step_resources.py` enforces that and the other invariants. The GPU templates accept either pool through a `karpenter.sh/nodepool In` node affinity. A separate `g6f-fractional-gpu` overlay covers the fractional-GPU g6f family, which no pool currently admits.
+**GPU time-slicing.** Slice counts are set per GPU pool. `gpu-nodepool` nodes carry **3** schedulable GPU slices per physical GPU: its smallest card, the g4dn's T4, has 15 GiB, and an xlarge has only ~3920m of CPU for `cpu: 1` pods. `gpu-dense-nodepool` nodes carry **4**. Those are 2xlarge nodes with a 22–45 GiB card, and 4 is the most that fits the largest per-pod VRAM: t1w-to-mni, measured at 4903 MiB per process. The pool shipped at 5, sized from an estimate of ~4.4 GiB, and was cut to 4 once the measurement showed four t1w-to-mni pods on one card would overflow. The count reaches Karpenter through a `NodeOverlay` per pool's types (`gpu-timeslice-3x`, and `gpu-dense-timeslice-4x` at weight 10). It reaches each node through the device-plugin profile selected by the `nvidia.com/device-plugin.config` label, which only the dense pool sets. Because overlays match instance types in every pool, two pools may share a type only if both load the same slice count. `gpu-ondemand-nodepool` shares `gpu-nodepool`'s types at the default 3 slices, and `gpu-nodepool` and `gpu-dense-nodepool` share none. `tests/argo/test_gpu_step_resources.py` enforces that and the other invariants, including that the device plugin tolerates the on-demand pool's taint. The GPU templates accept both spot pools through a `karpenter.sh/nodepool In` node affinity. A separate `g6f-fractional-gpu` overlay covers the fractional-GPU g6f family, which no pool currently admits.
 
 All Karpenter nodes consolidate to zero when empty (`consolidateAfter: 10m`). Disruption budgets allow removing up to 20% of nodes at a time.
 
@@ -278,7 +277,7 @@ Both instances:
 - Master password managed natively by RDS (`manage_master_user_password = true`) — password lives in RDS-owned Secrets Manager secret
 - CloudWatch log exports: `postgresql`, `upgrade`
 - Auto minor version upgrade enabled
-- Not publicly accessible; reachable from within the VPC (pods) and, for operators, over the Client VPN
+- Not publicly accessible; reachable from within the VPC (pods) and, for operators, over WARP
 - `deletion_protection = false` (set to `true` before production promotion)
 
 ### PgBouncer (Argo RDS only)
@@ -507,13 +506,13 @@ The table is the same one `--list-phases` prints; a test holds the two equal, so
 | 1 | **Create the network and the Kubernetes cluster.** `-target` the VPC, then EKS, with `endpoint_public_access=true` (bootstrapping needs a reachable API). Then `aws eks update-kubeconfig`, log Helm in to ECR Public, and pre-create the `argo-workflows` namespace — Phase 2's resources need it before ArgoCD has synced anything | open |
 | 2 | **Install the cluster add-ons.** One apply with seven `-target`s: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, Globus, FinOps. Terraform orders them by the graph: FinOps after add-ons, Globus after Argo Workflows. The Globus target is a no-op when `globus_enabled` is false — Terraform reports "No changes" for a module call with no instances, rather than an error | open |
 | 3 | **Add the network rules for the cluster's system services.** The twelve kube-system NetworkPolicies, in one apply. Strict mode blocks every pod with no policy, CoreDNS included, and the cluster deadlocks | open |
-| 4 | **Create the remaining resources, including the Cloudflare tunnel, and store its token.** First a targeted apply of ArgoCD and its root app, then a wait of up to ten minutes for each namespace ArgoCD's first sync creates that the next apply writes into (`argo-workflows`, `prefect`, `grafana`), then the full apply: the Cloudflare tunnel, its Access applications, the VPN and everything else. The token sync is part of this phase; the commands are below for an operator doing it by hand against a half-built cluster | open |
+| 4 | **Create the remaining resources, including the Cloudflare tunnel, and store its token.** First a targeted apply of ArgoCD and its root app, then a wait of up to ten minutes for each namespace ArgoCD's first sync creates that the next apply writes into (`argo-workflows`, `prefect`, `grafana`), then the full apply: the Cloudflare tunnel, its Access applications and everything else. The token sync is part of this phase; the commands are below for an operator doing it by hand against a half-built cluster | open |
 | 5 | **Wait for ArgoCD to install the resource types later phases need.** `clustersecretstores.external-secrets.io` and `prometheusrules.monitoring.coreos.com`, each polled for existence and then for `Established` | open |
 | 6 | **Save the install settings, then connect the cluster to its stored secrets.** Write `install-state.auto.tfvars` (see below), then apply with `crds_available=true` and `vpc_cni_network_policy_enabled=true`, **endpoint still open**. This creates the External Secrets `ClusterSecretStore`, without which cloudflared cannot receive its token. `vpc_cni_strict_mode` is left at its default of `false` — see the variable table below | open |
 | 7 | **Check that the Cloudflare tunnel works, while the cluster can still be reached.** The four checks are below. If it is not healthy, stop here: the cluster stays reachable through the IAM-gated public endpoint | open |
 | 8 | **Close the cluster's public endpoint, leaving WARP as the only way in.** Re-proves the tunnel, offers to create any missing operator accounts and re-checks that the user pool has a user, checks that the machine running it reaches the private API endpoint (proof that WARP enrollment and sign-in worked), then applies with the same two flags and no `endpoint_public_access`. Then refreshes the kubeconfig | **closed** |
 
-After Phase 8 the EKS API is private-only. Reach it through the Cloudflare tunnel (WARP), or the VPN as a fallback, for every later `kubectl` and `terraform` operation.
+After Phase 8 the EKS API is private-only. Reach it through the Cloudflare tunnel (WARP) for every later `kubectl` and `terraform` operation; if WARP itself is broken, use the [break-glass](operations.md#break-glass-api-access-without-warp) procedure.
 
 > **Phase 6 persists two flags to `install-state.auto.tfvars` in your Terraform root** — `crds_available` and `vpc_cni_network_policy_enabled` — and they must stay `true` for the life of the cluster. Terraform loads any `*.auto.tfvars` in the working directory, so a later plain `terraform apply` keeps them without `-var` flags. They cannot simply default to `true`, because Phases 1–4 run against a cluster that has neither the CRDs nor the kube-system policies. The file is gitignored (it is per-deployment state), so recreate it after a fresh clone — losing it destroys the ExternalSecrets and makes every NetworkPolicy inert, neither of which announces itself (#635).
 >

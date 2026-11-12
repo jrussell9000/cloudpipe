@@ -4,16 +4,27 @@ metadata:
   name: cloudpipe-semaphores
   namespace: argo-workflows
 data:
-  # Maximum concurrent Globus transfers through the single GCS EC2 instance.
-  # The GCS instance (c5n.xlarge, 4 vCPU / 10.5 GB RAM) runs one GridFTP process
-  # per active transfer. 8 is a safe ceiling for large BOLD file transfers.
-  globus-transfer: "8"
-  # Maximum concurrent ingress-mode=https copies (each runs rclone with
-  # `--transfers 8`, so 4 here is at most 32 GETs on the NBDC source). Not bound
-  # by our GCS host — there is none in that path — but by the source: its HTTP
-  # 500s are load-dependent. Measured in wave 1 (2026-10-21) on the same code, 8
-  # gave 40.7% of requests answered 500 and 109 subjects/h; 4 gave 13.6% and
-  # 112 subjects/h. At 8 the rejected requests ate the extra slots. Do not raise
-  # it without the source operators' agreement (MSI, globus-admin@msi.umn.edu)
-  # and a measured step; lowering it is always safe.
-  https-transfer: "4"
+  # Maximum concurrent ingress-mode=https copies. Each copy holds at most
+  # https_copy.SOURCE_CONCURRENCY GETs open, one per file, so this times that is
+  # our ceiling of concurrent GETs on the NBDC source. Bound by the
+  # source, not by anything of ours: its HTTP 500s are load-dependent. In
+  # wave 1 (2026-10-21), on the code of the time, 8 gave 40.7% of requests
+  # answered 500 and 109 subjects/h; 4 gave 13.6% and 112 subjects/h. That
+  # predates `--http-no-head` (#855, half the requests per file) and coincided
+  # with MSI's Globus node updates; from 2026-10-23 on, 4 saw only 0.1-0.2% of
+  # requests answered 500. Raised back to 8 on 2026-10-31 (operator decision,
+  # without asking MSI first).
+  #
+  # 2026-11-09, at MSI's request (they emailed that our concurrency was causing
+  # issues for their Globus transfer nodes, after the 11-07..09 outage): 4 slots
+  # x --transfers 8 = 32 GETs.
+  #
+  # 2026-11-10, operator decision: a ceiling of 8 concurrent GETs, as 2 slots x
+  # 4 per copy. Not 1 x 8, because one slow or hung subject would then block
+  # all ingress behind it. Each copy is also capped at
+  # https_copy.SOURCE_REQUESTS_PER_SEC (4) requests/s on the source, so 8
+  # requests/s in all: MSI's httpd locks up under tiny-file load (their reply,
+  # 2026-11-10). tests/argo/test_nbdc_concurrency.py fails if slots x either limit
+  # exceeds 8. Do not raise it without asking MSI (globus-admin@msi.umn.edu).
+  # Lowering it is always safe.
+  https-transfer: "2"

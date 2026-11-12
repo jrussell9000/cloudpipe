@@ -23,7 +23,9 @@ RUN pip install --disable-pip-version-check --root-user-action=ignore --no-cache
         botocore==1.43.72 \
         urllib3==2.7.0
 
-# rclone, for HTTPS ingress's copy. A pinned release whose SHA-256 is checked in
+# rclone. HTTPS ingress no longer uses it (https_copy.py replaced it, 2026-11-12),
+# but the investigation Jobs under scripts/investigations/ that run this image still
+# do. A pinned release whose SHA-256 is checked in
 # the same layer: a mismatch fails the build, so a changed archive cannot slip
 # into an image Inspector then scans as if it were the reviewed one. The checksum
 # is the one rclone publishes in its release SHA256SUMS. Fetched with Python
@@ -49,7 +51,8 @@ open('/usr/local/bin/rclone', 'wb').write(zipfile.ZipFile(io.BytesIO(data)).read
 RUN groupadd --gid 1000 cloudpipe && \
     useradd --uid 1000 --gid 1000 --no-create-home cloudpipe
 
-COPY images/globus/transfer.py /app/transfer.py
+COPY images/globus/listing.py /app/listing.py
+COPY images/globus/https_copy.py /app/https_copy.py
 COPY images/globus/https_ingress.py /app/https_ingress.py
 
 # The operator CLI's error translation, shared rather than copied: the pod log and

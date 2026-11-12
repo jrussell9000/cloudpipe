@@ -63,6 +63,9 @@ _UNION_COLUMNS = {
         "n_acompcor_csf",
         "n_tcompcor",
         "n_cosines",
+        "wm_mask_voxels",
+        "csf_mask_voxels",
+        "tissue_confounds",
         "stage_timings_s",
         "total_runtime_s",
         "peak_memory_gb",
@@ -180,6 +183,31 @@ _UNION_COLUMNS = {
         "pipeline",
         "completed_at",
     ],
+    # The whole table: identity, provenance, then the dseg and probseg volumes
+    # and their agreement, in emitter order (images/afni/tissue_masks.py).
+    # probseg_* and agreement_* are NULL when no probseg was fitted; read
+    # probseg_written to tell a rejected fit (FALSE, values present) from one
+    # that was never attempted (FALSE, values NULL).
+    "tissue_masks": [
+        "subject",
+        "session",
+        "pipeline",
+        "image_tag",
+        "source",
+        "completed_at",
+        "dseg_gm_vol_mm3",
+        "dseg_wm_vol_mm3",
+        "dseg_csf_vol_mm3",
+        "probseg_input",
+        "probseg_seed",
+        "probseg_written",
+        "probseg_gm_vol_mm3",
+        "probseg_wm_vol_mm3",
+        "probseg_csf_vol_mm3",
+        "agreement_gm",
+        "agreement_wm",
+        "agreement_csf",
+    ],
     "workflow_runs": [
         "workflow_name",
         # Schema 1.3+: the run's identity — Argo reuses names (#638). "" or NULL
@@ -259,6 +287,10 @@ _UNION_COLUMNS = {
         "attempts_run",
         "none_lncc",
         "none_jac_det_frac_negative",
+        # Schema 2.8, t1w_to_mni only: the talairach cross-check (#1105). NULL on
+        # earlier rows, bold_to_t1w rows, and any row whose talairach was unusable.
+        "affine_tal_dev_mm",
+        "none_affine_tal_dev_mm",
     ],
     "costs": [
         "date",
@@ -304,6 +336,8 @@ _UNION_COLUMNS = {
         "node_capacity_type",
         "node_effective_usd_per_hour",
         "node_ondemand_usd_per_hour",
+        # Schema 1.2+: the EC2 instance the pod was matched to (#1060).
+        "node_instance_id",
         "scrape_age_days",
         "pipeline",
         "completed_at",
@@ -711,6 +745,27 @@ class CloudpipeMetrics:
         non-zero = it degraded, NULL = it never reported).
         """
         return self._query("fsqc_qc", filters, dt_from, dt_to, compacted)
+
+    def tissue_qc(
+        self,
+        dt_from: str | None = None,
+        dt_to: str | None = None,
+        compacted: bool = False,
+        **filters: Any,
+    ):
+        """Return the per-session MNI tissue-map QC (TissueQC) as a DataFrame.
+
+        One row per subject+session: the FastSurfer dseg's and the DIPY
+        probseg's volume per class, and how far the two agree. Written by
+        func-preproc (source "func-preproc") and by the probseg backfill
+        (source "probseg-backfill"); a session reprocessed later appears under
+        the later dt, so dedupe on subject+session by latest completed_at.
+
+        probseg_written FALSE with values present is a fit the agreement guard
+        rejected (no probseg was published); FALSE with NULL values means no
+        fit was attempted.
+        """
+        return self._query("tissue_masks", filters, dt_from, dt_to, compacted)
 
     def anatomical_qc(
         self,

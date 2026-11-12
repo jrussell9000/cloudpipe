@@ -1,9 +1,9 @@
 """Stage one subject from the NBDC source collection over HTTPS (openspec add-https-ingress-mode).
 
 Runs as the `https-transfer` step of `ingress-mode=https`, once per subject, on the
-ingress node pool. It writes the same tree Globus ingress writes —
+ingress node pool. It writes the tree Globus ingress wrote —
 `{dest-base-path}/{subject}/{session}/{dir}/{file}` in the data bucket — so
-`ingress-verify`, inventory and everything after cannot tell the modes apart.
+`ingress-verify`, inventory and everything after see the layout they always have.
 Three phases, each with a failure behind it:
 
 **1. Refuse a stale session before any request.** The source grants access to a
@@ -16,14 +16,14 @@ expression excludes 78, because a refusal fails identically on every attempt.
 The Prefect gate refuses a batch earlier; this is the control that also holds
 for a hand `argo submit`.
 
-**2. List with production's walk, copy with rclone.** The HTTPS server cannot list
+**2. List with production's walk, then copy.** The HTTPS server cannot list
 directories, so the file set comes from the Transfer API through
-`transfer.discover_files` — the same filter and the same `TRANSFER-SUMMARY` line
-as Globus ingress. rclone then copies those exact paths. The access token reaches
-it only through `RCLONE_HTTP_HEADERS`, never its command line, so it appears in
-no process listing and no log. `no_check_bucket` stops rclone calling
-`CreateBucket` before its first upload, which failed with
-`IllegalLocationConstraintException` (plan 018, first T3 pod).
+`listing.discover_files` — the filter Globus ingress used, and the same
+`TRANSFER-SUMMARY` line it printed. `https_copy.Copier` then copies those exact
+paths, one GET per file streamed into an S3 multipart upload, with the request
+limit on the source only (its docstring says why that replaced rclone). The access
+token is held in a request header in this process, never in a command line or a
+log.
 
 **3. Check every object's size against the listing.** The source cannot compute
 checksums (`disable_verify: true`), and Globus never verified them either, so the
@@ -33,17 +33,16 @@ copies only what is missing.
 
 **Passes copy only what is missing.** The source fails individual requests with
 HTTP 500, intermittently and all the time (wave 1, 2026-10-21: in 99 of 153
-minutes with 500s, other pods were copying fine). rclone's own `--retries` re-runs
-the whole copy, which re-stats every listed file: a pass that lost 3 files sent
-113 HEADs into the struggling server and, in a bad minute, failed them all. So
-rclone makes one pass, and this step makes up to four, each against a file list
-rebuilt from what S3 actually holds. A pod retried by Argo starts the same way,
-so it never re-requests a file an earlier attempt staged. A file staged at the
-wrong size is deleted before the pass, because rclone, which cannot know sizes
-under `--http-no-head`, would otherwise skip it as present. After a pass that
-fails, one file still missing is probed directly (HEAD, then a 1-byte GET) and
-the source's status, timing, safe headers and JSON error body are logged: the
-body carries the request ID the source's operators need, which rclone discards.
+minutes with 500s, other pods were copying fine). With rclone, a whole-copy retry
+sent a HEAD for every listed file again: a pass that lost 3 files sent 113 HEADs into the
+struggling server and, in a bad minute, failed them all. So this step makes up to
+four passes, each against a file list rebuilt from what S3 actually holds, and the
+copier retries a file only a few times within a pass. A pod retried by Argo starts
+the same way, so it never re-requests a file an earlier attempt staged. A file
+staged at the wrong size is deleted before the pass. The copier logs each failed
+file's status and JSON error body (it carries the request ID the source's operators
+need); after a pass that fails, one file still missing is also probed directly
+(HEAD, then a 1-byte GET), with timing and safe headers.
 """
 
 from __future__ import annotations
@@ -52,20 +51,19 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import boto3
 import globus_sdk
+import https_copy
+import listing
 import requests
-import transfer
+from botocore.config import Config
 
 from globus_admin.errors import globus_error
 from globus_admin.exits import CliError
@@ -151,8 +149,8 @@ def check_session(
 class RecordingTransferClient:
     """Passes `operation_ls` through and keeps every file's listed size.
 
-    `transfer.discover_files` keeps paths only. Wrapping the client, rather than
-    copying the walk, keeps the file set exactly the one Globus ingress transfers.
+    `listing.discover_files` keeps paths only. Wrapping the client, rather than
+    copying the walk, keeps the file set exactly the one the listing decides.
     """
 
     def __init__(self, inner: Any) -> None:
@@ -174,7 +172,7 @@ def list_subject(
     transfer_client: Any, source_id: str, subject_root: str, scan_types: list[str], subject_id: str
 ) -> tuple[Any, dict[str, int]]:
     recorder = RecordingTransferClient(transfer_client)
-    discovery = transfer.discover_files(
+    discovery = listing.discover_files(
         recorder, source_id, subject_root, scan_types, subject_id=subject_id
     )
     sizes = {rel: recorder.sizes[f"{subject_root}/{rel}"] for rel in discovery.rel_paths}
@@ -213,75 +211,31 @@ def user_agent(contact: str | None) -> str:
     return USER_AGENT_PRODUCT
 
 
-def rclone_command(
+#: Our load on the NBDC source per copy lives in https_copy (SOURCE_CONCURRENCY,
+#: SOURCE_REQUESTS_PER_SEC). tests/argo/test_nbdc_concurrency.py holds each, times
+#: the https-transfer slots, to the operator's ceiling of 8.
+
+#: Connections to S3 per process: SOURCE_CONCURRENCY files x their part uploads,
+#: plus the listing and size check. botocore's default pool of 10 would make part
+#: uploads wait on each other.
+S3_MAX_POOL_CONNECTIONS = 32
+
+
+def probe_source(
+    url: str,
+    token: str,
     *,
-    https_server: str,
-    subject_root: str,
-    file_list: Path,
-    bucket: str,
-    dest_prefix: str,
-    region: str,
-    contact: str | None = None,
-) -> list[str]:
-    """The copy, with no secret in it: the token goes in rclone_env()."""
-    dest = f":s3,env_auth,provider=AWS,region={region},no_check_bucket:{bucket}/{dest_prefix}/"
-    return [
-        "rclone",
-        "copy",
-        ":http:",
-        dest,
-        "--http-url",
-        https_server.rstrip("/") + quote(subject_root.rstrip("/")) + "/",
-        "--files-from",
-        str(file_list),
-        "--no-traverse",
-        # No per-file HEAD: with --files-from and --no-traverse rclone would stat
-        # every file on the source before its GET. Measured in a probe pod
-        # (2026-10-22): 31 files cost 31 HEAD + 31 GET without this flag and 31
-        # GET with it, every size still matching the listing. Half the requests
-        # on a source that rejects requests under load. A file missing at the
-        # source still fails its GET, and the size check still decides the step.
-        "--http-no-head",
-        "--transfers",
-        "8",
-        "--multi-thread-streams",
-        "0",
-        "--s3-chunk-size",
-        "16M",
-        "--s3-upload-concurrency",
-        "4",
-        # One pass. The step's own passes (copy_missing) retry, each with only
-        # the files still missing; rclone's `--retries` would re-stat every
-        # listed file instead (module docstring).
-        "--retries",
-        "1",
-        "--low-level-retries",
-        "10",
-        "--stats",
-        "30s",
-        "--stats-one-line",
-        "--user-agent",
-        user_agent(contact),
-        "-v",
-    ]
-
-
-def rclone_env(token: str, base: dict[str, str]) -> dict[str, str]:
-    env = dict(base)
-    env["RCLONE_HTTP_HEADERS"] = f"Authorization,Bearer {token}"
-    # No config file is wanted; a path that does not exist keeps rclone from
-    # looking in a home directory the pod's user does not have.
-    env.setdefault("RCLONE_CONFIG", "/tmp/rclone-https-ingress.conf")
-    return env
-
-
-def probe_source(url: str, token: str, *, agent: str, http: Any = requests) -> dict[str, Any]:
+    agent: str,
+    http: Any = requests,
+    acquire: Callable[[], None] = lambda: None,
+) -> dict[str, Any]:
     """What the source answers for one file, with timing: a HEAD, then a 1-byte GET.
 
     `X-Requested-With` makes the server answer an error as JSON rather than a
     browser redirect. A body is read only when it is JSON (Globus's error shape),
     so a GET that unexpectedly succeeds brings at most one byte of file content.
-    The token is sent, never returned.
+    The token is sent, never returned. `acquire` runs before each request: the step
+    passes the copier's rate limiter, so the probe counts against the same limit.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -290,6 +244,7 @@ def probe_source(url: str, token: str, *, agent: str, http: Any = requests) -> d
     }
     out: dict[str, Any] = {}
     for method, extra in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
+        acquire()
         started = datetime.now(UTC)
         try:
             response = http.request(
@@ -330,59 +285,54 @@ def copy_missing(
     s3: Any,
     bucket: str,
     dest_prefix: str,
-    command_for: Callable[[Path], list[str]],
-    env: dict[str, str],
-    runner: Callable[..., Any],
+    copy: Callable[[list[str]], list[https_copy.Failure]],
     probe: Callable[[str], dict[str, Any]],
     sleeper: Callable[[float], None],
     log: Callable[[str], None],
 ) -> int:
-    """Up to four rclone passes, each over only the files S3 does not yet hold.
+    """Up to four passes, each over only the files S3 does not yet hold.
 
-    Returns the last pass's exit code (0 when nothing was left to copy). The size
-    check that follows is what decides the step.
+    Returns how many files the last pass failed (0 when nothing was left to copy).
+    The size check that follows is what decides the step.
     """
-    returncode = 0
-    with tempfile.TemporaryDirectory() as scratch:
-        file_list = Path(scratch) / "files.txt"
-        for attempt in range(len(PASS_SLEEPS_SECS) + 1):
-            staged = staged_sizes(s3, bucket, dest_prefix)
-            todo = still_missing(sizes, staged)
-            if not todo:
-                if attempt:
-                    log(f"Pass {attempt} left nothing missing.")
-                return 0
+    failed = 0
+    for attempt in range(len(PASS_SLEEPS_SECS) + 1):
+        staged = staged_sizes(s3, bucket, dest_prefix)
+        todo = still_missing(sizes, staged)
+        if not todo:
             if attempt:
-                wait = PASS_SLEEPS_SECS[attempt - 1]
-                log(f"{len(todo)} file(s) still missing; pass {attempt + 1} in {wait} s.")
-                sleeper(wait)
-            elif len(todo) < len(sizes):
-                log(f"{len(sizes) - len(todo)} of {len(sizes)} file(s) already staged.")
-            # A file staged at the wrong size is a stream the source cut short. With
-            # --http-no-head rclone never learns a file's size (it streams, "Rcat"),
-            # so it cannot see a short read, and on the next pass it skips the file
-            # as already present: "There was nothing to transfer", on every pass and
-            # every Argo attempt (wave 2, 2026-10-24: 3 subjects). Deleting the short
-            # copy makes it missing again, so the pass fetches it whole.
-            short = [rel for rel in todo if rel in staged]
-            if short:
-                log(
-                    f"{len(short)} file(s) staged short; deleting them before the copy: "
-                    + ", ".join(f"{rel} ({staged[rel]} of {sizes[rel]} bytes)" for rel in short)
-                )
-                delete_staged(s3, bucket, dest_prefix, short)
-            file_list.write_text("".join(f"{rel}\n" for rel in todo))
+                log(f"Pass {attempt} left nothing missing.")
+            return 0
+        if attempt:
+            wait = PASS_SLEEPS_SECS[attempt - 1]
+            log(f"{len(todo)} file(s) still missing; pass {attempt + 1} in {wait} s.")
+            sleeper(wait)
+        elif len(todo) < len(sizes):
+            log(f"{len(sizes) - len(todo)} of {len(sizes)} file(s) already staged.")
+        # A file staged at the wrong size is a stream the source cut short. rclone
+        # (before the copier) uploaded such a stream as complete and then skipped it
+        # as present on every pass and every Argo attempt (wave 2, 2026-10-24: 3
+        # subjects). The copier deletes its own short uploads, but an object can
+        # still be left short by an earlier image or a killed pod, so deleting it
+        # here makes it missing again and the pass fetches it whole.
+        short = [rel for rel in todo if rel in staged]
+        if short:
             log(
-                f"Pass {attempt + 1}: copying {len(todo)} file(s), "
-                f"{sum(sizes[rel] for rel in todo) / 2**30:.2f} GiB, over HTTPS."
+                f"{len(short)} file(s) staged short; deleting them before the copy: "
+                + ", ".join(f"{rel} ({staged[rel]} of {sizes[rel]} bytes)" for rel in short)
             )
-            returncode = runner(command_for(file_list), env=env, check=False).returncode
-            if returncode != 0:
-                left = still_missing(sizes, staged_sizes(s3, bucket, dest_prefix))
-                log(f"rclone exited {returncode}; {len(left)} file(s) still missing.")
-                if left:
-                    log(f"Source probe for {left[0]}: {json.dumps(probe(left[0]))}")
-    return returncode
+            delete_staged(s3, bucket, dest_prefix, short)
+        log(
+            f"Pass {attempt + 1}: copying {len(todo)} file(s), "
+            f"{sum(sizes[rel] for rel in todo) / 2**30:.2f} GiB, over HTTPS."
+        )
+        failed = len(copy(todo))
+        if failed:
+            left = still_missing(sizes, staged_sizes(s3, bucket, dest_prefix))
+            log(f"{failed} file(s) failed this pass; {len(left)} file(s) still missing.")
+            if left:
+                log(f"Source probe for {left[0]}: {json.dumps(probe(left[0]))}")
+    return failed
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +409,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Prefix in the bucket, e.g. /mmps_mproc; the subject ID is appended",
     )
-    parser.add_argument("--scan-types", required=True, help="JSON array, as for transfer.py")
+    parser.add_argument(
+        "--scan-types",
+        required=True,
+        help=f"JSON array of scan types; valid: {sorted(listing.VALID_SCAN_TYPES)}",
+    )
     parser.add_argument("--session-param", default=SESSION_PARAM)
     parser.add_argument("--max-session-days", type=int, default=MAX_SESSION_DAYS)
     return parser.parse_args(argv)
@@ -474,13 +428,13 @@ def run(
     transfer_client: Any,
     auth_client: Any,
     s3: Any,
-    runner: Callable[..., Any] = subprocess.run,
+    make_copier: Callable[..., Any] = https_copy.Copier,
     log: Callable[[str], None] = _log,
     sleeper: Callable[[float], None] = time.sleep,
     prober: Callable[..., dict[str, Any]] = probe_source,
 ) -> None:
     scan_types = json.loads(args.scan_types)
-    invalid = set(scan_types) - transfer.VALID_SCAN_TYPES
+    invalid = set(scan_types) - listing.VALID_SCAN_TYPES
     if invalid:
         raise ValueError(f"Unknown scan type(s): {sorted(invalid)}")
 
@@ -494,7 +448,7 @@ def run(
     discovery, sizes = list_subject(
         transfer_client, args.source_collection_id, source_root, scan_types, args.subject_id
     )
-    transfer.emit_summary(discovery, log=log)
+    listing.emit_summary(discovery, log=log)
     if not sizes:
         raise RuntimeError(
             "No matching files found for any requested scan type — check source-base-path "
@@ -507,33 +461,36 @@ def run(
 
     agent = user_agent(env.get("INGRESS_CONTACT"))
     file_url = https_server.rstrip("/") + quote(source_root.rstrip("/")) + "/"
-    returncode = copy_missing(
+    # One copier for every pass, so one rate limiter covers every request this pod
+    # sends the source, the probe's included.
+    copier = make_copier(
+        base_url=file_url,
+        token=token,
+        user_agent=agent,
+        s3=s3,
+        bucket=args.dest_bucket,
+        dest_prefix=dest_prefix,
+        log=log,
+    )
+    failed = copy_missing(
         sizes=sizes,
         s3=s3,
         bucket=args.dest_bucket,
         dest_prefix=dest_prefix,
-        command_for=lambda file_list: rclone_command(
-            https_server=https_server,
-            subject_root=source_root,
-            file_list=file_list,
-            bucket=args.dest_bucket,
-            dest_prefix=dest_prefix,
-            region=env["AWS_DEFAULT_REGION"],
-            contact=env.get("INGRESS_CONTACT"),
+        copy=lambda todo: copier.copy(todo, sizes),
+        probe=lambda rel: prober(
+            file_url + quote(rel), token, agent=agent, acquire=copier.limiter.acquire
         ),
-        env=rclone_env(token, env),
-        runner=runner,
-        probe=lambda rel: prober(file_url + quote(rel), token, agent=agent),
         sleeper=sleeper,
         log=log,
     )
 
-    # Phase 3. The sizes decide the step; rclone's exit code only explains it.
+    # Phase 3. The sizes decide the step; the copier's failures only explain it.
     try:
         verify_sizes(s3, args.dest_bucket, dest_prefix, sizes)
     except RuntimeError as exc:
-        if returncode:
-            raise RuntimeError(f"rclone exited {returncode} on its last pass; {exc}") from None
+        if failed:
+            raise RuntimeError(f"{failed} file(s) failed on the last pass; {exc}") from None
         raise
     log(f"HTTPS ingress complete for subject {args.subject_id}.")
 
@@ -565,20 +522,20 @@ def main(argv: list[str] | None = None) -> None:
             env=env,
             now=datetime.now(UTC),
             read_param=_read_param,
-            transfer_client=transfer.build_transfer_client(
+            transfer_client=listing.build_transfer_client(
                 env["GLOBUS_NATIVE_APP_CLIENT_ID"], env["GLOBUS_REFRESH_TOKEN"]
             ),
             auth_client=globus_sdk.NativeAppAuthClient(env["GLOBUS_NATIVE_APP_CLIENT_ID"]),
-            s3=boto3.client("s3"),
+            s3=boto3.client("s3", config=Config(max_pool_connections=S3_MAX_POOL_CONNECTIONS)),
         )
     except Refused as err:
         print(f"error: {err}", file=sys.stderr, flush=True)
         sys.exit(EXIT_REFUSED)
     except CliError as err:
-        transfer.report_error(err)
+        listing.report_error(err)
         sys.exit(1)
     except globus_sdk.TransferAPIError as exc:
-        transfer.report_error(globus_error(exc))
+        listing.report_error(globus_error(exc))
         sys.exit(1)
     except (ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr, flush=True)

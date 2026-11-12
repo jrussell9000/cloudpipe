@@ -144,6 +144,52 @@ def list_active_names(
     return call_with_retries(_list, on_retry=on_retry)
 
 
+def list_active_subjects(
+    template_name: str,
+    on_retry: Callable[[int, Exception, float], None] | None = None,
+) -> set[str]:
+    """Subject IDs, without `sub-`, of every uncompleted workflow made from `template_name`.
+
+    Read from each workflow's own `subjID` argument, which the create call sets, not
+    from the controller's labels, so a workflow submitted seconds ago is included
+    (#206). A queue manager that Prefect restarts walks its list from the start, and a
+    subject whose workflow is still running has no marker yet, so without this it is
+    submitted a second time. That happened to about 800 subjects in one cohort leg.
+    """
+    return list_active_subjects_by_prefix(f"{template_name}-", on_retry=on_retry)
+
+
+def list_active_subjects_by_prefix(
+    prefix: str,
+    exclude: tuple[str, ...] = (),
+    on_retry: Callable[[int, Exception, float], None] | None = None,
+) -> set[str]:
+    """As `list_active_subjects`, for workflows NAMED `prefix*` but not any of `exclude*`.
+
+    By name prefix rather than template because one template serves several
+    submitters: production `cloudpipe-*` and the reprocess audit's `cloudpipe-audit-*`
+    and `cloudpipe-audit-repeat-*` all run the `cloudpipe` template, and a restarted
+    production queue manager must skip ITS subjects, not the audit's.
+    """
+
+    def _list() -> set[str]:
+        wfs = _service().list_workflows(
+            namespace=ARGO_NAMESPACE,
+            label_selector=f"{LABEL_COMPLETED}!=true",
+            fields="items.metadata.name,items.spec.arguments.parameters",
+        )
+        out = set()
+        for wf in wfs.items or []:
+            name = wf.metadata.name or ""
+            if not name.startswith(prefix) or any(name.startswith(x) for x in exclude):
+                continue
+            params = (wf.spec.arguments.parameters if wf.spec and wf.spec.arguments else None) or []
+            out |= {p.value.removeprefix("sub-") for p in params if p.name == "subjID" and p.value}
+        return out
+
+    return call_with_retries(_list, on_retry=on_retry)
+
+
 class ConcurrencyGate:
     """Counts active Argo workflows, including ones too recent to be listed yet.
 
@@ -294,7 +340,8 @@ def wait_for_pace(
     arrive. From an empty queue the cap admits its whole width in minutes, and every
     one of those workflows first-reconciles together: on 2026-09-14, 300 workflows in
     7 minutes drove the control plane into `etcdserver: throttle`, which leaked the
-    `globus-transfer` semaphore in the controller's memory (a 2-hour transfer stall)
+    then-current `globus-transfer` semaphore in the controller's memory (a 2-hour
+    transfer stall; the Globus ingress it guarded is retired, the hazard is not)
     and stranded four WorkflowTaskResults at `report-outputs-completed=false` (#393).
     Neither recovered without a hand fix. Spacing arrivals is the fix; lowering the
     cap would cut steady-state throughput to buy the same thing.
@@ -319,8 +366,12 @@ def wait_for_pace(
     return clock() - started
 
 
-def submit(template_name: str, subj_id: str, **params) -> str:
+def submit(template_name: str, subj_id: str, *, name_prefix: str = "", **params) -> str:
     """Submit a workflow from a deployed WorkflowTemplate and return its generated name.
+
+    `name_prefix` replaces the default `"{template_name}-"` generateName. The
+    reprocess audit uses it to run the production template under a name the
+    cost scraper routes to the audit's own metrics bucket (src/metrics/audit_pairs.py).
 
     Deliberately *not* wrapped in `call_with_retries`. The workflow name comes from
     `generate_name`, so the call carries no idempotency key: if the server created
@@ -333,7 +384,7 @@ def submit(template_name: str, subj_id: str, **params) -> str:
     parameters += [Parameter(name=k, value=v) for k, v in params.items()]
 
     wf = Workflow(
-        generate_name=f"{template_name}-",
+        generate_name=name_prefix or f"{template_name}-",
         namespace=ARGO_NAMESPACE,
         workflow_template_ref=WorkflowTemplateRef(name=template_name),
         arguments=parameters,

@@ -22,7 +22,7 @@ spec:
     # artifact-staging class (#277). A missing artifact KEY is excluded, though:
     # its producer was skipped or failed, and a consumer retry cannot re-run the
     # producer. See the master template for the detail.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -309,15 +309,15 @@ spec:
         - name: session
 
       artifacts:
-        # SELECTIVE FETCH (ADR 017). This step reads exactly two files out of the
-        # 268 in a FastSurfer session tree — see the --t1w / --brainmask flags
+        # SELECTIVE FETCH (ADR 017). This step reads exactly three files out of the
+        # 268 in a FastSurfer session tree — see the --t1w / --brainmask / --talairach flags
         # below — so it now names them individually instead of downloading a
         # ~184 MB tarball to use ~4 MB of it. That is the single biggest transfer
-        # saving in the change, and it costs the fireANTs image nothing: neither
-        # file is a symlink, so no manifest replay runs here and the image needs
+        # saving in the change, and it costs the fireANTs image nothing: none of
+        # the three is a symlink, so no manifest replay runs here and the image needs
         # no new dependency.
         #
-        # Keep these two keys in sync with the flags in the args block. A file
+        # Keep these three keys in sync with the flags in the args block. A file
         # this step opens but does not stage fails at open time with a clear
         # ENOENT; tests/argo/test_derivative_staging.py asserts the pairing.
         #
@@ -351,6 +351,23 @@ spec:
             bucket: "{{workflow.parameters.bucket}}"
             region: "{{workflow.parameters.region}}"
             key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/brainmask.mgz'
+
+        # FastSurfer's own affine to MNI305, for the talairach cross-check (#1105). A
+        # text file (no archive sniff hazard) and a real file, not one of the 14
+        # aliases — talairach_with_skull.lta and talairach.lta are the aliases OF it —
+        # so it needs no link replay. OPTIONAL on purpose: an absent transform skips the
+        # check inside fst1w_to_mni.py (it is never a reason to fail a registration),
+        # so it must not fail the pod at artifact-load time either.
+        - name: fastsurfer-talairach
+          path: /fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/transforms/talairach.xfm.lta
+          optional: true
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/{{inputs.parameters.session}}/mri/transforms/talairach.xfm.lta'
 
         - name: mni-template
           # Register T1w against the 1mm template (matched to the 1mm ABCD moving
@@ -487,7 +504,7 @@ spec:
         emptyDir: {}
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:9379589c767ccd80fd155a4bd7f885bfad0c9f19a221bd8b814c0cf810de557d"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fireants@sha256:1d542b72bbe01e43f1e7f743e1d4424630cffb819c73b937c50c2aba560653dc"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -529,6 +546,13 @@ spec:
         # t1w-to-mni fail bounds were narrowed in 45f4726. Baseline to clear is
         # lncc 0.756-0.832, all pass/warn (n=23, 2026-07-23) — see
         # handoffs/fireants-fused-ops.md.
+        #
+        # Status 2026-11-06 (scripts/investigations/fused_ops_ab/README.md): the fused
+        # arms do not fold (the August rejection was the #1020 Jacobian bug), but they
+        # deform far harder for ~8% of the step, so they stay off. AND "True" CRASHES
+        # AS IS: the fused loss runs torch.compile, which calls getpass.getuser(), and
+        # uid 1000 has no passwd entry in this image (KeyError). Set USER (and
+        # TORCHINDUCTOR_CACHE_DIR) here, or add a passwd entry, before flipping it.
         - name: USE_FFO
           value: "False"
 
@@ -574,6 +598,7 @@ spec:
           python /app/fst1w_to_mni.py \
             --t1w '/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/orig.mgz' \
             --brainmask '/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/brainmask.mgz' \
+            --talairach '/fastsurfer/{{workflow.parameters.subjID}}_{{inputs.parameters.session}}/mri/transforms/talairach.xfm.lta' \
             --template /data/MNI152NLin2009cAsym_res-01_T1w_brain.nii \
             --out-dir '/work/registration/{{inputs.parameters.session}}/t1w_to_mni' \
             --prefix '{{workflow.parameters.subjID}}_{{inputs.parameters.session}}_desc-t1w2mni' \
@@ -650,7 +675,7 @@ spec:
       # inserted `OOMKilled|`. tests/argo/test_retry_expression.py asserts exactly
       # that relationship, so a future edit to the canonical string cannot silently
       # leave this copy behind — the divergence that cost #269.
-      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|OOMKilled|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|OOMKilled|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
       backoff:
         duration: "1m"
         factor: "2"
@@ -832,7 +857,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:3abfd19aa254d7bf340b981ab8ed7d6575140df84168ca399094ba9d4a89fa40"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:67da323487e00fd741d6233fd27134034194731770967a751aa99586cae270ef"
       imagePullPolicy: IfNotPresent
 
       # No PVC mount: outputs go straight to /tmp and are uploaded to S3 by the

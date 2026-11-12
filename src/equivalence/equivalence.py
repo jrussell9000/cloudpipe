@@ -769,3 +769,218 @@ def required_n(
             return n
         n += 1
     raise ValueError(f"no n <= {max_n} reaches power {power} for margin ±{margin} at sd {sd}")
+
+
+# ---------------------------------------------------------------------------
+# The final analysis's remaining tests (task 3.5): a robust TOST, the binomial
+# ceiling, and the proportionality check behind the log-ratio scale.
+# ---------------------------------------------------------------------------
+
+#: The trimmed mean drops this share from each tail. 20% is the conventional
+#: choice (Wilcox), and the one fixed for aqi's sensitivity analysis before the
+#: final values were read.
+ROBUST_TRIM = 0.2
+
+
+def trimmed_tost(
+    differences,
+    margin: float,
+    endpoint: str = "",
+    alpha: float = DEFAULT_ALPHA,
+    trim: float = ROBUST_TRIM,
+) -> EquivalenceResult:
+    """TOST on the trimmed mean (one-sample trimmed t): the robust sensitivity variant (D18).
+
+    The same decision as `tost`, the 1 - 2*alpha interval wholly inside ±margin,
+    but on the trimmed mean of the paired differences, with the standard error
+    from the winsorized variance: se = s_w / ((1 - 2g) sqrt(n)), on
+    n - 2*floor(g n) - 1 degrees of freedom. That is Tukey and McLaughlin's (1963,
+    Sankhyā A 25:331-352, eq. 15) trimmed t in the form Wilcox (2017) gives; their
+    own denominator, sqrt(SSD_W / (h (h - 1))) with h = n - 2k, is larger by
+    sqrt((n - 1) h / (n (h - 1))), 1.003 at n = 100, on the same h - 1 degrees of
+    freedom. Yuen (1974) is its two-sample form. A few sessions in a long
+    right tail move it far less than they move the mean, which is the question
+    the sensitivity analysis asks of `aqi`.
+    """
+    d = np.sort(np.asarray(differences, dtype=np.float64))
+    d = d[np.isfinite(d)]
+    n = d.size
+    k = int(np.floor(trim * n))
+    if n - 2 * k < 3:
+        raise ValueError(
+            f"{endpoint or 'endpoint'}: {n} values leave {n - 2 * k} after trimming {trim:.0%}"
+        )
+    if margin <= 0:
+        raise ValueError(f"{endpoint or 'endpoint'}: margin must be positive, got {margin}")
+
+    mean = float(d[k : n - k].mean())
+    winsorized = np.clip(d, d[k], d[n - k - 1])
+    se = float(winsorized.std(ddof=1) / ((1 - 2 * k / n) * np.sqrt(n)))
+    df = n - 2 * k - 1
+    if se == 0:
+        verdict = EQUIVALENT if abs(mean) < margin else NOT_ESTABLISHED
+        return EquivalenceResult(
+            endpoint, n, mean, mean, mean, margin,
+            0.0 if verdict == EQUIVALENT else 1.0, alpha, verdict,
+            classify_departure(mean, mean, margin, verdict),
+        )  # fmt: skip
+
+    p_lower = float(stats.t.sf((mean + margin) / se, df))
+    p_upper = float(stats.t.cdf((mean - margin) / se, df))
+    half_width = float(stats.t.ppf(1 - alpha, df)) * se
+    ci_low, ci_high = mean - half_width, mean + half_width
+    verdict = EQUIVALENT if (ci_low > -margin and ci_high < margin) else NOT_ESTABLISHED
+    return EquivalenceResult(
+        endpoint=endpoint,
+        n=n,
+        estimate=mean,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        margin=margin,
+        p_value=max(p_lower, p_upper),
+        alpha=alpha,
+        verdict=verdict,
+        departure=classify_departure(ci_low, ci_high, margin, verdict),
+    )
+
+
+CEILING_MET = "below the ceiling"
+CEILING_NOT_ESTABLISHED = "ceiling not established"
+
+
+@dataclass(frozen=True)
+class CeilingResult:
+    """The binomial companion: the share of sessions below a cut-off, against a ceiling."""
+
+    endpoint: str
+    n: int
+    below: int
+    share: float
+    #: One-sided (1 - alpha) Clopper-Pearson upper bound on the true share.
+    upper_bound: float
+    ceiling: float
+    #: P(X <= below | share = ceiling): the exact test of H0 share >= ceiling.
+    p_value: float
+    alpha: float
+    verdict: str
+
+    @property
+    def is_met(self) -> bool:
+        return self.verdict == CEILING_MET
+
+    def __str__(self) -> str:
+        return (
+            f"{self.endpoint}: {self.below} of {self.n} below ({self.share:.1%}; one-sided "
+            f"{1 - self.alpha:.0%} upper bound {self.upper_bound:.1%}) vs ceiling "
+            f"{self.ceiling:.0%}, p = {self.p_value:.3g} — {self.verdict}"
+        )
+
+
+def binomial_ceiling(
+    indicators,
+    ceiling: float,
+    endpoint: str = "",
+    alpha: float = DEFAULT_ALPHA,
+) -> CeilingResult:
+    """Is the share of sessions below the cut-off under `ceiling`? One-sided exact binomial.
+
+    `indicators` are one 0/1 per session (1 = below the cut-off). The verdict is
+    met exactly when the Clopper-Pearson upper bound is under the ceiling, which
+    is the same decision as P(X <= k | ceiling) <= alpha.
+    """
+    x = np.asarray(indicators, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if not np.isin(x, (0.0, 1.0)).all():
+        raise ValueError(f"{endpoint or 'endpoint'}: indicators must be 0 or 1")
+    n, k = int(x.size), int(x.sum())
+    if n < 1:
+        raise ValueError(f"{endpoint or 'endpoint'}: no sessions")
+    p_value = float(stats.binom.cdf(k, n, ceiling))
+    upper = 1.0 if k == n else float(stats.beta.ppf(1 - alpha, k + 1, n - k))
+    return CeilingResult(
+        endpoint=endpoint,
+        n=n,
+        below=k,
+        share=k / n,
+        upper_bound=upper,
+        ceiling=ceiling,
+        p_value=p_value,
+        alpha=alpha,
+        verdict=CEILING_MET if p_value <= alpha else CEILING_NOT_ESTABLISHED,
+    )
+
+
+@dataclass(frozen=True)
+class Slope:
+    slope: float
+    ci_low: float
+    ci_high: float
+
+    @property
+    def excludes_zero(self) -> bool:
+        return self.ci_low > 0 or self.ci_high < 0
+
+
+@dataclass(frozen=True)
+class ProportionalityResult:
+    """Do the arm differences scale with magnitude? The check behind a log-ratio scale.
+
+    Two Bland-Altman regressions on the same sessions: the log ratio on the log of
+    the pair's geometric mean, and the absolute difference on the pair's mean.
+    Proportional differences leave the first flat; constant (absolute) ones leave
+    the second flat. Descriptive: it decides no verdict, and the absolute-scale
+    interval is reported beside the ratio whatever it shows (spec, "Ratio-scale
+    endpoint").
+    """
+
+    endpoint: str
+    n: int
+    log_scale: Slope
+    absolute_scale: Slope
+    #: Mean of cloudpipe - fMRIPrep on the natural scale, with its 90% interval.
+    absolute_mean: float
+    absolute_ci: tuple[float, float]
+
+    @property
+    def proportional(self) -> bool:
+        """False only when the ratio drifts with magnitude and the difference does not."""
+        return not (self.log_scale.excludes_zero and not self.absolute_scale.excludes_zero)
+
+
+def _slope(x: np.ndarray, y: np.ndarray, confidence: float = 0.95) -> Slope:
+    fit = stats.linregress(x, y)
+    t_crit = float(stats.t.ppf(1 - (1 - confidence) / 2, x.size - 2))
+    return Slope(
+        float(fit.slope),
+        float(fit.slope - t_crit * fit.stderr),
+        float(fit.slope + t_crit * fit.stderr),
+    )
+
+
+def proportionality(
+    cloudpipe,
+    reference,
+    endpoint: str = "",
+    floor_offset: float = 0.0,
+    alpha: float = DEFAULT_ALPHA,
+) -> ProportionalityResult:
+    """Both arms' session values on the natural scale -> the two regressions and the absolute interval."""
+    a = np.asarray(cloudpipe, dtype=np.float64)
+    b = np.asarray(reference, dtype=np.float64)
+    keep = np.isfinite(a) & np.isfinite(b)
+    a, b = a[keep], b[keep]
+    if a.size < 3:
+        raise ValueError(f"{endpoint or 'endpoint'}: needs at least 3 paired sessions")
+    la, lb = np.log(a + floor_offset), np.log(b + floor_offset)
+    diff = a - b
+    se = float(diff.std(ddof=1) / np.sqrt(diff.size))
+    half = float(stats.t.ppf(1 - alpha, diff.size - 1)) * se
+    mean = float(diff.mean())
+    return ProportionalityResult(
+        endpoint=endpoint,
+        n=int(a.size),
+        log_scale=_slope((la + lb) / 2, la - lb),
+        absolute_scale=_slope((a + b) / 2, diff),
+        absolute_mean=mean,
+        absolute_ci=(mean - half, mean + half),
+    )

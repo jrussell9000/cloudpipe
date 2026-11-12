@@ -51,13 +51,6 @@ locals {
   grafana_url  = local.publish_uis ? "grafana.${var.domain}" : null
   kubecost_url = local.publish_uis ? "kubecost.${var.domain}" : null
 
-  # The Client VPN's certificates are self-signed and its endpoint is reached at
-  # the AWS-assigned DNS name, so this is a common name and a log-group label,
-  # never a resolvable host. It still has to be a string in both modes, because
-  # it reaches tls_cert_request.subject — where a change would reissue the
-  # certificates.
-  vpn_url = local.publish_uis ? "vpn.${var.domain}" : "vpn.${var.name}.internal"
-
   # Where a browser reaches each UI, in whichever mode this deployment runs.
   # Everything that builds a redirect URI, an issuer or an API URL reads these,
   # so the two modes differ in one place.

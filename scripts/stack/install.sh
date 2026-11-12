@@ -274,7 +274,7 @@ offer_operator_accounts() {
 
 # With Cognito, nobody can sign in to Cloudflare Access — and so reach the API
 # server over WARP — until a user exists in the pool. Closing the public endpoint
-# before then leaves only the VPN. offer_operator_accounts asks first on a
+# before then locks every operator out. offer_operator_accounts asks first on a
 # terminal; this is the check that holds either way.
 #
 # Prints nothing and succeeds for a deployment with an external identity
@@ -306,8 +306,7 @@ cognito_has_users() {
 # used to say the installer could not check them. It can, while the public
 # endpoint is still open: ask an API server address inside the VPC, by the
 # endpoint's own hostname so its certificate verifies, with this kubeconfig's
-# credentials. An answer proves the whole path. (The mTLS Client VPN routes the
-# same CIDR, so a deployer on the VPN passes too.)
+# credentials. An answer proves the whole path.
 #
 # Safe against WARP on another team: a deployment that shares the VPC CIDR
 # routes these addresses to a different VPC, where no API server presents a
@@ -509,7 +508,7 @@ phase_3_kube_system_network_policies() {
 
 # Full apply with crds_available at its default of false, to catch anything the
 # targeted phases did not cover. Public endpoint still open — the Cloudflare
-# tunnel, its Access applications, the VPN and, with no external identity
+# tunnel, its Access applications and, with no external identity
 # provider, the Cognito user pool and its clients are created here. Without a
 # domain there is no ALB, certificate or external-dns to create: those resources
 # and the targets above that name them plan nothing (design D2 of
