@@ -1,0 +1,511 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: newmsm
+  namespace: argo-workflows
+
+# newMSM surface registration of the subject's FastSurfer long-template to fsLR
+# (openspec add-newmsm-surface-registration, design D1/D7). One registration per
+# subject; every session's surface-resample on the newmsm route reads it.
+#
+# Publishes derivatives/newmsm/{subj}/ (design D3), exploded, `_complete.json`
+# last (ADR 017):
+#   {subj}_hemi-{L,R}_space-fsLR_desc-newmsm_sphere.surf.gii
+#   {subj}_hemi-{L,R}_desc-newmsm_affine.mat
+#   provenance.json
+#
+# The newMSM image links FSL-licensed libraries, so no template names it. It is
+# read from the deployment's `cloudpipe-config` ConfigMap, key `newmsm_image`
+# (design D7b), which Terraform sets from the variable of the same name and which
+# is ABSENT by default. A deployment without it cannot run this step: the guard
+# below fails it with exit 66 (dependency) before the pod is created.
+
+spec:
+  retryStrategy:
+    # Same canonical expression as every pipeline template (tests/argo/
+    # test_retry_expression.py). Under the master this spec-level block is
+    # ignored (a templateRef inherits `templates` only) and the master's own,
+    # identical, block applies. Exit 66 is the guard's refusal and is never
+    # retried: an unset ConfigMap key is the same on every attempt.
+    limit: "8"
+    retryPolicy: Always
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    backoff:
+      duration: "1m"
+      factor: "2"
+      cap: "5m"
+
+  podMetadata:
+    labels:
+      subjectid: "{{workflow.parameters.subjID}}"
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  podDisruptionBudget:
+    minAvailable: "100%"
+
+  workflowMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+
+  # Standalone submissions use these defaults; under the master the master's
+  # workflow-scope values win (issue #212).
+  arguments:
+    parameters:
+      - name: subjID
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
+
+  entrypoint: newmsm-entrypoint
+
+  templates:
+
+  # Standalone entrypoint, for a direct `argo submit --from workflowtemplate/newmsm
+  # -p subjID=...`. Not used under the master, which calls newmsm-dag-template.
+  - name: newmsm-entrypoint
+    steps:
+    - - name: newmsm
+        template: newmsm-dag-template
+
+  ###########################################################################
+  # The step: guard -> registration pod, with this template's own fallback
+  # recorders (ADR 016).
+  #
+  # Failures are recorded HERE, not by the master, because the guard's cause is
+  # only visible here: the master sees a DAG task, which has no exit code. The
+  # master records only Skipped and Omitted (the step never started). Every arm
+  # below fires on Failed || Errored, never on success: the pod's `main` writes
+  # its own `succeeded` record, and a fallback on success would overwrite it.
+  ###########################################################################
+
+  - name: newmsm-dag-template
+    inputs:
+      parameters:
+        # The deployment's newMSM image, by digest. `valueFrom.default` is the
+        # value when the ConfigMap has no such key; Terraform writes the key only
+        # when `newmsm_image` is set (modules/argo-workflows).
+        - name: newmsm-image
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: newmsm_image
+            default: ""
+    dag:
+      failFast: false
+      tasks:
+        - name: image-guard-dagtask
+          template: newmsm-image-guard-template
+          arguments:
+            parameters:
+              - name: newmsm-image
+                value: '{{inputs.parameters.newmsm-image}}'
+
+        - name: register-dagtask
+          template: newmsm-register-template
+          depends: image-guard-dagtask.Succeeded
+          arguments:
+            parameters:
+              - name: newmsm-image
+                value: '{{inputs.parameters.newmsm-image}}'
+
+        # Exit 66 classifies as `dependency` (images/shared/step_outcome.py).
+        # `?? ''`, never the bare tag: an Errored node may have no exit code, and
+        # the bare tag hangs the DAG (outcome-recorder template).
+        - name: record-outcome-image-guard-dagtask
+          depends: image-guard-dagtask.Failed || image-guard-dagtask.Errored
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: newmsm
+              - name: status
+                value: '{{tasks.image-guard-dagtask.status}}'
+              - name: exit-code
+                value: "{{= tasks['image-guard-dagtask'].exitCode ?? '' }}"
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        # A failed prep, register or publish container. `main` writes the
+        # succeeded record only after publishing, so no record exists to clash
+        # with. The recorder keeps the pod's status for this step rather than
+        # testing for `_complete.json`: a stale registration's marker is still
+        # in place when its re-registration fails (src/metrics/outcome_recorder.py).
+        - name: record-outcome-register-dagtask
+          depends: register-dagtask.Failed || register-dagtask.Errored
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: newmsm
+              - name: status
+                value: '{{tasks.register-dagtask.status}}'
+              - name: exit-code
+                value: "{{= tasks['register-dagtask'].exitCode ?? '' }}"
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+  ###########################################################################
+  # Guard: the registration pod cannot even be CREATED with an empty image (a
+  # containerSet creates every container up front), and a pod-creation failure
+  # reaches the recorder as an Errored node with no exit code, which reads as
+  # `infrastructure`. This pod turns the missing key into exit 66 (EX_NOINPUT),
+  # which the recorder classifies as `dependency`, and names the key in its log.
+  ###########################################################################
+
+  - name: newmsm-image-guard-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: anatomical
+        cloudpipe.io/step: newmsm-image-guard
+    inputs:
+      parameters:
+        - name: newmsm-image
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:302613557e5fbad1e0d4ec0ede67503f2cb5012e2be000ee92fb28ba70b52739"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 64M
+          cpu: 50m
+      command: [python]
+      source: |
+        import re
+        import sys
+
+        image = r"""{{inputs.parameters.newmsm-image}}""".strip()
+        if not image:
+            print("prerequisite absent: the cloudpipe-config ConfigMap has no "
+                  "`newmsm_image` key. Set terraform's `newmsm_image` to this "
+                  "deployment's newMSM image, pinned by digest, and apply. "
+                  "See docs/pipelines.md for building the image.", file=sys.stderr)
+            sys.exit(66)
+        if not re.fullmatch(r"\S+@sha256:[0-9a-f]{64}", image):
+            print(f"prerequisite absent: cloudpipe-config `newmsm_image` is {image!r}, "
+                  "which is not pinned by digest (…@sha256:<64 hex>).", file=sys.stderr)
+            sys.exit(66)
+        print(f"newMSM image: {image}")
+
+  ###########################################################################
+  # The registration: ONE containerSet pod (design D7).
+  #
+  #   prep (workbench)  ->  register-l || register-r (newMSM)  ->  main (workbench)
+  #
+  # prep     D2 steps 1-5: the long-template surfaces -> each hemisphere's
+  #          msm_inmesh/msm_indata, and newmsm.conf (HCP's MSMSulcStrainFinalconf
+  #          with --numthreads=4). Refuses any reference file whose sha256 is not
+  #          smriprep 0.19.2's.
+  # register D2 step 6, the probe's command line (check (b)). The image is
+  #          distroless: no shell, so the command is explicit.
+  # main     provenance.json, publish with `_complete.json` last, and the
+  #          `succeeded` StepOutcome.
+  #
+  # Argo loads and saves artifacts only for the container named `main`, so every
+  # artifact path is on the shared workspace volume, which the executor's init
+  # and wait containers mount as well.
+  #
+  # Resources: a containerSet's request is the SUM over its containers, all of
+  # which start at once. The two hemispheres therefore run in parallel; in series
+  # the same pod size would bill twice as long. Each register container runs 4
+  # OpenMP threads but requests 3.5 vCPU, so the whole pod (7.2 vCPU) fits one
+  # c/m 2xlarge, the instance the 3.95 min/hemisphere figure was measured on.
+  # There is no CPU limit, so each still gets 4 cores when the node is idle.
+  # Memory: the 60 reference runs peaked at 1.40 GiB (max_rss_kb, 1 thread);
+  # 4 threads add per-thread buffers, so request 2Gi and allow 4Gi. Task 6.3
+  # records the real 4-thread peak.
+  ###########################################################################
+
+  - name: newmsm-register-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: anatomical
+        cloudpipe.io/step: newmsm
+    inputs:
+      parameters:
+        - name: newmsm-image
+      artifacts:
+        # The long-template files the chain reads, one object each (ADR 017:
+        # the tree is exploded, and the whole surf/ is ~40 files this pod does
+        # not need). `white` is staged for the D2 fallback, which reads it beside
+        # sulc. None is gzip, so no archive sniff applies, but each declares
+        # `archive: none` like every other single-file input.
+        - name: lh-sphere
+          path: /workspace/surf/lh.sphere
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/surf/lh.sphere'
+        - name: lh-sphere-reg
+          path: /workspace/surf/lh.sphere.reg
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/surf/lh.sphere.reg'
+        - name: lh-sulc
+          path: /workspace/surf/lh.sulc
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/surf/lh.sulc'
+        - name: lh-white
+          path: /workspace/surf/lh.white
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/surf/lh.white'
+        - name: rh-sphere
+          path: /workspace/surf/rh.sphere
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/surf/rh.sphere'
+        - name: rh-sphere-reg
+          path: /workspace/surf/rh.sphere.reg
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/surf/rh.sphere.reg'
+        - name: rh-sulc
+          path: /workspace/surf/rh.sulc
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/surf/rh.sulc'
+        - name: rh-white
+          path: /workspace/surf/rh.white
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/surf/rh.white'
+        # The template's completion marker: the existence gate (ADR 017), and
+        # its `written_at` goes into provenance.json, which the inventory reads
+        # back to tell a current registration from a stale one.
+        - name: template-marker
+          path: /workspace/long-template/_complete.json
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/fastsurfer/{{workflow.parameters.subjID}}/long-template/_complete.json'
+        # smriprep 0.19.2's MSM config and atlases, staged flat (task 2.2).
+        # A prefix, like config/fsLR in surface-resample: no trailing slash
+        # (a zero-byte marker object would make Argo download nothing).
+        # newmsm_prep.py checks every file it reads against a pinned sha256.
+        - name: reference
+          path: /workspace/ref
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'config/newmsm'
+
+    outputs:
+      artifacts:
+        # main's own `succeeded` StepOutcome (ADR 016). Absent on any failure;
+        # the template's fallback recorder covers those.
+        - name: step-outcomes
+          optional: true
+          path: /workspace/step_outcomes
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.metrics-bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'metrics/step-outcomes/dt={{workflow.creationTimestamp.Y}}-{{workflow.creationTimestamp.m}}-{{workflow.creationTimestamp.d}}/'
+
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+
+    # Six times the slowest reference hemisphere at 4 threads (~4.4 min). A
+    # newMSM that runs past this is hung, and a blown deadline is not retried.
+    activeDeadlineSeconds: 1800
+
+    volumes:
+      - name: workspace
+        emptyDir: {}
+
+    containerSet:
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      containers:
+        - name: prep
+          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:60aeff7db03e845af0d9f480190df4787c1541cc5725ee3c86a831cad5b1134b"
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 100m
+              ephemeral-storage: 1G
+            limits:
+              memory: 2Gi
+          command: [/entrypoint.sh, python, -u, /app/newmsm_prep.py, prep]
+          args:
+            - --surf-dir
+            - /workspace/surf
+            - --ref-dir
+            - /workspace/ref
+            - --workspace
+            - /workspace/ws
+
+        - name: register-l
+          image: "{{inputs.parameters.newmsm-image}}"
+          imagePullPolicy: IfNotPresent
+          dependencies: [prep]
+          # The mount itself, never a subdirectory. Every container of a containerSet
+          # is created up front, and the runtime creates a missing workingDir as ROOT:
+          # `/workspace/ws` there raced prep's own mkdir, and when the runtime won,
+          # prep (uid 1000) could not write ws/newmsm.conf (24 of 30 pods,
+          # newmsm-equivalence-w2z6l, 2026-11-09). The mount exists and is
+          # group-writable (fsGroup). --out is absolute, so the cwd is only newMSM's.
+          workingDir: /workspace
+          env:
+            # Must equal newmsm_prep.THREADS, which writes --numthreads into the
+            # config: newMSM takes its thread count from the config file.
+            - name: OMP_NUM_THREADS
+              value: "4"
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: 3500m
+            limits:
+              memory: 4Gi
+          command: [/opt/newmsm/bin/newmsm]
+          args:
+            - --inmesh=/workspace/ws/L.msm_inmesh.surf.gii
+            - --refmesh=/workspace/ref/fsaverage.L_LR.spherical_std.164k_fs_LR.surf.gii
+            - --indata=/workspace/ws/L.msm_indata.shape.gii
+            - --refdata=/workspace/ref/L.refsulc.164k_fs_LR.shape.gii
+            - --conf=/workspace/ws/newmsm.conf
+            - --out=/workspace/ws/L.
+            - --verbose
+
+        - name: register-r
+          image: "{{inputs.parameters.newmsm-image}}"
+          imagePullPolicy: IfNotPresent
+          dependencies: [prep]
+          workingDir: /workspace
+          env:
+            - name: OMP_NUM_THREADS
+              value: "4"
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: 3500m
+            limits:
+              memory: 4Gi
+          command: [/opt/newmsm/bin/newmsm]
+          args:
+            - --inmesh=/workspace/ws/R.msm_inmesh.surf.gii
+            - --refmesh=/workspace/ref/fsaverage.R_LR.spherical_std.164k_fs_LR.surf.gii
+            - --indata=/workspace/ws/R.msm_indata.shape.gii
+            - --refdata=/workspace/ref/R.refsulc.164k_fs_LR.shape.gii
+            - --conf=/workspace/ws/newmsm.conf
+            - --out=/workspace/ws/R.
+            - --verbose
+
+        - name: main
+          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:60aeff7db03e845af0d9f480190df4787c1541cc5725ee3c86a831cad5b1134b"
+          imagePullPolicy: IfNotPresent
+          dependencies: [register-l, register-r]
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+          env:
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: cloudpipe-config
+                  key: region
+          command: [/entrypoint.sh, python, -u, /app/newmsm_prep.py, publish]
+          args:
+            - --subject
+            - '{{workflow.parameters.subjID}}'
+            - --bucket
+            - '{{workflow.parameters.bucket}}'
+            - --workspace
+            - /workspace/ws
+            - --template-marker
+            - /workspace/long-template/_complete.json
+            - --newmsm-image
+            - '{{inputs.parameters.newmsm-image}}'
+            - --outcome-dir
+            - /workspace/step_outcomes
+            - --workflow-name
+            - '{{workflow.name}}'
+            - --workflow-uid
+            - '{{workflow.uid}}'

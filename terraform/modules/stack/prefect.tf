@@ -27,6 +27,9 @@ module "prefect" {
   metrics_bucket = local.metrics_bucket
   work_pool      = var.prefect_work_pool
 
+  # The cost scraper routes audit workflows' cost here (audit_buckets.tf).
+  audit_metrics_buckets = local.audit_metrics_buckets
+
   # The batch gate starts the Globus host before listing through it (#652).
   # Empty when the ingress is not enabled, which the prefect module reads as "no
   # host to start" and attaches no ec2:StartInstances policy (iam.tf).

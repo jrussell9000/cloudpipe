@@ -87,6 +87,9 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+from nibabel.spatialimages import SpatialImage
+from nss import describe as nss_describe
+from nss import nss_for_run
 from registration_qc import (
     _BOLD_T1W_THRESHOLDS,
     modified_hausdorff_distance,
@@ -125,6 +128,21 @@ def get_first_steady_state_frame(nss_frames: int | None, json_sidecar: Path | No
             log.info(f"Sidecar: skipping {nss} NSS volume(s)")
         return nss
     return 0
+
+
+def run_nss_frames(bold: Path, session_nss: int, task: str) -> int:
+    """The run's NSS count from its session's, as preproc.py resolves it.
+
+    On GE a known run length decides (images/shared/nss.py), so the registration
+    reference skips the same frames the functional preprocessing does.
+    """
+    img = nib.load(str(bold))
+    if not isinstance(img, SpatialImage):  # nib.load is typed as FileBasedImage
+        raise TypeError(f"{bold}: expected a spatial image, nibabel read {type(img).__name__}")
+    shape = img.shape
+    n_frames = shape[3] if len(shape) > 3 else 1
+    log.info(nss_describe(session_nss, task, n_frames))
+    return nss_for_run(session_nss, task, n_frames)
 
 
 def build_reference(
@@ -619,6 +637,8 @@ def main() -> None:
             sys.exit(1)
 
     # Step 1: temporal-mean BOLD reference
+    if args.nss_frames is not None:
+        args.nss_frames = run_nss_frames(args.bold, args.nss_frames, args.task)
     build_reference(args.bold, args.nss_frames, args.json, ref)
 
     # Step 2: SynthMorph rigid registration

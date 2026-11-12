@@ -21,6 +21,7 @@ Every table also includes `pipeline` (str, always `"cloudpipe_minproc"` today) a
 | [SurfaceSampleQC](#surfacesampleqc--per-bold-run) | `metrics/surface-sample/` | 1 row per BOLD run | `images/afni/preproc.py` | raw dict — matches dataclass | `surface_qc.csv` |
 | [AnatQC](#anatqc--per-subjectsession) | `metrics/anat-qc/` | 1 row per subject×session | `images/fastsurfer/extract_qc.py` | raw dict — matches dataclass | `anat_qc.csv` |
 | [FsqcQC](#fsqcqc--per-subjectsession) | `metrics/fsqc-qc/` | 1 row per subject×session | `images/fsqc/stage_and_run.py` | raw dict — matches dataclass | `fsqc_qc.csv` |
+| [TissueQC](#tissueqc--per-subjectsession) | `metrics/tissue-masks/` | 1 row per subject×session | `images/afni/tissue_masks.py` | raw dict — matches dataclass | `tissue_qc.csv` |
 | [RegistrationQC](#registrationqc--per-registration-step) | `metrics/registration/` | 1 row per registration | `images/fireANTs/scripts/fst1w_to_mni.py`, `images/freesurfer/bold_to_t1w.py` | raw dict — **drifts heavily** | `registration_qc.csv` |
 | [WorkflowRun](#workflowrun--per-argo-workflow) | `metrics/workflow-runs/` | 1 row per Argo workflow | `src/metrics/exit_handler.py` | dataclass — no drift possible | `workflow_runs.csv` |
 | [CostAllocation](#costallocation--per-workflow-per-scrape-date) | `metrics/costs/` | 1 row per workflow×scrape-date | `src/metrics/kubecost_scraper.py` | dataclass — no drift possible | `costs_raw.csv` (raw), `costs_by_subject.csv` (summed per subject) |
@@ -28,12 +29,12 @@ Every table also includes `pipeline` (str, always `"cloudpipe_minproc"` today) a
 | [StepOutcome](#stepoutcome--per-step-per-scan-unit) | `metrics/step-outcomes/` | 1 row per (workflow, step, subject, session, task, run) | `src/metrics/outcome_recorder.py` | dataclass — no drift possible | *not exported* |
 | [SubjectManifest](#subjectmanifest--per-workflow-per-subject) | `metrics/subject-manifests/` | 1 row per (workflow, subject) | `src/metrics/exit_handler.py` | dataclass — no drift possible | *not exported* |
 
-All ten are partitioned `dt=YYYY-MM-DD/` (the write date, except `CostAllocation`/`PodCost`
+All eleven are partitioned `dt=YYYY-MM-DD/` (the write date, except `CostAllocation`/`PodCost`
 where `dt` equals the cost *report* date — see those tables' notes) and queryable via
 `metrics.athena.CloudpipeMetrics` / `metrics.duckdb_query.CloudpipeMetrics`
-(`func_qc`/`surface_qc`/`anat_qc`/`fsqc_qc`/`registration_qc`/`workflow_runs`/`costs`/`pod_costs`), or in bulk via
+(`func_qc`/`surface_qc`/`anat_qc`/`fsqc_qc`/`tissue_qc`/`registration_qc`/`workflow_runs`/`costs`/`pod_costs`), or in bulk via
 `scripts/export_batch_metrics.py`. `StepOutcome` and `SubjectManifest` are queryable but have no
-CSV export today — `export_batch_metrics.py` only pulls the six tables in the rightmost column
+CSV export today — `export_batch_metrics.py` only pulls the tables named in the rightmost column
 above. Two more S3 prefixes exist under `metrics/` that are **not** part of this queryable set
 — see [Non-schema objects](#non-schema-s3-objects) at the bottom.
 
@@ -60,7 +61,7 @@ S3 key: `metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json`
 |---|---|---|
 | `subject`, `session`, `task`, `run` | str | Run identity |
 | `n_frames` | int | Total frames in the BOLD volume |
-| `n_nss_frames` | int | Non-steady-state frames at the start of the run (5, 8 or 16 by scanner software, from `tools/nss_volumes.csv`). They stay in the BOLD and confounds, flagged by `non_steady_state_outlier_*`; from schema 1.3 every summary below excludes them |
+| `n_nss_frames` | int | Non-steady-state frames at the start of the run (5, 8 or 16 by scanner software). The session's count comes from `config/nss_volumes.csv`; on GE a run of a known length takes its length's count instead (rest 380 → 5, 391 → 16; n-back 367 → 5, 378 → 16; `images/shared/nss.py`), so runs of one session can differ. They stay in the BOLD and confounds, flagged by `non_steady_state_outlier_*`; from schema 1.3 every summary below excludes them |
 | `tr_seconds` | float | Repetition time (s) |
 | `mean_fd`, `median_fd`, `max_fd` | float | Framewise displacement stats (mm) |
 | `n_fd_above_0p2`, `n_fd_above_0p5` | int | Frame counts above FD thresholds |
@@ -74,12 +75,14 @@ S3 key: `metrics/func-preproc/dt={dt}/{subject}_{session}_{task}_{run}_qc.json`
 | `aqi` | float | **Schema 1.1.** AFNI quality index (mriqc `aqi`) — mean per-frame `1 - Spearman correlation with the median volume`. Lower is better |
 | `n_acompcor_wm`, `n_acompcor_csf` | int | aCompCor confound regressor counts (WM and CSF) |
 | `n_tcompcor`, `n_cosines` | int | tCompCor + cosine-basis regressor counts |
+| `wm_mask_voxels`, `csf_mask_voxels` | int | **Schema 1.5.** Voxels in the masks behind the confounds TSV's `white_matter` and `csf` columns: FastSurfer's 1 mm `label-{WM,CSF}_mask` taken to the 2 mm BOLD grid by AFNI-identical nearest neighbour, within the run's brain mask. These are the masks `fmri-first-level-proc` regresses on rest. `0` means that mask was empty, or not computed (see `tissue_confounds`) |
+| `tissue_confounds` | str | **Schema 1.5.** The two columns' status: `ok`; `empty-mask` (a mask had no voxel, so its column is `n/a`); `no-tissue-maps` (the session's maps failed to export, so both columns are `n/a`); `error` (both `n/a`, message in the pod log); `not-computed` (the default `preproc.py` emits, before the session pod's step fills it in) |
 | `stage_timings_s` | dict | Per-stage wall time: `boldref`, `composite_warp`, `4d_warp`, `mask_warp`, `masking`, `confounds`, and `grayordinates` on runs that emit surface output. Query `4d_warp` as `stage_timings_s."4d_warp"` — unquoted, its leading digit fails the **whole** query with `MALFORMED_QUERY`, not just that column. Pre-2026-08-03 records also carry `stc`, always ~0 — slice timing correction was a no-op on every run and has been removed. **The `4d_warp`/`masking` split moved on 2026-10-24**: the MNI BOLD is now written once, masked, in `masking` (which used to be 3dcalc plus the read-back), so `4d_warp` no longer includes a write and a compression. Compare the two keys' sum across that date, not either alone. **`boldref` reads the whole run since #858**: it used to read only the NSS frames, and now averages every steady-state frame, so it rose by one decompression pass of the native BOLD |
 | `total_runtime_s` | float | Total preprocessing wall time (s) |
 | `peak_memory_gb` | float | Peak RSS for **this run only** (`RUSAGE_SELF`/`RUSAGE_CHILDREN` max) — resets per run |
 | `container_peak_memory_gb` | float | Peak RSS over the **container's lifetime** — climbs across a multi-run session even when runs are identically sized; size pod memory limits against this one, not `peak_memory_gb` |
 | `pipeline`, `image_tag` | str | Provenance: pipeline name and image SHA |
-| `schema_version` | str | `"1.3"`: every summary is over the steady-state frames (#859, see below). `"1.2"` (#643) changed only the confounds, whose CompCor excludes the NSS frames. `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that #119 showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
+| `schema_version` | str | `"1.5"`: adds `wm_mask_voxels`, `csf_mask_voxels` and `tissue_confounds` for the TSV's `csf` and `white_matter` columns; every other field is as in 1.4. Published 1.4 records were patched to 1.5 in place by the tissue-confounds backfill, so each run still has one record. `"1.4"`: the confounds the counts describe (`n_acompcor_*`, `n_tcompcor`, `n_cosines`) are nipype's CompCor and cosine basis, as fMRIPrep computes them (#923); every IQM is as in 1.3. `"1.3"`: every summary is over the steady-state frames (#859, see below). `"1.2"` (#643) changed only the confounds, whose CompCor excludes the NSS frames. `"1.1"` (`"1.0"` records predate `dvars_std`/`gcor`/`aor`/`aqi` — those come back absent, not zero, on pre-1.1 rows). Schema 1.1 originally shipped with an IQM block that #119 showed could never have run: `aor`/`aqi`/`gcor` shelled out to AFNI's `3dToutcount`/`3dTqual`/`@compute_gcor`, and the image took AFNI from conda-forge at the time, whose package ships only 71 of AFNI's ~600 programs, so none of the three binaries existed in the image (the calls surfaced as `PermissionError`, not "not found"). The image installs upstream AFNI now, but still ships only an allow-listed set of binaries, so they remain absent — deliberately. All three are now **reimplemented in numpy** at AFNI's default settings, so the values stay comparable with AFNI's own and with MRIQC's, which wrap the same programs. Parity is exact for `aor` and `gcor`; `aqi` matches AFNI only to ~1e-5. The schema version deliberately stayed at 1.1 — the field set didn't change, only whether it was populated. On failure all three record `0.0` (with a WARNING in the pod log), not absent |
 
 **`gcor`/`aor`/`aqi` are computed in-process in `preproc.py`, at the same definitions as AFNI's
 `@compute_gcor`, `3dToutcount -fraction` and `3dTqual`** — the tools MRIQC wraps for the same
@@ -95,8 +98,10 @@ accumulation is the limiting error.
 
 **From schema 1.3 every summary excludes the non-steady-state frames** (#859): `gcor`, `aor`,
 `aqi`, `tsnr_median`, `mean_global_signal`, and `mean_dvars`/`dvars_std` and the FD fields, which
-also skip the first difference inside the window. ABCD discards the same frames before every
-analysis (Hagler et al. 2019, footnote 4). On GE DV26 and later and on Siemens VE11 those frames
+also skip the first difference inside the window. Hagler et al. (2019, footnote 4) has ABCD
+discard the same frames before every analysis, but on GE ABCD now discards one fewer: 4 and 15,
+not 5 and 16 (ABCD 6.0 release notes; each n-back events file's `dummy` row states what applied
+to that run). Cloudpipe still flags all 5 or 16, because the transient is in them. On GE DV26 and later and on Siemens VE11 those frames
 carry a T1-saturation transient (frame 0 ~+56% and ~+26% above steady state), and over the full
 series it dominated the metrics: on one GE DV26 run, `gcor` 0.546 against 0.058 and `tsnr_median`
 24.8 against 49.0. **1.2 and earlier values of these fields are therefore not comparable across
@@ -365,6 +370,61 @@ candidates for cross-subject outlier review, on the same reasoning as `AnatQC`'s
 
 ---
 
+## `TissueQC` — per subject×session
+
+**`export_batch_metrics.py` output file: `tissue_qc.csv`**
+
+QC of the session's two 1 mm MNI tissue segmentations, published beside its BOLD in
+`derivatives/func/{subj}/{ses}/` (see `docs/pipelines.md`):
+
+- the **dseg** is FastSurfer's aseg, warped to MNI and grouped into GM/WM/CSF;
+- the **probseg** is DIPY's HMRF, fitted to the session's `orig_nu.mgz` inside its brainmask.
+
+Emitted by `images/afni/tissue_masks.py --qc-out` as a raw dict whose key order is the column order.
+Two writers set `source`: func-preproc (`"func-preproc"`) and the probseg backfill (`"probseg-backfill"`).
+Matches `TissueQC` in `src/metrics/schemas.py`; `tests/metrics/test_tissue_qc_schema_sync.py`
+holds the emitter, the dataclass, both Glue tables and `_UNION_COLUMNS` together.
+
+S3 key: `metrics/tissue-masks/dt={dt}/{subject}_{session}_tissue_qc.json`
+
+**Sessions published before 2026-10-26 have no row until the probseg backfill writes one.** Their
+published probseg was fitted to `brainmask.mgz`'s WM-normalised intensities, and in 32 of 60
+audited sessions its classes collapsed: `label-CSF_probseg` held the grey matter and
+`label-WM_probseg` was nearly empty. Do not use a probseg that has no `probseg_written = true`
+row here.
+
+**`agreement_{gm,wm,csf}`** is, for one dseg class, the share of its voxels whose probseg argmax is
+the same class. The two segmentations differ by construction (sulcal CSF is in the probseg's CSF
+only, WM-bright deep grey nuclei go to its WM), so sound fits score about 0.68–0.91 per class;
+collapsed fits scored 0.0–0.44 on WM. Below `PROBSEG_MIN_AGREEMENT` (0.5) on any class,
+`tissue_masks.py` publishes **no** probseg and records `probseg_written = false`; the dseg and
+masks are always published.
+
+**`NULL`, never `0.0`, is "not fitted"** for every `probseg_*` and `agreement_*` field. 0.0 is a real
+volume and a real agreement. `probseg_written = false` with values present is a rejected fit; with
+`NULL` values, no fit was attempted.
+
+| Field | Type | Description |
+|---|---|---|
+| `subject`, `session` | str | Identity |
+| `pipeline` | str | `"cloudpipe_minproc"` |
+| `image_tag` | str | Tag half of the producing pod's image ref |
+| `source` | str | `"func-preproc"` or `"probseg-backfill"` |
+| `schema_version` | str | `"1.0"` |
+| `completed_at` | str | ISO 8601 UTC, when the record was written |
+| `dseg_gm_vol_mm3`, `dseg_wm_vol_mm3`, `dseg_csf_vol_mm3` | float | Dseg volume per class (mm³). Its CSF is the ventricles and choroid plexus only, so it is small (~20 ml) |
+| `probseg_input` | str? | The image the probseg was fitted to: `"orig_nu"` |
+| `probseg_seed` | int? | The HMRF's RNG seed (`PROBSEG_SEED`); the same input and seed give bit-identical maps |
+| `probseg_written` | bool | Whether the probseg was published |
+| `probseg_gm_vol_mm3`, `probseg_wm_vol_mm3`, `probseg_csf_vol_mm3` | float? | Sum of each class's probabilities (mm³). Its CSF includes sulcal CSF (~450 ml) |
+| `agreement_gm`, `agreement_wm`, `agreement_csf` | float? | Per dseg class, the share of its voxels whose probseg argmax agrees (0–1) |
+
+Deduplicate on `subject`+`session` by latest `completed_at`: a reprocess flushes the old row
+(`scripts/reprocess_func.py`), but a retried session or a re-run backfill writes a second row
+under a later `dt=` (`scripts/purge_superseded_metrics.py --table tissue_masks` removes it).
+
+---
+
 ## `RegistrationQC` — per registration step
 
 **`export_batch_metrics.py` output file: `registration_qc.csv`** (both `registration_type`s
@@ -377,7 +437,7 @@ defaults, and its own field defaults (including `schema_version: "1.2"`) do not 
 either live emitter actually writes today. Always filter `registration_qc(registration_type=...)`
 and read the section below for the type you asked for, not the dataclass.
 
-### `t1w_to_mni` (schema 2.7) — from `images/fireANTs/scripts/fst1w_to_mni.py` (FireANTs SyN, GPU)
+### `t1w_to_mni` (schema 2.8) — from `images/fireANTs/scripts/fst1w_to_mni.py` (FireANTs SyN, GPU)
 
 S3 key: `metrics/registration/dt={dt}/{subject}_{session}_t1w_to_mni_reg_qc.json`
 
@@ -399,6 +459,8 @@ alongside — the RANDOM attempts agreed with each other (median spread 0.020 `l
 from NONE (median jump 0.363), i.e. an escape from a local minimum rather than selection among
 noisy draws. `lncc - none_lncc` is that jump for any rescued row.
 
+**The talairach cross-check (schema 2.8, #1105).** When FastSurfer's `mri/transforms/talairach.xfm.lta` is staged and was fitted on the registered grid, every attempt also measures `affine_tal_dev_mm`: the mean displacement over the template brain between its affine and FastSurfer's independent one, net of the fixed 2009c→MNI305 map. It is gated, and it catches a failure `lncc` cannot: in ~3% of the cohort the moments-initialised affine lands ~1 cm off superior–inferior, SyN half-repairs it with heavy local compression, and `lncc` ends at 0.66–0.75 — a pass. A gate failure runs the same RANDOM ladder an `lncc` failure does, and every ticket must clear the bound too. Without a usable talairach transform the field is absent and nothing is gated on it.
+
 | Field | Type | Description |
 |---|---|---|
 | `subject`, `session` | str | Identity. `task`/`run` are present but always `""` — this is a session-level record |
@@ -413,17 +475,19 @@ noisy draws. `lncc - none_lncc` is that jump for any rescued row.
 | `log_jac_frac_beyond_1p5`, `log_jac_frac_beyond_3` | float | Fraction of (non-folded) brain voxels with \|log det J\| beyond 1.5 / 3 — healthy T1w→MNI152 keeps the vast majority within ±1.5; mass near ±3 means tissue is being squashed/ballooned to force an intensity match. **Recorded but not gated** — no threshold calibrated yet |
 | `ice_mean_mm`, `ice_p95_mm`, `ice_p99_mm`, `ice_max_mm` | float | Inverse consistency error (mm): displace a voxel by the forward warp then the inverse warp sampled there — the residual from the start point. Reads no image intensities, so it would catch a warp that matches intensities well but isn't globally invertible. **NEVER POPULATED — all four are absent (not zero).** Computing them needs the inverse of the SyN fit, and `fireants` 1.5.0 raises `NotImplementedError('Inverse warp not implemented for SyN registration')`, so the emitter no longer attempts it. Measured 2026-08-11: 0 of 582 records at schema 2.1 carry any `ice_*` value, and of 12 archived `t1w-to-mni` pod logs sampled across 2026-07-23..2026-08-11, 11 log that error and none emit a value. `ice_mean_mm` was gated (fail **above** 0.5 mm) from 2026-07-23 to 2026-08-11 and was evaluated on **zero** sessions in that window, because `verdict()` skips absent keys; the entry is withdrawn. Columns remain declared so no schema bump is needed if the inverse lands upstream. Treat any value here as missing data, never as a measurement |
 | `centroid_displacement_mm` | float | Brain-mask centroid displacement after alignment (mm) — recorded, **not** gated |
-| `verdict` | str | `"pass"` / `"fail"` against `registration_qc._T1W_MNI_THRESHOLDS`, which declares **two** fail bounds: `lncc < 0.65` and `jac_det_frac_negative > 0.005`. `mask_dice`, `centroid_displacement_mm` and the `ice_*` family are recorded but **not** gated (`ice_*` is not even measurable — see above). **There is no warn band** — both threshold tables dropped theirs on 2026-07-30 and `verdict()` can no longer emit one, because a warn exited 0 and promoted outputs exactly as a pass did. Records written before then still carry `"warn"`, so queries spanning historical partitions must handle the value |
-| `sampling_strategy` | str | Schema 2.7+. `"NONE"` or `"RANDOM"` — the affine metric sampling of the attempt this row describes |
+| `verdict` | str | `"pass"` / `"fail"` against `registration_qc._T1W_MNI_THRESHOLDS`, which declares **three** fail bounds: `lncc < 0.65`, `jac_det_frac_negative > 0` (any folded brain voxel; it was `> 0.005` before the #1020 Jacobian fix) and, from schema 2.8 when measured, `affine_tal_dev_mm > 10`. `mask_dice`, `centroid_displacement_mm` and the `ice_*` family are recorded but **not** gated (`ice_*` is not even measurable — see above). **There is no warn band** — both threshold tables dropped theirs on 2026-07-30 and `verdict()` can no longer emit one, because a warn exited 0 and promoted outputs exactly as a pass did. Records written before then still carry `"warn"`, so queries spanning historical partitions must handle the value |
+| `sampling_strategy` | str | Schema 2.7+. `"NONE"` or `"RANDOM"` — the affine metric sampling of the attempt this row describes. |
 | `rescue_ticket` | int | Schema 2.7+. `0` = the NONE attempt; `1`–`3` = the RANDOM ticket that passed. **`0` covers two different outcomes** — a first-attempt pass *and* a total failure (every attempt failed, NONE recorded); tell them apart with `verdict` and `attempts_run` |
 | `sampling_seed` | int | Schema 2.7+. RANDOM seed of the recorded attempt; `-1` when NONE (no sample drawn — `-1` because `0` is a legal seed). With `itk_threads`, regenerates a rescued transform's **affine** bit-for-bit — and so its basin. The final warp is reproducible only up to GPU SyN, which is not bit-deterministic: identical runs on one card model differ by a median 1.8e-4 `lncc`, up to ~0.02 on a few rugged sessions, with no verdict flips across 30 validation sessions. That residual applies to NONE rows equally |
 | `itk_threads` | int | Schema 2.7+. ITK thread count of the recorded attempt. Always `1` for RANDOM, the only count at which RANDOM's affine is reproducible: above one thread Mattes MI merges per-thread partial sums in scheduling order and the affine endpoint wanders, even at a fixed seed |
 | `attempts_run` | int | Schema 2.7+. Registrations run this step: `1` (NONE passed, or the rescue was disabled) up to `4` |
 | `none_lncc`, `none_jac_det_frac_negative` | float | Schema 2.7+. The NONE attempt's values for the **two gated metrics** — i.e. why it was rejected, on a rescued row. On a first-attempt pass they equal `lncc` / `jac_det_frac_negative` |
-| `completed_at`, `schema_version` | str | `schema_version` is `"2.7"` (`"2.1"` before the rescue; the number is shared with `bold_to_t1w` across one table, so no `t1w_to_mni` row carries 2.2–2.6). `completed_at` is when the **step** finished — after every rescue ticket, not when the recorded attempt did |
+| `affine_tal_dev_mm` | float | Schema 2.8+. Mean displacement (mm) over the template brain between this attempt's affine and FastSurfer's talairach affine, net of the fixed 2009c→MNI305 map. **Gated: fails above 10.** Cohort 2026-11-09: median 3.4, 95th percentile 7.8. **Absent (NULL) when no usable talairach transform was staged** — never read NULL as 0 |
+| `none_affine_tal_dev_mm` | float | Schema 2.8+. The NONE attempt's `affine_tal_dev_mm` — on a rescued row, how far off the attempt it replaced was. Absent when the check did not run |
+| `completed_at`, `schema_version` | str | `schema_version` is `"2.8"` (`"2.7"` for the rescue without the talairach check, `"2.1"` before the rescue; the number is shared with `bold_to_t1w` across one table, so no `t1w_to_mni` row carries 2.2–2.6). `completed_at` is when the **step** finished — after every rescue ticket, not when the recorded attempt did |
 
 **Filter on `schema_version >= '2.7'`** before reading the provenance fields — pre-2.7 rows and
-every `bold_to_t1w` row return `NULL` for all seven in Athena (the dataclass's defaults apply
+every `bold_to_t1w` row return `NULL` for all seven in Athena (and pre-2.8 rows for the two 2.8 fields) (the dataclass's defaults apply
 only when deserializing in Python). Counting rescues: `rescue_ticket > 0`. Genuinely lost
 sessions: `verdict = 'fail'`, which on 2.7+ rows means all `attempts_run` attempts failed.
 
@@ -525,7 +589,7 @@ S3 key: `metrics/workflow-runs/dt={dt}/{workflow_name}__{workflow_uid}__{subject
 `costs_by_subject.csv`** (via `subject_costs()` — summed to one row per subject, see the grain
 warning below)
 
-Written nightly (02:00 UTC, or on demand) by `src/metrics/kubecost_scraper.py`, one record per
+Written nightly (02:00 UTC, rewritten by the 12:00 UTC day+1 refresh, or on demand) by `src/metrics/kubecost_scraper.py`, one record per
 Argo workflow visible to Kubecost that day. Requires the `subjectid` pod label. Also written by
 `scripts/reconstruct_costs.py` for days Kubecost lost or under-captured — those rows are a
 **model, not an invoice**; see `source` below. Both writers construct the dataclass
@@ -623,8 +687,31 @@ auto-detects it, so only `compactor.read_raw_records` needed to learn about the 
 | `node_capacity_type` | str | **Schema 1.1+.** `"spot"` on every Karpenter-provisioned node — which is all pipeline compute, since all four nodepools are spot-only (ADR 007) — and `"on-demand"` on the EKS managed-nodegroup nodes that carry system pods. Taken from the `karpenter.sh/capacity-type` node label, falling back to Kubecost's `preemptible` flag for nodes Karpenter did not create. `""` on rows written before schema 1.1 |
 | `node_effective_usd_per_hour` | float | **Schema 1.1+.** What the node actually cost per hour: its Kubecost **Assets** `totalCost` divided by its node-hours. This is the rate the pod's own cost columns were derived from, so it inherits the same day+1 drift and only settles at `scrape_age_days = 3`. **NULL, not 0**, when Kubecost had no asset for the node |
 | `node_ondemand_usd_per_hour` | float | **Schema 1.1+.** AWS **list** price for `node_instance_type` in-region, from the Pricing API at scrape time (`src/metrics/ec2_pricing.py`). Does not drift, and is *not* reduced by any savings plan or RI the account holds. **NULL, not 0**, when the Pricing API returned no rate for the type |
+| `node_instance_id` | str | **Schema 1.2+.** The EC2 instance the pod was matched to, by time, among the instances that held its hostname (`kubecost_scraper.resolve_node`). `""` when it could not be proven. `node` is a hostname, and hostnames are reused private IPs, so `node` alone does not name an instance. See *Which rows' node columns to trust* below |
 | `scrape_age_days` | int | Same meaning as on `CostAllocation` |
-| `schema_version` | str | `"1.1"` (`"1.0"` on rows predating the three `node_capacity_type`/rate columns) |
+| `schema_version` | str | `"1.2"`. `"1.1"` on rows predating `node_instance_id`, and `"1.0"` on rows predating the three `node_capacity_type`/rate columns |
+
+### Which rows' node columns to trust
+
+The instance behind a hostname changes during a day: EC2 reuses private IPs, and on busy days in
+2026-10 about a quarter of workflow pods ran on a hostname that more than one instance held.
+Kubecost keeps hourly data for 49 hours and serves older windows from daily rollups, and **the
+rollups merge the instances that shared a hostname**. Their windows overlap and one instance type
+is stamped on both. So:
+
+- **Schema 1.2, `node_instance_id` set, `node_effective_usd_per_hour` set:** the instance is proven
+  and the rates are its own.
+- **Schema 1.2, `node_instance_id` set, `node_effective_usd_per_hour` NULL:** the settled re-scrape
+  could not prove the instance from the rollup, so it carried the instance, `node_instance_type`,
+  `node_capacity_type` and `node_ondemand_usd_per_hour` forward from the day+1 record, which proved
+  them from hourly data. The effective rate stays NULL because an unreconciled day+1 rate beside
+  settled dollars would not cancel. These rows can be priced at list price, but `spot_savings()`
+  excludes them and they lower its `coverage_frac`.
+- **Schema 1.2, `node_instance_id` empty:** unproven. The three node columns are NULL / `""`.
+- **Schema 1.0 / 1.1:** the node columns came from a hostname-keyed table that let one instance's
+  rates overwrite another's. On a hostname that more than one instance held that day they can be
+  wrong, and nothing in the row says so. `total_cost_usd` and the other cost columns are Kubecost's
+  own and were not affected.
 
 **Grain is one row per pod per report date — one below `costs`.** Summing `total_cost_usd` over
 a `(date, workflow_name)` reproduces that workflow's `costs` row; the two passes share
@@ -820,9 +907,9 @@ message, falling back to container exit code since `{{tasks.<name>.message}}` do
 | Category | Trigger examples |
 |---|---|
 | `infrastructure` | `OOMKilled`, exit 137/143, node eviction/cordon, `Unschedulable`, deadline exceeded |
-| `data` | `NoSuchKey`/`NoSuchBucket`, missing/corrupt input, `nss_volumes` errors |
+| `data` | `NoSuchKey`/`NoSuchBucket`, missing/corrupt input, `nss_volumes` errors; exit 70: `fastsurfer-template-parc`'s topology correction ran past its 30 min bound on a hemisphere whose surface is not a brain (a saturated T1w gives one defect spanning the hemisphere), so the anatomy is unusable rather than the step broken (#958) |
 | `algorithm` | `AssertionError`/`ValueError`/`RuntimeError`, segfault (incl. exit 139), `CalledProcessError` |
-| `dependency` | Upstream DAG task failed or was skipped |
+| `dependency` | Upstream DAG task failed or was skipped; exit 66: a prerequisite the step does not make is absent (the `newmsm` image guard, when `cloudpipe-config` has no `newmsm_image`) |
 | `qc_rejected` | Exit 65: `t1w-to-mni` or `bold-to-t1w` evaluated its own output, its QC gate said `fail`, and it exited without promoting anything. **Not a defect** — the step worked; the session/run is still lost (no transform, so no `derivatives/func/`). The gated metric is in `registration` (`verdict = 'fail'`) |
 | `unknown` | Failed/skipped with no message and no recognized exit code |
 
@@ -952,6 +1039,8 @@ deliberately. 3,031 records were written that neither engine could read.
 ---
 
 ## See also
+
+- [qc-metrics-explained.md](qc-metrics-explained.md): what the QC metrics in these tables measure and how they are computed.
 
 - [`src/metrics/schemas.py`](https://github.com/jrussell9000/cloudpipe/blob/main/src/metrics/schemas.py) — the dataclasses (authoritative for
   the five tables built via constructor; a useful but sometimes-stale reference for the two

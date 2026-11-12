@@ -7,6 +7,7 @@ Each dataclass maps to one S3 prefix and one Glue/Athena table:
   SurfaceSampleQC → metrics/surface-sample/ → cloudpipe_metrics.surface_sample
   AnatQC          → metrics/anat-qc/        → cloudpipe_metrics.anat_qc
   FsqcQC          → metrics/fsqc-qc/        → cloudpipe_metrics.fsqc_qc
+  TissueQC        → metrics/tissue-masks/   → cloudpipe_metrics.tissue_masks
   WorkflowRun     → metrics/workflow-runs/  → cloudpipe_metrics.workflow_runs
   CostAllocation  → metrics/costs/          → cloudpipe_metrics.costs
   PodCost         → metrics/pod-costs/      → cloudpipe_metrics.pod_costs
@@ -121,6 +122,15 @@ class FuncQC:
     n_tcompcor: int = 0
     n_cosines: int = 0
 
+    # The confounds TSV's csf and white_matter columns (schema 1.5,
+    # add-tissue-confound-columns): each mask's voxel count on the BOLD grid after
+    # the brain-mask intersection (0 = empty, its column n/a), and the columns'
+    # status: ok, no-tissue-maps, empty-mask, error, or not-computed (the default
+    # preproc.py emits; the session pod or the tissue backfill fills it in).
+    wm_mask_voxels: int = 0
+    csf_mask_voxels: int = 0
+    tissue_confounds: str = "not-computed"
+
     # Runtime
     stage_timings_s: dict[str, float] = field(default_factory=dict)
     total_runtime_s: float = 0.0
@@ -148,7 +158,17 @@ class FuncQC:
     # n_nss_frames onward. Over the full series the T1-saturation transient on
     # GE DV26+ and Siemens VE11 dominated them, so 1.2 values of these fields
     # are not comparable across scanner software.
-    schema_version: str = "1.3"
+    # 1.3 -> 1.4 (2026-10-27): no field added, but the confounds behind
+    # n_acompcor_wm/csf, n_tcompcor and n_cosines are now nipype's (as fMRIPrep
+    # runs them): CompCor cosine-high-passed and variance-normalised, components
+    # to 50% variance with no cap, cosines over the steady-state frames. Those
+    # counts and the published confounds TSV differ from 1.3's; every IQM is
+    # unchanged.
+    # 1.4 -> 1.5 (2026-11-08): wm_mask_voxels, csf_mask_voxels and
+    # tissue_confounds, for the TSV's new csf and white_matter columns. Every
+    # other field is as in 1.4, and the tissue backfill patches published 1.4
+    # records to 1.5 in place.
+    schema_version: str = "1.5"
     completed_at: str = field(default_factory=_now_utc)
 
     # Grayordinate QC, present only on runs that also emit surfaces (--emit
@@ -474,6 +494,82 @@ class FsqcQC:
     def s3_key(subject: str, session: str, dt: str | None = None) -> str:
         dt = dt or _today_utc()
         return f"metrics/fsqc-qc/dt={dt}/{subject}_{session}_fsqc_qc.json"
+
+
+# ---------------------------------------------------------------------------
+# MNI tissue maps QC
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TissueQC:
+    """Per-subject×session QC of the session's 1 mm MNI tissue maps.
+
+    Written by images/afni/tissue_masks.py --qc-out, from func-preproc (source
+    "func-preproc") or the probseg backfill (source "probseg-backfill"), as a
+    raw dict in this field order, which is also the Glue tables' column order.
+
+    S3 key: metrics/tissue-masks/dt={dt}/{subject}_{session}_tissue_qc.json
+
+    Two segmentations are described. The dseg is FastSurfer's aseg warped to
+    MNI and grouped into GM/WM/CSF; the probseg is DIPY's HMRF fit to the
+    session's orig_nu intensities. agreement_{class} is the share of that dseg
+    class's voxels whose probseg argmax is the same class. They differ by
+    construction (sulcal CSF, WM-bright deep grey), so sound fits score
+    0.68-0.91; a fit whose classes collapsed scores 0.0-0.44 on WM, and below
+    tissue_masks.PROBSEG_MIN_AGREEMENT (0.5) on any class the probseg is not
+    published and probseg_written is False.
+
+    probseg_* and agreement_* are None, never 0.0, when no probseg was fitted
+    (0.0 is a real volume). probseg_written False with values present is a
+    rejected fit; False with None values is no fit at all. Sessions published
+    before 2026-10-26 have no row until the backfill writes one, and their
+    published probseg (fitted to brainmask.mgz) must not be used.
+    """
+
+    subject: str
+    session: str
+    pipeline: str = "cloudpipe_minproc"
+    image_tag: str = ""
+    source: str = ""
+    schema_version: str = "1.0"
+    completed_at: str = field(default_factory=_now_utc)
+
+    # FastSurfer dseg volume per class (mm³, 1 mm MNI grid).
+    dseg_gm_vol_mm3: float | None = None
+    dseg_wm_vol_mm3: float | None = None
+    dseg_csf_vol_mm3: float | None = None
+
+    # The probseg fit: its input image, its RNG seed, and whether it was published.
+    probseg_input: str | None = None
+    probseg_seed: int | None = None
+    probseg_written: bool = False
+
+    # Probseg volume per class: the sum of that class's probabilities (mm³).
+    probseg_gm_vol_mm3: float | None = None
+    probseg_wm_vol_mm3: float | None = None
+    probseg_csf_vol_mm3: float | None = None
+
+    # Per dseg class, the share of its voxels whose probseg argmax agrees.
+    agreement_gm: float | None = None
+    agreement_wm: float | None = None
+    agreement_csf: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self, indent: int | None = None) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> TissueQC:
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+    @staticmethod
+    def s3_key(subject: str, session: str, dt: str | None = None) -> str:
+        dt = dt or _today_utc()
+        return f"metrics/tissue-masks/dt={dt}/{subject}_{session}_tissue_qc.json"
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1076,17 @@ class RegistrationQC:
     none_lncc: float = 0.0
     none_jac_det_frac_negative: float = 0.0
 
+    # T1w→MNI only (schema 2.8, #1105): the talairach cross-check. Mean displacement
+    # over the template brain between this record's affine and FastSurfer's own
+    # (mri/transforms/talairach.xfm.lta), net of the fixed 2009c->MNI305 map — GATED
+    # (registration_qc._T1W_MNI_THRESHOLDS). Absent from the JSON, and so NULL in
+    # Athena, when no usable talairach transform was staged; the dataclass default
+    # below is the same "not recorded" and must not be read as a measurement.
+    affine_tal_dev_mm: float | None = None
+    # The NONE attempt's affine_tal_dev_mm — why a 2.8 rescue was needed, alongside
+    # none_lncc / none_jac_det_frac_negative. None = not recorded.
+    none_affine_tal_dev_mm: float | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -1210,9 +1317,22 @@ class PodCost:
     node_effective_usd_per_hour: float | None = None
     node_ondemand_usd_per_hour: float | None = None
 
+    # Schema 1.2+. The EC2 instance ID the pod was matched to by time
+    # (kubecost_scraper.resolve_node), "" when it could not be proven. `node`
+    # is a hostname, and hostnames are reused private IPs, so it does not name
+    # an instance on its own (#1060). The day+1 read proves this from hourly
+    # data; the settled day+3 read, served from daily rollups that merge the
+    # instances behind a reused hostname, often cannot, and then carries this,
+    # node_capacity_type, node_ondemand_usd_per_hour and node_instance_type
+    # forward from the day+1 record, leaving node_effective_usd_per_hour NULL
+    # (an unreconciled day+1 rate beside settled dollars would not cancel).
+    # So a row with an instance ID but no effective rate is priceable at list
+    # price but excluded from spot_savings(), by design.
+    node_instance_id: str = ""
+
     scrape_age_days: int = 1
     pipeline: str = "cloudpipe_minproc"
-    schema_version: str = "1.1"
+    schema_version: str = "1.2"
     completed_at: str = field(default_factory=_now_utc)
 
     def to_dict(self) -> dict[str, Any]:

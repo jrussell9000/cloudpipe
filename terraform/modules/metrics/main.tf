@@ -33,6 +33,7 @@ locals {
     surface_sample    = "s3://${var.bucket}/metrics/surface-sample/"
     anat_qc           = "s3://${var.bucket}/metrics/anat-qc/"
     fsqc_qc           = "s3://${var.bucket}/metrics/fsqc-qc/"
+    tissue_masks      = "s3://${var.bucket}/metrics/tissue-masks/"
     registration_qc   = "s3://${var.bucket}/metrics/registration/"
     workflow_runs     = "s3://${var.bucket}/metrics/workflow-runs/"
     costs             = "s3://${var.bucket}/metrics/costs/"
@@ -96,6 +97,7 @@ locals {
     surface_sample    = "s3://${var.bucket}/metrics/compacted/surface_sample/"
     anat_qc           = "s3://${var.bucket}/metrics/compacted/anat_qc/"
     fsqc_qc           = "s3://${var.bucket}/metrics/compacted/fsqc_qc/"
+    tissue_masks      = "s3://${var.bucket}/metrics/compacted/tissue_masks/"
     workflow_runs     = "s3://${var.bucket}/metrics/compacted/workflow_runs/"
     step_outcomes     = "s3://${var.bucket}/metrics/compacted/step_outcomes/"
     subject_manifests = "s3://${var.bucket}/metrics/compacted/subject_manifests/"
@@ -136,7 +138,11 @@ resource "aws_glue_catalog_table" "func_preproc_compacted" {
     # 1.0 and 1.1 stay until no pre-reprocess partitions remain.
     # 1.3 added for #859 (every summary excludes the non-steady-state frames),
     # under the same rule: applied BEFORE any afni image emits it.
-    "projection.schema_version.values" = "1.0,1.1,1.2,1.3"
+    # 1.4 added for the nipype-equivalent CompCor and cosines (2026-10-27), again
+    # applied before the image that emits it is pinned.
+    # 1.5 added for the tissue-mask fields (add-tissue-confound-columns, 2026-11-08),
+    # applied before the image pin and before the backfill patches any record.
+    "projection.schema_version.values" = "1.0,1.1,1.2,1.3,1.4,1.5"
   })
 
   partition_keys {
@@ -252,6 +258,18 @@ resource "aws_glue_catalog_table" "func_preproc_compacted" {
     columns {
       name = "n_cosines"
       type = "int"
+    }
+    columns {
+      name = "wm_mask_voxels"
+      type = "int"
+    }
+    columns {
+      name = "csf_mask_voxels"
+      type = "int"
+    }
+    columns {
+      name = "tissue_confounds"
+      type = "string"
     }
     columns {
       # Every key preproc.py's timed_stage() emits must be listed here or Athena
@@ -481,6 +499,114 @@ resource "aws_glue_catalog_table" "surface_sample_compacted" {
     columns {
       name = "subcort_space"
       type = "string"
+    }
+  }
+}
+
+resource "aws_glue_catalog_table" "tissue_masks_compacted" {
+  database_name = aws_glue_catalog_database.metrics.name
+  name          = "tissue_masks_compacted"
+
+  table_type = "EXTERNAL_TABLE"
+
+  parameters = merge(local.compacted_partition_projection.tissue_masks, {
+    "classification" = "parquet"
+    # 1.0 is the first and only version the emitter (images/afni/tissue_masks.py)
+    # stamps. "unknown" is declared for the same reason as surface_sample's: a
+    # record without schema_version compacts under that literal, and a value
+    # outside this enum returns ZERO ROWS with a successful query status (#241).
+    "projection.schema_version.values" = "unknown,1.0"
+  })
+
+  partition_keys {
+    name = "dt"
+    type = "string"
+  }
+  partition_keys {
+    name = "schema_version"
+    type = "string"
+  }
+
+  storage_descriptor {
+    location      = "s3://${var.bucket}/metrics/compacted/tissue_masks/"
+    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
+
+    ser_de_info {
+      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+    }
+
+    columns {
+      name = "subject"
+      type = "string"
+    }
+    columns {
+      name = "session"
+      type = "string"
+    }
+    columns {
+      name = "pipeline"
+      type = "string"
+    }
+    columns {
+      name = "image_tag"
+      type = "string"
+    }
+    columns {
+      name = "source"
+      type = "string"
+    }
+    columns {
+      name = "completed_at"
+      type = "string"
+    }
+    columns {
+      name = "dseg_gm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "dseg_wm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "dseg_csf_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_input"
+      type = "string"
+    }
+    columns {
+      name = "probseg_seed"
+      type = "int"
+    }
+    columns {
+      name = "probseg_written"
+      type = "boolean"
+    }
+    columns {
+      name = "probseg_gm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_wm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_csf_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "agreement_gm"
+      type = "double"
+    }
+    columns {
+      name = "agreement_wm"
+      type = "double"
+    }
+    columns {
+      name = "agreement_csf"
+      type = "double"
     }
   }
 }
@@ -1049,10 +1175,12 @@ resource "aws_glue_catalog_table" "pod_costs_compacted" {
   parameters = merge(local.compacted_partition_projection.pod_costs, {
     "classification" = "parquet"
     # 1.1 adds the no-spot counterfactual columns (node_capacity_type and the
-    # two rates). 1.0 stays declared: those records are not rewritten, and a
+    # two rates). 1.2 adds node_instance_id, the EC2 instance a pod was matched
+    # to (#1060). 1.0 stays declared: those records are not rewritten, and a
     # version missing from this enum is not a projected partition, so its rows
-    # return zero with a SUCCESS status rather than an error.
-    "projection.schema_version.values" = "1.0,1.1"
+    # return zero with a SUCCESS status rather than an error. That is why 1.2
+    # must be APPLIED before the scraper that emits it reaches the flow runner.
+    "projection.schema_version.values" = "1.0,1.1,1.2"
   })
 
   partition_keys {
@@ -1180,6 +1308,14 @@ resource "aws_glue_catalog_table" "pod_costs_compacted" {
     columns {
       name = "node_ondemand_usd_per_hour"
       type = "double"
+    }
+    columns {
+      # Schema 1.2+. The EC2 instance ID (Kubecost's properties.providerID) the
+      # pod was matched to by time, "" when it could not be proven. Hostnames
+      # are reused private IPs, so `node` alone does not name an instance
+      # (#1060). The settled re-scrape carries this forward from the day+1 read.
+      name = "node_instance_id"
+      type = "string"
     }
     columns {
       name = "scrape_age_days"
@@ -1318,8 +1454,9 @@ resource "aws_glue_catalog_table" "registration_compacted" {
     # RegistrationQC's docstring in src/metrics/schemas.py.
     # 2.7 is t1w_to_mni's RANDOM-rescue provenance (fst1w_to_mni.py). The number is
     # table-wide, not per registration_type, so t1w_to_mni goes 2.1 -> 2.7 and no
-    # t1w record ever carries 2.2-2.6 (those are all bold_to_t1w).
-    "projection.schema_version.values" = "1.1,1.2,2.0,2.1,2.2,2.3,2.4,2.5,2.6,2.7"
+    # t1w record ever carries 2.2-2.6 (those are all bold_to_t1w). 2.8 is t1w_to_mni's
+    # talairach cross-check (#1105).
+    "projection.schema_version.values" = "1.1,1.2,2.0,2.1,2.2,2.3,2.4,2.5,2.6,2.7,2.8"
   })
 
   partition_keys {
@@ -1566,6 +1703,17 @@ resource "aws_glue_catalog_table" "registration_compacted" {
     }
     columns {
       name = "none_jac_det_frac_negative"
+      type = "double"
+    }
+    # Schema 2.8, t1w_to_mni only: the talairach cross-check (#1105), from
+    # fst1w_to_mni.py. NULL on earlier records, on bold_to_t1w rows, and on any row
+    # whose talairach transform was unusable. Same relative order as the raw table.
+    columns {
+      name = "affine_tal_dev_mm"
+      type = "double"
+    }
+    columns {
+      name = "none_affine_tal_dev_mm"
       type = "double"
     }
   }
@@ -1998,7 +2146,7 @@ resource "aws_glue_catalog_table" "pod_costs" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "completed_at,cpu_core_hours,cpu_cost_usd,cpu_efficiency,date,gpu_cost_usd,gpu_hours,memory_cost_usd,network_cost_usd,node,node_capacity_type,node_effective_usd_per_hour,node_instance_type,node_ondemand_usd_per_hour,phase,pipeline,pod,pv_cost_usd,ram_efficiency,ram_gb_hours,runtime_minutes,schema_version,scrape_age_days,session,step,subject,total_adjustment_usd,total_cost_usd,workflow_name"
+        paths                   = "completed_at,cpu_core_hours,cpu_cost_usd,cpu_efficiency,date,gpu_cost_usd,gpu_hours,memory_cost_usd,network_cost_usd,node,node_capacity_type,node_effective_usd_per_hour,node_instance_id,node_instance_type,node_ondemand_usd_per_hour,phase,pipeline,pod,pv_cost_usd,ram_efficiency,ram_gb_hours,runtime_minutes,schema_version,scrape_age_days,session,step,subject,total_adjustment_usd,total_cost_usd,workflow_name"
         "ignore.malformed.json" = "true"
       }
     }
@@ -2115,6 +2263,14 @@ resource "aws_glue_catalog_table" "pod_costs" {
     columns {
       name = "node_ondemand_usd_per_hour"
       type = "double"
+    }
+    columns {
+      # Schema 1.2+. The EC2 instance ID (Kubecost's properties.providerID) the
+      # pod was matched to by time, "" when it could not be proven. Hostnames
+      # are reused private IPs, so `node` alone does not name an instance
+      # (#1060). The settled re-scrape carries this forward from the day+1 read.
+      name = "node_instance_id"
+      type = "string"
     }
     columns {
       name = "scrape_age_days"
@@ -2339,7 +2495,7 @@ resource "aws_glue_catalog_table" "registration_qc" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "attempts_run,centroid_displacement_mm,completed_at,ice_max_mm,ice_mean_mm,ice_p95_mm,ice_p99_mm,itk_threads,jac_det_frac_negative,jac_det_max,jac_det_mean,jac_det_min,jac_det_std,lncc,log_jac_frac_beyond_1p5,log_jac_frac_beyond_3,log_jac_max,log_jac_mean,log_jac_min,log_jac_p01,log_jac_p99,log_jac_std,mask_dice,method,mhd_mm,mi,ngf,ngf_identity,nmi,nmi_gain,nmi_identity,none_jac_det_frac_negative,none_lncc,pipeline,registration_type,rescue_ticket,rigid_disp_max_mm,rigid_disp_mean_mm,rigid_rot_deg,run,sampling_seed,sampling_strategy,schema_version,seg_bbr_contrast,seg_bbr_contrast_identity,session,subject,task,verdict"
+        paths                   = "affine_tal_dev_mm,attempts_run,centroid_displacement_mm,completed_at,ice_max_mm,ice_mean_mm,ice_p95_mm,ice_p99_mm,itk_threads,jac_det_frac_negative,jac_det_max,jac_det_mean,jac_det_min,jac_det_std,lncc,log_jac_frac_beyond_1p5,log_jac_frac_beyond_3,log_jac_max,log_jac_mean,log_jac_min,log_jac_p01,log_jac_p99,log_jac_std,mask_dice,method,mhd_mm,mi,ngf,ngf_identity,nmi,nmi_gain,nmi_identity,none_affine_tal_dev_mm,none_jac_det_frac_negative,none_lncc,pipeline,registration_type,rescue_ticket,rigid_disp_max_mm,rigid_disp_mean_mm,rigid_rot_deg,run,sampling_seed,sampling_strategy,schema_version,seg_bbr_contrast,seg_bbr_contrast_identity,session,subject,task,verdict"
         "ignore.malformed.json" = "true"
       }
     }
@@ -2558,6 +2714,17 @@ resource "aws_glue_catalog_table" "registration_qc" {
       name = "none_jac_det_frac_negative"
       type = "double"
     }
+    # Schema 2.8, t1w_to_mni only: the talairach cross-check (#1105). Same names,
+    # types and relative order as registration_compacted and _UNION_COLUMNS; also in
+    # `paths` above.
+    columns {
+      name = "affine_tal_dev_mm"
+      type = "double"
+    }
+    columns {
+      name = "none_affine_tal_dev_mm"
+      type = "double"
+    }
   }
 }
 
@@ -2591,7 +2758,7 @@ resource "aws_glue_catalog_table" "func_preproc" {
     ser_de_info {
       serialization_library = "org.openx.data.jsonserde.JsonSerDe"
       parameters = {
-        paths                   = "subject,session,task,run,n_frames,n_nss_frames,tr_seconds,mean_fd,median_fd,max_fd,n_fd_above_0p2,n_fd_above_0p5,pct_fd_above_0p5,mean_dvars,dvars_std,mean_global_signal,tsnr_median,gcor,aor,aqi,n_acompcor_wm,n_acompcor_csf,n_tcompcor,n_cosines,stage_timings_s,total_runtime_s,peak_memory_gb,container_peak_memory_gb,pipeline,image_tag,schema_version,completed_at,surf_L_n_vertices,surf_L_coverage_frac,surf_L_nan_frac,surf_L_tsnr_median,surf_R_n_vertices,surf_R_coverage_frac,surf_R_nan_frac,surf_R_tsnr_median,subcort_n_voxels,subcort_n_structures,subcort_space"
+        paths                   = "subject,session,task,run,n_frames,n_nss_frames,tr_seconds,mean_fd,median_fd,max_fd,n_fd_above_0p2,n_fd_above_0p5,pct_fd_above_0p5,mean_dvars,dvars_std,mean_global_signal,tsnr_median,gcor,aor,aqi,n_acompcor_wm,n_acompcor_csf,n_tcompcor,n_cosines,wm_mask_voxels,csf_mask_voxels,tissue_confounds,stage_timings_s,total_runtime_s,peak_memory_gb,container_peak_memory_gb,pipeline,image_tag,schema_version,completed_at,surf_L_n_vertices,surf_L_coverage_frac,surf_L_nan_frac,surf_L_tsnr_median,surf_R_n_vertices,surf_R_coverage_frac,surf_R_nan_frac,surf_R_tsnr_median,subcort_n_voxels,subcort_n_structures,subcort_space"
         "ignore.malformed.json" = "true"
       }
     }
@@ -2691,6 +2858,18 @@ resource "aws_glue_catalog_table" "func_preproc" {
     columns {
       name = "n_cosines"
       type = "int"
+    }
+    columns {
+      name = "wm_mask_voxels"
+      type = "int"
+    }
+    columns {
+      name = "csf_mask_voxels"
+      type = "int"
+    }
+    columns {
+      name = "tissue_confounds"
+      type = "string"
     }
     # Fixed set of stage names emitted by preproc.py — a dict[str, float] in
     # Python, but the JSON SerDe needs a concrete struct shape.
@@ -2969,6 +3148,120 @@ resource "aws_glue_catalog_table" "surface_sample" {
     columns {
       name = "subcort_space"
       type = "string"
+    }
+  }
+}
+
+resource "aws_glue_catalog_table" "tissue_masks" {
+  # Added 2026-10-26: per-session QC of the 1 mm MNI tissue maps (TissueQC),
+  # written by images/afni/tissue_masks.py --qc-out from func-preproc and from
+  # the probseg backfill. Column order is the emitter's dict order.
+  database_name = aws_glue_catalog_database.metrics.name
+  name          = "tissue_masks"
+
+  table_type = "EXTERNAL_TABLE"
+
+  parameters = merge(local.partition_projection.tissue_masks, {
+    "classification"        = "json"
+    "compressionType"       = "none"
+    "typeOfData"            = "file"
+    "ignore.malformed.json" = "true"
+  })
+
+  partition_keys {
+    name = "dt"
+    type = "string"
+  }
+
+  storage_descriptor {
+    location      = "s3://${var.bucket}/metrics/tissue-masks/"
+    input_format  = "org.apache.hadoop.mapred.TextInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+
+    ser_de_info {
+      serialization_library = "org.openx.data.jsonserde.JsonSerDe"
+      parameters = {
+        # A name in `columns` but absent from `paths` reads NULL.
+        paths                   = "subject,session,pipeline,image_tag,source,schema_version,completed_at,dseg_gm_vol_mm3,dseg_wm_vol_mm3,dseg_csf_vol_mm3,probseg_input,probseg_seed,probseg_written,probseg_gm_vol_mm3,probseg_wm_vol_mm3,probseg_csf_vol_mm3,agreement_gm,agreement_wm,agreement_csf"
+        "ignore.malformed.json" = "true"
+      }
+    }
+
+    columns {
+      name = "subject"
+      type = "string"
+    }
+    columns {
+      name = "session"
+      type = "string"
+    }
+    columns {
+      name = "pipeline"
+      type = "string"
+    }
+    columns {
+      name = "image_tag"
+      type = "string"
+    }
+    columns {
+      name = "source"
+      type = "string"
+    }
+    columns {
+      name = "schema_version"
+      type = "string"
+    }
+    columns {
+      name = "completed_at"
+      type = "string"
+    }
+    columns {
+      name = "dseg_gm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "dseg_wm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "dseg_csf_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_input"
+      type = "string"
+    }
+    columns {
+      name = "probseg_seed"
+      type = "int"
+    }
+    columns {
+      name = "probseg_written"
+      type = "boolean"
+    }
+    columns {
+      name = "probseg_gm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_wm_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "probseg_csf_vol_mm3"
+      type = "double"
+    }
+    columns {
+      name = "agreement_gm"
+      type = "double"
+    }
+    columns {
+      name = "agreement_wm"
+      type = "double"
+    }
+    columns {
+      name = "agreement_csf"
+      type = "double"
     }
   }
 }

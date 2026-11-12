@@ -165,12 +165,18 @@ module "argo_workflows" {
   bucket         = var.globus_s3_destination_bucket
   metrics_bucket = local.metrics_bucket
 
+  # Reprocess-audit pairs (audit_buckets.tf); empty unless var.reprocess_audit.
+  audit_data_buckets    = local.audit_data_buckets
+  audit_metrics_buckets = local.audit_metrics_buckets
+
   # This deployment's private ECR, or the pull-through cache of the published
   # images; var.image_registry decides, see image_cache.tf. Either way layer blobs
   # are served from S3 via the gateway endpoint, not across the NAT gateway.
   ecr_registry = local.ecr_registry
   # The address the HTTPS ingress names in its User-Agent, for the source's operators.
   ingress_contact = var.globus_contact_email
+  # The FSL-carrying newMSM image, by digest; the deployment builds its own.
+  newmsm_image = var.newmsm_image
 
   # Database
   db_name       = var.argo_workflows_db_name

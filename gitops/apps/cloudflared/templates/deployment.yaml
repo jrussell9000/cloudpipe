@@ -1,8 +1,8 @@
 # cloudflared connector for the cloudpipe-eks tunnel (ADR 014 phase 1).
 #
-# Two replicas because tunnel availability gates ALL kubectl access once the
-# Client VPN is retired — a single connector would make a pod eviction an
-# access outage. cloudflared registers multiple connections per replica and
+# Two replicas because tunnel availability gates ALL kubectl access — the
+# Client VPN was retired on 2026-11-06 — so a single connector would make a pod
+# eviction an access outage. cloudflared registers multiple connections per replica and
 # Cloudflare load-balances across them.
 #
 # There is no Service and no ingress: the connector dials OUT to Cloudflare's
@@ -29,15 +29,20 @@ spec:
       labels:
         app: cloudflared
     spec:
-      # Placement. This connector is the only path to the EKS API server once
-      # the Client VPN is retired, so it runs only on the stable, on-demand
+      # Placement. This connector is the only path to the EKS API server (the
+      # Client VPN was retired 2026-11-06), so it runs only on the stable, on-demand
       # managed nodegroups — never on Karpenter spot capacity:
-      #   backend   — 2x m7g.2xlarge, first AZ,  taint CriticalAddonsOnly
-      #   karpenter — 1x m7g.xlarge,  second AZ, untainted
+      #   backend — 2x m7g.2xlarge, first AZ only, taint CriticalAddonsOnly
+      #   argo    — 1x m7g.xlarge, AZ not pinned, taint argoproj.io/backend
       # Both carry the node security group that the API server's cluster SG
       # admits ("Node groups to cluster API"), so pinning here is also what
-      # guarantees cloudflared can reach the API server without the VPN's
-      # eks_api_from_vpn rule (plan 012 §6). All arm64.
+      # guarantees cloudflared reaches the API server now that the VPN's
+      # VPC-wide eks_api_from_vpn rule is gone (plan 012 §6). All arm64.
+      #
+      # `argo` replaced the `karpenter` nodegroup here when that group was
+      # removed (2026-11-06, see modules/stack/eks.tf). Backend alone would
+      # still satisfy the hard per-node spread, but both its nodes share one
+      # AZ; argo is the only managed node that can sit elsewhere.
       #
       # The previous *preferred* hostname anti-affinity was not enough: on
       # 2026-09-17 both replicas were found on the single karpenter-nodegroup
@@ -49,9 +54,13 @@ spec:
               - matchExpressions:
                   - key: eks.amazonaws.com/nodegroup
                     operator: In
-                    values: [backend, karpenter]
+                    values: [backend, argo]
       tolerations:
         - key: CriticalAddonsOnly
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        - key: argoproj.io/backend
           operator: Equal
           value: "true"
           effect: NoSchedule

@@ -11,12 +11,21 @@ uploads anything:
 |---|---|---|
 | `config/MNI152NLin2009cAsym_res-01_T1w_brain.nii` | TemplateFlow `res-01_desc-brain_T1w` | decompressed |
 | `config/MNI152NLin2009cAsym_T1w_brain_res-2_RAI.nii` | TemplateFlow `res-02_desc-brain_T1w` | decompressed, reoriented to LPS (AFNI's "RAI") |
-| `config/fsLR/` (6 files) | HCPpipelines v6.0.0 `standard_mesh_atlases` | none |
+| `config/fsLR/` (8 files) | HCPpipelines v6.0.0 `standard_mesh_atlases` | none |
+| `config/newmsm/` (9 files) | HCPpipelines v6.0.0 `standard_mesh_atlases`; the MSM config from smriprep 0.19.2 | none |
 
 The pinned digests are of what the reference deployment runs on. Its two MNI files
 have the same voxels and affine as the transformed TemplateFlow files, and its six
 fsLR files are byte-identical to HCPpipelines v6.0.0 (checked 2026-10-12). So a
 deployment seeded here registers to exactly the same template.
+
+`config/newmsm/` and the two standard 32k spheres in `config/fsLR/` are read only by
+the opt-in newMSM surface route (openspec add-newmsm-surface-registration). The
+newMSM files are smriprep 0.19.2's, which `images/workbench/newmsm_prep.py` pins by
+sha256. Its eight atlases are byte-identical to HCPpipelines v6.0.0 and are fetched
+from there. Its `MSMSulcStrainFinalconf` is HCPpipelines' `MSMConfig/` file without
+the trailing blank line, so that one comes from smriprep's tag (checked 2026-11-09).
+All of them are distributed under the HCPpipelines license.
 
 It also writes `config/reference-sources.json`: each object, its source URL, the
 checksums, and the license it is distributed under.
@@ -42,6 +51,7 @@ from pathlib import Path
 
 TEMPLATEFLOW = "https://templateflow.s3.amazonaws.com/tpl-MNI152NLin2009cAsym"
 HCP = "https://raw.githubusercontent.com/Washington-University/HCPpipelines/v6.0.0/global/templates/standard_mesh_atlases"
+SMRIPREP = "https://raw.githubusercontent.com/nipreps/smriprep/0.19.2/src/smriprep/data"
 
 MNI_LICENSE = {
     "name": "ICBM 2009c Nonlinear Asymmetric template (Fonov et al.), MNI license",
@@ -130,6 +140,76 @@ SOURCES = (
                 "resample_fsaverage/",
                 "fs_LR.R.midthickness_va_avg.32k_fs_LR.shape.gii",
                 "cb4b7680b8637c81398a99d4a034ee1680510ad6528d6948b4aa9c67b3e81867",
+            ),
+            # The standard fsLR 32k spheres: the newmsm route's target sphere
+            # (cifti_assemble.py --standard-sphere).
+            (
+                "",
+                "L.sphere.32k_fs_LR.surf.gii",
+                "1846b053f870405466776d004d714cc1da0cec7361761c65a864782dd09f30a8",
+            ),
+            (
+                "",
+                "R.sphere.32k_fs_LR.surf.gii",
+                "1a898433a9f1070e4e0435d4db966776ecc3291bfcd444efc7910aeffb91561c",
+            ),
+        )
+    ),
+    # smriprep 0.19.2's MSM config: HCPpipelines' MSMConfig/MSMSulcStrainFinalconf
+    # minus its trailing blank line, which newmsm_prep.py's pin is of.
+    Source(
+        key="config/newmsm/MSMSulcStrainFinalconf",
+        url=f"{SMRIPREP}/msm/MSMSulcStrainFinalconf",
+        download_sha256="d6a7e16123179d1b3de655dd7a103bcbfb2faffd1de561763f67ac404e89eb3d",
+        license=HCP_LICENSE,
+    ),
+    *(
+        Source(
+            key=f"config/newmsm/{name}",
+            url=f"{HCP}/{path}{name}",
+            download_sha256=digest,
+            license=HCP_LICENSE,
+        )
+        for path, name, digest in (
+            (
+                "",
+                "L.refsulc.164k_fs_LR.shape.gii",
+                "10f5e3fd775bb2f77278b0b69126f6f67abefb3c76de6f1233128d9914ddcb5c",
+            ),
+            (
+                "",
+                "R.refsulc.164k_fs_LR.shape.gii",
+                "4eefc7807cdd9076cfc9ffc933da3d0c100a4770d5359c3e5f4fb37d71097520",
+            ),
+            (
+                "",
+                "fsaverage.L_LR.spherical_std.164k_fs_LR.surf.gii",
+                "6968ef7d9638de54ade78cdbb7f0c6f25025c60477f72456ab2fb77c53a85cfa",
+            ),
+            (
+                "",
+                "fsaverage.R_LR.spherical_std.164k_fs_LR.surf.gii",
+                "85e718e424a1d87521fb0f3942538db16d8c745fe5b9ee20405baac2aff1dbb1",
+            ),
+            (
+                "fs_L/",
+                "fsaverage.L.sphere.164k_fs_L.surf.gii",
+                "9bf5b673cc1c4738b1137ac53ff724ff0ef45e12f5550448efa2da50bb521c32",
+            ),
+            (
+                "fs_R/",
+                "fsaverage.R.sphere.164k_fs_R.surf.gii",
+                "a2fada23394286212f38cd44303bce0b3252759e09fe693f92d463286ca28b45",
+            ),
+            (
+                "fs_L/",
+                "fs_L-to-fs_LR_fsaverage.L_LR.spherical_std.164k_fs_L.surf.gii",
+                "a92b7c63eff6d04d8ce74b38e9f0060390b88d24b7c109bf13b194f0e8a54221",
+            ),
+            (
+                "fs_R/",
+                "fs_R-to-fs_LR_fsaverage.R_LR.spherical_std.164k_fs_R.surf.gii",
+                "d4b5808a75df1d9499f9f8339931fd385766ba625953823d662cb11f4b5e68cf",
             ),
         )
     ),

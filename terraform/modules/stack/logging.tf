@@ -562,11 +562,13 @@ locals {
   # matches the bucket itself and logs nothing.
   cloudtrail_state_bucket = coalesce(var.terraform_state_bucket, "${local.bucket_prefix}-terraform-state")
 
-  cloudtrail_data_bucket_arns = [
+  # The reprocess-audit buckets (audit_buckets.tf) hold the same subject data as
+  # the data and metrics buckets, so they carry the same access record.
+  cloudtrail_data_bucket_arns = concat([
     "arn:aws:s3:::${var.globus_s3_destination_bucket}/",
     "arn:aws:s3:::${local.metrics_bucket}/",
     "arn:aws:s3:::${local.cloudtrail_state_bucket}/",
-  ]
+  ], [for b in values(local.audit_buckets) : "arn:aws:s3:::${b}/"])
 }
 
 resource "aws_cloudtrail" "this" {

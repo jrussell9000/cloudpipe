@@ -1,0 +1,140 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: staged-backfill
+  namespace: argo-workflows
+
+###########################################################################
+# One-off: give each first-level tree written before fmri-first-level-proc
+# 4.0.0+cp.11 its staged runs (staged/{subj}_{ses}_{rid}_bold.nii.gz), cut from
+# its n-back {pre}_concat_scan and checked voxel for voxel, then delete both
+# n-back analyses' concatenations ({pre}_concat_scan, {pre}_psc) and rewrite the
+# marker last (operator, 2026-11-11). images/fmri-first-level-proc/staged_backfill.py
+# does one session at a time; its docstring has the order and the resume rules.
+#
+# Planned, submitted and verified by scripts/backfill_staged_runs.py, never by
+# hand: the session list it writes is the contract, and its `verify` is the proof.
+#
+#   label   names the plan: config/first-level/staged-backfill/{label}/
+#   shards  how many pods share the list (each takes every shards-th)
+#
+# The shard count IS the concurrency, as in probseg-backfill: every shard starts
+# at once and runs its share to the end, with no semaphore (see that template for
+# why). spec.parallelism is only a runaway backstop; the driver refuses more
+# shards than it.
+#
+# Each session is idempotent and resumable from its state key, so a retried
+# shard redoes nothing that finished and finishes what was cut off.
+###########################################################################
+
+spec:
+  # Runaway backstop, not the working cap. Equals MAX_SHARDS in
+  # scripts/backfill_staged_runs.py; tests/argo hold the two together.
+  parallelism: 400
+
+  serviceAccountName: argo-workflows-runner
+
+  workflowMetadata:
+    labels:
+      pipeline: staged-backfill
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  arguments:
+    parameters:
+      - name: label
+      - name: shards
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  volumes:
+    - name: scratch
+      emptyDir:
+        sizeLimit: 20Gi
+
+  entrypoint: backfill
+
+  templates:
+  - name: backfill
+    steps:
+    - - name: shard
+        template: backfill-shard
+        withSequence:
+          count: "{{workflow.parameters.shards}}"
+        arguments:
+          parameters:
+            - name: shard
+              value: "{{item}}"
+
+  - name: backfill-shard
+    metadata:
+      labels:
+        cloudpipe.io/phase: first-level
+        cloudpipe.io/step: staged-backfill
+    inputs:
+      parameters:
+        - name: shard
+    # Spot reclaims and S3 errors only, as in fmri-first-level-proc: 64/143
+    # executor or SIGTERM, 75 the module's own S3-error exit. A session that
+    # cannot be backfilled is set aside and recorded, never a pod failure, so a
+    # deterministic error cannot loop; anything else is a bug and stops the shard.
+    retryStrategy:
+      limit: "8"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: first-level-nodepool
+    container:
+      # The first-level image: the same AFNI that wrote the concatenations, and
+      # staged_backfill.py. build-fmri-first-level-proc.yaml re-pins both templates.
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:8434991e571b54615c7ba631b77e33e832144cbf9305d2a5e65f91af8cd9a5ee"
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "/app/staged_backfill.py"]
+      args:
+        - --label
+        - "{{workflow.parameters.label}}"
+        - --shard
+        - "{{inputs.parameters.shard}}"
+        - --shards
+        - "{{workflow.parameters.shards}}"
+        - --bucket
+        - "{{workflow.parameters.bucket}}"
+        - --region
+        - "{{workflow.parameters.region}}"
+        - --scratch
+        - /scratch
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+      resources:
+        # One session at a time: the concatenation decompressed (~3.2 GB on disk,
+        # read as a memory map), one run in memory to check (~1.6 GB), and the
+        # gzipped runs (~0.65 GB). 3dTcat's gzip is single-threaded.
+        requests:
+          cpu: "1"
+          memory: 4Gi
+          ephemeral-storage: 8Gi
+        limits:
+          cpu: "1"
+          memory: 6Gi

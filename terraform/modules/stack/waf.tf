@@ -68,8 +68,7 @@
 #
 # The ALB is internal, so every client address WAF observes is private and belongs
 # to whatever forwarded the request — a cloudflared pod for operators on WARP, the
-# calling pod for in-cluster traffic to Dex, the Client VPN's source-NAT address
-# for the fallback path. Consequences:
+# calling pod for in-cluster traffic to Dex. Consequences:
 #
 #   - IP-based rules are near-useless. AWSManagedRulesAmazonIpReputationList is
 #     deliberately NOT included: a reputation list never matches an RFC 1918

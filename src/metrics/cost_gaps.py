@@ -37,6 +37,9 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
+import audit_pairs  # type: ignore[import-not-found]
+from kubecost_scraper import cost_is_recorded  # type: ignore[import-not-found]
+
 SNAPSHOT_PREFIX = "snapshots/argo-nodes/"
 GPU_KEY = "nvidia.com/gpu"
 
@@ -197,6 +200,11 @@ def gaps_for_day(
     rd_cpu: dict[str, float] = defaultdict(float)
     rd_gpu: dict[str, float] = defaultdict(float)
     for p in pods:
+        # A workflow the scraper drops on purpose is neither a gap nor a shortfall,
+        # and neither is a reprocess-audit run: its cost is recorded, but in the
+        # audit's own metrics bucket, which this detector does not read.
+        if not cost_is_recorded(p["workflow"] or "") or audit_pairs.is_audit(p["workflow"] or ""):
+            continue
         frac, minutes = pod_day_share(p["started_at"], p["finished_at"], day)
         if frac <= 0:
             continue

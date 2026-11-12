@@ -74,7 +74,7 @@ kubectl() {
 
 # The cluster's API has to be reachable from this shell before anything is
 # destroyed. After the install's last phase it is private, reachable only over
-# WARP (or the VPN). Every kubectl call below ends in `|| true`, because a
+# WARP. Every kubectl call below ends in `|| true`, because a
 # resource that is already gone is not an error — so an unreachable API reads as
 # "nothing to delete": the deletion-protected web-UI ALB is left behind, and the
 # VPC destroy then fails on its network interfaces, halfway through the teardown
@@ -95,7 +95,7 @@ require_reachable_cluster() {
     fail "$EXIT_BLOCKED" \
       "ERROR: the cluster $CLUSTER_NAME exists, but its API cannot be reached from this shell." \
       "After the install's last phase the API is private: connect WARP to this deployment's" \
-      "Zero Trust team (or the VPN), check that \`kubectl get nodes\` works, then run this" \
+      "Zero Trust team, check that \`kubectl get nodes\` works, then run this" \
       "again. Nothing has been destroyed."
   fi
 }
@@ -146,6 +146,99 @@ forget_in_cluster_resources() {
   echo "    Removing them from state, so nothing below tries to reach it:"
   printf '      %s\n' "${addresses[@]}"
   terraform state rm "${addresses[@]}" >/dev/null
+}
+
+# Every PersistentVolumeClaim's EBS volume is deleted while something can still
+# delete it. Nothing else in this teardown deletes a claim: the ArgoCD apps
+# (Prometheus, Grafana) are never uninstalled, `helm uninstall` of Kubecost leaves
+# its StatefulSets' claims, and the EBS CSI driver loses its Pod Identity in the
+# add-ons destroy and its cluster after that. Each volume was then stranded
+# `available` and billed: 8 volumes, 212 GiB, from BOTH second-account installs
+# (teardowns of 2026-10-23 and 2026-11-06, #1045), while the run reported success.
+#
+# A sweep from the AWS side afterwards cannot replace this: the driver tags the
+# volumes `ebs.csi.aws.com/cluster=true` with no cluster name, so they cannot be
+# told apart from another cluster's in the same account.
+#
+# Order matters. ArgoCD stops first, or it scales the workloads back up. Each
+# claim's workloads scale to zero before the claim goes: a StatefulSet whose pod
+# is recreated re-creates a missing claim from its template, and that volume
+# would leak in turn. Deployments first, so an operator (prometheus-operator)
+# cannot restore the StatefulSet it owns. The driver's own namespace and
+# kube-system are never scaled; a claim there is deleted and waited for like the
+# rest, and the wait fails loudly if it cannot go.
+#
+# Fails rather than continues when a volume is still there after the wait: the
+# destroys below would leave it behind for good, while a re-run of this script
+# picks up exactly here.
+PVC_NEVER_SCALED=(kube-system aws-ebs-csi-driver)
+release_persistent_volumes() {
+  [[ $CLUSTER_EXISTS == true ]] || return 0
+  local listing namespaces=() ns remaining=""
+  # A plain assignment, so a failed lookup stops the script under set -e instead
+  # of reading as "no claims" (the same reason as the ALB wait below).
+  listing=$(kubectl get pvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}')
+  mapfile -t namespaces < <(sort -u <<<"$listing" | sed '/^$/d')
+  if [[ ${#namespaces[@]} -eq 0 ]]; then
+    echo "==> No PersistentVolumeClaims: no volumes to release."
+    return 0
+  fi
+  echo "==> Stopping ArgoCD controllers (so nothing scales the workloads back up)..."
+  kubectl -n argocd scale deployment/argocd-applicationset-controller --replicas=0 2>/dev/null || true
+  kubectl -n argocd scale statefulset/argocd-application-controller --replicas=0 2>/dev/null || true
+  for ns in "${namespaces[@]}"; do
+    if [[ " ${PVC_NEVER_SCALED[*]} " != *" $ns "* ]]; then
+      echo "==> Scaling $ns to zero..."
+      kubectl -n "$ns" scale deployment --all --replicas=0 >/dev/null 2>&1 || true
+      kubectl -n "$ns" scale statefulset --all --replicas=0 >/dev/null 2>&1 || true
+    fi
+    echo "==> Deleting the PersistentVolumeClaims in $ns..."
+    kubectl -n "$ns" delete pvc --all --wait=false >/dev/null
+  done
+  # Up to 10 minutes: Prometheus's pod has a 600 s termination grace period, and
+  # its claim cannot go until the pod has.
+  echo "==> Waiting for the EBS CSI driver to delete their volumes..."
+  local _
+  for _ in $(seq 120); do
+    remaining=$(kubectl get pv -o jsonpath='{range .items[?(@.spec.persistentVolumeReclaimPolicy=="Delete")]}{.metadata.name}{" "}{.spec.csi.volumeHandle}{"\n"}{end}')
+    [[ -z "$remaining" ]] && { echo "SUCCESS: every claim's volume is deleted"; return 0; }
+    sleep 5
+  done
+  echo "FAILED: these PersistentVolumes (and their EBS volumes) still exist:" >&2
+  local line
+  while read -r line; do echo "      $line"; done <<<"$remaining" >&2
+  echo "    Nothing past the web UIs has been destroyed. Find what still holds them" >&2
+  echo "    (kubectl get pods -A -o wide | grep -v Running), then run this script again." >&2
+  exit "$EXIT_CHECK_FAILED"
+}
+
+# The pull-through cache's repositories. ECR creates one on each image's first
+# pull, so they are not in Terraform state and the final destroy cannot reach
+# them; the 2026-10-15 cache outlived both second-account teardowns (#1045).
+# Reported, not deleted, like the buckets: the prefix is the only thing that
+# names them, and a teardown should not delete by name pattern in an account it
+# may share. The prefix is read from state BEFORE the destroy removes the rule.
+image_cache_prefix() {
+  state_attr "$(stack_address aws_ecr_pull_through_cache_rule.public)[0]" ecr_repository_prefix
+}
+
+report_cached_images() {
+  [[ -n $IMAGE_CACHE_PREFIX ]] || return 0
+  local repos=()
+  mapfile -t repos < <(
+    aws ecr describe-repositories --region "$DEPLOYMENT_REGION" \
+      --query "repositories[?starts_with(repositoryName, '$IMAGE_CACHE_PREFIX/')].repositoryName" \
+      --output text 2>/dev/null | tr '\t' '\n' | sed '/^$/d'
+  )
+  [[ ${#repos[@]} -eq 0 ]] && return 0
+  echo ""
+  echo "==> These image-cache repositories outlive the teardown (ECR created them on"
+  echo "    first pull, so Terraform never managed them). They hold only copies of"
+  echo "    published images and bill for storage. To delete them:"
+  local repo
+  for repo in "${repos[@]}"; do
+    echo "      aws ecr delete-repository --region $DEPLOYMENT_REGION --force --repository-name $repo"
+  done
 }
 
 # The two RDS databases, Argo's and Prefect's. Each defaults to
@@ -410,6 +503,8 @@ for _output in terraform_state_bucket data_bucket metrics_bucket; do
   [[ -n "$_bucket" && "$_bucket" != "null" ]] && SURVIVING_BUCKETS+=("$_bucket")
 done
 unset _output _bucket
+# Read now for the same reason: the final destroy removes the rule that names it.
+IMAGE_CACHE_PREFIX=$(image_cache_prefix)
 
 # Before the confirmation, so an unreachable cluster stops the run with nothing
 # destroyed and nobody has typed "destroy" for a teardown that cannot finish.
@@ -562,6 +657,10 @@ if [[ -n "$remaining" ]]; then
 fi
 
 fi # SKIP_UI_ALB_TEARDOWN
+
+# Before the add-ons destroy: it takes the EBS CSI driver's Pod Identity, and
+# with it the only thing that can delete a claim's volume.
+release_persistent_volumes
 
 # Same list install.sh applies — not a second hand-kept copy — and, like its
 # apply, in one destroy: Terraform destroys a dependent before what it depends
@@ -739,6 +838,7 @@ report_surviving_buckets() {
 
 report_final_snapshots
 report_kept_audit_logs
+report_cached_images
 report_surviving_buckets
 
 echo "==> Cleanup complete."

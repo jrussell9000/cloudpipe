@@ -5,9 +5,9 @@ Submits directly to the Argo Workflows API — no SQS or Argo Events required.
 Concurrency is gated in-process: ConcurrencyGate.count() blocks until a slot opens.
 The controller's `namespaceParallelism` is the server-side backstop behind it.
 
-The Globus destination collection UUID is read from SSM at runtime so that
-instance replacements (which update the SSM value) take effect automatically
-without redeploying this flow.
+In https mode the Globus source collection UUID and base path are read from SSM at
+runtime (unless the flow's arguments override them), so a change to either takes
+effect without redeploying this flow.
 
 Max concurrency is controlled via a Prefect variable so it can be adjusted
 while the flow is running:
@@ -19,18 +19,17 @@ instead of all at once. Also live, in workflows per minute (`0` disables pacing)
 
     prefect variable set cloudpipe-max-submissions-per-minute 5
 
-Where FastSurfer segmentation runs is decided per submission (#373): during a GPU
-spot drought — GPU pods Pending for 15+ minutes, see lib/gpu_drought.py — new
-workflows are submitted with `fastsurfer-device=cpu` so their anatomy runs on
-cpu-heavy-nodepool instead of waiting on a pool that is not granting nodes. A
-second Prefect variable overrides the detector while the flow is running:
+Where FastSurfer segmentation runs is decided per submission (#373). The default is
+`fastsurfer-device=cpu` (operator, 2026-11-11): GPU spot capacity is a chronic
+bottleneck, and CPU runs cost less overall. A second Prefect variable chooses
+otherwise while the flow is running:
 
-    prefect variable set cloudpipe-fastsurfer-device auto   # default: follow the detector
-    prefect variable set cloudpipe-fastsurfer-device cpu    # force the fallback
-    prefect variable set cloudpipe-fastsurfer-device cuda   # force the GPU
+    prefect variable set cloudpipe-fastsurfer-device cpu    # default: always CPU
+    prefect variable set cloudpipe-fastsurfer-device auto   # GPU unless a drought (lib/gpu_drought.py)
+    prefect variable set cloudpipe-fastsurfer-device cuda   # always GPU
 
-In Globus and HTTPS modes the run stops before the first submission if the Globus
-session cannot carry the batch (lib/globus_session.py). Two Prefect variables tune it:
+In https mode the run stops before the first submission if the Globus session
+cannot carry the batch (lib/globus_session.py). Two Prefect variables tune it:
 
     prefect variable set cloudpipe-globus-session-margin-hours 24
     prefect variable set cloudpipe-globus-session-warn-days 5
@@ -42,7 +41,9 @@ Usage
 """
 
 import json
+import sys
 import time
+from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
@@ -51,6 +52,7 @@ from lib.argo import (
     ConcurrencyGate,
     cap_reader,
     list_active_names,
+    list_active_subjects_by_prefix,
     parse_submission_rate,
     submit,
     wait_for_pace,
@@ -59,17 +61,25 @@ from lib.argo import (
 from lib.config import deployment_region
 from lib.gpu_drought import (
     DEFAULT_MIN_PENDING_AGE_S,
-    DEVICE_AUTO,
+    DEVICE_CPU,
     DroughtDetector,
     choose_device,
     parse_device_mode,
 )
-from lib.subjects import load
+from lib.subjects import load_with_params
 from prefect.variables import Variable
 
 from prefect import flow, get_run_logger, task
 
-SSM_COLLECTION_PARAM = "/cloudpipe/globus/collection-id"
+# As in cost_scraper.py: src/metrics/ is on PYTHONPATH in the flow-runner image;
+# for local runs add it from the repo. audit_pairs is shared with the cost scraper,
+# so the two cannot disagree on which name prefix routes where.
+_METRICS_PATH = str(Path(__file__).resolve().parents[2] / "src" / "metrics")
+if _METRICS_PATH not in sys.path:
+    sys.path.insert(0, _METRICS_PATH)
+
+import audit_pairs  # type: ignore[import-not-found]  # noqa: E402
+
 SSM_SOURCE_COLLECTION_PARAM = "/cloudpipe/globus/source-collection-id"
 SSM_SOURCE_BASE_PATH_PARAM = "/cloudpipe/globus/source-base-path"
 
@@ -77,10 +87,12 @@ MAX_CONCURRENT_VARIABLE = "cloudpipe-max-concurrent"
 DEFAULT_MAX_CONCURRENT = 50
 
 # Workflows submitted per minute; `0` disables pacing (#393). The default sits above
-# the globus-transfer semaphore's measured drain (8 slots, ~2.4 subjects/min on
-# 2026-09-14), so a globus batch never starves its transfers, yet it spreads a
-# 300-wide cold start over an hour rather than the 7 minutes that throttled etcd.
-# Not yet calibrated against a cold start: tune it live, then record what held.
+# the https-transfer semaphore's measured drain (4 slots, 112 subjects/h, so ~1.9
+# subjects/min, over hour-long windows in plan 017's 2026-10 func-reprocess waves),
+# so pacing never starves an https batch's
+# transfers, yet it spreads a 300-wide cold start over an hour rather than the 7
+# minutes that throttled etcd. Not yet calibrated against a cold start: tune it
+# live, then record what held.
 SUBMISSION_RATE_VARIABLE = "cloudpipe-max-submissions-per-minute"
 DEFAULT_SUBMISSIONS_PER_MINUTE = 5.0
 
@@ -98,15 +110,15 @@ def _read_ssm_optional(name: str) -> str | None:
     """SSM read that treats an ABSENT parameter as "not configured", not an error.
 
     A denied one is a different thing and is raised. This used to swallow every
-    exception, and that is how the session gate spent months measuring against
-    `DEFAULT_SESSION_TIMEOUT_MINUTES`: the worker had no `ssm:GetParameter` on
-    the configuration document, the AccessDenied read back as None, and the gate
-    reported `from the default (nothing declares a timeout)` on every run.
+    exception, and that is how the session gate once spent months measuring
+    against a default timeout: the worker had no `ssm:GetParameter` on the
+    gateway's configuration document, the AccessDenied read back as None, and
+    the gate fell back to the default on every run.
 
-    "Not configured" is a real state — a deployment that has not rendered its
-    document yet — and deserves the fallback. "You are not allowed to look" is a
-    misconfiguration of this deployment, and answering it with a default is how
-    a safety gate becomes decoration.
+    "Not configured" is a real state — a deployment that has not logged in yet —
+    and the gate answers it by refusing and naming the login. "You are not
+    allowed to look" is a misconfiguration of this deployment, and answering it
+    with a default is how a safety gate becomes decoration.
     """
     try:
         return _read_ssm(name)
@@ -121,10 +133,6 @@ def _read_secret(secret_id: str) -> dict:
         SecretId=secret_id
     )
     return json.loads(payload["SecretString"])
-
-
-def _ec2_client():
-    return boto3.client("ec2", region_name=deployment_region())
 
 
 def _transfer_client():
@@ -146,94 +154,6 @@ def _https_token():
     return native_client, secret.get("https-refresh-token")
 
 
-def check_globus_session(
-    logger,
-    *,
-    dest_collection_id: str,
-    dest_base_path: str,
-    read_ssm=_read_ssm_optional,
-    read_variable=None,
-    transfer_client_factory=_transfer_client,
-    ec2_client_factory=_ec2_client,
-    wake=globus_session.wake_host,
-) -> globus_session.GateDecision:
-    """Refuse the batch before the first submission if the session cannot carry it.
-
-    Raises `RuntimeError` when the batch must not start. That ends the flow run
-    with the reason in the failure, which is the only place an operator reliably
-    looks — a warning in the logs of a run that submitted anyway is how 300
-    workflows died unnoticed on 2026-08-17.
-
-    Starts the Globus host before the live listing, which cannot succeed against
-    a stopped host (#652). That is a side effect of a check, and it is deliberate:
-    the batch's first workflow would start the host minutes later anyway, and the
-    nightly schedule stops it again if the batch is refused.
-    """
-    margin_hours, warn_days = _gate_thresholds(read_variable)
-
-    # Name the gateway. Without it, a document declaring more than one gateway
-    # sent this lookup to a default that happened to match production's
-    # declaration, so the gate measured the right number for the wrong reason
-    # and would have kept measuring 30 days after anyone lowered the real
-    # timeout (#506). `_read_ssm_optional` returns None on an absent parameter,
-    # and `timeout_minutes_from_config` then raises rather than guessing.
-    gateway_name = read_ssm(globus_session.SSM_GATEWAY_NAME_PARAM)
-    timeout_minutes, timeout_source = globus_session.timeout_minutes_from_config(
-        read_ssm(globus_session.SSM_CONFIG_PARAM), gateway_name
-    )
-    decision = globus_session.evaluate(
-        read_ssm(globus_session.SSM_SESSION_PARAM),
-        timeout_minutes=timeout_minutes,
-        margin_hours=margin_hours,
-        warn_days=warn_days,
-    )
-    logger.info(f"Globus session timeout: {timeout_minutes} minutes, from {timeout_source}")
-    logger.info(decision.reason)
-    if not decision.allowed:
-        raise RuntimeError(f"Refusing to submit: {decision.reason}")
-
-    # The listing needs the host up, and the host is stopped every night (#652).
-    # An unreadable instance ID degrades to the old behaviour, loudly, rather than
-    # refusing: the grant ships in Terraform, and a flow image deployed before the
-    # apply must not refuse batches that would list fine against a running host.
-    try:
-        instance_id = read_ssm(globus_session.SSM_INSTANCE_ID_PARAM)
-        unreadable = "is not set"
-    except ClientError as exc:
-        instance_id = None
-        unreadable = (
-            f"could not be read ({exc}); grant the worker role ssm:GetParameter on it in "
-            "terraform/modules/prefect/iam.tf"
-        )
-    if instance_id:
-        ready, detail = wake(ec2_client_factory(), instance_id, log=logger.info)
-        if not ready:
-            raise RuntimeError(f"Refusing to submit: {detail}")
-        logger.info(detail)
-    else:
-        logger.warning(
-            f"{globus_session.SSM_INSTANCE_ID_PARAM} {unreadable}, so the Globus host was not "
-            "started. If it is stopped, the listing below fails."
-        )
-
-    # The age check cannot see a revoked session or a timeout somebody lowered,
-    # so one real listing follows it. It costs a single API call per run.
-    try:
-        reachable, detail = globus_session.destination_reachable(
-            transfer_client_factory(), dest_collection_id, dest_base_path
-        )
-    except ImportError:
-        logger.warning(
-            "globus-sdk is not installed in this image, so the live destination check was "
-            "skipped. The session's age was checked; a revoked session would not be caught."
-        )
-        return decision
-    if not reachable:
-        raise RuntimeError(f"Refusing to submit: {detail}")
-    logger.info(detail)
-    return decision
-
-
 def check_https_session(
     logger,
     *,
@@ -244,13 +164,18 @@ def check_https_session(
     transfer_client_factory=_transfer_client,
     https_token_factory=_https_token,
 ) -> globus_session.GateDecision:
-    """The `ingress-mode=https` gate: `check_globus_session`'s questions, other answers.
+    """The `ingress-mode=https` gate: refuse the batch before the first submission.
 
-    Life is measured against our 30-day rule, never a gateway's declared timeout:
-    no gateway of ours is in the HTTPS path, and the source's year is not the
-    rule. The live check is one listing of the source base path with the transfer
+    Raises `RuntimeError` when the batch must not start. That ends the flow run
+    with the reason in the failure, which is the only place an operator reliably
+    looks — a warning in the logs of a run that submitted anyway is how 300
+    workflows died unnoticed on 2026-08-17.
+
+    Life is measured against our 30-day rule, not the source collection's own
+    timeout, which is a year. The age check cannot see a revoked session, so a
+    live check follows it: one listing of the source base path with the transfer
     token, then one refresh of the HTTPS token — a login can grant the first and
-    not the second. Nothing is woken: the Globus host plays no part.
+    not the second.
 
     The ingress pod checks the age again before any request. This gate is the
     courtesy that refuses a batch once; the pod is the control, because a hand
@@ -318,8 +243,9 @@ def _as_float(value, default: float) -> float:
 
 
 # Must match the `ingress-mode` enum in cloudpipe-long-master-workflow-template.yaml
-# (tests/prefect/test_ingress_mode.py pins the two together).
-INGRESS_MODES = ("globus", "presynced", "https")
+# (tests/prefect/test_ingress_mode.py pins the two together). `globus` left both
+# with the Globus host (openspec retire-globus-host), so it is now an unknown mode.
+INGRESS_MODES = ("https", "presynced")
 
 
 def ingress_params(
@@ -342,9 +268,10 @@ def ingress_params(
     because the template declares them without defaults and Argo rejects a
     submission that omits them.
 
-    In https mode the destination collection is not read either — the copy goes
-    straight to S3, so there is no destination collection in the path — and is
-    sent empty for the same reason.
+    In https mode only the source collection and base path are read. The copy
+    goes straight to S3, so there is no destination collection in the path;
+    `globus-dest-collection-id` is still sent, empty, because the template keeps
+    it declared (deprecated, unread) for parameter sets from older submitters.
     """
     if ingress_mode not in INGRESS_MODES:
         raise ValueError(f"ingress_mode={ingress_mode!r} is not one of {list(INGRESS_MODES)}")
@@ -361,33 +288,73 @@ def ingress_params(
         source_collection_id = read_ssm(SSM_SOURCE_COLLECTION_PARAM)
     if source_base_path is None:
         source_base_path = read_ssm(SSM_SOURCE_BASE_PATH_PARAM)
-    if ingress_mode == "https":
-        return {
-            "ingress-mode": ingress_mode,
-            "globus-source-collection-id": source_collection_id,
-            "globus-source-base-path": source_base_path,
-            "globus-dest-collection-id": "",
-            "globus-dest-base-path": dest_base_path,
-            "globus-scan-types": scan_types,
-        }
-    # No "ingress-mode" key: the template defaults it to globus, so the production
-    # submission stays exactly what it was before #336 — and still submits cleanly
-    # to a template ArgoCD has not yet synced to declare the parameter.
+    # The mode is sent explicitly even though it is the template's default, so a
+    # submission never depends on which default the synced template carries.
     return {
+        "ingress-mode": ingress_mode,
         "globus-source-collection-id": source_collection_id,
         "globus-source-base-path": source_base_path,
-        "globus-dest-collection-id": read_ssm(SSM_COLLECTION_PARAM),
+        "globus-dest-collection-id": "",
         "globus-dest-base-path": dest_base_path,
         "globus-scan-types": scan_types,
-        # "globus-use-s3-gateway" is deliberately not sent: the POSIX staging path
-        # it selected is gone, so the value carried no meaning. The template still
-        # DECLARES it, so an older submission that sends it is not rejected.
     }
 
 
+# The WorkflowTemplates this flow may submit. `confounds-rerun` is the one-off
+# confounds-only re-run (scripts/rerun_confounds.py); it declares every parameter
+# the master takes, so one submission shape serves both
+# (tests/prefect/test_workflow_template.py holds them together).
+WORKFLOW_TEMPLATES = ("cloudpipe", "confounds-rerun")
+
+
+def check_workflow_template(workflow_template: str, ingress_mode: str, batch_label: str) -> None:
+    """Refuse a template this flow does not submit, or one submitted the wrong way.
+
+    confounds-rerun stages its input over HTTPS only, and reads its plan from
+    config/confounds-rerun/{batch_label}/, so a run without a label would submit
+    every subject to a pod that finds no plan.
+    """
+    if workflow_template not in WORKFLOW_TEMPLATES:
+        raise ValueError(
+            f"workflow_template={workflow_template!r} is not one of {list(WORKFLOW_TEMPLATES)}"
+        )
+    if workflow_template == "confounds-rerun":
+        if ingress_mode != "https":
+            raise ValueError(f"confounds-rerun needs ingress_mode='https', not {ingress_mode!r}")
+        if not batch_label:
+            raise ValueError("confounds-rerun needs batch_label: it is the plan's label")
+
+
 @task(name="submit-cloudpipe-workflow", retries=2, retry_delay_seconds=10)
-def submit_workflow(subj_id: str, **globus_params) -> str:
-    return submit("cloudpipe", subj_id, **globus_params)
+def submit_workflow(
+    workflow_template: str, subj_id: str, name_prefix: str = "", **globus_params
+) -> str:
+    return submit(workflow_template, subj_id, name_prefix=name_prefix, **globus_params)
+
+
+def own_prefixes(workflow_template: str, name_prefix: str) -> tuple[str, tuple[str, ...]]:
+    """(this run's workflow-name prefix, longer prefixes that belong to someone else).
+
+    Production `cloudpipe-` would also match the audit's `cloudpipe-audit-*` names, and
+    the primary audit's `cloudpipe-audit-` the repeat pair's: each run skips only its
+    OWN active subjects on a restart.
+    """
+    prefix = name_prefix or f"{workflow_template}-"
+    return prefix, tuple(p for p in audit_pairs.PREFIXES if p != prefix and p.startswith(prefix))
+
+
+def bucket_params(bucket: str, metrics_bucket: str) -> dict[str, str]:
+    """The bucket overrides to pass, if any. Empty means the ConfigMap's defaults.
+
+    Passed as a pair or not at all: a workflow writing derivatives to one
+    deployment's data bucket and metrics to another's is the mix the audit guard
+    exists to prevent.
+    """
+    if bool(bucket) != bool(metrics_bucket):
+        raise audit_pairs.AuditConfigError(
+            "bucket and metrics_bucket are set together or not at all"
+        )
+    return {"bucket": bucket, "metrics-bucket": metrics_bucket} if bucket else {}
 
 
 @flow(name="cloudpipe-queue-manager", log_prints=True)
@@ -401,20 +368,34 @@ def cloudpipe_queue_manager(
     globus_dest_base_path: str = "/mmps_mproc",
     globus_scan_types: str = '["T1w","T2w","rest","nback"]',
     batch_label: str = "",
-    ingress_mode: str = "globus",
+    ingress_mode: str = "https",
+    workflow_template: str = "cloudpipe",
+    bucket: str = "",
+    metrics_bucket: str = "",
+    name_prefix: str = "",
 ):
     """
     Submit ABCD subjects directly to the cloudpipe Argo WorkflowTemplate.
 
     Parameters
     ----------
-    subjects_file:                local path or s3://bucket/key URI to a CSV of subject IDs.
+    subjects_file:                local path or s3://bucket/key URI to a CSV of subject IDs, or
+                                  a .jsonl with a "subject" per row whose exclude_sessions,
+                                  template_qsphere, fastsurfer_device and
+                                  surface_registration, where non-empty, are passed with that
+                                  subject (lib/subjects.py). An audit batch (an audit
+                                  name_prefix) must set surface_registration on every row. A row's
+                                  fastsurfer_device overrides the drought detector and
+                                  ``cloudpipe-fastsurfer-device``: the reprocess audit's
+                                  sample.jsonl replays each subject's production device.
+                                  Per-subject parameters need workflow_template "cloudpipe".
     poll_interval:                seconds to wait between running-count checks when at capacity.
     start_index:                  skip the first N subjects (resume after a pause).
     end_index:                    stop at this index (exclusive); omit to process all.
     globus_source_collection_id:  UUID of the remote Globus source collection.
     globus_source_base_path:      Root path on the source collection (subject ID appended automatically).
-    globus_dest_base_path:        Root path on the destination collection.
+    globus_dest_base_path:        Staging prefix in the data bucket (subject ID appended); the
+                                  name is kept from the retired Globus ingress.
     globus_scan_types:            JSON array of BIDS scan types, e.g. '["T1w","T2w","rest"]'.
     batch_label:                  Free-text era/batch label stamped onto every WorkflowRun
                                   metrics record in this submission, e.g. "leg-2". Empty by
@@ -422,17 +403,32 @@ def cloudpipe_queue_manager(
                                   to isolate: without it, eras are separable only by timestamp,
                                   and batches whose runs overlap a date boundary cannot be
                                   told apart by `dt` at all.
-    ingress_mode:                 "globus" (default) pulls each subject from the Globus source
-                                  collection. "presynced" skips Globus entirely — the data must
-                                  already be under s3://<bucket>/mmps_mproc/{subj}/ — validates
-                                  the staged input instead, and does NOT delete it on success.
-                                  No Globus SSM parameters are read, and the globus_* arguments
-                                  are ignored. See docs/data-ingress.md.
-                                  "https" lists each subject through Globus Transfer as globus
-                                  mode does, then copies it over the source collection's HTTPS
-                                  server straight to S3. No Globus host is used. The batch is
-                                  refused if the last `pixi run globus login` would pass 30 days
-                                  within the safety margin.
+    ingress_mode:                 "https" (default) lists each subject on the Globus source
+                                  collection through Globus Transfer, then copies it over the
+                                  collection's HTTPS server straight to S3. The batch is refused
+                                  if the last `pixi run globus login` would pass 30 days within
+                                  the safety margin. "presynced" skips ingress entirely — the
+                                  data must already be under s3://<bucket>/mmps_mproc/{subj}/ —
+                                  validates the staged input instead, and does NOT delete it on
+                                  success. No Globus SSM parameters are read, and the globus_*
+                                  arguments are ignored. Any other value, including the retired
+                                  "globus", is refused before anything is submitted. See
+                                  docs/data-ingress.md.
+    workflow_template:            "cloudpipe" (default), or "confounds-rerun" for the one-off
+                                  confounds-only re-run, which needs ingress_mode "https" and
+                                  batch_label = the plan's label. scripts/rerun_confounds.py
+                                  submit sets all three.
+    bucket, metrics_bucket:       Override the data and metrics buckets every workflow writes
+                                  to. Empty (default) = the cloudpipe-config ConfigMap's
+                                  production buckets. Set both or neither.
+    name_prefix:                  Workflow generateName. Empty (default) = "<template>-". The
+                                  reprocess audit sets "cloudpipe-audit-" (primary pair) or
+                                  "cloudpipe-audit-repeat-" (repeat pair), which the cost scraper
+                                  routes to that pair's metrics bucket. An audit prefix must
+                                  come with exactly its pair's buckets from the Prefect Variable
+                                  ``cloudpipe-audit-buckets`` and the ``cloudpipe`` template; a
+                                  non-audit prefix must not name an audit bucket. Anything else
+                                  is refused before anything is submitted (src/metrics/audit_pairs.py).
 
     Concurrency
     -----------
@@ -455,14 +451,14 @@ def cloudpipe_queue_manager(
     the cap's whole width at once. A failed or malformed read holds the last good
     rate. Each "submitted" log line reports how long pacing held that submission.
 
-    GPU drought fallback (#373)
-    ---------------------------
-    Each submission carries ``fastsurfer-device``. In the default ``auto`` mode
-    it is ``cuda`` until GPU pods in ``argo-workflows`` have been Pending for
-    15+ minutes in numbers (10 to enter, 3 to leave — hysteresis), then ``cpu``
-    so the subject's FastSurfer segmentation runs on cpu-heavy-nodepool instead.
-    The Prefect variable ``cloudpipe-fastsurfer-device`` (``auto``/``cuda``/``cpu``)
-    is re-read every submission and overrides the detector. A failed read of
+    FastSurfer device (#373)
+    ------------------------
+    Each submission carries ``fastsurfer-device``: ``cpu`` by default (operator,
+    2026-11-11), from the Prefect variable ``cloudpipe-fastsurfer-device``
+    (``cpu``/``cuda``/``auto``), re-read every submission. In ``auto`` it is
+    ``cuda`` until GPU pods in ``argo-workflows`` have been Pending for 15+ minutes
+    in numbers (10 to enter, 3 to leave — hysteresis), then ``cpu``. A subject
+    row's ``fastsurfer_device`` overrides all of these. A failed read of
     either the variable or the pod list holds the previous decision; neither
     can end the leg.
     """
@@ -481,6 +477,20 @@ def cloudpipe_queue_manager(
 
     # First, before loading subjects or touching Argo: a bad mode must end the run,
     # not reach a submission.
+    check_workflow_template(workflow_template, ingress_mode, batch_label)
+    if workflow_template != "cloudpipe":
+        logger.info(f"Workflow template: {workflow_template}")
+    # Also before anything else: audit and production must never mix (openspec
+    # add-reprocess-audit, audit-isolation). The pairs are read even for a
+    # production run, which is how a production run naming an audit bucket is caught.
+    pairs = audit_pairs.parse_pairs(Variable.get(audit_pairs.PAIRS_VARIABLE, default=""))
+    audit_pairs.check_submission(name_prefix, bucket, metrics_bucket, workflow_template, pairs)
+    overrides = bucket_params(bucket, metrics_bucket)
+    if name_prefix or overrides:
+        logger.info(
+            f"Workflow names {name_prefix or workflow_template + '-'}*, buckets "
+            f"{overrides.get('bucket', '<ConfigMap>')} / {overrides.get('metrics-bucket', '<ConfigMap>')}"
+        )
     params = ingress_params(
         ingress_mode,
         _read_ssm,
@@ -489,16 +499,9 @@ def cloudpipe_queue_manager(
         dest_base_path=globus_dest_base_path,
         scan_types=globus_scan_types,
     )
-    if ingress_mode == "globus":
-        logger.info(f"Globus dest collection: {params['globus-dest-collection-id']}")
+    if ingress_mode == "https":
         # Before the subject list, before Argo: a batch that cannot transfer must
         # not exist. In presynced mode there is no Globus to check.
-        check_globus_session(
-            logger,
-            dest_collection_id=params["globus-dest-collection-id"],
-            dest_base_path=params["globus-dest-base-path"],
-        )
-    elif ingress_mode == "https":
         logger.info(
             f"Ingress mode https: source {params['globus-source-collection-id']} read over "
             "HTTPS, straight to S3"
@@ -513,14 +516,33 @@ def cloudpipe_queue_manager(
             f"Ingress mode {ingress_mode}: Globus skipped; staged input is validated, not deleted"
         )
 
-    subjects = load(subjects_file)
+    subjects = load_with_params(subjects_file)
+    if workflow_template != "cloudpipe" and any(p for _, p in subjects):
+        # Only the cloudpipe template declares them; Argo refuses an undeclared
+        # parameter, so this would fail one submission at a time instead of now.
+        raise ValueError(
+            f"{subjects_file} sets per-subject parameters, which only the cloudpipe "
+            f"template takes (workflow_template={workflow_template!r})"
+        )
+    if audit_pairs.is_audit(name_prefix):
+        # The audit compares a fresh run with what production made, so every
+        # subject replays production's surface route. Left to the template
+        # default, a default flip (fs -> newmsm) would silently turn the audit
+        # into a method comparison. The audit buckets start empty, so the
+        # inventory's "once newmsm, always newmsm" rule cannot supply it either.
+        unset = [s for s, p in subjects if "surface-registration" not in p]
+        if unset:
+            raise ValueError(
+                f"{len(unset)} audit subject(s) set no surface_registration (e.g. {unset[0]}): "
+                "an audit row must replay production's route"
+            )
     batch = subjects[start_index:end_index]
     total = len(batch)
     logger.info(
         f"Loaded {len(subjects)} subjects; submitting {total} (indices {start_index}–{end_index or len(subjects)})"
     )
 
-    globus_params = {**params, "batch-label": batch_label}
+    globus_params = {**params, "batch-label": batch_label, **overrides}
     if batch_label:
         logger.info(f"Batch label: {batch_label}")
 
@@ -555,8 +577,8 @@ def cloudpipe_queue_manager(
     # A malformed value raises inside the read, so cap_reader holds the last good
     # mode rather than submitting something the templates would misread as cuda.
     read_device_mode = cap_reader(
-        lambda: parse_device_mode(Variable.get(FASTSURFER_DEVICE_VARIABLE, default=DEVICE_AUTO)),
-        initial=DEVICE_AUTO,
+        lambda: parse_device_mode(Variable.get(FASTSURFER_DEVICE_VARIABLE, default=DEVICE_CPU)),
+        initial=DEVICE_CPU,
         on_error=lambda exc, held: logger.warning(
             f"Could not read {FASTSURFER_DEVICE_VARIABLE} ({type(exc).__name__}: {exc}) "
             f"— holding device mode at {held!r}"
@@ -574,8 +596,37 @@ def cloudpipe_queue_manager(
         ),
     )
 
+    # Read once, before the walk. When Prefect restarts this flow (its runner pod was
+    # replaced: node reclaim, consolidation) it walks the list from the START, and
+    # every subject already submitted would go in a second time and run CONCURRENTLY
+    # with the first, both writing the same session (2026-11-10: 46 subjects of a
+    # 568-subject reprocess slice, caught before either wrote; #1105). A subject with
+    # an active workflow of THIS run's name prefix is skipped. A subject whose first
+    # workflow already finished is resubmitted, which the pipeline's exists-gates turn
+    # into a no-op; only concurrency is the hazard.
+    prefix, foreign = own_prefixes(workflow_template, name_prefix)
+    running = list_active_subjects_by_prefix(
+        prefix,
+        exclude=foreign,
+        on_retry=lambda attempt, exc, delay: logger.warning(
+            f"Argo list attempt {attempt} failed ({type(exc).__name__}: {exc}) — retrying in {delay:.0f}s"
+        ),
+    )
+    if running:
+        logger.warning(
+            f"{len(running)} subject(s) already have an active {prefix}* workflow — skipping "
+            "them (a restarted flow must not resubmit them)"
+        )
+
     last_submitted_at: float | None = None
-    for i, subj_id in enumerate(batch):
+    skipped = 0
+    for i, (subj_id, subj_params) in enumerate(batch):
+        if subj_id.removeprefix("sub-") in running:
+            logger.info(
+                f"[{i + 1}/{total}] skipping {subj_id} — its {prefix}* workflow is still running"
+            )
+            skipped += 1
+            continue
         # Pace before the slot check, not after: the active count must be the last
         # thing read before a submission, or a pacing sleep could let it go stale.
         paced_s = wait_for_pace(last_submitted_at, read_rate, max_sleep=poll_interval)
@@ -595,11 +646,24 @@ def cloudpipe_queue_manager(
 
         # Decided at submission time, not per poll: the verdict only matters when a
         # workflow is about to be created, and a slot opening is the natural cadence.
-        device = choose_device(read_device_mode(), drought.observe())
-        name = submit_workflow(subj_id, **globus_params, **{"fastsurfer-device": device})
+        # Observed every submission even when a row pins the device, so the
+        # detector's hysteresis sees an unbroken series.
+        chosen = choose_device(read_device_mode(), drought.observe())
+        device = subj_params.get("fastsurfer-device") or chosen
+        name = submit_workflow(
+            workflow_template,
+            subj_id,
+            name_prefix=name_prefix,
+            **{**globus_params, **subj_params, "fastsurfer-device": device},
+        )
         last_submitted_at = time.monotonic()
         gate.record(name)
         logger.info(
             f"[{i + 1}/{total}] submitted {subj_id} → {name} "
-            f"({active + 1} active, fastsurfer-device={device}, paced {paced_s:.0f}s)"
+            f"({active + 1} active, fastsurfer-device={device}"
+            f"{' (row)' if 'fastsurfer-device' in subj_params else ''}, paced {paced_s:.0f}s"
+            + "".join(f", {k}={v}" for k, v in subj_params.items() if k != "fastsurfer-device")
+            + ")"
         )
+    if skipped:
+        logger.warning(f"Done: {skipped} of {total} subject(s) skipped as already running")

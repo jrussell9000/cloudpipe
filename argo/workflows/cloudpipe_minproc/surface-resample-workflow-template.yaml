@@ -22,7 +22,7 @@ spec:
     # artifact-staging class (#277). A missing artifact KEY is excluded, though:
     # its producer was skipped or failed, and a consumer retry cannot re-run the
     # producer. See the master template for the detail.
-    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+    expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
     backoff:
       duration: "1m"
       factor: "2"
@@ -63,6 +63,14 @@ spec:
       # JSON array of the session's runs, as produced by inventory:
       #   [{"task": "rest", "run": "run-01", "surf_target_exists": false}, ...]
       - name: runs
+      # fs | newmsm. Under the master this is the inventory's EFFECTIVE route; a
+      # standalone submission for a subject with a newMSM registration must pass
+      # newmsm, or its `runs` (computed on that route) and this pod disagree.
+      - name: surface-registration
+        value: fs
+        enum:
+          - fs
+          - newmsm
       - name: bucket
         valueFrom:
           configMapKeyRef:
@@ -112,6 +120,8 @@ spec:
               value: '{{workflow.parameters.session}}'
             - name: runs
               value: '{{workflow.parameters.runs}}'
+            - name: surface-registration
+              value: '{{workflow.parameters.surface-registration}}'
 
   ###########################################################################
   # Core template — ONE pod per session, looping over that session's runs.
@@ -135,6 +145,16 @@ spec:
   # Uploads to S3, one dtseries per run (built by the driver):
   #   derivatives/func_surf/{subj}/{ses}/fsLR32k/
   #     {subj}_{ses}_{task}_{run}_space-fsLR32k_bold.dtseries.nii
+  #
+  # On the newmsm route (openspec add-newmsm-surface-registration, design D4/D5)
+  # it also stages derivatives/newmsm/{subj} → /data/newmsm and resamples through
+  # the subject's newMSM sphere onto HCP's standard fsLR 32k sphere (in
+  # config/fsLR). Each run's output is
+  #     {prefix}_space-fsLR32k_desc-newmsm_bold.dtseries.nii  + its .json sidecar
+  # and it REPLACES the run's FS-route dtseries. The driver uploads both itself,
+  # dtseries then sidecar, and only then deletes the FS-route file: Argo uploads
+  # output artifacts after the driver exits, too late to order a delete after.
+  # An interrupted pod therefore always leaves the run one complete CIFTI.
   ###########################################################################
 
   - name: surface-resample-session-template
@@ -147,6 +167,9 @@ spec:
       parameters:
         - name: session
         - name: runs
+        # fs | newmsm: the inventory's effective route (design D6).
+        - name: surface-registration
+          default: fs
         # Static mesh filenames, templated on {hemi}. Parameters rather than
         # constants because they come from the HCP standard_mesh_atlases
         # package staged in config/ — restaging under different names should
@@ -216,6 +239,22 @@ spec:
             region: "{{workflow.parameters.region}}"
             key: 'config/fsLR'
 
+        # The subject's newMSM registration, read only on the newmsm route.
+        # Optional: on fs the subject has no tree (a registered subject is
+        # always on newmsm), so nothing is downloaded. On newmsm an absent tree
+        # is cifti_assemble.py's guard to report (exit 3, `dependency`), per run,
+        # not an init-container failure that would hide the cause.
+        - name: newmsm
+          path: /data/newmsm
+          optional: true
+          archive:
+            none: {}
+          s3:
+            endpoint: "s3.{{workflow.parameters.region}}.amazonaws.com"
+            bucket: "{{workflow.parameters.bucket}}"
+            region: "{{workflow.parameters.region}}"
+            key: 'derivatives/newmsm/{{workflow.parameters.subjID}}'
+
     outputs:
       artifacts:
         # Per-run StepOutcome JSON records, written directly by the driver
@@ -252,7 +291,7 @@ spec:
       # unpinned ref. build-images.yaml's re-pin step matches `sha-*|latest` and
       # rewrites this to sha-<commit> once the first build lands, and only after
       # confirming that tag actually reached the registry.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:321be98fc9405f07e689997b5778e4b57117d2320525de6e059e6f3cb46808ab"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:60aeff7db03e845af0d9f480190df4787c1541cc5725ee3c86a831cad5b1134b"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -302,6 +341,9 @@ spec:
         TARGET_AREA = "{{inputs.parameters.target-area}}"
         AREA_MODE = "{{inputs.parameters.area-mode}}"
         TARGET_ROI = "{{inputs.parameters.target-roi}}"
+        # fs | newmsm (openspec add-newmsm-surface-registration). On fs every
+        # command line, file name and upload below is exactly as before.
+        ROUTE = "{{inputs.parameters.surface-registration}}"
         WORKFLOW_NAME = "{{workflow.name}}"
         # Argo reuses names; the UID is what keeps this run's records apart (#638).
         WORKFLOW_UID = "{{workflow.uid}}"
@@ -342,8 +384,34 @@ spec:
         COMPONENTS = Path("/data/components")
         ANAT = Path("/data/anat")
         MESHES = Path("/data/meshes")
+        NEWMSM_DIR = Path("/data/newmsm")
         OUT_DIR = Path("/tmp/cifti_out")
         OUT_DIR.mkdir(parents=True, exist_ok=True)
+        FSLR_PREFIX = f"derivatives/func_surf/{SUBJ}/{SES}/fsLR32k/"
+
+        if ROUTE not in ("fs", "newmsm"):
+            # Nothing has run, so every run's outcome would be a guess; let the
+            # master's fallback recorder record the pod's failure.
+            print(f"[driver] FATAL: surface-registration must be fs or newmsm, got {ROUTE!r}")
+            sys.exit(1)
+
+        def dtseries_name(prefix, route=ROUTE):
+            """The run's CIFTI name on `route`; equals cifti_assemble.dtseries_name."""
+            desc = "_desc-newmsm" if route == "newmsm" else ""
+            return f"{prefix}_space-fsLR32k{desc}_bold.dtseries.nii"
+
+        def sidecar_name(prefix):
+            return dtseries_name(prefix, "newmsm").removesuffix(".dtseries.nii") + ".json"
+
+        # cifti_assemble.py's newMSM guards (EXIT_NEWMSM_ABSENT = 3,
+        # EXIT_MESH_MISMATCH = 4). The wording is what classifies them in
+        # step_outcome: "upstream task failed" -> dependency, "corrupt" -> data.
+        ASSEMBLE_EXIT_REASON = {
+            3: ("upstream task failed: no usable newMSM registration for this subject "
+                f"(derivatives/newmsm/{SUBJ}/; cifti_assemble.py exit 3)"),
+            4: ("corrupt registration for this session: the newMSM sphere is not on the "
+                "session's mesh (cifti_assemble.py exit 4)"),
+        }
 
         pending = [r for r in RUNS if not r.get("surf_target_exists")]
         print(f"[driver] {SES}: {len(pending)} of {len(RUNS)} runs need assembly")
@@ -366,7 +434,7 @@ spec:
 
         def dtseries_is_intact(prefix):
             """True if this run's assembled dtseries is present and above floor."""
-            out = OUT_DIR / f"{prefix}_space-fsLR32k_bold.dtseries.nii"
+            out = OUT_DIR / dtseries_name(prefix)
             if not out.is_file():
                 print(f"[reclaim] keeping {prefix} components: no dtseries at {out}")
                 return False
@@ -389,8 +457,7 @@ spec:
             `components_exist OR surf_target_exists` disjunction inventory uses
             (src/inventory.py), at the moment it actually matters.
             """
-            key = (f"derivatives/func_surf/{SUBJ}/{SES}/fsLR32k/"
-                   f"{prefix}_space-fsLR32k_bold.dtseries.nii")
+            key = FSLR_PREFIX + dtseries_name(prefix)
             try:
                 head = boto3.client("s3").head_object(Bucket=BUCKET, Key=key)
             except Exception:
@@ -400,6 +467,92 @@ spec:
                 return False
             # Same floor as the local check: a truncated upload is not a result.
             return head["ContentLength"] >= MIN_DTSERIES_BYTES
+
+        def replace_fs_route(prefix):
+            """Delete the run's FS-route dtseries, once its newMSM pair is in S3.
+
+            Returns "" on success (including when there was nothing to delete:
+            S3 deletes are idempotent), else why the FS file was kept. Checks S3,
+            not local state, so it is equally right for a run published by this
+            pod and for one whose earlier pod died between upload and delete.
+            """
+            s3 = boto3.client("s3")
+            new_key = FSLR_PREFIX + dtseries_name(prefix, "newmsm")
+            try:
+                if s3.head_object(Bucket=BUCKET, Key=new_key)["ContentLength"] < MIN_DTSERIES_BYTES:
+                    return "newMSM dtseries in S3 is below the size floor; FS-route dtseries kept"
+                s3.head_object(Bucket=BUCKET, Key=FSLR_PREFIX + sidecar_name(prefix))
+                s3.delete_object(Bucket=BUCKET, Key=FSLR_PREFIX + dtseries_name(prefix, "fs"))
+            except Exception as exc:
+                return f"FS-route dtseries not replaced: {type(exc).__name__}: {exc}"
+            print(f"[replace] {prefix}: FS-route dtseries removed (newMSM pair in S3)")
+            return ""
+
+        def publish_newmsm(prefix):
+            """newmsm route: upload the run's sidecar, then its dtseries, then
+            delete the FS-route dtseries (design D4, replace semantics).
+
+            The dtseries is uploaded LAST because it is the commit point: it is
+            what the inventory tests (surf_target_exists). A kill before it
+            leaves at most an orphan sidecar, which the next attempt overwrites;
+            a kill after it, before the delete, leaves the newMSM pair complete
+            and the FS file in place, which replace_fs_route removes on the
+            session's next pod. The FS file is never removed before a complete
+            newMSM pair is in S3, so a run always has one complete CIFTI.
+            Returns "" on success, else the failure reason.
+            """
+            s3 = boto3.client("s3")
+            dts = OUT_DIR / dtseries_name(prefix)
+            sidecar = OUT_DIR / sidecar_name(prefix)
+            if not sidecar.is_file():
+                return f"cifti_assemble.py wrote no sidecar {sidecar.name}"
+            for path in (sidecar, dts):
+                key = FSLR_PREFIX + path.name
+                s3.upload_file(str(path), BUCKET, key)
+                if s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"] != path.stat().st_size:
+                    return f"upload of {path.name} is short; FS-route dtseries kept"
+                print(f"[publish] s3://{BUCKET}/{key}")
+            return replace_fs_route(prefix)
+
+        def transform_absent(task, rid):
+            """True only if S3 positively shows bold-to-t1w left no transform for this run.
+
+            That is what a QC rejection (exit 65) does: the transform is never
+            published, func-preproc skips the run (its `SKIPPED ... no
+            bold_to_t1w transform (QC-rejected upstream)` line), and so no
+            components ever exist for this pod. Such a run is `skipped` with
+            upstream_failed_step bold-to-t1w, exactly as func-preproc and
+            surface-sample record it, not a surface-resample failure: recorded
+            as failed it made the workflow verdict (#899) fail every subject
+            with a rejected run. A listing, not a HEAD, so a credential or
+            network fault cannot pass for "absent": any error returns False and
+            the run keeps the failure path.
+            """
+            prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+            key = (f"derivatives/registration/{SUBJ}/{SES}/bold_to_t1w_{task}_{rid}/"
+                   f"{prefix}_desc-bold2t1w_itk.txt")
+            try:
+                resp = boto3.client("s3").list_objects_v2(Bucket=BUCKET, Prefix=key, MaxKeys=1)
+            except Exception:
+                return False
+            return not any(o["Key"] == key for o in resp.get("Contents", []))
+
+        # A pending run with no components of any kind (no directory, no
+        # tarball) whose transform is absent never reached func-preproc. Decided
+        # before the geometry check: a session whose every run was rejected
+        # has no geometry either, and that is not a fault.
+        skipped = {}
+        for r in pending:
+            task, rid = r["task"], r["run"]
+            prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+            has_components = (
+                (COMPONENTS / f"{task}_{rid}").is_dir()
+                or (COMPONENTS / f"{prefix}_desc-grayordcomponents_bold.tar.gz").exists()
+            )
+            if not has_components and transform_absent(task, rid):
+                print(f"[driver] SKIPPED {prefix}: no bold_to_t1w transform (QC-rejected upstream)")
+                skipped[prefix] = "bold-to-t1w left no transform for this run (QC-rejected upstream)"
+        pending = [r for r in pending if f"{SUBJ}_{SES}_{r['task']}_{r['run']}" not in skipped]
 
         # Runs excluded from `pending` already had their dtseries verified in S3
         # by inventory's surf_target_exists, so their components are reclaimable
@@ -426,6 +579,11 @@ spec:
 
         failed = []
         reason_by_prefix = {}
+        # Runs whose dtseries an earlier pod already wrote. On newmsm, that pod
+        # may have died between its upload and the FS-route delete.
+        done_earlier = [
+            f"{SUBJ}_{SES}_{r['task']}_{r['run']}" for r in RUNS if r.get("surf_target_exists")
+        ]
         try:
             for run in pending:
                 task, rid = run["task"], run["run"]
@@ -463,6 +621,7 @@ spec:
                         # not failure: the derivative this run owes exists.
                         print(f"[driver] SKIP {prefix}: dtseries already in S3, "
                               f"components already reclaimed")
+                        done_earlier.append(prefix)
                         continue
 
                     if not comp_dir.is_dir():
@@ -473,7 +632,7 @@ spec:
                         reason_by_prefix[prefix] = f"no components at {comp_dir}"
                         continue
 
-                    rc = subprocess.run([
+                    cmd = [
                         "python", "/app/cifti_assemble.py",
                         "--components", str(comp_dir),
                         "--anat", str(ANAT),
@@ -487,12 +646,30 @@ spec:
                         "--target-area", TARGET_AREA,
                         "--area-mode", AREA_MODE,
                         "--target-roi", TARGET_ROI,
-                    ]).returncode
+                    ]
+                    # Appended only on newmsm, so the fs command line is the one
+                    # this step has always run.
+                    if ROUTE == "newmsm":
+                        cmd += ["--registration", "newmsm", "--newmsm-dir", str(NEWMSM_DIR)]
+                    rc = subprocess.run(cmd).returncode
 
                     if rc != 0:
                         print(f"[driver] FAILED {prefix} (exit {rc})")
                         failed.append(prefix)
-                        reason_by_prefix[prefix] = f"cifti_assemble.py exited {rc}"
+                        reason_by_prefix[prefix] = ASSEMBLE_EXIT_REASON.get(
+                            rc, f"cifti_assemble.py exited {rc}"
+                        )
+                    elif ROUTE == "newmsm":
+                        why = (
+                            publish_newmsm(prefix) if dtseries_is_intact(prefix)
+                            else "assembled dtseries missing or below the size floor; not published"
+                        )
+                        if why:
+                            print(f"[driver] FAILED {prefix}: {why}")
+                            failed.append(prefix)
+                            reason_by_prefix[prefix] = why
+                        else:
+                            reclaimable.append(prefix)
                     elif dtseries_is_intact(prefix):
                         reclaimable.append(prefix)
                 except Exception as exc:
@@ -505,6 +682,12 @@ spec:
                     # components would otherwise accumulate alongside the
                     # tarballs they came from.
                     shutil.rmtree(comp_dir, ignore_errors=True)
+                    # On newmsm the driver uploads in order itself. Anything
+                    # left in OUT_DIR would be uploaded again by Argo after
+                    # exit, unordered, including a run that failed mid-publish.
+                    if ROUTE == "newmsm":
+                        (OUT_DIR / dtseries_name(prefix)).unlink(missing_ok=True)
+                        (OUT_DIR / sidecar_name(prefix)).unlink(missing_ok=True)
         finally:
             # Record every run's outcome directly (see ADR 016). Written in a
             # `finally`: the loop is sequential and each iteration is fully
@@ -516,12 +699,27 @@ spec:
             for r in RUNS:
                 task, rid = r["task"], r["run"]
                 prefix = f"{SUBJ}_{SES}_{task}_{rid}"
+                if prefix in skipped:
+                    write_outcome("surface-resample", task, rid, "skipped", skipped[prefix],
+                                  upstream_failed_step="bold-to-t1w")
+                    continue
                 if prefix in failed:
                     status, reason = "failed", reason_by_prefix.get(prefix, "")
                 else:
                     status, reason = "succeeded", ""
                 write_outcome("surface-resample", task, rid, status, reason)
-        print(f"[driver] {len(pending) - len(failed)} succeeded, {len(failed)} failed")
+        print(f"[driver] {len(pending) - len(failed)} succeeded, {len(failed)} failed, "
+              f"{len(skipped)} skipped (QC-rejected upstream)")
+
+        # Finish replace semantics for runs an earlier pod published: its FS-route
+        # dtseries survives a kill between that pod's upload and its delete, and
+        # the inventory, which tests only the newMSM file, never sends the run
+        # back here as pending. Best effort, after the records, like reclaim.
+        if ROUTE == "newmsm":
+            for prefix in done_earlier:
+                why = replace_fs_route(prefix)
+                if why:
+                    print(f"[replace] WARNING {prefix}: {why}")
 
         # Reclaim runs after the outcome records are written, so a failure in
         # here can never cost us the StepOutcome facts for this session.

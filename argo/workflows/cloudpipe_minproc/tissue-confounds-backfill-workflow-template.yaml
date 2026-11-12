@@ -1,0 +1,150 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: tissue-confounds-backfill
+  namespace: argo-workflows
+
+###########################################################################
+# One-off (add-tissue-confound-columns): add the csf and white_matter columns
+# to every published confounds TSV that predates them, then patch each run's
+# FuncQC record in place to schema 1.5 (D7). The columns are the mean MNI BOLD
+# within the session's FastSurfer label masks (images/shared/confounds_tissue.py,
+# the module the func session pod writes them with), so every published BOLD
+# is read once, in-cluster. Nothing leaves the cluster.
+#
+# Planned, submitted, verified and finished by scripts/backfill_tissue_confounds.py,
+# never by hand: its session list is the contract, its `verify` is the proof,
+# and its `finish` recompacts the func_preproc partitions the records sit in.
+#
+#   sessions-key  the plan's session list, a key in the data bucket
+#   shards        how many pods share the list (each takes every shards-th)
+#   mode          apply | verify | recompute | restore (images/afni/tissue_confounds_backfill.py)
+#
+# The afni image (NumPy, nibabel, boto3). One run's BOLD is held at a time
+# (~1.7 GB as float32), and the masks once per session.
+#
+# The shard count IS the concurrency, as in probseg-backfill and dvars-backfill:
+# every shard starts at once and runs its share to the end, with deliberately no
+# semaphore. spec.parallelism is only a runaway backstop, and
+# scripts/backfill_tissue_confounds.py refuses more shards than it.
+#
+# Idempotent per run (a TSV with both columns reads as `already`, and every
+# write is conditional on the ETag read), so retries are safe.
+###########################################################################
+
+spec:
+  # Runaway backstop, not the working cap. Equals MAX_SHARDS in
+  # scripts/backfill_tissue_confounds.py; tests hold the two together.
+  parallelism: 100
+
+  serviceAccountName: argo-workflows-runner
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  arguments:
+    parameters:
+      - name: sessions-key
+      - name: shards
+      - name: mode
+        enum: [apply, verify, recompute, restore]
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: metrics_bucket
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  entrypoint: backfill
+
+  templates:
+  - name: backfill
+    steps:
+    - - name: shard
+        template: backfill-shard
+        withSequence:
+          count: "{{workflow.parameters.shards}}"
+        arguments:
+          parameters:
+            - name: shard
+              value: "{{item}}"
+
+  - name: backfill-shard
+    metadata:
+      labels:
+        cloudpipe.io/phase: functional
+        cloudpipe.io/step: tissue-confounds-backfill
+    inputs:
+      parameters:
+        - name: shard
+    # Spot reclaims and S3 errors only: 64/143 executor or SIGTERM, 75 the
+    # module's own S3-error exit. A run it cannot compute is recorded (`error`,
+    # n/a columns) and the shard goes on, so a deterministic error cannot loop.
+    retryStrategy:
+      limit: "8"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-heavy-nodepool
+    container:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:7e57fc87a24774898613f7126afdc02f3683d0fd2aae3b11d827b465a2641705"
+      imagePullPolicy: IfNotPresent
+      command: [/entrypoint.sh, python, -u, /app/tissue_confounds_backfill.py]
+      args:
+        - --sessions-key
+        - "{{workflow.parameters.sessions-key}}"
+        - --shard
+        - "{{inputs.parameters.shard}}"
+        - --shards
+        - "{{workflow.parameters.shards}}"
+        - --mode
+        - "{{workflow.parameters.mode}}"
+        - --data-bucket
+        - "{{workflow.parameters.bucket}}"
+        - --metrics-bucket
+        - "{{workflow.parameters.metrics-bucket}}"
+        - --region
+        - "{{workflow.parameters.region}}"
+        - --workdir
+        - /tmp/tissue-backfill
+      # A retried attempt resumes after the sessions an earlier attempt of this
+      # workflow finished, as in dvars-backfill.
+      env:
+        - name: WORKFLOW_UID
+          value: "{{workflow.uid}}"
+      resources:
+        # One run's MNI BOLD (~340 MB gzipped on disk, ~1.7 GB as float32 in
+        # memory), its brain mask and the session's two 1 mm masks.
+        requests:
+          cpu: "1"
+          memory: 4G
+          ephemeral-storage: 2G
+        limits:
+          memory: 6G
+          ephemeral-storage: 4G

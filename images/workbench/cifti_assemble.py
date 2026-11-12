@@ -21,11 +21,23 @@ Note the subcortical block is on MNI152NLin2009cAsym, not the MNI152NLin6Asym
 grid standard 91282-grayordinate files use, so the total grayordinate count
 will not be 91282. That is intended — see the openspec change
 `add-surface-func-processing` Decision 2a.
+
+Two registration routes (openspec add-newmsm-surface-registration):
+  fs      the session's FreeSurfer sphere.reg -> the fs_LR-deformed_to-fsaverage
+          sphere; writes `..._space-fsLR32k_bold.dtseries.nii`. Unchanged.
+  newmsm  the subject's newMSM sphere (derivatives/newmsm/{subj}/) -> HCP's
+          standard fsLR 32k sphere; writes `..._space-fsLR32k_desc-newmsm_bold
+          .dtseries.nii` and a sidecar JSON, after refusing a registration that
+          is absent (exit EXIT_NEWMSM_ABSENT) or not on the session's mesh (exit
+          EXIT_MESH_MISMATCH). Uploading in order and deleting the FS-route file
+          is the driver's job: this script only writes locally.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +46,113 @@ import nibabel as nib
 import numpy as np
 
 HEMIS = ("L", "R")
+
+# Guard exit codes on the newmsm route, so the driver can record the right
+# failure category without parsing text: no registration is the newmsm step's
+# failure (dependency); a registration on another mesh is bad data (data).
+EXIT_NEWMSM_ABSENT = 3
+EXIT_MESH_MISMATCH = 4
+
+
+class GuardError(Exception):
+    """A newmsm-route precondition failed; `code` is the exit code to use."""
+
+    def __init__(self, code: int, reason: str):
+        super().__init__(reason)
+        self.code = code
+
+
+def newmsm_sphere_name(subj: str, hemi: str) -> str:
+    """The registered sphere's name in derivatives/newmsm/{subj}/ (design D3)."""
+    return f"{subj}_hemi-{hemi}_space-fsLR_desc-newmsm_sphere.surf.gii"
+
+
+def dtseries_name(prefix: str, registration: str) -> str:
+    desc = "_desc-newmsm" if registration == "newmsm" else ""
+    return f"{prefix}_space-fsLR32k{desc}_bold.dtseries.nii"
+
+
+def _mesh(path: Path) -> tuple[int, np.ndarray]:
+    img = nib.load(str(path))
+    coords = img.agg_data("NIFTI_INTENT_POINTSET")
+    faces = np.asarray(img.agg_data("NIFTI_INTENT_TRIANGLE"))
+    return len(coords), faces
+
+
+def check_newmsm(newmsm_dir: Path, anat: Path, subj: str, ses_stem: str) -> dict[str, Path]:
+    """The design D5 guards; returns each hemisphere's newMSM sphere.
+
+    The registration was computed on the long-template's native mesh, which every
+    longitudinal session shares (60/60 in the probe). A sphere from any other mesh
+    still resamples without complaint and yields a valid-looking, misregistered
+    CIFTI, so the vertex count AND the triangles must equal the session's.
+    """
+    if not (newmsm_dir / "_complete.json").is_file():
+        raise GuardError(
+            EXIT_NEWMSM_ABSENT,
+            f"upstream task failed: no newMSM registration for {subj} "
+            f"(derivatives/newmsm/{subj}/_complete.json absent)",
+        )
+    spheres = {}
+    for hemi in HEMIS:
+        sphere = newmsm_dir / newmsm_sphere_name(subj, hemi)
+        midthickness = anat / f"{ses_stem}_hemi-{hemi}_midthickness.surf.gii"
+        if not sphere.is_file():
+            raise GuardError(
+                EXIT_NEWMSM_ABSENT,
+                f"upstream task failed: newMSM tree for {subj} has no {sphere.name}",
+            )
+        n_sphere, f_sphere = _mesh(sphere)
+        n_mid, f_mid = _mesh(midthickness)
+        if n_sphere != n_mid or not np.array_equal(f_sphere, f_mid):
+            raise GuardError(
+                EXIT_MESH_MISMATCH,
+                f"corrupt registration for this session: hemi-{hemi} newMSM sphere has "
+                f"{n_sphere} vertices, session midthickness {n_mid}"
+                + ("" if n_sphere != n_mid else " (same count, different triangles)"),
+            )
+        spheres[hemi] = sphere
+    return spheres
+
+
+def newmsm_sidecar(newmsm_dir: Path, subj: str, hemi_spheres: dict[str, Path]) -> dict:
+    """What the newMSM CIFTI's sidecar records (design D4)."""
+    provenance = newmsm_dir / "provenance.json"
+    return {
+        "SurfaceRegistration": "newMSM",
+        "NewMSMSphere": {
+            hemi: f"derivatives/newmsm/{subj}/{path.name}" for hemi, path in hemi_spheres.items()
+        },
+        "NewMSMProvenance": (
+            hashlib.sha256(provenance.read_bytes()).hexdigest() if provenance.is_file() else None
+        ),
+    }
+
+
+def route_spheres(
+    args: argparse.Namespace, ses_stem: str, prefix: str
+) -> tuple[dict[str, Path], dict[str, Path]]:
+    """(current, new) sphere per hemisphere for the route; exits on a refused guard.
+
+    fs: the session's sphere.reg onto --target-sphere, as always. newmsm: the
+    subject's guarded newMSM sphere onto --standard-sphere.
+    """
+    if args.registration == "fs":
+        current = {h: args.anat / f"{ses_stem}_hemi-{h}_sphere.reg.surf.gii" for h in HEMIS}
+        return current, {h: args.meshes / args.target_sphere.format(hemi=h) for h in HEMIS}
+    try:
+        current = check_newmsm(args.newmsm_dir, args.anat, args.subj, ses_stem)
+    except GuardError as e:
+        print(f"[assemble] REFUSED {prefix}: {e}", file=sys.stderr, flush=True)
+        sys.exit(e.code)
+    new = {h: args.meshes / args.standard_sphere.format(hemi=h) for h in HEMIS}
+    missing = [str(s) for s in new.values() if not s.exists()]
+    if missing:
+        sys.exit(
+            f"missing staged mesh: {', '.join(missing)}. The newmsm route needs HCP's "
+            f"standard fsLR 32k sphere in config/fsLR/ (--standard-sphere)."
+        )
+    return current, new
 
 
 def run(cmd: list) -> None:
@@ -171,11 +290,37 @@ def main() -> None:
         "Supplying it removes the medial wall, giving the "
         "standard 59412 cortical grayordinates.",
     )
+    p.add_argument(
+        "--registration",
+        default="fs",
+        choices=["fs", "newmsm"],
+        help="Surface route to fsLR. 'fs' (default) is unchanged: --target-sphere "
+        "along the session sphere.reg. 'newmsm' resamples along the subject's "
+        "newMSM sphere onto --standard-sphere.",
+    )
+    p.add_argument(
+        "--newmsm-dir",
+        type=Path,
+        help="The staged derivatives/newmsm/{subj}/ tree (newmsm route only)",
+    )
+    p.add_argument(
+        "--standard-sphere",
+        default="{hemi}.sphere.32k_fs_LR.surf.gii",
+        help="newmsm route: HCP's standard fsLR 32k sphere, filename template "
+        "with {hemi}, in --meshes. NOT the fs_LR-deformed_to-fsaverage variant: "
+        "the newMSM sphere is registered to fsLR, not fsaverage.",
+    )
     args = p.parse_args()
+    if args.registration == "newmsm" and args.newmsm_dir is None:
+        p.error("--newmsm-dir is required with --registration newmsm")
 
     prefix = f"{args.subj}_{args.session}_{args.task}_{args.run}"
     ses_stem = f"{args.subj}_{args.session}"
     args.outdir.mkdir(parents=True, exist_ok=True)
+
+    # Before any work: a refused registration must cost nothing and write nothing.
+    current_sphere, new_sphere = route_spheres(args, ses_stem, prefix)
+
     work = args.outdir / "_work"
     work.mkdir(exist_ok=True)
 
@@ -220,8 +365,8 @@ def main() -> None:
             )
         resampled[hemi] = resample_hemi(
             metric_in=metric_in,
-            current_sphere=args.anat / f"{ses_stem}_hemi-{hemi}_sphere.reg.surf.gii",
-            new_sphere=args.meshes / args.target_sphere.format(hemi=hemi),
+            current_sphere=current_sphere[hemi],
+            new_sphere=new_sphere[hemi],
             current_midthickness=args.anat / f"{ses_stem}_hemi-{hemi}_midthickness.surf.gii",
             target_area=target_area,
             area_mode=args.area_mode,
@@ -255,7 +400,7 @@ def main() -> None:
         ]
     )
 
-    dtseries = args.outdir / f"{prefix}_space-fsLR32k_bold.dtseries.nii"
+    dtseries = args.outdir / dtseries_name(prefix, args.registration)
     assemble(
         out=dtseries,
         left=resampled["L"],
@@ -274,6 +419,15 @@ def main() -> None:
         f"[assemble] wrote {dtseries.name}: {n_grayord} grayordinates x {n_frames} frames",
         flush=True,
     )
+
+    if args.registration == "newmsm":
+        # After the dtseries: the driver uploads in this order and deletes the
+        # FS-route file only once both are in S3 (design D4).
+        sidecar = dtseries.with_name(dtseries.name.removesuffix(".dtseries.nii") + ".json")
+        sidecar.write_text(
+            json.dumps(newmsm_sidecar(args.newmsm_dir, args.subj, current_sphere), indent=2) + "\n"
+        )
+        print(f"[assemble] wrote {sidecar.name}", flush=True)
 
     for f in work.iterdir():
         f.unlink()

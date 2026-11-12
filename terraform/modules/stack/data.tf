@@ -34,12 +34,13 @@ locals {
 }
 
 # Whether this deployment's VPC exists right now, found by the Name tag
-# module.vpc gives it. The Client VPN's per-subnet resources in vpn.tf are keyed
-# by subnet ID, and once module.vpc is destroyed those IDs are unknown, so every
-# plan failed "Invalid for_each argument" — a teardown's final destroy included,
+# module.vpc gives it. Any for_each keyed by subnet ID must expand only when
+# this is true: once module.vpc is destroyed those IDs are unknown, so every
+# plan fails "Invalid for_each argument" — a teardown's final destroy included,
 # since cleanup.sh destroys the VPC before it (second-account acceptance run,
-# 2026-10-23). They expand only when this is true; with no VPC there are no
-# subnets to associate.
+# 2026-10-23, on the Client VPN's per-subnet resources). Nothing uses it since
+# the VPN was removed (2026-11-06); it stays because
+# tests/test_terraform_cluster_lookup.py requires the guard on any future one.
 data "aws_vpcs" "this" {
   tags = {
     Name = var.name

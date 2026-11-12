@@ -1,9 +1,15 @@
-# Cloudflare Zero Trust — phase 1 of ADR 014: private-network access to the EKS
-# API server, replacing the AWS Client VPN.
+# Cloudflare Zero Trust — ADR 014: private-network access to the EKS API server
+# and the web UIs. This is the ONLY operator path into the cluster: the AWS
+# Client VPN it ran alongside was removed on 2026-11-06 (plan 012 §6), after
+# kubectl (plan 010 §4) and the UIs (plan 012 §4) were proven through the tunnel
+# and the VPN had logged no connections since September.
 #
-# Phase 1 is deliberately ADDITIVE. The Client VPN (vpn.tf) stays up and remains
-# the working path until `kubectl get nodes` has been proven through the tunnel
-# with the VPN disconnected. Do not touch vpn.tf from here.
+# Break-glass, if the tunnel or Access is down: reopen the public endpoint to one
+# address with the AWS API, which needs no cluster access —
+#   aws eks update-cluster-config --name <name> --resources-vpc-config \
+#     endpointPublicAccess=true,publicAccessCidrs=<your-ip>/32
+# — then close it again with a normal apply (endpoint_public_access = false).
+# See docs/operations.md.
 #
 # Provider auth is the CLOUDFLARE_API_TOKEN environment variable, never a
 # Terraform variable — a variable would persist the token in state. See

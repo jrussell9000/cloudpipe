@@ -65,7 +65,11 @@ locals {
   # perfectly well.
   ecr_images = [
     "afni",
+    # audit: the reprocess audit's comparison (openspec add-reprocess-audit, 3.6);
+    # pixi + equivalence's locked numpy/scipy/nibabel/pandas, no FSL, so public.
+    "audit",
     "diffusion",
+    "equivalence",
     "fastsurfer",
     "fireants",
     "fmriprep",
@@ -78,6 +82,7 @@ locals {
     "workbench",
     "fmri-first-level-proc",
     "cloudpipe-flow-runner",
+    "newmsm",
   ]
 
   # Step 6 of handoffs/ecr-private-registry-migration.md, one image at a time.
@@ -111,6 +116,16 @@ locals {
     # destroys two empty repositories and nothing else.
     "diffusion",
     "fsl",
+    # fmriprep: the equivalence benchmark's reference arm (images/fmriprep/),
+    # FROM nipreps/fmriprep, which installs FSL — so the same rule as fsl and
+    # diffusion. The repository was never pushed to, and nothing pins it.
+    "fmriprep",
+    # newmsm: links FSL's libraries (fsl-miscmaths, fsl-newmesh, ... from the FSL
+    # conda channel), so the same rule. Listed from the start, so its public
+    # repository is never created; nothing is destroyed by this entry. Its recipe
+    # lives in the newMSM fork (jrussell9000/newMSM, docker/), built into this
+    # private repository by .github/workflows/build-newmsm.yaml.
+    "newmsm",
   ]
 
   # The public set is DERIVED, so a name can only ever leave it by being listed
@@ -134,16 +149,19 @@ locals {
     "fireants",   # 5.35 GB
     "freesurfer", # 6.77 GB
     "fsl",        # unbuilt
-    "fmriprep",   # unbuilt
+    "fmriprep",   # unbuilt; upstream base alone is 2.65 GB compressed
   ]
 
   ecr_images_scan_on_push = [
     "afni",                  # 593 MB
+    "audit",                 # unbuilt; the equivalence environment + src/audit
     "cloudpipe-flow-runner", # 380 MB
     "diffusion",             # never built; ubuntu:24.04 + pixi
+    "equivalence",           # unbuilt; pixi + numpy/scipy/nibabel/pandas, no FSL
     "fmri-first-level-proc", # 578 MB
     "fsqc",                  # 215 MB
     "globus",                # 56 MB
+    "newmsm",                # 14.8 MB (distroless + newmsm closure); built from the newMSM fork
     "python",                # 42 MB
     "synthmorph",            # unbuilt
     "workbench",             # 485 MB

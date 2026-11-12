@@ -73,6 +73,7 @@ from step_outcome import (  # noqa: F401 — re-exports
     _EXIT_CODE_REASON,
     _TAXONOMY,
     QC_REJECTED_EXIT_CODE,
+    TOPOLOGY_UNFIXABLE_EXIT_CODE,
     classify_failure,
 )
 from writer import emit_to_s3
@@ -130,8 +131,23 @@ def resolve_run_status(
 # ---------------------------------------------------------------------------
 
 
+# Steps whose output is per BOLD run. A record for one of these at session scope
+# (task=na/run=na) is the fallback recorder's aggregate, and has no single output.
+_RUN_SCOPED_STEPS = frozenset({"bold-to-t1w", "func-preproc", "surface-sample", "surface-resample"})
+
+
 def default_expected_keys(step: str, subject: str, session: str, task: str, run: str) -> list[str]:
-    """Return the canonical S3 key(s) that indicate step completion."""
+    """Return the canonical S3 key(s) that indicate step completion.
+
+    None for a run-scoped step recorded at session scope. The key it would
+    build, `{subj}_{ses}_na_na_...`, never exists, so checking it turned every
+    session-level fallback record into "Failed: expected output not found",
+    even when the pod had ended Error after publishing (2026-10-29: 4 sessions
+    of func-reprocess-05-12-retry). With no key, resolve_run_status keeps the
+    pod's own status, and an Error with no message classifies as infrastructure.
+    """
+    if step in _RUN_SCOPED_STEPS and "na" in (task, run):
+        return []
     prefix = f"{subject}_{session}_{task}_{run}"
     mapping: dict[str, list[str]] = {
         "t1w-to-mni": [
@@ -145,7 +161,7 @@ def default_expected_keys(step: str, subject: str, session: str, task: str, run:
         # The run's exploded MNI BOLD (ADR 017). This is a size-floor backstop,
         # not the completion test: that is the session's _complete.json listing
         # the run, which inventory reads. The only live caller is the session-
-        # level fallback recorder (task=na), whose key never exists anyway.
+        # level fallback recorder, which now returns early above (task=na).
         "func-preproc": [
             f"derivatives/func/{subject}/{session}/{prefix}_space-MNI152NLin2009cAsym_bold.nii.gz",
         ],
@@ -167,8 +183,20 @@ def default_expected_keys(step: str, subject: str, session: str, task: str, run:
             f"derivatives/func_surf/{subject}/{session}/fsLR32k/"
             f"{prefix}_space-fsLR32k_bold.dtseries.nii",
         ],
+        # Subject-scoped (session=na): one registration of the long-template serves
+        # every session (openspec add-newmsm-surface-registration). The tree's
+        # marker, never one of its files, is the existence test (ADR 017).
+        "newmsm": [f"derivatives/newmsm/{subject}/_complete.json"],
     }
     return mapping.get(step, [])
+
+
+# Steps whose recorded status is the pod's own, never re-derived from whether the
+# expected output exists. newmsm re-runs over its OWN earlier output: a stale
+# registration (template rebuilt since) keeps its `_complete.json` while the step
+# re-registers, so a failed re-run would find the old marker and record
+# `succeeded`. Its expected key is still verified and reported.
+_POD_STATUS_STEPS = frozenset({"newmsm"})
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +222,9 @@ _MIN_OUTPUT_BYTES: dict[str, int] = {
     # Text/matrix outputs, legitimately tiny — presence is all we can assert.
     "t1w-to-mni": 1,
     "bold-to-t1w": 1,
+    # A _complete.json marker. fs_derivatives.publish writes eight fixed fields
+    # (~250 bytes); anything under 100 is not one.
+    "newmsm": 100,
 }
 
 
@@ -301,7 +332,10 @@ def record_one_step(args: argparse.Namespace, step: str) -> None:
     outputs_verified = verify_outputs(expected_keys, args.bucket, args.region, step=step)
 
     # The pod-level status is only a starting point — resolve this run's own.
-    run_status = resolve_run_status(args.status, expected_keys, outputs_verified)
+    if step in _POD_STATUS_STEPS:
+        run_status = args.status
+    else:
+        run_status = resolve_run_status(args.status, expected_keys, outputs_verified)
     if run_status.lower() != args.status.lower():
         print(
             f"  Per-run status {run_status} overrides pod aggregate "

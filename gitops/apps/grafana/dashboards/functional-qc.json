@@ -145,7 +145,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_runs, ROUND(AVG(mean_fd), 3) AS mean_fd, ROUND(100.0 * SUM(CASE WHEN pct_fd_above_0p5 > 10 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_high_motion, ROUND(AVG(tsnr_median), 1) AS avg_tsnr, ROUND(AVG(max_fd), 3) AS avg_max_fd, ROUND(100.0 * SUM(n_fd_above_0p2) / NULLIF(SUM(n_frames), 0), 1) AS pct_frames_above_0p2, ROUND(AVG(mean_dvars), 2) AS mean_dvars, ROUND(AVG(gcor), 3) AS gcor, ROUND(AVG(aor), 4) AS aor, ROUND(AVG(aqi), 4) AS aqi, ROUND(AVG(total_runtime_s) / 60.0, 1) AS mean_min, ROUND(APPROX_PERCENTILE(peak_memory_gb, 0.95), 1) AS peak_mem_p95_gb, ROUND(APPROX_PERCENTILE(container_peak_memory_gb, 0.95), 1) AS container_peak_mem_p95_gb, ROUND(AVG(stage_timings_s.boldref) / 60, 2) AS boldref, ROUND(AVG(stage_timings_s.composite_warp) / 60, 2) AS composite_warp, ROUND(AVG(stage_timings_s.\"4d_warp\") / 60, 2) AS warp_4d, ROUND(AVG(stage_timings_s.mask_warp) / 60, 2) AS mask_warp, ROUND(AVG(stage_timings_s.masking) / 60, 2) AS masking, ROUND(AVG(stage_timings_s.confounds) / 60, 2) AS confounds, ROUND(AVG(stage_timings_s.grayordinates) / 60, 2) AS grayordinates, ROUND(AVG(n_acompcor_wm), 1) AS aCompCor_WM, ROUND(AVG(n_acompcor_csf), 1) AS aCompCor_CSF, ROUND(AVG(n_tcompcor), 1) AS tCompCor, ROUND(AVG(n_cosines), 1) AS Cosines FROM d WHERE rn = 1"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT COUNT(*) AS n_runs, ROUND(AVG(mean_fd), 3) AS mean_fd, ROUND(100.0 * SUM(CASE WHEN pct_fd_above_0p5 > 10 THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_high_motion, ROUND(AVG(tsnr_median), 1) AS avg_tsnr, ROUND(AVG(max_fd), 3) AS avg_max_fd, ROUND(100.0 * SUM(n_fd_above_0p2) / NULLIF(SUM(n_frames), 0), 1) AS pct_frames_above_0p2, ROUND(AVG(NULLIF(dvars_std, 0)), 2) AS dvars_std, ROUND(AVG(gcor), 3) AS gcor, ROUND(AVG(aor), 4) AS aor, ROUND(AVG(aqi), 4) AS aqi, ROUND(AVG(total_runtime_s) / 60.0, 1) AS mean_min, ROUND(APPROX_PERCENTILE(peak_memory_gb, 0.95), 1) AS peak_mem_p95_gb, ROUND(APPROX_PERCENTILE(container_peak_memory_gb, 0.95), 1) AS container_peak_mem_p95_gb, ROUND(AVG(stage_timings_s.boldref) / 60, 2) AS boldref, ROUND(AVG(stage_timings_s.composite_warp) / 60, 2) AS composite_warp, ROUND(AVG(stage_timings_s.\"4d_warp\") / 60, 2) AS warp_4d, ROUND(AVG(stage_timings_s.mask_warp) / 60, 2) AS mask_warp, ROUND(AVG(stage_timings_s.masking) / 60, 2) AS masking, ROUND(AVG(stage_timings_s.confounds) / 60, 2) AS confounds, ROUND(AVG(stage_timings_s.grayordinates) / 60, 2) AS grayordinates, ROUND(AVG(n_acompcor_wm), 1) AS aCompCor_WM, ROUND(AVG(n_acompcor_csf), 1) AS aCompCor_CSF, ROUND(AVG(n_tcompcor), 1) AS tCompCor, ROUND(AVG(n_cosines), 1) AS Cosines FROM d WHERE rn = 1"
         }
       ],
       "fieldConfig": {
@@ -498,7 +498,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "percent",
           "decimals": 2,
           "color": {
             "mode": "fixed",
@@ -506,7 +506,7 @@
           }
         }
       },
-      "description": "Root-mean-square change in BOLD intensity between consecutive frames. Complements FD: FD measures how much the head moved, DVARS measures how much the image actually changed as a result. In arbitrary scanner intensity units, so it is comparable across runs within a batch but not across sites.",
+      "description": "Root-mean-square change in BOLD intensity between consecutive frames, averaged over runs. Complements FD: FD measures how much the head moved, DVARS measures how much the image actually changed as a result. Raw DVARS is in the input BOLD's own intensity units, which differ roughly 60-fold between ABCD scanners, so this shows it as a percent of each run's mean in-brain intensity (dvars_std) — comparable across runs and scanners. Runs with no measured global signal are left out.",
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -517,7 +517,7 @@
           "calcs": [
             "lastNotNull"
           ],
-          "fields": "/^mean_dvars$/"
+          "fields": "/^dvars_std$/"
         }
       }
     },
@@ -545,7 +545,7 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_fd, mean_dvars, tsnr_median, mean_global_signal FROM d WHERE rn = 1"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT mean_fd, NULLIF(dvars_std, 0) AS dvars_std, tsnr_median, mean_global_signal FROM d WHERE rn = 1"
         }
       ],
       "options": {
@@ -608,18 +608,18 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "percent",
           "decimals": 2
         }
       },
-      "description": "Paired with the FD histogram to its left. The two tails should largely be the same runs — motion moves the head (FD) and that shows up as changed intensity (DVARS). A DVARS tail with no matching FD tail points at something other than motion: a spike artefact, a coil fault, or a scaling problem.",
+      "description": "Paired with the FD histogram to its left. The two tails should largely be the same runs — motion moves the head (FD) and that shows up as changed intensity (DVARS). A DVARS tail with no matching FD tail points at something other than motion: a spike artefact or a coil fault. DVARS is plotted as a percent of each run's mean in-brain intensity (dvars_std): raw DVARS is in the input BOLD's own intensity units, which differ roughly 60-fold between ABCD scanners, so pooled raw values would put whole scanners in the tails instead of bad runs.",
       "transformations": [
         {
           "id": "filterFieldsByName",
           "options": {
             "include": {
               "names": [
-                "mean_dvars"
+                "dvars_std"
               ]
             }
           }
@@ -877,7 +877,7 @@
           "decimals": 1
         }
       },
-      "description": "Mean in-brain BOLD intensity per run, in arbitrary scanner units. Its absolute value carries no quality information — what matters is the shape. One tight cluster is one consistent acquisition; distinct clumps mean the batch mixes scanners, coils, or intensity-scaling conventions, which makes raw DVARS non-comparable across those groups.",
+      "description": "Mean in-brain BOLD intensity per run, in arbitrary scanner units. Its absolute value carries no quality information — what matters is the shape. One tight cluster is one consistent acquisition; distinct clumps mean the batch mixes scanners, coils, or intensity-scaling conventions, which makes raw DVARS non-comparable across those groups — the reason the DVARS panels above plot it as a percent of this level.",
       "transformations": [
         {
           "id": "filterFieldsByName",
@@ -1192,10 +1192,10 @@
             "database": "__default",
             "region": "__default"
           },
-          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT subject, session, task, run, ROUND(mean_fd, 3) AS mean_fd, ROUND(max_fd, 3) AS max_fd, ROUND(pct_fd_above_0p5, 1) AS pct_fd_above_0p5, ROUND(mean_dvars, 2) AS mean_dvars, ROUND(tsnr_median, 1) AS tsnr_median, n_frames, completed_at FROM d WHERE rn = 1 AND mean_fd > 0.5 ORDER BY mean_fd DESC LIMIT 100"
+          "rawSQL": "WITH d AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY subject, session, task, run ORDER BY completed_at DESC) AS rn FROM cloudpipe_metrics.func_preproc WHERE ('${subject}' = 'All' OR subject = '${subject}') AND ('${session}' = 'All' OR session = '${session}') AND ('${task}' = 'All' OR task = '${task}') AND from_iso8601_timestamp(completed_at) BETWEEN $__timeFrom() AND $__timeTo() AND CAST(dt AS DATE) BETWEEN CAST($__timeFrom() AS DATE) AND CAST($__timeTo() AS DATE)) SELECT subject, session, task, run, ROUND(mean_fd, 3) AS mean_fd, ROUND(max_fd, 3) AS max_fd, ROUND(pct_fd_above_0p5, 1) AS pct_fd_above_0p5, ROUND(NULLIF(dvars_std, 0), 2) AS dvars_std, ROUND(mean_dvars, 2) AS mean_dvars, ROUND(tsnr_median, 1) AS tsnr_median, n_frames, completed_at FROM d WHERE rn = 1 AND mean_fd > 0.5 ORDER BY mean_fd DESC LIMIT 100"
         }
       ],
-      "description": "Runs whose mean FD exceeds 0.5 mm. Empty is the good outcome. Sorted worst-first and capped at 100 — if exactly 100 rows appear, compare against 'Runs QC'd' in the header, because the tail is being truncated. tSNR is included so you can tell a merely restless run from one that also carries no usable signal.",
+      "description": "Runs whose mean FD exceeds 0.5 mm. Empty is the good outcome. Sorted worst-first and capped at 100 — if exactly 100 rows appear, compare against 'Runs QC'd' in the header, because the tail is being truncated. tSNR is included so you can tell a merely restless run from one that also carries no usable signal. dvars_std is DVARS as a percent of the run's mean in-brain intensity, comparable across runs; mean_dvars is the raw value in the input BOLD's scanner-dependent units, kept only to match against the dvars column of that run's confounds TSV.",
       "fieldConfig": {
         "defaults": {},
         "overrides": [
@@ -1250,9 +1250,29 @@
           {
             "matcher": {
               "id": "byName",
+              "options": "dvars_std"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
               "options": "mean_dvars"
             },
             "properties": [
+              {
+                "id": "displayName",
+                "value": "mean_dvars (scanner units)"
+              },
               {
                 "id": "decimals",
                 "value": 2

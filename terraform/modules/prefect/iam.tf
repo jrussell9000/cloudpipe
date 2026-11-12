@@ -47,6 +47,27 @@ data "aws_iam_policy_document" "worker" {
     resources = ["arn:aws:s3:::${var.metrics_bucket}/*"]
   }
 
+  # The scraper routes reprocess-audit workflows' cost records to the audit's
+  # metrics buckets (src/metrics/audit_pairs.py) and reads them back for the
+  # settled carry-forward. Same grant as the production metrics bucket.
+  dynamic "statement" {
+    for_each = length(var.audit_metrics_buckets) > 0 ? [1] : []
+    content {
+      sid       = "AuditListMetricsBuckets"
+      actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+      resources = [for b in var.audit_metrics_buckets : "arn:aws:s3:::${b}"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = length(var.audit_metrics_buckets) > 0 ? [1] : []
+    content {
+      sid       = "AuditS3MetricsReadWrite"
+      actions   = ["s3:PutObject", "s3:GetObject"]
+      resources = [for b in var.audit_metrics_buckets : "arn:aws:s3:::${b}/*"]
+    }
+  }
+
   # The pod-cost pass looks up on-demand LIST prices to build the no-spot
   # counterfactual (src/metrics/ec2_pricing.py). Granted here in the same change
   # that starts calling it: the lookup swallows its own failures by design, so

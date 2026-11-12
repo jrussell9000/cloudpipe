@@ -260,13 +260,19 @@ def read_provenance(
 
 
 def _normalise_command(command: str) -> str:
-    """Collapse whitespace and drop shell line continuations.
+    """Collapse whitespace, drop shell line continuations, and reduce argv[0] to its name.
 
     The configured command line lives in a WorkflowTemplate, wrapped over several
     lines; fMRIPrep reports the one string it was invoked with. Neither the
-    wrapping nor the trailing backslashes are a deviation.
+    wrapping nor the trailing backslashes are a deviation. Nor is the executable's
+    path: fMRIPrep reports argv[0] as resolved (`/app/.pixi/envs/fmriprep/bin/fmriprep`
+    in 25.2.5's image) where the configuration says `fmriprep`, which the first
+    smoke run recorded as a command-line deviation (2026-10-28).
     """
-    return " ".join(token for token in command.split() if token != "\\")
+    tokens = [token for token in command.split() if token != "\\"]
+    if tokens:
+        tokens[0] = tokens[0].rsplit("/", 1)[-1]
+    return " ".join(tokens)
 
 
 def require_anatomy_handover(provenance: RunProvenance) -> None:

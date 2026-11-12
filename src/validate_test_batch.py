@@ -66,6 +66,10 @@ EXPECTED_STEP_NAMES: list[str] = [
     "t1w-to-mni",
     "bold-to-t1w",
     "func-preproc",
+    # Recorded by every workflow from openspec add-newmsm-surface-registration on:
+    # `skipped` by the master on the default fs route, by the step itself when it
+    # runs. A batch submitted before that change has no such rows.
+    "newmsm",
 ]
 
 # Steps that only run when a subject has BOLD runs in the requested scan types.

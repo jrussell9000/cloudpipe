@@ -128,8 +128,11 @@ pool and does the whole ingest:
    30 days is this deployment's own rule; the source itself allows a year.
 2. **Lists the subject** through the Globus Transfer API, with the same walk and
    file filter `globus` mode uses, and prints the same `TRANSFER-SUMMARY` line.
-3. **Copies the files** with rclone from the collection's HTTPS server straight to
-   `s3://<bucket>{globus-dest-base-path}/{subj}/`, the prefix `globus` mode writes.
+3. **Copies the files** from the collection's HTTPS server straight to
+   `s3://<bucket>{globus-dest-base-path}/{subj}/`, the prefix `globus` mode writes:
+   one GET per file, streamed into an S3 multipart upload (`images/globus/https_copy.py`),
+   at most 4 at once and 4 requests/s on the source per copy. The request limit applies
+   to the source only; rclone, used until 2026-11-12, could only limit both together.
 4. **Checks every object's size** in S3 against the listing, and fails naming the
    file and both sizes on any difference or missing object.
 

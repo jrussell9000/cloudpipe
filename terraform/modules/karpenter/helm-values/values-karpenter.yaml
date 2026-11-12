@@ -1,8 +1,12 @@
-nodeSelector:
-  karpenter.sh/controller: 'true'
+# The controller runs on the `backend` managed nodegroup: a node Karpenter does
+# not manage, so it can never consolidate away its own controller. There used to
+# be a dedicated `karpenter` nodegroup (removed 2026-11-06, see the note in
+# modules/stack/eks.tf); the nodegroup-name affinity replaced its
+# `karpenter.sh/controller` node label, so the backend group needed no label.
 tolerations:
-- key: karpenter.sh/controller
-  operator: Exists
+- key: CriticalAddonsOnly
+  operator: Equal
+  value: "true"
   effect: NoSchedule
 affinity:
   nodeAffinity:
@@ -12,7 +16,7 @@ affinity:
           - key: eks.amazonaws.com/nodegroup
             operator: In
             values:
-              - karpenter
+              - backend
           - key: karpenter.sh/nodepool
             operator: DoesNotExist
   podAntiAffinity:

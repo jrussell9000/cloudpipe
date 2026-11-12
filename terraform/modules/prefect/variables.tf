@@ -203,3 +203,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "audit_metrics_buckets" {
+  description = "Reprocess-audit metrics buckets the kubecost-cost-scraper flow writes audit workflows' cost records to (src/metrics/audit_pairs.py). Same grant as `metrics_bucket`. Empty unless the audit is enabled."
+  type        = list(string)
+  default     = []
+}

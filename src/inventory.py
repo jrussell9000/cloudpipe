@@ -12,6 +12,10 @@ Two modes, both driven from the master DAG:
                             Argo's result output parameter.
   /tmp/fastsurfer_exists.txt  "True" or "False"; gates the anatomical phase.
   /tmp/subregions_exists.txt  "True" or "False"; gates the subregion-segmentation phase.
+  /tmp/effective_surface_registration.txt
+                            "fs" or "newmsm": the route every surface consumer uses
+                            (see effective_surface_registration).
+  /tmp/newmsm_exists.txt      "True" or "False"; gates the newmsm registration step.
 
 `--mode published-sessions` — re-reads the completion markers AFTER the anatomical
 phase and splits the inventory into the sessions that actually have derivatives and
@@ -37,6 +41,17 @@ from botocore.exceptions import ClientError
 # sst, mid, and dwi are excluded: insufficient run count for functional
 # connectivity analysis and not part of the current analysis protocol.
 TARGET_TASKS = {"rest", "nback"}
+
+# Surface registration routes to fsLR 32k (openspec add-newmsm-surface-registration).
+# `fs` is FreeSurfer's sphere.reg route; `newmsm` resamples through the subject's
+# newMSM-registered long-template sphere and names its CIFTI `desc-newmsm`.
+SURFACE_ROUTES = ("fs", "newmsm")
+
+# The field of derivatives/newmsm/{subj}/provenance.json that records which
+# long-template the registration was computed from: the `written_at` of the
+# long-template `_complete.json` at the time. Written by the newmsm step's
+# publish container (images/workbench/newmsm_prep.py).
+NEWMSM_TEMPLATE_FIELD = "long_template_written_at"
 
 
 class InventoryError(Exception):
@@ -113,7 +128,40 @@ def func_session_runs(s3, bucket: str, subj: str, ses: str) -> set[str]:
     return set(marker.get("runs") or {})
 
 
-def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict]) -> None:
+def _object_exists(s3, bucket: str, key: str) -> bool:
+    """head_object as a bool: 404 is False, any other error propagates."""
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            return False
+        raise
+
+
+def surf_target_keys(subj: str, ses: str, prefix: str, route: str) -> list[str]:
+    """
+    The dtseries keys that count as a run's fsLR CIFTI on `route`, in probe order.
+
+    `newmsm` accepts only its own `desc-newmsm` file: an FS-route CIFTI is what a
+    newMSM workflow exists to replace. `fs` accepts either. A newMSM file is a
+    finished, better-registered output, and treating it as missing would send a
+    default-route workflow back through the short path to write an FS-route CIFTI
+    beside it, mixing routes in one session (design D4, "no downgrade"). With
+    per-subject stickiness the effective route is only `fs` for a subject with no
+    newMSM tree, so this matters only when a tree was deleted and its CIFTIs kept.
+    """
+    if route not in SURFACE_ROUTES:
+        raise ValueError(f"unknown surface route {route!r}; expected one of {SURFACE_ROUTES}")
+    base = f"derivatives/func_surf/{subj}/{ses}/fsLR32k/{prefix}_space-fsLR32k"
+    fs_key = f"{base}_bold.dtseries.nii"
+    newmsm_key = f"{base}_desc-newmsm_bold.dtseries.nii"
+    return [newmsm_key] if route == "newmsm" else [fs_key, newmsm_key]
+
+
+def check_run_completion(
+    s3, bucket: str, subj: str, ses: str, runs: list[dict], route: str = "fs"
+) -> None:
     """
     Add b2t_exists, func_exists and surf_exists flags to each run dict (in-place).
 
@@ -122,7 +170,9 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
       func_exists: the run is listed in the session's func _complete.json, or
                    (legacy) its _space-MNI152NLin2009cAsym_bold.tar.gz exists
       components_exist: _desc-grayordcomponents_bold.tar.gz (grayordinate extraction)
-      surf_target_exists: _space-fsLR32k_bold.dtseries.nii  (fsLR/CIFTI assembly)
+      surf_target_exists: the route's fsLR CIFTI (fsLR/CIFTI assembly). `route` is
+                   the EFFECTIVE surface route (effective_surface_registration);
+                   see surf_target_keys for which filenames count on each.
       surf_exists: components_exist OR surf_target_exists   (see below)
 
     func_exists reads the marker, never an object probe: the exploded layout has no
@@ -153,6 +203,11 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
     the `--emit grayordinate` short path to regenerate components that the next
     resample would immediately delete again — paying cpu-heavy compute on every
     subsequent workflow to reclaim storage that was already reclaimed.
+
+    The same OR is what drives a surface-only reprocess onto the newMSM route: a
+    processed run has an FS-route CIFTI and no components, so on `newmsm` its
+    surf_target_exists is False, surf_exists follows, and with func_exists True
+    the func-preproc driver picks `--emit grayordinate` (design D9).
     """
     published = func_session_runs(s3, bucket, subj, ses)
     for run in runs:
@@ -169,27 +224,21 @@ def check_run_completion(s3, bucket: str, subj: str, ses: str, runs: list[dict])
             f"derivatives/func_surf/{subj}/{ses}/components/"
             f"{prefix}_desc-grayordcomponents_bold.tar.gz"
         )
-        surf_target_key = (
-            f"derivatives/func_surf/{subj}/{ses}/fsLR32k/{prefix}_space-fsLR32k_bold.dtseries.nii"
-        )
         checks = [
             ("b2t_exists", b2t_key),
             ("components_exist", surf_key),
-            ("surf_target_exists", surf_target_key),
         ]
         if f"{task}_{run_id}" in published:
             run["func_exists"] = True
         else:
             checks.insert(1, ("func_exists", legacy_func_key))
         for field, s3_key in checks:
-            try:
-                s3.head_object(Bucket=bucket, Key=s3_key)
-                run[field] = True
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "404":
-                    run[field] = False
-                else:
-                    raise
+            run[field] = _object_exists(s3, bucket, s3_key)
+        # any() stops at the first hit, so the `fs` route probes the newMSM key only
+        # when its own CIFTI is absent.
+        run["surf_target_exists"] = any(
+            _object_exists(s3, bucket, key) for key in surf_target_keys(subj, ses, prefix, route)
+        )
 
         # See the docstring: extraction is done if EITHER the intermediate is
         # still present or the artifact built from it is. components_exist is
@@ -423,10 +472,104 @@ def check_subregions_derivatives(s3, bucket: str, subj: str) -> bool:
     return len(missing) == 0
 
 
-def build_inventory(s3, bucket: str, subj: str) -> tuple[list[dict], bool, bool]:
+def _read_json(s3, bucket: str, key: str) -> dict | None:
+    """get_object + json.loads; None when the key is absent, other errors propagate."""
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        raise
+    return json.loads(obj["Body"].read())
+
+
+def newmsm_registration_status(s3, bucket: str, subj: str) -> tuple[bool, bool]:
+    """
+    Return (tree_exists, current) for the subject's newMSM registration.
+
+    tree_exists — `derivatives/newmsm/{subj}/_complete.json` is present. That marker
+      and nothing else says the tree is whole (ADR 017). It also makes the subject's
+      effective surface route `newmsm` from then on (effective_surface_registration).
+    current — the tree exists AND its provenance.json records the `written_at` of the
+      long-template `_complete.json` that is in the bucket now. A template republished
+      after registration makes the registration stale: it was computed on a mesh that
+      may no longer be the sessions' mesh, so the step must run again. surface-resample's
+      vertex-and-face guard (design D5) catches a mismatch too, but only by failing.
+    """
+    tree = f"derivatives/newmsm/{subj}"
+    if _read_json(s3, bucket, f"{tree}/_complete.json") is None:
+        return False, False
+    provenance = _read_json(s3, bucket, f"{tree}/provenance.json") or {}
+    recorded = provenance.get(NEWMSM_TEMPLATE_FIELD)
+    template = _read_json(s3, bucket, f"derivatives/fastsurfer/{subj}/long-template/_complete.json")
+    current = bool(recorded) and template is not None and recorded == template.get("written_at")
+    if not current:
+        print(
+            f"newMSM registration for {subj} is stale: recorded long-template "
+            f"written_at {recorded!r}, current "
+            f"{None if template is None else template.get('written_at')!r}",
+            file=sys.stderr,
+        )
+    return True, current
+
+
+def effective_surface_registration(requested: str, newmsm_tree_exists: bool) -> str:
+    """
+    The surface route a workflow actually uses (design D6).
+
+    `newmsm` when it was requested, or when the subject already has a newMSM tree,
+    current or stale: once a subject is registered it stays on newMSM, so a
+    default-route workflow (the Prefect queue manager passes no route) never gives a
+    registered subject an FS-route CIFTI. A stale tree still counts: the step then
+    re-runs (newmsm_exists is False) before any session is resampled. `fs` otherwise.
+    """
+    if requested not in SURFACE_ROUTES:
+        raise InventoryError(
+            f"--surface-registration must be one of {SURFACE_ROUTES}, got {requested!r}"
+        )
+    return "newmsm" if requested == "newmsm" or newmsm_tree_exists else "fs"
+
+
+def newmsm_exists(registration_current: bool, fastsurfer_exists: bool) -> bool:
+    """
+    The `newmsm-exists` gate: a current registration AND no anatomical rebuild pending.
+
+    When fastsurfer_exists is False the anatomical phase runs, and it republishes the
+    long-template, which makes even a current registration stale before any session
+    reaches surface-resample. The inventory runs before that phase, so it cannot see
+    the new written_at yet; it can only predict it. Redoing a registration costs one
+    ~5 min pod; resampling through a stale sphere would fail every session's guard.
+    """
+    return registration_current and fastsurfer_exists
+
+
+def parse_excluded_sessions(value: str | None) -> set[str]:
+    """`--exclude-sessions` as a set: comma-separated, whitespace and empties dropped."""
+    return {s.strip() for s in (value or "").split(",") if s.strip()}
+
+
+def build_inventory(
+    s3,
+    bucket: str,
+    subj: str,
+    exclude_sessions: set[str] | None = None,
+    route: str = "fs",
+) -> tuple[list[dict], bool, bool]:
     """
     Run all discovery and completion checks; return
     (session_list, fastsurfer_exists, subregions_exists).
+
+    `route` is the EFFECTIVE surface route (effective_surface_registration); it
+    decides which CIFTI each run's surf_target_exists looks for.
+
+    `exclude_sessions` names sessions whose T1w must not enter the longitudinal
+    template, reported as `t1w_available: false` whatever is staged. Everything
+    downstream already keys off that flag: the template-build fan-out drops the
+    session, and published-sessions excludes it from functional processing like
+    any session that never had a T1w. The session stays in the list so the
+    exclusion is visible in the inventory output, not silent. For a T1w that is
+    unusable (saturated, FOV missed the head) and would otherwise break the whole
+    subject's template; the operator decides, session by session.
 
     session_list — one dict per session:
       {
@@ -445,14 +588,28 @@ def build_inventory(s3, bucket: str, subj: str) -> tuple[list[dict], bool, bool]
     """
     sessions = list_sessions(s3, bucket, subj)
     nss_map = load_nss_volumes(s3, bucket, subj)
+    excluded = exclude_sessions or set()
+    unknown = sorted(excluded - set(sessions))
+    if unknown:
+        print(
+            f"WARNING: --exclude-sessions names {unknown}, not staged for {subj}; ignored",
+            file=sys.stderr,
+        )
 
     result = []
     t1w_sessions = []
     for ses in sessions:
         runs = list_bold_runs(s3, bucket, subj, ses)
-        check_run_completion(s3, bucket, subj, ses, runs)
+        check_run_completion(s3, bucket, subj, ses, runs, route=route)
         t1w_exists = check_t1w_completion(s3, bucket, subj, ses)
         t1w_available = check_t1w_source_exists(s3, bucket, subj, ses)
+        if ses in excluded and t1w_available:
+            print(
+                f"EXCLUDED {subj}/{ses}: T1w staged but excluded by --exclude-sessions; "
+                "it enters neither the longitudinal template nor functional processing",
+                file=sys.stderr,
+            )
+            t1w_available = False
         if t1w_available:
             t1w_sessions.append(ses)
 
@@ -522,6 +679,22 @@ def main() -> None:
         "--inventory-json",
         help="JSON array from the inventory pass; required for --mode published-sessions",
     )
+    parser.add_argument(
+        "--exclude-sessions",
+        default="",
+        help=(
+            "comma-separated session IDs whose T1w must not enter the longitudinal "
+            "template (reported t1w_available=false); e.g. ses-00A"
+        ),
+    )
+    parser.add_argument(
+        "--surface-registration",
+        default="fs",
+        help=(
+            "requested surface route to fsLR: fs (default) or newmsm. A subject that "
+            "already has a newMSM registration uses newmsm regardless"
+        ),
+    )
     args = parser.parse_args()
 
     s3 = boto3.client("s3")
@@ -533,7 +706,21 @@ def main() -> None:
         return
 
     try:
-        session_list, fs_exists, subregions_exists = build_inventory(s3, args.bucket, args.subject)
+        tree_exists, registration_current = newmsm_registration_status(
+            s3, args.bucket, args.subject
+        )
+        route = effective_surface_registration(args.surface_registration, tree_exists)
+        print(
+            f"Surface route: requested {args.surface_registration}, effective {route}",
+            file=sys.stderr,
+        )
+        session_list, fs_exists, subregions_exists = build_inventory(
+            s3,
+            args.bucket,
+            args.subject,
+            parse_excluded_sessions(args.exclude_sessions),
+            route=route,
+        )
     except InventoryError as e:
         # Sole exit-status decision for the step; the marker files and the JSON
         # array are deliberately left unwritten so no downstream fan-out reads
@@ -546,6 +733,12 @@ def main() -> None:
 
     with open("/tmp/subregions_exists.txt", "w") as fh:
         fh.write("True" if subregions_exists else "False")
+
+    with open("/tmp/effective_surface_registration.txt", "w") as fh:
+        fh.write(route)
+
+    with open("/tmp/newmsm_exists.txt", "w") as fh:
+        fh.write("True" if newmsm_exists(registration_current, fs_exists) else "False")
 
     print(json.dumps(session_list))
 

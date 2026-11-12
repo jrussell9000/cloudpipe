@@ -189,13 +189,13 @@ All infrastructure is in `terraform/`. Run commands from that directory.
 
 | Resource | Details |
 |---|---|
-| EKS cluster | `cloudpipe`, Kubernetes 1.35, private API endpoint (VPN required) |
+| EKS cluster | `cloudpipe`, Kubernetes 1.35, private API endpoint (Cloudflare WARP required) |
 | VPC | 10.0.0.0/16 (single CIDR — `var.secondary_cidr_blocks` is declared but `vpc.tf` never associates it) |
-| Client VPN | **Full-tunnel** (`split_tunnel = false`, required so ALB traffic is NAT'd into the client CIDR the ALB security groups trust), client CIDR 10.3.0.0/22 |
+| Remote access | Cloudflare Zero Trust tunnel only (ADR 014); the AWS Client VPN was removed 2026-11-06 |
 | Karpenter — `cpu-light-nodepool` | t-series, spot only, for lightweight pods. Limits 160 CPU / 640 Gi |
 | Karpenter — `cpu-heavy-nodepool` | c/m 2xl–4xl (no `r`), nitro, spot only, for compute-heavy pods. Limits 2560 CPU / 10240 Gi |
 | Karpenter — `gpu-nodepool` | g4dn/g5/g6/g6e, xlarge–2xlarge only, NVIDIA GPU, spot only, for registration + FastSurfer GPU steps. GPUs are time-sliced 3 ways (`nvidia.com/gpu: 3` per node). Limits 512 CPU / 2048 Gi |
-| Karpenter — `first-level-nodepool` | Graviton `{c,m,r}{6,7}gd` xl–4xl, spot only, for the first-level GLM pipeline. Limits 512 CPU / 4096 Gi |
+| Karpenter — `first-level-nodepool` | Graviton `{c,m,r}{6,7}gd` xl–4xl, spot only, for the first-level GLM pipeline. Limits 1536 CPU / 12288 Gi |
 | RDS PostgreSQL | `cloudpipe-argo` (`db.m7g.large`, Argo metadata, fronted by PgBouncer) and `cloudpipe-prefect` (`db.t4g.micro`, Prefect metadata) |
 | S3 — data bucket (`var.globus_s3_destination_bucket`) | Primary data bucket (unversioned; derivative prefixes are flushed per test batch) |
 | S3 — `cloudpipe-metrics` | QC + cost metrics, **versioned** — kept separate from the data bucket so records survive derivative flushes |
@@ -263,7 +263,7 @@ Prefect API is at `https://prefect.<domain>/api`, where `<domain>` is the Terraf
 | Max concurrent Argo workflows (cloudpipe) | 50 (fallback when Variable unset, overridable live) | Prefect Variable `cloudpipe-max-concurrent` |
 | Max concurrent Argo workflows (first-level) | 25 (fallback when Variable unset, overridable live) | Prefect Variable `first-level-max-concurrent` |
 | Max cloudpipe submissions per minute | 5 (fallback when Variable unset, `0` disables, overridable live) | Prefect Variable `cloudpipe-max-submissions-per-minute` |
-| FastSurfer segmentation device for new workflows | `auto` (cpu during a GPU spot drought, else cuda; overridable live) | Prefect Variable `cloudpipe-fastsurfer-device` |
+| FastSurfer segmentation device for new workflows | `cpu` (since 2026-11-11; `cuda` or `auto` selectable live) | Prefect Variable `cloudpipe-fastsurfer-device` |
 | Max pod creates per second | 50, burst 90 | `resourceRateLimit`, `terraform/modules/argo-workflows/main.tf` |
 | Max concurrent Globus transfers | 8 | `cloudpipe-semaphores` ConfigMap |
 | Max parallel sessions per workflow | 3 (master DAG `parallelism`) | `cloudpipe-long-master-workflow-template.yaml` |

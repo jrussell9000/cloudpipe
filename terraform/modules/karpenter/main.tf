@@ -185,6 +185,18 @@ resource "kubectl_manifest" "gpu-dense-nodepool" {
   ]
 }
 
+# On-demand, tainted, opt-in GPU capacity for runs that cannot wait out a spot
+# drought (the equivalence benchmark's D20 anchors first); see the file.
+resource "kubectl_manifest" "gpu-ondemand-nodepool" {
+  server_side_apply = true
+  force_conflicts   = true
+  yaml_body         = templatefile("${path.module}/helm-values/gpu-ondemand-nodepool.yaml", { zones_list = local.zones_list })
+  depends_on = [
+    kubectl_manifest.gpu-nodeclass,
+    kubectl_manifest.gpu-timeslice-nodeoverlay
+  ]
+}
+
 resource "kubectl_manifest" "cpu-light-nodepool" {
   server_side_apply = true
   force_conflicts   = true
@@ -198,6 +210,16 @@ resource "kubectl_manifest" "cpu-heavy-nodepool" {
   server_side_apply = true
   force_conflicts   = true
   yaml_body         = file("${path.module}/helm-values/cpu-heavy-nodepool.yaml")
+  depends_on = [
+    kubectl_manifest.nodeclass
+  ]
+}
+
+# On-demand, tainted, for the fMRIPrep equivalence benchmark only; see the file.
+resource "kubectl_manifest" "fmriprep-bench-nodepool" {
+  server_side_apply = true
+  force_conflicts   = true
+  yaml_body         = file("${path.module}/helm-values/fmriprep-bench-nodepool.yaml")
   depends_on = [
     kubectl_manifest.nodeclass
   ]

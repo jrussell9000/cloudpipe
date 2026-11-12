@@ -12,6 +12,24 @@ spec:
       labels:
         cloudpipe.io/phase: inventory
         cloudpipe.io/step: subject-data-inventory
+    inputs:
+      parameters:
+        # Comma-separated session IDs whose T1w must not enter the longitudinal
+        # template; inventory reports them `t1w_available: false`. An input with a
+        # default rather than a `{{workflow.parameters.*}}` read, so a caller that
+        # does not declare the workflow parameter still resolves. See the master
+        # template's `exclude-sessions`.
+        - name: exclude-sessions
+          value: ""
+        # The REQUESTED route to fsLR 32k, fs | newmsm (openspec
+        # add-newmsm-surface-registration, design D6). inventory.py turns it into
+        # the EFFECTIVE route: newmsm when requested or when the subject already
+        # has a newMSM registration ("once registered, always newMSM"). Every
+        # consumer downstream reads the effective-surface-registration output,
+        # never the workflow parameter. A `value`, like exclude-sessions, so a
+        # caller that does not pass it gets fs.
+        - name: surface-registration
+          value: fs
     # `Always`, not `OnFailure`: OnFailure cannot see phase=Error, so a
     # control-plane-throttled or deleted pod got zero retries out of a budget of
     # three. Same defect and same reasoning as globus-transfer-workflow-template
@@ -34,9 +52,19 @@ spec:
         - name: subregions-exist
           valueFrom:
             path: /tmp/subregions_exists.txt
+        # fs | newmsm: the route surf_target_exists was judged against, and the
+        # one the newmsm gate and every session's surface-resample must use.
+        - name: effective-surface-registration
+          valueFrom:
+            path: /tmp/effective_surface_registration.txt
+        # "True" when derivatives/newmsm/{subj}/ is complete AND was registered
+        # from the current long-template; gates the newmsm step.
+        - name: newmsm-exists
+          valueFrom:
+            path: /tmp/newmsm_exists.txt
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:302613557e5fbad1e0d4ec0ede67503f2cb5012e2be000ee92fb28ba70b52739"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -57,6 +85,10 @@ spec:
         - '{{workflow.parameters.subjID}}'
         - --bucket
         - '{{workflow.parameters.bucket}}'
+        - --exclude-sessions
+        - '{{inputs.parameters.exclude-sessions}}'
+        - --surface-registration
+        - '{{inputs.parameters.surface-registration}}'
 
   # Re-reads the FastSurfer completion markers AFTER the anatomical phase and
   # splits the inventory into the sessions that have derivatives and those that
@@ -119,7 +151,7 @@ spec:
             path: /tmp/rejected_count.txt
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:3ea3ae95ade9f7996b9bbd950637e2d6e04735734939c5f6be2907db64324c00"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:302613557e5fbad1e0d4ec0ede67503f2cb5012e2be000ee92fb28ba70b52739"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

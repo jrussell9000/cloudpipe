@@ -17,7 +17,7 @@ resource "aws_security_group" "db" {
 
 # Only the VPC may connect. The instance is not publicly accessible, so it has
 # no public address, and a rule for public sources could never match; operators
-# arriving over WARP or the Client VPN reach it from inside the VPC CIDR. A rule
+# arriving over WARP reach it from inside the VPC CIDR. A rule
 # for the operator prefix list (all public ranges) was removed on 2026-10-05 for
 # that reason.
 resource "aws_vpc_security_group_ingress_rule" "db_vpc" {

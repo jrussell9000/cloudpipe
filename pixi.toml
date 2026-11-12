@@ -105,12 +105,10 @@ deadcode = "vulture src images scripts prefect tests .vulture-whitelist.py --exc
 # Until then, stale-dep detection uses the manual import audit in the plan doc.
 deps = "deptry ."
 complexity = "ruff check --select C901 --statistics ."
-# Type-check images/afni/preproc.py (scope + options in mypy.ini). Report-only:
-# a first-pass baseline to make preproc.py's implicit numpy/Path/subprocess
-# contracts explicit before the density refactor. Deliberately NOT in `health`
-# yet — the baseline has findings; gating comes after they're triaged.
+# Type-check images/afni/preproc.py (scope + options in mypy.ini). A gate since
+# #288 cleared its baseline: in `health`, and a step in CI's checks job.
 typecheck = "mypy"
-health = { depends-on = ["lint", "deadcode"] }
+health = { depends-on = ["lint", "deadcode", "typecheck"] }
 # Mutating (explicit): only these two change files
 format = "ruff format ."
 lint-fix = "ruff check --fix ."
