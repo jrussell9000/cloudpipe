@@ -110,7 +110,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:302613557e5fbad1e0d4ec0ede67503f2cb5012e2be000ee92fb28ba70b52739"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:803b7296c5ad533c2d98f2eabdc0b4b342157dd9061c477f95f1415404a6c9cc"
       imagePullPolicy: IfNotPresent
       command: [python, -u, /app/dvars_backfill.py]
       args:

@@ -120,7 +120,7 @@ spec:
     container:
       # The cloudpipe/globus image, pinned by digest (the pin job rewrites this
       # line): it ships https_ingress.py with the listing module it imports.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:7ba67d2df6c06fbe0c5dc25a1ca3fa3aa3bb0edb57f8054b7637fdbdd9ebf502"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/globus@sha256:565c1d7edf74f0829c1723e5a59fb753ec94968ed5dc29003eb038006a2795ce"
       imagePullPolicy: IfNotPresent
 
       # Plan 018 §7: one subject peaked at 1,118 MiB, about 8.4 CPU-s per GiB

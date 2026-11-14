@@ -214,30 +214,31 @@ AL2023 nodes (unlike Bottlerocket) do not bundle the NVIDIA device plugin in the
 
 **An AMI's snapshot is the AMI.** `deregister-image` on its own reclaims nothing —
 the snapshot survives and keeps billing, which is where the cost sits. Each GPU
-bake adds about 60 GiB of snapshot, each Globus bake about 20 GiB, and for the
-first two months nothing removed either: by 2026-10-08 the account held 17 AMIs
+bake adds about 60 GiB of snapshot, each bake of the retired Globus host's image
+added about 20 GiB, and for the first two months nothing removed either: by 2026-10-08 the account held 17 AMIs
 and 700 GiB of snapshots, of which 2 AMIs were referenced (#734). That is also a
 cost that hides, because it is EBS *snapshot* storage rather than EC2 — invisible
 from anything that looks at compute, and larger at the time than the 325 GiB of
 live volumes sitting next to it.
 
-The policy is **current + one generation back, per kind**, applied by
-`scripts/prune_amis.py` as the last step of each bake workflow. 160 GiB (~$8/month)
-against ~$4/month for current-only. Both images are reproducible from pinned
-inputs — a commit plus two image digests for GPU, a GCS version for Globus — so
-strictly none of the old ones are needed. What the spare insures against is not the
-AMI but the *inputs*: a rebake takes 30+ minutes and needs upstream to still be
-serving `deepmi/fastsurfer` at that digest and the GCS tarball at that version.
+The policy is **current + one generation back**, applied by
+`scripts/prune_amis.py` as the last step of the bake workflow. The image is
+reproducible from pinned inputs — a commit plus two image digests — so strictly
+none of the old ones are needed. What the spare insures against is not the AMI but
+the *inputs*: a rebake takes 30+ minutes and needs upstream to still be serving
+`deepmi/fastsurfer` at that digest.
 
-Run it by hand against either kind; `--dry-run` deletes nothing:
+`gpu` is the only kind. The Globus host's `globus` kind went with the host on
+2026-11-12, after its last AMIs and snapshots were deregistered (ADR 024).
+
+Run it by hand; `--dry-run` deletes nothing:
 
 ```bash
 scripts/prune_amis.py --kind gpu --dry-run
-scripts/prune_amis.py --kind globus --dry-run
 ```
 
 **The dangerous case is deleting an AMI something still needs**, which is
-unrecoverable and surfaces only the next time a node or the Globus host launches.
+unrecoverable and surfaces only the next time a node launches.
 Four independent guards decide what survives, and every one of them fails *closed* —
 an unreadable pin, a pin that resolves to no AMI, a missing `CreationDate`, an
 `AccessDenied` on any query, and the run aborts having deleted nothing:
@@ -245,8 +246,8 @@ an unreadable pin, a pin that resolves to no AMI, a missing `CreationDate`, an
 | Guard | Answers |
 |---|---|
 | The two newest by `CreationDate` | the retention policy itself |
-| The Terraform pin — `karpenter.tf`'s digest pair resolved through AMI tags, or `globus.tf`'s literal id | what Terraform says is current |
-| `describe-instances`, every state but `terminated` | what is running — including `stopped`, which is the Globus host's normal state |
+| The Terraform pin — `karpenter.tf`'s digest pair resolved through AMI tags | what Terraform says is current |
+| `describe-instances`, every state but `terminated` | what is running, or stopped and able to start again |
 | `describe-launch-template-versions` across every template | what something is still *able* to launch |
 
 A protected AMI does not consume a retention slot, so if the live image is older

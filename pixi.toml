@@ -50,11 +50,11 @@ test = "pytest -n auto --maxprocesses 4 --dist loadfile"
 # tests/images/afni/test_driver_gating.py) belongs to no file and is not counted.
 coverage = "pytest -n auto --maxprocesses 4 --dist loadfile --cov=images --cov=src --cov=prefect --cov-report=term-missing"
 
-# Operator surface for the Globus ingress: `pixi run globus doctor`, `... login`,
-# `... status`. PYTHONPATH rather than an installed package, matching how
+# Operator surface for the HTTPS ingress's Globus session: `pixi run globus login`
+# and `... doctor`. PYTHONPATH rather than an installed package, matching how
 # pytest.ini puts src/ on the path — there is no build step in this repo.
 # AWS credentials come from the caller's environment (an AWS CLI v2 SSO profile);
-# the CLI never takes keys. See docs/globus-setup.md.
+# the CLI never takes keys. See docs/globus.md.
 globus = { cmd = "python -m globus_admin", env = { PYTHONPATH = "src" } }
 
 # Deployment setup wizard: `pixi run cloudpipe setup`, `... preflight`. Collects

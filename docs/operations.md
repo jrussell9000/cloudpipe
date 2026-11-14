@@ -110,16 +110,15 @@ The Variable is capped server-side by the controller's `namespaceParallelism` (`
 prefect variable set cloudpipe-max-submissions-per-minute 5
 ```
 
-The cap limits how many workflows stand at once, not how fast they arrive. Unpaced, a cold start admits the cap's whole width in minutes, and the resulting control-plane throttle leaked the `globus-transfer` semaphore and wedged workflows on 2026-09-14 (#393). So don't ramp `cloudpipe-max-concurrent` by hand to smooth a start; pacing already does it. The default is above the globus-transfer drain (~2.4 subjects/min), so pacing never becomes the bottleneck of a globus batch. It has not yet been calibrated against a cold start. Each `submitted` log line ends with `paced Ns`, how long pacing held that submission; waits on the cap are logged separately as `N active ≥ cap`.
+The cap limits how many workflows stand at once, not how fast they arrive. Unpaced, a cold start admits the cap's whole width in minutes, and the resulting control-plane throttle leaked the then `globus-transfer` semaphore and wedged workflows on 2026-09-14 (#393). So don't ramp `cloudpipe-max-concurrent` by hand to smooth a start; pacing already does it. It has not yet been calibrated against a cold start. Each `submitted` log line ends with `paced Ns`, how long pacing held that submission; waits on the cap are logged separately as `N active ≥ cap`.
 
-Globus destination collection UUID is always read from SSM (`/cloudpipe/globus/collection-id`) at runtime, so instance replacements take effect automatically.
+The source collection UUID and base path are read from SSM (`/cloudpipe/globus/source-collection-id`, `/cloudpipe/globus/source-base-path`) at runtime.
 
 ### cloudpipe_minproc (single subject, direct Argo submit)
 
 Useful for testing or rerunning a specific subject without touching Prefect.
 
 ```bash
-DEST_COLL=$(aws ssm get-parameter --name /cloudpipe/globus/collection-id --query Parameter.Value --output text)
 SRC_COLL=$(aws ssm get-parameter --name /cloudpipe/globus/source-collection-id --query Parameter.Value --output text)
 SRC_PATH=$(aws ssm get-parameter --name /cloudpipe/globus/source-base-path --query Parameter.Value --output text)
 
@@ -128,14 +127,13 @@ argo submit --from workflowtemplate/cloudpipe \
   -p subjID=NDARINVXXXXXXXX \
   -p globus-source-collection-id=$SRC_COLL \
   -p globus-source-base-path=$SRC_PATH \
-  -p globus-dest-collection-id=$DEST_COLL \
   -p globus-dest-base-path=/mmps_mproc \
   -p 'globus-scan-types=["T1w","T2w","rest","nback"]'
 ```
 
 Always use `submit --from workflowtemplate/` — never `resubmit` (resubmit snapshots the template from the prior run and ignores any template updates).
 
-`bucket`, `metrics-bucket`, `ecr-registry` and `region` are read automatically from the `cloudpipe-config` ConfigMap and do not need to be specified. Globus collection UUIDs are read from SSM at submission time.
+`bucket`, `metrics-bucket`, `ecr-registry` and `region` are read automatically from the `cloudpipe-config` ConfigMap and do not need to be specified. The source collection UUID and base path come from SSM, as above.
 
 For data already staged in S3, add `-p ingress-mode=presynced` and pass the `globus-*` parameters empty — the full command is in [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced).
 
@@ -343,7 +341,7 @@ partition. Records written before 2026-09-02 predate the field and read back **`
 
 Resume with the **complete ordered CSV** and a moved `start_index` — never a filtered remainder.
 The inventory step checks S3 for existing derivatives, so already-completed subjects cost one
-Globus transfer plus an inventory pod and then skip the rest.
+HTTPS copy plus an inventory pod and then skip the rest.
 
 ---
 
@@ -432,6 +430,8 @@ cp-prod && pixi run -e ops python scripts/reprocess_t1w_mni.py verify --sessions
 
 Upload the ready sessions' subjects and run the first-level flow with `missing_only=true`, so only the flushed sessions are refitted. `reprocess_func.py reconcile` stays the cohort-wide cleanup afterwards: this tool's labels start with `func-reprocess`.
 
+Run these tools from a checkout that is current with `origin/main`. `reconcile` (dry runs too) and every write guarded by the account check refuse otherwise, and say how many commits the checkout lacks. The rules for what to delete change: on 2026-11-12 a `reconcile --write` from a day-old checkout, without #1173, deleted 14,842 current newMSM step records, which were restored from the versioned metrics bucket. `CLOUDPIPE_ALLOW_STALE_CHECKOUT=1` skips the check, with a warning, when it can't be met (no network, say).
+
 ### Flush all metric data (start fresh dashboards)
 
 > **Destructive.** This deletes every per-scan QC record ever produced, which cannot be
@@ -474,26 +474,23 @@ run. The canonical subject list is `tools/cloudpipe_test_sample.csv` (100 subjec
 
 **Prerequisites:** WARP connected, AWS SSO active, `kubectl` context set to `cloudpipe`.
 
-**Also check the age of the Globus refresh token, before Step 1 and not after Step 2:**
+**Also check the Globus session, before Step 1 and not after Step 2:**
 
 ```bash
-aws secretsmanager list-secrets --filters Key=name,Values=globus \
-  --query 'SecretList[].LastChangedDate' --output text
+pixi run globus doctor
 ```
 
-The destination collection's storage gateway is High Assurance with a **1-week**
-`--authentication-timeout-mins`, so a token older than 7 days fails every single
-`globus-transfer` pod and takes the whole batch with it. Nothing warns you: the token is
-still valid, the secret is still synced, and the error Globus returns is
-`not_from_allowed_domain`, which reads as a gateway misconfiguration rather than an expiry.
-Check with `pixi run globus doctor`, and re-run `pixi run globus login` if it is anywhere near expiry
-([globus.md → Recognising an expired session](globus.md#recognising-an-expired-session)).
+A login older than 30 days is refused by the queue manager before the first submission,
+and by every `https-transfer` pod (exit 78) on a hand submission. `doctor` warns five days
+ahead. Re-run `pixi run globus login` if it is anywhere near expiry
+([globus.md → Session renewal](globus.md#session-renewal)).
 
-This is not hypothetical: the batch submitted 2026-08-17T01:43Z lost 300/300 subjects to a
-session that had lapsed 23 hours earlier, and had to be terminated and resubmitted.
+This is not hypothetical: the batch submitted 2026-08-17T01:43Z, on the Globus host's
+7-day session, lost 300/300 subjects to a session that had lapsed 23 hours earlier, and had
+to be terminated and resubmitted. That is why the batch gate exists.
 After reauthenticating, prove it with a **single-subject** submit
 ([above](#cloudpipe_minproc-single-subject-direct-argo-submit)) and wait for
-`Destination collection pre-flight check passed` before releasing 300.
+`Globus session is 0 day(s) old` in the `https-transfer` log before releasing 300.
 
 ### Generating a subject list
 
@@ -548,7 +545,7 @@ The script:
 4. Deletes `metrics/costs/` records belonging to the batch subjects (see below)
 5. Filters the same subjects' rows out of the compacted Parquet of every table it just
    flushed raw records from (see below)
-6. Prints cluster node pool status and Globus instance state
+6. Prints cluster node pool status
 
 `metrics/workflow-runs/` and `metrics/subject-manifests/` filenames embed the subject ID
 (`{workflow-name}__{subject}_...json`), so they're flushed per-subject by key matching.
@@ -790,11 +787,16 @@ batch submitted in the evening CDT crosses the UTC midnight boundary (e.g. submi
 01:30 UTC next day), most workflow costs land on the *following* UTC day. Wait for 02:00 UTC or
 trigger manually.
 
-A second deployment, `kubecost-day1-refresh`, re-reads the same day at **12:00 UTC** and rewrites
-it. At 02:00 Kubecost has not finished building the day's node data, so the 02:00 read cannot
-match every pod to the EC2 instance it ran on: its `node_instance_id` and node rates are blank on
-pods it could not prove. The 12:00 read fills most of those in. Per-pod node rates for yesterday
-are complete only after 12:00 UTC; workflow totals are usable from 02:00.
+A second deployment, `kubecost-day1-refresh`, re-reads the same day at **12:00 and 22:00 UTC**
+and rewrites it. At 02:00 Kubecost has not finished building the day's data, so the 02:00 read
+cannot match every pod to the EC2 instance it ran on (its `node_instance_id` and node rates are
+blank on pods it could not prove), and on a busy day it is missing pods outright. On a heavy day
+even 12:00 is early for the instance match: read at 12:00, 66% of 11-12's 7,881 production pods
+were proven; the same pods read at 16:45 were 94% proven. 22:00 is the last read that safely fits
+inside Kubecost's 49 h of hourly data;
+past it, reused hostnames can no longer be told apart. Each read only adds proofs. Treat
+yesterday's per-pod node rates, and on a busy day its totals, as complete only after the 22:00
+UTC read.
 
 ```bash
 prefect deployment run kubecost-cost-scraper/kubecost-cost-scraper
@@ -935,7 +937,7 @@ All spot-exposed workflow templates retry automatically on spot interruption (`p
 
 **The budget is sized for infrastructure, not for the workload.** Every nodepool is spot-only, so consecutive reclaims on a single long step are routine and 8 attempts exist to absorb them. Exit **137 is deliberately not retried**: a genuine OOMKill in this pipeline has always been deterministic (#120, #129, #134 each needed a memory or partitioning change, and no number of retries would have helped), so retrying it would burn the budget re-running an identical failure. If you find yourself wanting 137 back in the expression, the real fix is almost certainly a memory request or a step split. See issue #115.
 
-The short `cpu-light` steps (`globus-transfer`, `inventory`) are the exception — they have no expression at all and a limit of 2–3, so they retry on *any* failure. They used `retryPolicy: OnFailure`, which silently dropped every reclaimed pod (phase `Error`, not `Failed`) and cost 4 subjects zero retries; #269 moved them to `Always`.
+The short steps (`https-transfer`, `inventory`) are the exception — they have a limit of 2–3 and no infrastructure-codes expression, so they retry on *any* failure, except that `https-transfer` never retries its own refusal (exit 78, a session past 30 days or a missing token). They used `retryPolicy: OnFailure`, which silently dropped every reclaimed pod (phase `Error`, not `Failed`) and cost 4 subjects zero retries; #269 moved them to `Always`.
 
 **The codes are matched in the node message as well as in `exitCode`, and that is not belt-and-braces — it is load-bearing.** Argo populates `outputs.exitCode` from the **main** container only. A pod that dies in its **init** container (where argoexec's artifact loader runs) has no `exitCode` at all, and one that dies in its `wait` container records `"0"`. Neither is in `["64","75","143"]`, so before #277 every artifact-staging failure got exactly one attempt regardless of `limit: "8"` — which is how #274 turned a transient staging fault into the permanent loss of all three sessions of one subject. The tell in `status.nodes` is a message reading `init: Error (exit code 64): …` next to an absent `exitCode`; the plain-text `64` in the message is exactly what made the dead arm look live.
 
@@ -964,7 +966,6 @@ It also fails when it finds no rows at all, since then it cannot vouch for the r
 
 Failed workflows are not auto-resubmitted. Resubmit a failed workflow manually:
 ```bash
-DEST_COLL=$(aws ssm get-parameter --name /cloudpipe/globus/collection-id --query Parameter.Value --output text)
 SRC_COLL=$(aws ssm get-parameter --name /cloudpipe/globus/source-collection-id --query Parameter.Value --output text)
 SRC_PATH=$(aws ssm get-parameter --name /cloudpipe/globus/source-base-path --query Parameter.Value --output text)
 
@@ -973,7 +974,6 @@ argo submit --from workflowtemplate/cloudpipe \
   -p subjID=NDARINVXXXXXXXX \
   -p globus-source-collection-id=$SRC_COLL \
   -p globus-source-base-path=$SRC_PATH \
-  -p globus-dest-collection-id=$DEST_COLL \
   -p globus-dest-base-path=/mmps_mproc \
   -p 'globus-scan-types=["T1w","T2w","rest","nback"]'
 ```
@@ -1139,7 +1139,6 @@ git add argo/workflows/cloudpipe_minproc/<template>.yaml
 git commit && git push
 
 # 4. Resubmit
-DEST_COLL=$(aws ssm get-parameter --name /cloudpipe/globus/collection-id --query Parameter.Value --output text)
 SRC_COLL=$(aws ssm get-parameter --name /cloudpipe/globus/source-collection-id --query Parameter.Value --output text)
 SRC_PATH=$(aws ssm get-parameter --name /cloudpipe/globus/source-base-path --query Parameter.Value --output text)
 
@@ -1148,7 +1147,6 @@ argo submit --from workflowtemplate/cloudpipe \
   -p subjID=NDARINVXXXXXXXX \
   -p globus-source-collection-id=$SRC_COLL \
   -p globus-source-base-path=$SRC_PATH \
-  -p globus-dest-collection-id=$DEST_COLL \
   -p globus-dest-base-path=/mmps_mproc \
   -p 'globus-scan-types=["T1w","T2w","rest","nback"]'
 ```
@@ -1624,33 +1622,16 @@ For real-time or intra-day cost breakdowns, use the Kubecost UI at `https://kube
 
 ---
 
-## Globus EC2 instance
+## The Globus session
 
-The Globus Connect Server runs on an EC2 instance that is started automatically by the `start-globus-instance-template` step at the beginning of each workflow. It stays running until manually stopped.
+The HTTPS ingress reads the source with one person's Globus login, which this deployment holds to 30 days. Check it before a batch and renew it before it lapses:
 
 ```bash
-# Get the instance ID
-aws ssm get-parameter --name /cloudpipe/globus/instance-id --query Parameter.Value --output text
-
-# Stop the instance when no transfers are running
-aws ec2 stop-instances --instance-ids <instance-id>
+pixi run globus doctor   # six checks; the session check warns five days ahead
+pixi run globus login    # renews it, from a terminal with a browser
 ```
 
-If the instance is replaced, update SSM:
-```bash
-aws ssm put-parameter \
-  --name /cloudpipe/globus/instance-id \
-  --value <new-instance-id> \
-  --overwrite
-
-# Also update the collection UUID if it changed
-aws ssm put-parameter \
-  --name /cloudpipe/globus/collection-id \
-  --value <new-collection-uuid> \
-  --overwrite
-```
-
-The Prefect queue manager reads the collection UUID from SSM at runtime, so in-flight flow runs pick up the new value automatically on the next subject submission.
+The procedure, the SSM parameters behind it and how a lapsed session presents are in [globus.md](globus.md). Until 2026-11-12 this section described starting and stopping a Globus Connect Server host on EC2; the host is destroyed (ADR 024).
 
 ---
 

@@ -31,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-CONTRACT_VERSION = "2.0"
+CONTRACT_VERSION = "3.0"
 
 #: Where pixi comes from. Shown before any offer to install, never fetched behind
 #: the deployer's back: this script asks them to run a shell script from the

@@ -28,6 +28,9 @@ for a deliberate subset, such as a reprocess slice:
 ConfigMap, when ``pixi run prefect-deploy`` registers it.
 """
 
+import sys
+from pathlib import Path
+
 import boto3
 from botocore.exceptions import ClientError
 from lib.argo import (
@@ -42,6 +45,15 @@ from lib.subjects import load
 from prefect.variables import Variable
 
 from prefect import flow, get_run_logger, task
+
+# As in cloudpipe_queue_manager.py: src/metrics/ is on PYTHONPATH in the flow-runner
+# image; for local runs add it from the repo. The first-level image reads the same
+# module, so the stager and this check cannot disagree on which sessions are rejected.
+_METRICS_PATH = str(Path(__file__).resolve().parents[2] / "src" / "metrics")
+if _METRICS_PATH not in sys.path:
+    sys.path.insert(0, _METRICS_PATH)
+
+import anat_qc_rejects  # type: ignore[import-not-found]  # noqa: E402
 
 FUNC_PREFIX = "derivatives/func"
 S3_UPLOAD_PREFIX = "derivatives/first_levels"
@@ -91,16 +103,29 @@ def func_subjects(bucket: str) -> list[str]:
         token = resp["NextContinuationToken"]
 
 
+def load_rejected(bucket: str) -> frozenset[tuple[str, str]]:
+    """The anatomical-QC reject list (#1205). Raises MissingList when it is absent."""
+    return anat_qc_rejects.load(boto3.client("s3"), bucket)
+
+
 @task(name="check-first-level-complete")
-def is_completed(subj_id: str, bucket: str) -> tuple[bool, str]:
+def is_completed(
+    subj_id: str, bucket: str, rejected: frozenset[tuple[str, str]] = frozenset()
+) -> tuple[bool, str]:
     """(done, why): done when every session with a func `_complete.json` also has a
     first-level `_complete.json`. A subject with no complete func session has
-    nothing to run, so it is done too, and `why` says which case it is."""
+    nothing to run, so it is done too, and `why` says which case it is.
+
+    Sessions on the anatomical-QC reject list don't count: the workflow skips them
+    too, so they would hold the subject open and resubmit it on every run."""
     subj = subj_id if subj_id.startswith("sub-") else f"sub-{subj_id}"
     s3 = boto3.client("s3")
-    func = _marked_sessions(s3, bucket, f"{FUNC_PREFIX}/{subj}/")
-    if not func:
+    marked = _marked_sessions(s3, bucket, f"{FUNC_PREFIX}/{subj}/")
+    if not marked:
         return True, "no complete func session"
+    func = {ses for ses in marked if (subj, ses) not in rejected}
+    if not func:
+        return True, f"all {len(marked)} complete func session(s) rejected by anatomical QC"
     missing = func - _marked_sessions(s3, bucket, f"{S3_UPLOAD_PREFIX}/{subj}/")
     if missing:
         return False, f"no first-level marker for {sorted(missing)}"
@@ -168,6 +193,11 @@ def first_level_queue_manager(
         )
     )
 
+    # Before the subject walk: without the list every session would count, and a
+    # subject whose only missing session is rejected would be resubmitted for nothing.
+    rejected = load_rejected(bucket)
+    logger.info(f"{len(rejected)} session(s) on the anatomical-QC reject list")
+
     if subjects_file:
         subjects, source = load(subjects_file), subjects_file
     else:
@@ -207,7 +237,7 @@ def first_level_queue_manager(
         if subj_id.removeprefix("sub-") in running:
             logger.info(f"[{i + 1}/{total}] skipping {subj_id} — its workflow is still running")
             continue
-        done, why = is_completed(subj_id, bucket)
+        done, why = is_completed(subj_id, bucket, rejected)
         if done:
             logger.info(f"[{i + 1}/{total}] skipping {subj_id} — {why}")
             continue

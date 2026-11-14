@@ -114,6 +114,21 @@ TOPOLOGY_UNFIXABLE_EXIT_CODE = 70
 # is absent on every attempt.
 PREREQUISITE_ABSENT_EXIT_CODE = 66
 
+# The exit code fastsurfer-long-parcellation uses when a session the base
+# template was built from failed its long stream (issue #1197). The template is
+# shaped by every session handed to mri_robust_template, so publishing the
+# survivors would put their anatomy in a template partly made from a session
+# production does not keep, and base-tps would disagree with the template's own
+# `<ses>_to_<subject>_template.lta` set. So the step publishes nothing, and the
+# master's anatomy-with-rebuild wrapper runs the phase again from the surviving
+# sessions (the rejected one becomes missing data, operator 2026-11-14). It is
+# `algorithm`: a FreeSurfer program failed on one timepoint (the step's log
+# names the session and why). 69 is EX_UNAVAILABLE in sysexits.h ("a support
+# program did something wrong") and nothing else in the cluster emits it; every
+# retry expression leaves it out, since the one observed cause (HISTOalloc,
+# #235) replayed identically on every attempt.
+TEMPLATE_TIMEPOINT_FAILED_EXIT_CODE = 69
+
 # Container exit codes carry the only failure signal a DAG task actually
 # exposes, since {{tasks.<name>.message}} does not exist. 128+N is the shell
 # convention for "killed by signal N".
@@ -125,6 +140,7 @@ _EXIT_CODE_CATEGORY: dict[int, str] = {
     QC_REJECTED_EXIT_CODE: "qc_rejected",
     TOPOLOGY_UNFIXABLE_EXIT_CODE: "data",
     PREREQUISITE_ABSENT_EXIT_CODE: "dependency",
+    TEMPLATE_TIMEPOINT_FAILED_EXIT_CODE: "algorithm",
 }
 
 # What a known exit code means, spelled out in failure_reason. The panel a
@@ -140,6 +156,12 @@ _EXIT_CODE_REASON: dict[int, str] = {
         "a prerequisite the step does not make is absent (an upstream output or the "
         "deployment's configuration); the step's log names it"
     ),
+    TEMPLATE_TIMEPOINT_FAILED_EXIT_CODE: (
+        "a session the longitudinal template was built from failed its long stream; "
+        "nothing published from this attempt. The workflow rebuilds the subject's "
+        "anatomy without that session, so it ends as missing data; if no rebuild was "
+        "possible, resubmit with exclude-sessions. The step's log names the session"
+    ),
 }
 
 
@@ -152,7 +174,7 @@ def classify_failure(status: str, message: str, exit_code: object = "") -> str:
       a reason naming a missing input would read as `data` — bad subject data —
       rather than an upstream QC rejection (#222).
     - otherwise the message patterns, then the exit code (65 -> qc_rejected,
-      #368; 70 -> data, #958; signal deaths), then "infrastructure" for an Error with nothing to go
+      #368; 70 -> data, #958; 69 -> algorithm, #1197; signal deaths), then "infrastructure" for an Error with nothing to go
       on (the controller never ran the pod), else "unknown".
 
     `exit_code` may be an int, a numeric string, "" or None — the fallback

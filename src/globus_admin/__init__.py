@@ -1,10 +1,10 @@
-"""Operator tooling for the CloudPipe Globus ingress.
+"""Operator tooling for the CloudPipe HTTPS ingress's Globus credentials.
 
-One command surface (`pixi run globus <command>`) for every routine Globus task,
-so no runbook asks an operator to type a raw `globus-connect-server`, `aws ssm`,
-or `kubectl` command. See the `simplify-globus-ingress` OpenSpec change for the
-requirements this implements, and `docs/globus-contract.md` for the outputs a
-setup wizard may depend on.
+Two commands (`pixi run globus login`, `pixi run globus doctor`), so no runbook
+asks an operator to type a raw `aws ssm` or `kubectl` command. The Globus Connect
+Server host and every command that addressed it were retired (openspec
+retire-globus-host); see `docs/globus-contract.md` for the outputs a setup wizard
+may depend on.
 
 Two rules hold across every module here:
 
@@ -16,9 +16,11 @@ Two rules hold across every module here:
    text on stderr, and the exit codes in `exits.py`.
 """
 
-CONTRACT_VERSION = "1.0"
-"""Version of the integration contract (JSON outputs, exit codes, gate list).
+CONTRACT_VERSION = "2.0"
+"""Version of the integration contract (JSON outputs, exit codes, the answers schema).
 
 Additive changes within a major version only: fields are never removed or
-renamed, and identifiers stay stable, because a wizard reads them.
+renamed, and identifiers stay stable, because a wizard reads them. 2.0 removed the
+endpoint checks and every command but `login` and `doctor`, keeping each surviving
+check's 1.x identifier.
 """

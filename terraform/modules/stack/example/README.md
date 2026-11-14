@@ -76,8 +76,9 @@ Prerequisites the stack expects to already exist:
 - an OIDC client registered with your institution's identity provider, with its
   credentials placed in Secrets Manager by hand (Terraform reads that secret and
   must not own it);
-- for Globus, a registered service client and a source collection. See
-  [the Globus setup guide](../../../../docs/globus-setup.md).
+- for HTTPS ingress, access to a Globus source collection and a native app
+  registration for the login. See
+  [the Globus prerequisites](../../../../docs/globus-prerequisites.md).
 
 ## Inputs
 

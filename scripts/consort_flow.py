@@ -10,6 +10,7 @@ after the shared anatomical stages. Read-only on S3.
 Every existence test is the pipeline's own (src/inventory.py):
 
   anatomy         derivatives/fastsurfer/{subj}/{ses}/_complete.json
+  anatomical QC   not on config/anat_qc_rejected.csv (src/metrics/anat_qc_rejects.py, #1205)
   t1w -> MNI      derivatives/registration/{subj}/{ses}/t1w_to_mni/{prefix}_desc-t1w2mni_affine.mat
   BOLD -> T1w     derivatives/registration/{subj}/{ses}/bold_to_t1w_{task}_{run}/{prefix}_desc-bold2t1w_itk.txt
   MNI BOLD        the run listed in derivatives/func/{subj}/{ses}/_complete.json
@@ -48,6 +49,9 @@ from threading import local
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from metrics import anat_qc_rejects  # noqa: E402
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "data" / "consort"
 PHENOTYPE = "tabulated/abcd/rawdata/phenotype"
@@ -241,6 +245,12 @@ def collect(args) -> int:
     sessions["t1w2mni_verdict"] = [
         verdicts.get((s, ses, "t1w_to_mni", "", ""), "") for s, ses in units
     ]
+    rejected = anat_qc_rejects.load(s3, args.data_bucket)
+    sessions["anat_qc_rejected"] = [
+        (s, ses) in rejected
+        for s, ses in zip(sessions["subject"], sessions["session"], strict=True)
+    ]
+    print(f"anatomical-QC reject list: {len(rejected)} session(s)", flush=True)
 
     # One row per (session, task, run) the pipeline knows about, with each stage's outcome.
     by_session = defaultdict(dict)
@@ -283,8 +293,8 @@ def collect(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _inventory(s3, bucket: str, run: dict) -> list | None:
-    """The session list a workflow's subject-data-inventory pod printed, or None.
+def _step_logs(s3, bucket: str, run: dict, step: str):
+    """Yield the text of each archived pod log of `step` in this run.
 
     Names are reused, so only a log written inside this run's own window counts.
     """
@@ -295,17 +305,56 @@ def _inventory(s3, bucket: str, run: dict) -> list | None:
 
     start, end = at(run.get("started_at")), at(run.get("finished_at"))
     if not start:
-        return None
+        return
     end = (end or start) + timedelta(hours=1)
-    wf = run["workflow_name"]
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=f"logs/{wf}/"):
+    for page in s3.get_paginator("list_objects_v2").paginate(
+        Bucket=bucket, Prefix=f"logs/{run['workflow_name']}/"
+    ):
         for o in page.get("Contents", []):
-            if "subject-data-inventory" in o["Key"] and start <= o["LastModified"] <= end:
-                text = s3.get_object(Bucket=bucket, Key=o["Key"])["Body"].read().decode()
-                for line in text.splitlines():
-                    if line.strip().startswith("[{"):
-                        return json.loads(line)
+            if step in o["Key"] and start <= o["LastModified"] <= end:
+                yield s3.get_object(Bucket=bucket, Key=o["Key"])["Body"].read().decode()
+
+
+def _inventory(s3, bucket: str, run: dict) -> list | None:
+    """The session list a workflow's subject-data-inventory pod printed, or None.
+
+    A session the operator excluded (`--exclude-sessions`) is listed with
+    t1w_available false, the same as a session with no T1w, so the pod's
+    `EXCLUDED {subj}/{ses}: ...` line is read too, and that session is marked
+    `"excluded": True`.
+    """
+    for text in _step_logs(s3, bucket, run, "subject-data-inventory"):
+        excluded = {
+            line.split("EXCLUDED ", 1)[1].split(":", 1)[0].split("/", 1)[-1]
+            for line in text.splitlines()
+            if "EXCLUDED " in line and ": T1w staged but excluded" in line
+        }
+        for line in text.splitlines():
+            if line.strip().startswith("[{"):
+                inv = json.loads(line)
+                for s in inv:
+                    if s.get("session") in excluded:
+                        s["excluded"] = True
+                return inv
     return None
+
+
+def _long_stream_rejected(s3, bucket: str, run: dict) -> set[str]:
+    """The sessions this run's fastsurfer-long-parcellation guard rejected (#245).
+
+    Since #1197 one rejection publishes nothing from that attempt: the base
+    template was built from every session. The workflow then rebuilds the subject
+    without the rejected session (anatomy-with-rebuild), so its siblings are
+    normally published and never reach this classifier; a sibling is "withheld"
+    only when that rebuild did not succeed. Read from the guard's
+    `REJECTED <ses>: <reason>` lines, over every attempt's log.
+    """
+    rejected = set()
+    for text in _step_logs(s3, bucket, run, "fastsurfer-long-parcellation"):
+        for line in text.splitlines():
+            if line.strip().startswith("REJECTED ses-"):
+                rejected.add(line.strip().removeprefix("REJECTED ").split(":", 1)[0])
+    return rejected
 
 
 NO_BOLD_ERROR = "no rest/nback BOLD run in any session"
@@ -317,24 +366,12 @@ def _refused_for_no_bold(s3, bucket: str, run: dict) -> bool:
     Such a subject never reaches inventory, so it has no inventory log to read;
     the ingress contract (docs/data-ingress.md) stops it one step earlier.
     """
-    from datetime import datetime, timedelta
-
-    def at(v):
-        return datetime.fromisoformat(v.replace("Z", "+00:00")) if v else None
-
-    start, end = at(run.get("started_at")), at(run.get("finished_at"))
-    if not start:
-        return False
-    end = (end or start) + timedelta(hours=1)
-    for page in s3.get_paginator("list_objects_v2").paginate(
-        Bucket=bucket, Prefix=f"logs/{run['workflow_name']}/"
-    ):
-        for o in page.get("Contents", []):
-            if "verify-staged-input" in o["Key"] and start <= o["LastModified"] <= end:
-                text = s3.get_object(Bucket=bucket, Key=o["Key"])["Body"].read().decode()
-                if NO_BOLD_ERROR in text:
-                    return True
-    return False
+    # The ERROR line only. Since 2026-11-12 a subject with a T1w and no BOLD is
+    # processed for anatomy and logs the same words as a WARNING.
+    return any(
+        f"ERROR: {NO_BOLD_ERROR}" in text
+        for text in _step_logs(s3, bucket, run, "verify-staged-input")
+    )
 
 
 def _session_source(found: dict, row) -> str:
@@ -348,7 +385,30 @@ def _session_source(found: dict, row) -> str:
         return "no_bold"
     if row["session"] not in inv:
         return "not_distributed"
+    if inv[row["session"]] == "excluded":
+        return "operator_excluded"
+    if inv[row["session"]] == "withheld":
+        return "template_withheld"
     return "t1w" if inv[row["session"]] else "no_t1w"
+
+
+def _sources_from_inventory(inv: list, rejected: set[str]) -> dict:
+    """Per session: "excluded", "withheld", or whether a T1w was available.
+
+    `rejected` is the long-parcellation guard's verdict for the same run. When it
+    rejected any session, the subject's other T1w sessions passed but were not
+    published (#1197): they are "withheld", not FastSurfer failures. The rejected
+    sessions stay True, i.e. "T1w distributed; FastSurfer produced no anatomy".
+    """
+    out = {}
+    for s in inv:
+        if s.get("excluded"):
+            out[s["session"]] = "excluded"
+        elif s.get("t1w_available") and rejected and s["session"] not in rejected:
+            out[s["session"]] = "withheld"
+        else:
+            out[s["session"]] = bool(s.get("t1w_available"))
+    return out
 
 
 def source(args) -> int:
@@ -359,6 +419,8 @@ def source(args) -> int:
     WorkflowRun whose inventory log survives. A subject the ingress contract
     refused for having no BOLD at all never ran inventory; its newest run's
     verify-staged-input log says so, and every session of it is `no_bold`.
+    The same run's fastsurfer-long-parcellation log separates a session that
+    failed the long stream from its siblings withheld with it (#1197).
     """
     import pandas as pd
     import pyarrow as pa
@@ -416,7 +478,9 @@ def source(args) -> int:
         for run in runs:
             inv = _inventory(c, args.data_bucket, run)
             if inv is not None:
-                return subj, {s["session"]: bool(s.get("t1w_available")) for s in inv}
+                return subj, _sources_from_inventory(
+                    inv, _long_stream_rejected(c, args.data_bucket, run)
+                )
         return subj, None
 
     with ThreadPoolExecutor(args.workers) as pool:
@@ -493,6 +557,29 @@ def compute(sessions, runs) -> list[dict]:
         "T1w distributed; FastSurfer produced no anatomy",
         lost[src == "t1w"],
     )
+    # Sessions that passed the longitudinal stream but were not published because
+    # another session of the same participant failed it: the base template was
+    # built from every session, so none of its outputs are kept (#1197). Counted
+    # apart so the failure box holds only the sessions that actually failed.
+    box(
+        "x_anat_withheld",
+        "",
+        "excluded",
+        "T1w distributed; withheld because another session's longitudinal stream failed (shared template)",
+        lost[src == "template_withheld"],
+    )
+    # An operator's exclude-sessions decision (inventory logs `EXCLUDED`): the
+    # session's T1w is kept out of the longitudinal template. Without this box such
+    # a session would be counted as "No T1w", which it is not. The label states
+    # the mechanism only; a session FastSurfer failed on is "FastSurfer produced
+    # no anatomy" above, not an exclusion.
+    box(
+        "x_anat_excluded",
+        "",
+        "excluded",
+        "T1w distributed; excluded by the operator (exclude-sessions)",
+        lost[src == "operator_excluded"],
+    )
     box(
         "x_anat_unknown",
         "",
@@ -501,6 +588,24 @@ def compute(sessions, runs) -> list[dict]:
         lost[src == "no_record"],
     )
     s = box("anat", "", "stage", "FastSurfer longitudinal anatomy complete", s[s["fastsurfer"]])
+    # #1205: the session's cortical surfaces collapsed (FreeSurfer's autodet took the
+    # 110 white-matter clip spike as gray_mean), measured by fsqc. Taken out first, so
+    # a collapsed session that T1w -> MNI QC also rejected is counted here once. A table collected before the list existed has
+    # no column, and every session passes.
+    aqc = (
+        s["anat_qc_rejected"].astype(bool)
+        if "anat_qc_rejected" in s
+        else pd.Series(False, index=s.index)
+    )
+    box(
+        "x_anat_qc",
+        "",
+        "excluded",
+        "Cortical surfaces collapsed in the longitudinal stream (fsqc white/grey contrast below "
+        f"{anat_qc_rejects.CON_SNR_FLOOR:g})",
+        s[aqc],
+    )
+    s = s[~aqc]
     lost = s[~s["t1w2mni"]]
     rejected = lost["t1w2mni_verdict"] == "fail"
     # The gate runs the rescue ladder before it rejects, so a rejection means every
@@ -602,9 +707,11 @@ EXCLUSIONS = {
         "x_anat_no_t1w",
         "x_anat_no_bold",
         "x_anat_failed",
+        "x_anat_withheld",
+        "x_anat_excluded",
         "x_anat_unknown",
     ],
-    "anat": ["x_mni_qc", "x_mni_no_bold", "x_mni_other"],
+    "anat": ["x_anat_qc", "x_mni_qc", "x_mni_no_bold", "x_mni_other"],
 } | {
     step: reasons
     for arm in TASKS

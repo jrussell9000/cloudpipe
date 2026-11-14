@@ -95,12 +95,6 @@ variable "argo_namespace" {
   default     = "argo-workflows"
 }
 
-variable "globus_instance_arn" {
-  description = "ARN of the Globus Connect Server EC2 instance. The queue manager's batch gate starts it before its live listing, since the host is stopped nightly (#652). Empty grants no EC2 permissions; the gate then warns and lists without starting the host."
-  type        = string
-  default     = ""
-}
-
 ################################################################################
 # Prefect — service account names
 ################################################################################

@@ -29,6 +29,13 @@ metadata:
 # thing it validates cannot drift apart. That is also why this template needs no
 # image rebuild: inventory.py has shipped in cloudpipe/python since the pin.
 #
+# A subject with a T1w but no rest/nback BOLD is NOT a violation: it is anatomy
+# only (reprocess audit 6.5, 2026-11-12) and gets a warning. No BOLD and no T1w
+# is. A failure here is recorded by record-outcome-verify-staged-input-dagtask,
+# so workflow-verdict fails the workflow; before that a refused subject ended
+# Succeeded with nothing processed (Argo counts a failure that a downstream
+# `depends` names as handled).
+#
 # Exit status: 1 on any contract violation. Not retried — the workflow-level
 # retryStrategy admits only infrastructure codes (64/75/143), and a staging
 # mistake fails identically on every attempt. 75 when S3 itself failed (a read
@@ -55,7 +62,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:302613557e5fbad1e0d4ec0ede67503f2cb5012e2be000ee92fb28ba70b52739"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:803b7296c5ad533c2d98f2eabdc0b4b342157dd9061c477f95f1415404a6c9cc"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -158,6 +165,7 @@ spec:
                     )
 
             bold_total = 0
+            t1w_total = 0
             for ses in sessions:
                 runs = inventory.list_bold_runs(s3, bucket, subj, ses)
                 bold_total += len(runs)
@@ -166,6 +174,7 @@ spec:
                 t1w = f"{root}{ses}/anat/{subj}_{ses}_run-01_T1w.nii.gz"
                 if inventory.check_t1w_source_exists(s3, bucket, subj, ses):
                     print(f"{ses}: T1w present")
+                    t1w_total += 1
                     continue
                 near = [
                     k for k in _list_keys(s3, bucket, f"{root}{ses}/anat/")
@@ -196,10 +205,22 @@ spec:
                     if func_images
                     else ""
                 )
-                errors.append(
-                    f"no rest/nback BOLD run in any session — expected "
-                    f"{root}ses-*/func/*_task-(rest|nback)_run-NN*.nii[.gz].{detail}"
-                )
+                expected = f"expected {root}ses-*/func/*_task-(rest|nback)_run-NN*.nii[.gz]."
+                if t1w_total:
+                    # Anatomy only (operator, 2026-11-12, reprocess audit 6.5): a
+                    # subject with a T1w and no BOLD still gets its anatomy and
+                    # T1w->MNI. Every BOLD step gates on its pending runs, so they
+                    # Skip. Production built such subjects' anatomy before this
+                    # check refused them.
+                    warnings.append(
+                        f"no rest/nback BOLD run in any session — anatomy only "
+                        f"({t1w_total} session(s) with a T1w); {expected}{detail}"
+                    )
+                else:
+                    errors.append(
+                        f"no rest/nback BOLD run in any session and no T1w either — "
+                        f"nothing to process; {expected}{detail}"
+                    )
 
             return errors, warnings
 

@@ -5,7 +5,7 @@ One invocation handles one subject across all of its sessions. fsqc's notion of 
 directory *per session* — so fsqc's "subject" is our session, and the QC records
 this writes are keyed subject+session.
 
-The S3 layout this reads (exploded per-file objects — see CLAUDE.md and ADR 017):
+The S3 layout this reads (exploded per-file objects — see docs/architecture.md and ADR 017):
 
   derivatives/fastsurfer/{subj}/{ses}/...          -> staged as {ses}/...
   derivatives/subregions/{subj}/hippoamyg/...      -> staged as hippoamyg/{ses}/mri/...

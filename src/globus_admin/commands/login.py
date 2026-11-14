@@ -2,7 +2,7 @@
 
 The order of the writes is the part to preserve:
 
-1. the token goes into Secrets Manager,
+1. the tokens go into Secrets Manager,
 2. `session-established-at` is written **last**,
 3. the cluster is told to re-sync.
 
@@ -14,6 +14,9 @@ wave a 300-subject batch through.
 Step 3 is an annotation on the ExternalSecret, never `kubectl delete secret`. The
 old procedure deleted it, which leaves every pod that mounts it without a
 credential until the operator re-creates it.
+
+A login always needs a person at a browser, so `--non-interactive` exits 2 before
+asking for anything, naming the browser login as the step a human must take.
 """
 
 from __future__ import annotations
@@ -24,13 +27,36 @@ from typing import Any
 from .. import cluster, guards, sessions
 from .. import login as login_module
 from ..cli import Context, register
-from ..exits import ExitCode
+from ..exits import CliError, ExitCode, Remedy
 
 CLIENT_ID_ENV = "GLOBUS_NATIVE_APP_CLIENT_ID"
 
 
 @register("login")
 def login(ctx: Context) -> ExitCode:
+    if ctx.non_interactive:
+        raise CliError(
+            "login.needs_browser",
+            "A Globus login needs a person to consent in a browser, which no unattended run "
+            "can do.",
+            exit_code=ExitCode.BLOCKED,
+            remedy=Remedy("human", "run `pixi run globus login` in a terminal with a browser"),
+            gate="globus_login",
+        )
+
+    # Every login grants the HTTPS scope, so it needs to know whose. Refused up
+    # front rather than noted: a login without it stores a credential every
+    # ingress pod then refuses (exit 78), which is worse than no login at all.
+    https_collection_id = ctx.config.source_collection_id
+    if not https_collection_id:
+        raise CliError(
+            "login.no_source_collection",
+            "No source_collection_id is configured, so this login could not grant the HTTPS "
+            "scope that ingress-mode=https needs.",
+            exit_code=ExitCode.INVALID,
+            remedy=Remedy("human", "add source_collection_id to the answers document"),
+        )
+
     ctx.require_prereqs(mutating=True)
     env = ctx.env
     emitter = ctx.emitter
@@ -65,15 +91,6 @@ def login(ctx: Context) -> ExitCode:
             "transfer pod(s) are running; they keep using the token they already hold."
         )
 
-    # The source collection's `/https` scope comes with the same login, for
-    # `ingress-mode=https`. Without a configured source there is nothing to ask for.
-    https_collection_id = ctx.config.source_collection_id
-    if not https_collection_id:
-        emitter.note(
-            "note: no source_collection_id is configured, so this login does not grant the "
-            "HTTPS scope that ingress-mode=https needs."
-        )
-
     result = login_module.LoginSession(
         client_id=client_id,
         domains=domains,
@@ -82,10 +99,11 @@ def login(ctx: Context) -> ExitCode:
     ).run()
     emitter.note(f"Logged in as {result.username}")
 
-    aws.put_secret_json(env.token_secret, result.secret_payload())
+    payload = result.secret_payload()
+    aws.put_secret_json(env.token_secret, payload)
     emitter.note(f"Stored the credential in {env.token_secret}")
 
-    # Last, and only after the token is safely stored.
+    # Last, and only after the tokens are safely stored.
     aws.put_parameter(env.session_param, result.established_at.isoformat())
 
     state = sessions.evaluate(
@@ -99,17 +117,21 @@ def login(ctx: Context) -> ExitCode:
         "identity_id": result.identity_id,
         "secret": env.token_secret,
         "session": state.as_dict(),
-        "cluster_sync": _sync_cluster(ctx, result.refresh_token),
+        "cluster_sync": _sync_cluster(ctx, payload),
     }
     return emitter.result(data)
 
 
-def _sync_cluster(ctx: Context, refresh_token: str) -> dict[str, Any]:
+def _sync_cluster(ctx: Context, payload: dict[str, str]) -> dict[str, Any]:
     """Push the new credential into the cluster, and say plainly if it did not land.
 
-    A failure here is never fatal: the token is already in Secrets Manager, and
+    A failure here is never fatal: the tokens are already in Secrets Manager, and
     External Secrets converges on its own interval. Reporting this as a failed
     login would send the operator through the browser flow again for nothing.
+
+    Waits for every key the ExternalSecret syncs, not only `refresh-token`: the
+    ingress pods read `https-refresh-token`, and a wait on one key reported the
+    Secret up to date while the other was still the old value.
     """
     secret_name = ctx.env.k8s_secret
     access = cluster.probe(ctx.runner)
@@ -117,7 +139,7 @@ def _sync_cluster(ctx: Context, refresh_token: str) -> dict[str, Any]:
         interval = cluster.eso_refresh_interval()
         ctx.emitter.note(
             f"The cluster was unreachable, so `{secret_name}` was not refreshed now. "
-            f"External Secrets will pick the new token up within {interval}. "
+            f"External Secrets will pick the new tokens up within {interval}. "
             "Connect Cloudflare WARP and re-run to refresh it immediately."
         )
         return {"attempted": False, "synced": False, "reason": "cluster unreachable"}
@@ -127,14 +149,15 @@ def _sync_cluster(ctx: Context, refresh_token: str) -> dict[str, Any]:
         ctx.emitter.note(f"warning: {error.message}")
         return {"attempted": True, "synced": False, "reason": error.code}
 
-    ctx.emitter.note(f"Waiting for `{secret_name}` in the cluster to carry the new token…")
-    if cluster.wait_for_secret_token(ctx.runner, name=secret_name, expected=refresh_token):
+    expected = {key: payload[key] for key in cluster.SYNCED_KEYS if key in payload}
+    ctx.emitter.note(f"Waiting for `{secret_name}` in the cluster to carry the new tokens…")
+    if cluster.wait_for_secret(ctx.runner, name=secret_name, expected=expected):
         ctx.emitter.note(f"`{secret_name}` is up to date.")
         return {"attempted": True, "synced": True}
 
     interval = cluster.eso_refresh_interval()
     ctx.emitter.note(
-        f"`{secret_name}` has not picked up the new token yet. Nothing is wrong with the "
+        f"`{secret_name}` has not picked up the new tokens yet. Nothing is wrong with the "
         f"login — the credential is stored, and External Secrets re-reads it every "
         f"{interval}. Check with `pixi run globus doctor` before starting a batch."
     )

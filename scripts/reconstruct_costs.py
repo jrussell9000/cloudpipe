@@ -287,8 +287,43 @@ def build_rows(
 # ----------------------------------------------------------------- AWS-facing plumbing
 
 
-def calibrate_from_days(s3, m, bucket: str, cal_days: list[str]) -> tuple[Rates, dict[str, str]]:
-    """Load the clean days and return (rates, node -> instance type seen there)."""
+def host_types(rows: list[dict]) -> tuple[dict[str, str], set[str]]:
+    """One day's hostname -> instance type, from its pod_costs rows; plus the ambiguous hosts.
+
+    A hostname is a private IP, and the cluster reuses private IPs, often within a day
+    (#1060). Two instances of different types behind one hostname used to collapse to
+    whichever row came last, pricing every pod on either at the other's rate. A hostname
+    that carried more than one type that day now names no type: its pods go unpriced
+    (the fallback rate) and are counted, rather than priced at a type they may not have
+    run on. Two instances of the SAME type behind one hostname are harmless here, because
+    the price is per type. Each row's own node_instance_type is the instance proven for
+    that pod (#1063 forward, the phase A/B backfills for history).
+    """
+    seen: dict[str, set[str]] = defaultdict(set)
+    for r in rows:
+        if r.get("node") and r.get("node_instance_type"):
+            seen[r["node"]].add(r["node_instance_type"])
+    types = {host: next(iter(ts)) for host, ts in seen.items() if len(ts) == 1}
+    return types, {host for host, ts in seen.items() if len(ts) > 1}
+
+
+def assign_instance_types(m, day_s: str, pods: list[dict]) -> set[str]:
+    """Set each snapshot pod's `instance_type` from that day's pod_costs; return ambiguous hosts.
+
+    Only the pod's own report date is consulted. A hostname seen on another day (the
+    calibration days used to be the fallback) says nothing about which instance held
+    that IP on this one.
+    """
+    rows = m._run_sql(f"""SELECT DISTINCT node, node_instance_type FROM cloudpipe_metrics.pod_costs
+                          WHERE date = '{day_s}'""").to_dict("records")
+    types, ambiguous = host_types(rows)
+    for p in pods:
+        p["instance_type"] = types.get(p.get("host_node"))
+    return ambiguous
+
+
+def calibrate_from_days(s3, m, bucket: str, cal_days: list[str]) -> Rates:
+    """Load the clean days and return their rates."""
     # Key everything by (date, workflow). load_snapshot_pods reads the day AND the morning
     # after (for pods crossing midnight), so two calibration days share snapshot files: a
     # pod-level concat would count those pods twice and halve every ratio. Quantities are
@@ -308,17 +343,11 @@ def calibrate_from_days(s3, m, bucket: str, cal_days: list[str]) -> tuple[Rates,
             SELECT date, workflow_name, node, node_instance_type, cpu_core_hours, ram_gb_hours,
                    gpu_hours, cpu_cost_usd, memory_cost_usd, gpu_cost_usd
             FROM cloudpipe_metrics.pod_costs WHERE date = '{d}'""").to_dict("records")
-    rates = calibrate(
+    return calibrate(
         {k: tuple(v) for k, v in quantities.items()},
         cal_rows,
         key=lambda r: (r["date"], r["workflow_name"]),
     )
-    node_type = {
-        r["node"]: r["node_instance_type"]
-        for r in cal_rows
-        if r.get("node") and r.get("node_instance_type")
-    }
-    return rates, node_type
 
 
 def reconstruct_day(
@@ -327,21 +356,17 @@ def reconstruct_day(
     args,
     day: date,
     rates: Rates,
-    node_type: dict[str, str],
     runs_by_name: dict[str, list[dict]],
 ) -> tuple[list[CostAllocation], list[dict]]:
     """Price one report-date's pods and return its rows (plus audit records)."""
     day_s = day.isoformat()
     pods = load_snapshot_pods(s3, args.metrics_bucket, day)
-    types = dict(node_type)
-    for (
-        r
-    ) in m._run_sql(f"""SELECT DISTINCT node, node_instance_type FROM cloudpipe_metrics.pod_costs
-                            WHERE date = '{day_s}'""").to_dict("records"):
-        if r.get("node") and r.get("node_instance_type"):
-            types[r["node"]] = r["node_instance_type"]
-    for p in pods:
-        p["instance_type"] = types.get(p.get("host_node"))
+    ambiguous = assign_instance_types(m, day_s, pods)
+    if ambiguous:
+        print(
+            f"{day_s}: {len(ambiguous)} hostname(s) carried more than one instance type; "
+            f"{sum(p.get('host_node') in ambiguous for p in pods):,} of their pods go unpriced"
+        )
 
     stored = m._run_sql(f"""SELECT workflow_name, subject, total_cost_usd
                             FROM cloudpipe_metrics.costs WHERE date = '{day_s}'""").to_dict(
@@ -401,7 +426,7 @@ def main() -> int:
     m = CloudpipeMetrics(bucket=args.metrics_bucket, region=args.region)
     cal_days = args.calibration_day or list(DEFAULT_CALIBRATION)
 
-    rates, node_type = calibrate_from_days(s3, m, args.metrics_bucket, cal_days)
+    rates = calibrate_from_days(s3, m, args.metrics_bucket, cal_days)
     print(
         f"calibrated on {', '.join(cal_days)}: cpu x{rates.cpu_ratio:.4f} mem x{rates.mem_ratio:.4f} "
         f"gpu x{rates.gpu_ratio:.4f}, {len(rates.per_type)} instance types"
@@ -420,7 +445,7 @@ def main() -> int:
     total_written = 0
     for day_s in args.day:
         day = date.fromisoformat(day_s)
-        rows, audit = reconstruct_day(s3, m, args, day, rates, node_type, runs_by_name)
+        rows, audit = reconstruct_day(s3, m, args, day, rates, runs_by_name)
         if not args.write:
             continue
         with audit_path.open("a") as fh:

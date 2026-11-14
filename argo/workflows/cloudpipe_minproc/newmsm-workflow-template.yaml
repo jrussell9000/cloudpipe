@@ -204,7 +204,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:302613557e5fbad1e0d4ec0ede67503f2cb5012e2be000ee92fb28ba70b52739"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:803b7296c5ad533c2d98f2eabdc0b4b342157dd9061c477f95f1415404a6c9cc"
       imagePullPolicy: IfNotPresent
       resources:
         requests:
@@ -401,7 +401,7 @@ spec:
           mountPath: /workspace
       containers:
         - name: prep
-          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:60aeff7db03e845af0d9f480190df4787c1541cc5725ee3c86a831cad5b1134b"
+          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:1172b6fd9abb86397606da52fdfc43fe2a094f1e8c5c598421991c7d4835ef33"
           imagePullPolicy: IfNotPresent
           resources:
             requests:
@@ -476,7 +476,7 @@ spec:
             - --verbose
 
         - name: main
-          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:60aeff7db03e845af0d9f480190df4787c1541cc5725ee3c86a831cad5b1134b"
+          image: "{{workflow.parameters.ecr-registry}}/cloudpipe/workbench@sha256:1172b6fd9abb86397606da52fdfc43fe2a094f1e8c5c598421991c7d4835ef33"
           imagePullPolicy: IfNotPresent
           dependencies: [register-l, register-r]
           resources:

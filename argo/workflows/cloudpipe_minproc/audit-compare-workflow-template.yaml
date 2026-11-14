@@ -105,7 +105,7 @@ spec:
     container:
       # Re-pinned to the digest of every audit build by build-images.yaml. First
       # pinned by hand to the first build (sha-8a81fb99, #1088).
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/audit@sha256:1e7d218f9a6f3c430b57ee250ea51cf0bfcdd8aa278739ac39835ad51d8599d8"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/audit@sha256:a89a010670e7dd11b48437e15de56e6d9a36c4c544f94d231c8c3dfd3f43fe54"
       imagePullPolicy: IfNotPresent
       command: [/entrypoint.sh, python, -u, -m, audit.compare]
       args:

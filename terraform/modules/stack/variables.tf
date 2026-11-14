@@ -375,28 +375,25 @@ variable "public_ami_regions" {
 
 
 #######################
-# Globus Variables    #
+# Ingress Variables   #
 #######################
 
-# Whether this deployment stands up the Globus ingress at all, and therefore
-# whether the six variables below are required. See the header of
-# `globus.tf` for what enabling it costs the deployer, and the Globus
-# section of docs/deployer-first-hour.md for how to turn it on later.
-variable "globus_enabled" {
-  description = "Stand up the Globus Connect Server ingress — an EC2 host, an Elastic IP, its S3 signing roles and the staging test-bed. False is a complete deployment that reads imaging someone else staged into the data bucket (`ingress-mode=presynced`). Default false because enabling it needs a Globus subscription, a registered Globus service client, a managed prefix list, and a GCS AMI built from `packer/globus-gcs/` in your own account — none of which a fork of this repository inherits. The reference deployment sets it true."
-  type        = bool
-  default     = false
-}
+# The Globus Connect Server ingress and its `globus_enabled` switch were retired
+# (openspec retire-globus-host): HTTPS ingress reads the source collection's own
+# HTTPS server from an Argo pod, and no Globus host of ours exists. The variables
+# below survive because something other than that host reads them. They keep
+# their `globus_` names because Terraform only warns about an undeclared tfvars
+# value and then drops it, so a rename would quietly turn a configured value into
+# the default.
 
 # Not a Globus variable despite the name: this is the imaging data bucket, read
 # by the Prefect worker, the Argo runner's IAM policy, the S3 access-logging
-# configuration, the lifecycle rules and the CloudTrail data-event selector. It
-# stays required with `globus_enabled = false`, and `globus init` still owns the
-# name. Renaming it is a separate change — it is one string in six Terraform
-# files, the wizard's preflight, the Globus answers schema and this deployment's
-# tfvars, and every one of them has to move together.
+# configuration, the lifecycle rules and the CloudTrail data-event selector.
+# Renaming it is a separate change — it is one string in several Terraform files,
+# the wizard's preflight and this deployment's tfvars, and every one of them has
+# to move together.
 variable "globus_s3_destination_bucket" {
-  description = "S3 bucket name holding the imaging data. The Globus Connect Server writes into it when the ingress is enabled; the pipeline reads it either way. Created by the bootstrap root, not by the stack."
+  description = "S3 bucket name holding the imaging data. HTTPS ingress writes into it, and the pipeline reads it. Created by the bootstrap root, not by the stack."
   type        = string
 
   validation {
@@ -405,109 +402,13 @@ variable "globus_s3_destination_bucket" {
   }
 }
 
-# The six variables below are required only when `globus_enabled` is true.
-# (There were seven until `globus_source_collection_id` stopped being ingress-
-# gated; see its declaration further down.)
-#
-# Each one defaults to the empty string and each validation refuses the empty
-# string once the ingress is on, which keeps #526's rule — a default must not be
-# able to stand up an endpoint advertising a stranger's organization — while
-# costing a deployment that runs no ingress nothing. The old arrangement, no
-# default at all, made seven values mandatory for every deployment including the
-# ones that never create a Globus resource.
-#
-# `var.globus_enabled` inside a `validation` block needs Terraform 1.9; this
-# module's floor is 1.10 (versions.tf).
-
-variable "globus_admin_prefix_list_id" {
-  description = "ID (not ARN) of the AWS managed prefix list allowed SSH access to the Globus Connect Server (e.g. pl-xxxxxxxx). Required when globus_enabled is true."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = !var.globus_enabled || startswith(var.globus_admin_prefix_list_id, "pl-")
-    error_message = "globus_admin_prefix_list_id must be a prefix list ID (pl-...), not an ARN."
-  }
-}
-
-# The four institution-identifying variables below carry no deployment's value
-# as a default (#526). A default that named one would stand up an endpoint
-# advertising a stranger's organization and mailbox (`globus_org_name` and
-# `globus_contact_email` are baked into the bootstrap SSM document) behind a
-# gateway that admits only that stranger's institution (`globus_identity_domain`
-# is the gateway's `--domain`). `globus init` renders all four.
-variable "globus_org_name" {
-  description = "Organization name displayed on the Globus endpoint. Baked into the bootstrap SSM document as `endpoint setup --organization`. Rendered by `globus init` from the answers document. Required when globus_enabled is true."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = !var.globus_enabled || var.globus_org_name != ""
-    error_message = "globus_org_name must be set when globus_enabled is true: it is the organization the endpoint advertises."
-  }
-}
-
 variable "globus_contact_email" {
-  description = "Contact email displayed on the Globus endpoint. Baked into the bootstrap SSM document as `endpoint setup --contact-email`. Rendered by `globus init` from the answers document's `contact_email`. Required when globus_enabled is true."
+  description = "The address HTTPS ingress names in its User-Agent (cloudpipe-config `ingress_contact`), so the source's operators can reach this deployment about its traffic. Empty leaves the address off; the User-Agent still names cloudpipe."
   type        = string
   default     = ""
-
-  validation {
-    condition     = !var.globus_enabled || var.globus_contact_email != ""
-    error_message = "globus_contact_email must be set when globus_enabled is true: it is the mailbox the endpoint advertises."
-  }
 }
 
-variable "globus_owner_email" {
-  description = "Email of the person an institution contacts about this endpoint — typically an institutional Globus admin. The human in the subscription request `globus bootstrap-endpoint` prints; NOT `endpoint setup --owner`, which is the service client. Rendered by `globus init` from the answers document's `owner_email`. Required when globus_enabled is true."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = !var.globus_enabled || var.globus_owner_email != ""
-    error_message = "globus_owner_email must be set when globus_enabled is true: it names the human in the subscription request."
-  }
-}
-
-variable "globus_identity_domain" {
-  description = "Identity domain permitted to authenticate to the Globus storage gateway (e.g. your institution's domain). Passed as the gateway's `--domain`. Rendered by `globus init` from the answers document's `identity_domain`. Required when globus_enabled is true."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = !var.globus_enabled || var.globus_identity_domain != ""
-    error_message = "globus_identity_domain must be set when globus_enabled is true: an empty --domain admits no identity to the gateway."
-  }
-}
-
-variable "globus_gateway_name" {
-  description = "Display name of the production Globus storage gateway. This deployment's gateway predates the operator CLI and is named `cloudpipe-s3-gateway`, beside a `cloudpipe-s3` collection; the reconcile matches by display name, so this has to say so. Empty derives it from globus_collection_name, which is what a fresh deployment gets from `globus init`."
-  type        = string
-  default     = "cloudpipe-s3-gateway"
-}
-
-variable "globus_collection_name" {
-  description = "Display name for the S3-backed Globus mapped collection."
-  type        = string
-  default     = "cloudpipe-s3"
-}
-
-variable "globus_client_id" {
-  description = "Client ID of the Globus service client registered in the Globus Developers Portal. `globus bootstrap-endpoint` creates the endpoint under it rather than under a personal identity. Required when globus_enabled is true."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = !var.globus_enabled || var.globus_client_id != ""
-    error_message = "globus_client_id must be set when globus_enabled is true: the endpoint is created under the service client, not a personal identity."
-  }
-}
-
-# The two source variables below are not ingress-gated: HTTPS ingress reads them
-# from SSM whether or not `module.globus` exists (ingress_session.tf). They keep
-# their `globus_` names because Terraform only warns about an undeclared tfvars
-# value and then drops it, so a rename would quietly turn a configured source
-# into the placeholder.
+# HTTPS ingress reads the two source variables from SSM (ingress_session.tf).
 variable "globus_source_collection_id" {
   description = "Globus source collection UUID (NBDC Data Hub collection) that `ingress-mode=https` copies from. Empty is a complete deployment that ingresses nothing itself (`ingress-mode=presynced`); the SSM parameter then holds a placeholder the queue manager refuses."
   type        = string
@@ -529,42 +430,6 @@ variable "fasttrack_source_base_path" {
   description = "Root path on the same source collection holding the ABCD FastTrack DICOMs (BIDS-named, one directory per subject), read by cloudpipe_fasttrack's convert job. Subject ID is appended automatically."
   type        = string
   default     = "/abcd/sourcedata"
-}
-
-# `globus_dest_base_path` and `globus_scan_types` were declared here and read by
-# nothing — no Terraform code referenced either. Both are really parameters of
-# `prefect/flows/cloudpipe_queue_manager.py`, which Terraform has no part in
-# setting, so an operator who followed the setup guide's "Set
-# `globus_dest_base_path = \"/mmps_mproc\"`" changed nothing and was told nothing.
-# `terraform.tfvars.example` even suggested `/incoming`, a value that disagrees
-# with what the pipeline actually writes to.
-#
-# Deleted rather than wired up to the new `globus_destination_prefix` on
-# module.globus. Wiring would have made the disagreement worse, not better: that
-# variable scopes the writer role's IAM prefix, so a root variable set to
-# `/incoming` would confine the role to a prefix nothing writes to and every
-# transfer would fail with AccessDenied. The prefix genuinely lives in two
-# systems, and the honest arrangement is one declaration in each with a test
-# holding them equal — see tests/test_terraform_globus_s3_roles.py.
-
-variable "globus_staging_enabled" {
-  description = "Provision the AWS side of the Globus staging gateway: its two Secrets Manager containers. It used to also attach an S3 policy to a named IAM user; `retire-globus-s3-access-keys` 9.2 removed that, since staging signs through its own listener as a prefix-scoped role. The staging gateway and collection themselves are created in Globus, not by Terraform. This default is THIS deployment's value — it keeps staging as the proving ground for a production endpoint that predates the operator CLI, and it applies Terraform on these defaults, so flipping it would drop staging here. A fresh deployment gets `false` from `globus init`, which always renders this variable (docs/globus.md, Staging gateway)."
-  type        = bool
-  default     = true
-}
-
-
-
-variable "globus_session_timeout_days" {
-  description = "How often a human must re-authenticate to Globus, in days. Rendered into the GCS configuration document as `authentication_timeout_mins`. There is no 30-day High Assurance ceiling (ADR 010's Correction) — this is a choice, not a limit."
-  type        = number
-  default     = 30
-}
-
-variable "globus_production_managed" {
-  description = "Whether the on-instance reconcile may APPLY changes to the production gateway and collection. False means it reports drift and changes nothing. Held false from 2026-04 until 2026-09-23 while this hand-built endpoint was brought under the reconcile; flipped to true once `configure --plan-only` read the live endpoint correctly and proposed exactly one action (the session timeout). The module's own default stays false, so a deployment that has not made this decision is still safe by default. Revert by setting this to false — no other change is needed, and the reconcile goes back to reporting."
-  type        = bool
-  default     = true
 }
 
 
@@ -599,7 +464,6 @@ variable "grafana_namespace" {
 ###################
 # Batch Variables  #
 ###################
-
 
 
 #####################

@@ -4,7 +4,7 @@ Neuroimaging preprocessing pipeline for the ABCD Study. Processes minimally prep
 
 This page is the bird's-eye view: what the components are and how work flows between them. For what each pipeline *step* does to the data, see [pipelines.md](pipelines.md); for the AWS resources themselves, [infrastructure.md](infrastructure.md).
 
-**The one idea that explains the rest of the design:** nothing is persistent. Compute nodes are provisioned per pod and reclaimed after, there is no shared POSIX filesystem, and pod-local disk dies with the pod. Everything that must outlive a step — intermediate volumes, transforms, QC records, logs — is written to S3. Read the diagram below with that in mind and the otherwise-surprising choices (S3 artifacts between steps rather than a mounted volume, a Globus S3 gateway rather than a staged copy, structured metrics rather than log scraping) all follow from it.
+**The one idea that explains the rest of the design:** nothing is persistent. Compute nodes are provisioned per pod and reclaimed after, there is no shared POSIX filesystem, and pod-local disk dies with the pod. Everything that must outlive a step — intermediate volumes, transforms, QC records, logs — is written to S3. Read the diagram below with that in mind and the otherwise-surprising choices (S3 artifacts between steps rather than a mounted volume, an ingress that copies straight into S3 rather than through a staging volume, structured metrics rather than log scraping) all follow from it.
 
 Three control planes divide the work, and it is worth knowing which owns what before changing anything:
 
@@ -57,7 +57,7 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
                                               ▼
                         ┌──────────────────────────────────────────────────────────────────┐
                         │  S3 bucket: <bucket>  (primary data)                            │
-                        │   mmps_mproc/{subj}/{ses}/func/      ← Globus lands here        │
+                        │   mmps_mproc/{subj}/{ses}/func/      ← HTTPS ingress lands here │
                         │   derivatives/fastsurfer/{subj}/                                │
                         │   derivatives/registration/{subj}/{ses}/                        │
                         │   derivatives/func/{subj}/{ses}/     → final outputs            │
@@ -78,10 +78,9 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
                         └──────────────────────────────────────────────────────────────────┘
                                               ▲
                         ┌─────────────────────┴────────────────────────────────────────────┐
-                        │  Globus Connect Server (EC2, stopped when idle)                  │
-                        │  S3 storage gateway → writes directly to <bucket>                │
-                        │  Source: NBDC Data Hub Globus collection                        │
-                        │  Instance ID / collection UUID stored in SSM                    │
+                        │  Source: NBDC Data Hub Globus collection (its HTTPS server)      │
+                        │  https-transfer pod (ingress-nodepool) → writes to <bucket>      │
+                        │  Globus login time / source collection UUID stored in SSM        │
                         └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,7 +93,7 @@ The ArgoCD row is the one that surprises people; see [gitops.md](gitops.md) for 
 | **GitHub Actions** | `push` to `main` touching `images/prefect-flow-runner/**` or `prefect/flows/**` | Builds `cloudpipe-flow-runner` image, pushes to ECR Public |
 | **ArgoCD** (`cluster-addons` ApplicationSet) | New commit on `main` in `gitops/apps/**` | Reconciles Helm releases (Argo Workflows, Prefect, cert-manager, external-secrets, etc.) |
 | **ArgoCD** (`workflow-templates` Application) | New commit on `main` in `argo/workflows/**` | Applies WorkflowTemplates + ConfigMaps to `argo-workflows` namespace. `selfHeal=true` reverts any manual `kubectl apply` within seconds. |
-| **Prefect** `cloudpipe-queue-manager` | Manually triggered deployment run | Drip-feeds subjects from a CSV into the `cloudpipe` Argo WorkflowTemplate. Blocks when the `cloudpipe-max-concurrent` Prefect Variable's count (default 50) of running workflows are active. Reads Globus collection UUID from SSM at runtime. |
+| **Prefect** `cloudpipe-queue-manager` | Manually triggered deployment run | Drip-feeds subjects from a CSV into the `cloudpipe` Argo WorkflowTemplate. Blocks when the `cloudpipe-max-concurrent` Prefect Variable's count (default 50) of running workflows are active. Reads the source collection UUID and base path from SSM at runtime, and refuses an `https` batch on a Globus login that would pass 30 days within its margin. |
 | **Prefect** `first-level-queue-manager` | Manually triggered deployment run | Same drip-feed pattern for `fmri-first-level-proc`. Skips subjects that already have S3 outputs. Shares the same namespace-wide `ConcurrencyGate` counter as cloudpipe-queue-manager. |
 | **Argo Workflows** `cloudpipe` | Prefect submits via Argo API | Per-subject pipeline (see pipeline section below). |
 | **Argo Workflows** `fmri-first-level-proc` | Prefect submits via Argo API | First-level GLM analysis (separate pipeline). |
@@ -113,15 +112,12 @@ Each workflow processes one subject. The master DAG (`cloudpipe-long-master-work
 
 ### Phase 1 — Transfer
 
-| Step | Template | Skips when |
-|---|---|---|
-| Start Globus EC2 instance | `globus-transfer` → `start-globus-instance-template` | Instance already running |
-| Globus transfer | `globus-transfer` → `globus-transfer-template` | `ingress-mode != globus` (i.e. `presynced`) |
-| Verify staged input | `ingress-verify` → `verify-staged-input-template` | `ingress-mode == globus` |
+| Step | Template | Node pool | Skips when |
+|---|---|---|---|
+| HTTPS copy | `globus-transfer` → `https-transfer-template` | `ingress-nodepool` | `ingress-mode != https` (i.e. `presynced`) |
+| Verify staged input | `ingress-verify` → `verify-staged-input-template` | `cpu-light-nodepool` | never; it runs in every mode and refuses an unknown one |
 
-The transfer step writes directly to the data bucket through the S3 storage gateway. Exactly one of the two rows above runs; the other is Skipped, and the inventory gate accepts either. Semaphore caps concurrent transfers at 8.
-
-Node pool: `cpu-light-nodepool`
+The copy lists the subject through the Globus Transfer API and copies each file from the source collection's HTTPS server straight to the data bucket, then checks every object's size. The `https-transfer` semaphore caps concurrent copies. The validator then checks the staged tree against the ingress contract, and the inventory gate accepts either step Skipped but never Omitted. See [data-ingress.md](data-ingress.md). Until 2026-11-12 an `ingress-mode=globus` arm started a Globus Connect Server host and transferred through it; it is retired (ADR 024).
 
 ### Phase 2 — Inventory
 
@@ -129,7 +125,7 @@ Template: `inventory` → `subject-data-inventory-template`
 
 Scans S3 `mmps_mproc/{subj}/` to discover sessions and BOLD runs (task-rest, task-nback only). For each run, checks whether `b2t_exists` and `func_exists` in `derivatives/`. Checks `t1w_to_mni.tar.gz` per session. Checks FastSurfer derivatives for all sessions and the long-template, by each tree's `_complete.json` marker and nothing else (ADR 017). Attaches `nss_frames` from `config/nss_volumes.csv`. Outputs a JSON array describing the subject's **inputs**.
 
-A second template in the same WorkflowTemplate, `published-sessions-template`, narrows that array to the sessions the anatomical phase actually published, and it is that narrowed list the per-session fan-out iterates. The two are not interchangeable: the first is about inputs, the second about outputs, and they diverge whenever the completion guard rejects one timepoint.
+A second template in the same WorkflowTemplate, `published-sessions-template`, narrows that array to the sessions the anatomical phase actually published, and it is that narrowed list the per-session fan-out iterates. The two are not interchangeable: the first is about inputs, the second about outputs. They diverged whenever the completion guard rejected one timepoint and published the rest. Since #1197 a rejection publishes nothing, so on a fresh anatomical run they agree, and the narrowing is a backstop for trees published by older releases.
 
 Node pool: `cpu-light-nodepool`
 
@@ -205,14 +201,13 @@ All infrastructure is in `terraform/`. Run commands from that directory.
 | ECR (private, primary) | `{account-id}.dkr.ecr.{region}.amazonaws.com/cloudpipe/` — layer blobs served via VPC S3 gateway endpoint, no NAT traversal on pull |
 | ECR Public (secondary, being retired) | `public.ecr.aws/l9e7l1h1/cloudpipe/` — most images are dual-pushed here, kept as a one-line rollback target (`local.ecr_public_registry` in `terraform/modules/stack/ecr.tf`). Repos are retired image by image via `local.ecr_images_public_retired`; `fmri-first-level-proc` is already gone |
 | Route53 | `var.domain` — Argo UI, Prefect UI, ArgoCD |
-| SSM Parameter Store | Globus instance ID, collection UUIDs, base paths (see below) |
+| SSM Parameter Store | The Globus login time, the source collection UUID and base paths (see below) |
 
 Key SSM parameters:
 
 | Parameter | Content |
 |---|---|
-| `/cloudpipe/globus/instance-id` | EC2 instance ID of the Globus Connect Server |
-| `/cloudpipe/globus/collection-id` | Destination GCS collection UUID (updated on instance replacement) |
+| `/cloudpipe/globus/session-established-at` | When the stored Globus login was made (written by `pixi run globus login`) |
 | `/cloudpipe/globus/source-collection-id` | Source collection UUID (NBDC Data Hub) |
 | `/cloudpipe/globus/source-base-path` | Root path on source collection |
 
@@ -234,8 +229,8 @@ Most images are dual-pushed to both the private ECR registry (`{account-id}.dkr.
 
 | Image | Used by | Purpose |
 |---|---|---|
-| `bravepy` | Globus control, inventory, S3 sync | Lightweight Python + boto3 for scripting steps |
-| `globus` | `globus-transfer-template` | Runs `transfer.py` — submits and polls Globus transfers |
+| `bravepy` | inventory, S3 sync | Lightweight Python + boto3 for scripting steps |
+| `globus` | `https-transfer-template` | Runs `https_ingress.py` — lists the subject through the Globus Transfer API and copies it over HTTPS into S3 |
 | `fireants` | `t1w-to-mni-template` | FireANTs affine + SyN T1w→MNI registration (GPU) |
 | `synthmorph` | `bold-to-t1w-session-template` | SynthMorph deep learning BOLD→T1w registration |
 | `afni` | `functional-preprocessing-session-template` | AFNI + `preproc.py` functional preprocessing |
@@ -265,7 +260,7 @@ Prefect API is at `https://prefect.<domain>/api`, where `<domain>` is the Terraf
 | Max cloudpipe submissions per minute | 5 (fallback when Variable unset, `0` disables, overridable live) | Prefect Variable `cloudpipe-max-submissions-per-minute` |
 | FastSurfer segmentation device for new workflows | `cpu` (since 2026-11-11; `cuda` or `auto` selectable live) | Prefect Variable `cloudpipe-fastsurfer-device` |
 | Max pod creates per second | 50, burst 90 | `resourceRateLimit`, `terraform/modules/argo-workflows/main.tf` |
-| Max concurrent Globus transfers | 8 | `cloudpipe-semaphores` ConfigMap |
+| Max concurrent HTTPS copies | 2 | `cloudpipe-semaphores` ConfigMap (`https-transfer`) |
 | Max parallel sessions per workflow | 3 (master DAG `parallelism`) | `cloudpipe-long-master-workflow-template.yaml` |
 | Argo workflow max runtime | 12 hours | `activeDeadlineSeconds: 43200` |
 | Argo workflow TTL after completion | 24 hours | `ttlStrategy.secondsAfterCompletion: 86400` |

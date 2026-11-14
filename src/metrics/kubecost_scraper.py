@@ -75,7 +75,6 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from itertools import pairwise
 from typing import Any
 
 import audit_pairs  # type: ignore[import-not-found]
@@ -486,15 +485,20 @@ def parse_node_assets(
     return index
 
 
-def _windows_overlap(candidates: list[NodeAsset]) -> bool:
-    """True when any two instances under one hostname claim overlapping time.
+def _overlaps_another(chosen: NodeAsset, candidates: list[NodeAsset]) -> bool:
+    """True when `chosen` claims time that another instance under its hostname also claims.
 
     A window that is missing counts as overlapping: it cannot be ruled out.
+    Windows that only touch (one ends the minute the next starts) do not overlap.
     """
-    windows = sorted((c.start, c.end) for c in candidates if c.start and c.end)
-    if len(windows) < len(candidates):
-        return True
-    return any(later[0] < earlier[1] for earlier, later in pairwise(windows))
+    for other in candidates:
+        if other is chosen:
+            continue
+        if not (chosen.start and chosen.end and other.start and other.end):
+            return True
+        if chosen.start < other.end and other.start < chosen.end:
+            return True
+    return False
 
 
 def resolve_node(
@@ -514,10 +518,16 @@ def resolve_node(
     - Several: the one whose up-window contains the pod's window. Two
       instances cannot hold one private IP at once, so on the day+1 read,
       which Kubecost serves from hourly data, exactly one does (2026-11-06:
-      91/91 pods). Zero or several is AMBIGUOUS, and so is every pod on a
-      hostname whose instances' windows overlap: that is physically
-      impossible, so those windows — and the minutes, and so the effective
-      rates, computed over them — are not real.
+      91/91 pods). Zero or several is AMBIGUOUS, and so is a pod whose
+      containing instance's window overlaps another instance's on the same
+      hostname: that is physically impossible, so those windows — and the
+      minutes, and so the effective rates, computed over them — are not real.
+      Overlap is judged per instance, not per hostname. An instance whose
+      window touches no other is not made doubtful by an overlap between two
+      OTHER instances under its hostname (2026-11-12: 244 pods, on 9 such
+      instances, all confirmed by CloudTrail — launched with the hostname's IP
+      before the pod started, alive when it ended). Refusing the whole
+      hostname had left them unpriced.
     - Either way, the instance is refused if its nodeType disagrees with its
       own instance-type label (INCONSISTENT_ASSET), or with the pod's
       (TYPE_MISMATCH).
@@ -537,7 +547,7 @@ def resolve_node(
     if len(candidates) == 1:
         chosen = candidates[0]
     else:
-        if pod_start is None or pod_end is None or _windows_overlap(candidates):
+        if pod_start is None or pod_end is None:
             return None, AMBIGUOUS
         containing = [
             c
@@ -547,7 +557,7 @@ def resolve_node(
             and c.start <= pod_start
             and pod_end <= c.end
         ]
-        if len(containing) != 1:
+        if len(containing) != 1 or _overlaps_another(containing[0], candidates):
             return None, AMBIGUOUS
         chosen = containing[0]
 

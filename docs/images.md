@@ -111,7 +111,7 @@ Triggers on changes to `images/prefect-flow-runner/**`, `src/metrics/**` (`COPY`
 **Contents**: Python 3.14 + `boto3` + `botocore` + metrics scripts (`exit_handler.py`, `writer.py`, `schemas.py`), `COPY`ed at build time from `src/metrics/` and `src/inventory.py`.
 
 Used by all lightweight scripting steps that need boto3:
-- `start-globus-instance-template` — EC2 start + SSM waiter
+- `verify-staged-input-template` — checks staged input against the ingress contract, importing `/app/inventory.py`
 - `subject-data-inventory-template` — S3 listing and derivative existence checks
 - `published-sessions-template` — re-reads the FastSurfer completion markers after the anatomical phase to build the per-session fan-out list
 - Init containers in fastsurfer templates that download T1w inputs from S3
@@ -126,13 +126,15 @@ The metrics scripts (`/app/exit_handler.py` etc.) are present in all containers 
 **ECR repo**: `cloudpipe/globus`  
 **Tag**: SHA-pinned  
 **Platform**: `linux/amd64`  
-**Base**: `public.ecr.aws/docker/library/python:3.12-slim-bookworm`  
-**Contents**: Python 3.12 + `globus-sdk>=4,<5`. Runs as UID 1000 (`cloudpipe`).
+**Base**: `public.ecr.aws/docker/library/python:3.15-slim-bookworm`  
+**Contents**: Python + `globus-sdk>=4,<5` + `boto3`, and the three `globus_admin` modules the error translation needs (`__init__.py`, `exits.py`, `errors.py`). Runs as UID 1000 (`cloudpipe`). Used by `https-transfer-template`, on `ingress-nodepool`.
 
 Scripts:
-- `transfer.py` — discovers BIDS files on the source collection, submits a Globus transfer, polls until completion. Handles `TooManyPendingJobs` with exponential backoff (10 attempts, starting at 60s). Reuses an existing active task with the same label if found (idempotent on retry).
-- `setup_auth.py` — retired stub. The login is `pixi run globus login` (see [globus-contract.md](globus-contract.md)); the file remains so older runbooks land on a signpost rather than a missing file.
-- `cancel_transfers.py` — utility to cancel active transfers (used operationally, not in workflows).
+- `https_ingress.py` — the step's entry point: refuses a Globus login older than 30 days (exit 78), lists the subject, copies it, and checks every object's size against the listing.
+- `listing.py` — the discovery walk: lists the subject's sessions and BIDS directories through the Globus Transfer API, filtered to the requested scan types, and prints the `TRANSFER-SUMMARY` line.
+- `https_copy.py` — the copier: one GET per file from the source collection's HTTPS server, streamed into an S3 multipart upload, with concurrency and a request rate limited on the source only.
+
+The image still carries a pinned rclone, which the ingress no longer uses (2026-11-12) but one-off investigation Jobs do. The Globus Transfer task code (`transfer.py`) and the retired `setup_auth.py` and `cancel_transfers.py` went with the Globus host (ADR 024).
 
 Valid scan types: `T1w`, `T2w`, `rest`, `nback`, `sst`, `mid`, `dwi`. Source layout expected: `{subject}/{session}/{bids_dir}/`.
 
@@ -196,7 +198,12 @@ Requires the fsLR meshes staged at `s3://{bucket}/config/fsLR/` — see [pipelin
 **Tag**: SHA-pinned  
 **Platform**: `linux/amd64`  
 **Base**: `deepmi/fastsurfer:cu128-v2.5.4`, pinned by digest: FastSurfer 2.5.4 with FreeSurfer 7.4.1 for its surface stage. Held for the cohort so every subject's anatomy comes from one build; Dependabot ignores it, and a release change means re-running the anatomy  
-**Contents**: FastSurfer with a `nonroot` user (UID/GID 1000) added. `/opt/freesurfer` ownership transferred to 1000. **`/opt/freesurfer/bin/mri_normalize` is replaced** with a static build (like every binary in the tree; it links a static ITK 4.13.2 compiled in the builder stage) from pinned FreeSurfer `v7.4.1` source carrying `images/fastsurfer/patches/0001-mri_normalize-bias-outlier-sentinel.patch` (the HISTOalloc fix, [freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452)); it self-identifies as `7.4.1-cloudpipe-histoalloc1452` in the MGH tag block of every volume it writes. The rest of the FreeSurfer tree is the base image's, untouched. See `docs/pipelines.md` ("The third option: we compile the fix ourselves"). Validated 2026-10-29 on 9 real failing sessions (all recovered) and 19 healthy ones (voxel-identical to stock).
+**Contents**: FastSurfer with a `nonroot` user (UID/GID 1000) added. `/opt/freesurfer` ownership transferred to 1000. **`/opt/freesurfer/bin/mri_normalize` is replaced** with a static build (like every binary in the tree; it links a static ITK 4.13.2 compiled in the builder stage) from pinned FreeSurfer `v7.4.1` source carrying `images/fastsurfer/patches/0001-mri_normalize-bias-outlier-sentinel.patch` (the HISTOalloc fix, [freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452)); it self-identifies as `7.4.1-cloudpipe-histoalloc1452` in the MGH tag block of every volume it writes. The rest of the FreeSurfer tree is the base image's, untouched. See `docs/pipelines.md` ("The third option: we compile the fix ourselves"). Validated 2026-10-29 on 9 real failing sessions (all recovered) and 19 healthy ones (voxel-identical to stock). Three FreeSurfer binaries are wrapped, each moved aside as `<name>.unbounded`/`.unguarded`:
+- `mris_fix_topology` and `mris_topo_fixer` get a time bound (`topology_bound.sh`, #958).
+- `mri_normalize` gets `normalize_aseg_guard.sh`, which clears segmentation labels outside the brain mask and re-runs, but only when the sentinel fires (Deep-MI/FastSurfer#956).
+- `mris_autodet_gwstats` gets `autodet_gm_guard.sh`, which replaces a gray-matter mode equal to the 110 white-matter clip spike and re-runs.
+
+Each runs the stock command unchanged when nothing is wrong. See `docs/pipelines.md` ("Two silent anatomy failures and their guards").
 
 Used by the four anatomical phase templates (`fastsurfer-template-build-template`, `fastsurfer-template-parcellation-template`, `fastsurfer-long-segmentation-template`, `fastsurfer-long-parcellation-template`).
 

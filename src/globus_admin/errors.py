@@ -4,7 +4,7 @@ Each of these cost someone real time at least once, and every one of them reads
 as something other than what it is:
 
 * A lapsed Globus session arrives as `not_from_allowed_domain`, which reads as a
-  gateway misconfiguration. It sent people to inspect `--domain` and identity
+  domain misconfiguration. It sent people to inspect `--domain` and identity
   mapping while a whole 300-subject batch died at pre-flight (2026-08-17). The
   discriminator is `authorization_parameters.session_required_single_domain`: a
   genuinely wrong-domain identity has no session requirement to satisfy.
@@ -27,7 +27,7 @@ LOGIN_COMMAND = "pixi run globus login"
 WARP_REAUTH_COMMAND = "warp-cli debug access-reauth"
 
 
-def globus_error(exc: Exception, *, env: str = "production", context: str = "") -> CliError:
+def globus_error(exc: Exception, *, context: str = "") -> CliError:
     """Translate a Globus SDK error. Unrecognized errors keep their text and exit 3."""
     payload = _globus_payload(exc)
     code = str(payload.get("code") or getattr(exc, "code", "") or "")
@@ -36,7 +36,6 @@ def globus_error(exc: Exception, *, env: str = "production", context: str = "") 
     auth_params = payload.get("authorization_parameters") or {}
     detail = payload.get("detail") or {}
     detail_type = detail.get("DATA_TYPE", "") if isinstance(detail, dict) else ""
-    env_flag = "" if env == "production" else f" --env {env}"
 
     wrong_domain = "not_from_allowed_domain" in f"{detail_type} {code} {message}"
     session_required = bool(
@@ -54,7 +53,7 @@ def globus_error(exc: Exception, *, env: str = "production", context: str = "") 
             f"{domain_text}. Refreshing the token cannot fix this — Globus sessions are "
             "extended by an interactive login, not by a token refresh.",
             exit_code=ExitCode.BLOCKED,
-            remedy=Remedy("command", f"{LOGIN_COMMAND}{env_flag}"),
+            remedy=Remedy("command", LOGIN_COMMAND),
             gate="globus_login",
             raw=raw,
             detail={"allowed_domains": list(domains)},
@@ -63,41 +62,12 @@ def globus_error(exc: Exception, *, env: str = "production", context: str = "") 
     if wrong_domain:
         return CliError(
             "globus.identity_wrong_domain",
-            "The identity used is outside the domains this storage gateway allows. "
+            "The identity used is outside the domains the source collection's High "
+            "Assurance policy allows. "
             "This is an identity problem, not an expired session — there is no session "
             "requirement in the response to satisfy.",
             exit_code=ExitCode.CHECK_FAILED,
-            remedy=Remedy("human", "log in with an identity in the gateway's allowed domain"),
-            raw=raw,
-        )
-
-    # The code is kept; the remedy is not. It used to name `rotate-s3-key`, which
-    # was never built (`simplify-globus-ingress` 9.2, superseded) — and this is the
-    # path a transfer pod takes, so the pod log was telling its reader to run a
-    # command that does not exist. Behind a signing listener the registered key
-    # authenticates nothing, so the cause is one of several that only `doctor` can
-    # tell apart (check 12 for the role); guessing between them here would be wrong
-    # as often as right.
-    if "invalid_credential" in f"{code} {message}" or "requires some initial setup" in message:
-        return CliError(
-            "globus.s3_credential_invalid",
-            "The storage gateway could not authenticate to S3. Behind a signing listener "
-            "that means the listener is down, its role cannot be assumed, or no key pair is "
-            "registered for this identity; on a gateway still using a static key, the key "
-            "itself may be missing or invalid.",
-            exit_code=ExitCode.CHECK_FAILED,
-            remedy=Remedy("command", f"pixi run globus doctor{env_flag}"),
-            raw=raw,
-        )
-
-    if "Bucket not allowed" in message:
-        return CliError(
-            "globus.gateway_path_misconfigured",
-            "The gateway rejected the path's first component as a bucket name. The "
-            "collection must be rooted at /<bucket>, and the gateway created with "
-            "--no-allow-multiple-keys.",
-            exit_code=ExitCode.CHECK_FAILED,
-            remedy=Remedy("command", f"pixi run globus configure{env_flag}"),
+            remedy=Remedy("human", "log in with an identity in the collection's allowed domain"),
             raw=raw,
         )
 
@@ -113,49 +83,12 @@ def globus_error(exc: Exception, *, env: str = "production", context: str = "") 
             raw=raw,
         )
 
-    # Checked last, so every classification above wins: a lapsed session and a
-    # rejected credential are both more specific readings of a failed login than
-    # "the connection ended", and a response can carry both.
-    if _is_transport_eof(f"{code} {message} {raw}"):
-        return CliError(
-            GRIDFTP_UNAVAILABLE,
-            "The collection's GridFTP server closed the connection during login. That is "
-            "the server going away mid-conversation, not a credential being refused — a "
-            "refusal names the identity or the domain. On an instance that has just been "
-            "started, expect this for a minute or so: GridFTP restarts several times while "
-            "the node re-registers, and it accepts TCP connections throughout.",
-            exit_code=ExitCode.CHECK_FAILED,
-            remedy=Remedy("human", "if the instance has just started, wait a minute and retry"),
-            raw=raw,
-        )
-
     return CliError(
         "globus.error",
         message or "Globus returned an error.",
         exit_code=ExitCode.CHECK_FAILED,
         raw=raw,
     )
-
-
-#: A login that ended rather than answered. `doctor` waits on this code, which is
-#: why it is a named constant and why the markers below are narrow: anything folded
-#: in here becomes something the checklist sits and waits on, and waiting fixes only
-#: a server that is still coming up.
-GRIDFTP_UNAVAILABLE = "globus.gridftp_unavailable"
-
-#: Two spellings because two layers produce them: the GridFTP control channel says
-#: "an end-of-file was reached", and globus_xio underneath it says "An end of file
-#: occurred". A real failure has shown both in one message, but neither alone can be
-#: assumed — matching only one would leave the other reading as an ordinary error.
-_TRANSPORT_EOF_MARKERS = (
-    "an end-of-file was reached",
-    "an end of file occurred",
-)
-
-
-def _is_transport_eof(text: str) -> bool:
-    lowered = text.lower()
-    return any(marker in lowered for marker in _TRANSPORT_EOF_MARKERS)
 
 
 def aws_error(exc: Exception, *, profile: str | None = None) -> CliError:

@@ -45,15 +45,14 @@ prefect deployment run cloudpipe-queue-manager/cloudpipe-queue-manager \
 
 The flow gates concurrency: `ConcurrencyGate.count()` counts active Argo workflows and waits until below `max_concurrent` before submitting the next subject. `max_concurrent` is **not** a flow parameter — it's read live from the Prefect Variable `cloudpipe-max-concurrent` (fallback `50` when unset) on every poll cycle, so it can be changed mid-run with `prefect variable set cloudpipe-max-concurrent <N>` without restarting the flow. Use `start_index`/`end_index` to resume after a pause. The controller's `namespaceParallelism` (`400`) is the server-side backstop — see ADR 008 for why a client-side gate alone cannot enforce the cap (#206). Arrivals are also paced to at most `cloudpipe-max-submissions-per-minute` (fallback `5`, `0` disables, read live), so a cold start ramps up instead of creating the cap's whole width at once (#393).
 
-**Direct single-subject submission** (the two collection IDs are in SSM — see
-[globus.md → Deployment values](globus.md#deployment-values)):
+**Direct single-subject submission** (the source collection ID is in SSM — see
+[globus.md → The SSM parameters](globus.md#the-ssm-parameters)):
 ```bash
 argo submit --from workflowtemplate/cloudpipe \
   -n argo-workflows \
   -p subjID=NDARINVXXXXXXXX \
   -p globus-source-collection-id=<source-collection-id> \
   -p globus-source-base-path=/abcd/derivatives/mmps_mproc \
-  -p globus-dest-collection-id=<collection-id> \
   -p globus-dest-base-path=/mmps_mproc \
   -p globus-scan-types='["T1w","T2w","rest","nback"]'
 ```
@@ -74,10 +73,10 @@ argo submit --from workflowtemplate/cloudpipe \
 ### DAG overview
 
 ```
-start-globus-instance ──► record-workflow-start
+https-transfer (https mode only)       record-workflow-start
         │
         ▼
-globus-transfer
+verify-staged-input (every mode)
         │
         ▼
 subject-data-inventory
@@ -135,40 +134,31 @@ See [Phase 5 — Observability and cleanup](#phase-5--observability-and-cleanup)
 
 ### Phase 1 — Transfer
 
-**`start-globus-instance-template`**
-(image: `cloudpipe/python`, node: `cpu-light-nodepool`)
+**`https-transfer-template`** (in the `globus-transfer` WorkflowTemplate, whose name predates this step)
+(image: `cloudpipe/globus`, node: `ingress-nodepool`, semaphore: `https-transfer`, `activeDeadlineSeconds: 7200`; runs only when `ingress-mode == https`, the default)
 
-Reads the GCS EC2 instance ID from SSM (`/cloudpipe/globus/instance-id`), calls `ec2.start_instances()`, and waits for the EC2 status check to pass. Then polls port 443 on the instance's public IP directly — EC2 status checks pass before the boot registration (`cloudpipe-gcs-boot.service`, or `gcs-auto-reregister.service` on an instance built before the Packer AMI) finishes restarting gridftp, so port polling is the correct readiness signal. Idempotent: safe to re-run when the instance is already running.
+Reads `GLOBUS_NATIVE_APP_CLIENT_ID`, `GLOBUS_REFRESH_TOKEN` and `GLOBUS_HTTPS_REFRESH_TOKEN` from the `globus-credentials` K8s Secret, and the login time from SSM (`/cloudpipe/globus/session-established-at`).
 
-Resources: 128M memory, 100m CPU.
-
-Failure modes:
-- Instance doesn't exist at the SSM-stored ID → run `terraform apply` to update the parameter
-- Status check never passes → SSM into the instance and check for boot errors
-- Port 443 never opens (40 × 15s = 10 min timeout) → gridftp may have failed to start; check the instance
-
----
-
-**`globus-transfer-template`**
-(image: `cloudpipe/globus`, node: `cpu-light-nodepool`, semaphore: `globus-transfer` limit 8, `activeDeadlineSeconds: 7200`)
-
-Authenticates using `GLOBUS_NATIVE_APP_CLIENT_ID` + `GLOBUS_REFRESH_TOKEN` from the `globus-credentials` K8s secret.
-
-What `transfer.py` does:
-1. Walks the source collection BIDS tree under `{source-base-path}/{subjID}` — lists sessions, then each `bids_dir` per requested scan type
-2. Checks for an existing active transfer task with label `cloudpipe-{subjID}` (idempotent retry guard)
-3. Submits a new transfer task with `sync_level="checksum"` and `encrypt_data=True`
-4. Handles `TooManyPendingJobs` with exponential backoff
-5. Polls every 60 seconds until the task `SUCCEEDED`
+What `https_ingress.py` does:
+1. Refuses, before any request, a login older than 30 days, a missing one, or an unparseable one — exit 78, which the retry expression excludes
+2. Walks the source collection BIDS tree under `{source-base-path}/{subjID}` through the Globus Transfer API (`listing.py`) — lists sessions, then each `bids_dir` per requested scan type — and records each file's size
+3. Copies each file from the collection's HTTPS server straight into S3, one GET per file streamed into a multipart upload (`https_copy.py`), in up to four passes, each over only the files S3 does not yet hold at the right size
+4. Checks every object's size against the listing
 
 S3 destination pattern: `s3://{bucket}/{dest-base-path}/{subjID}/{session}/{bids_dir}/`
 
-Resources: 256M memory, 100m CPU.
+Resources: 2Gi memory (limit 3Gi), 2 CPU.
 
 Failure modes:
-- Auth error → the Globus session has lapsed; run `pixi run globus login` (see `docs/globus.md`)
-- `FAILED` or `CANCELLED` transfer → check the Globus web app for the task error
-- Semaphore timeout → 8 concurrent transfers are running; the pod waits until a slot opens
+- Exit 78 → the Globus session is past 30 days, or a token is missing or refused; run `pixi run globus login` (see [globus.md → Troubleshooting](globus.md#troubleshooting))
+- `globus.not_found_at_source` → the subject is not under the source base path
+- A size mismatch or a file still missing after the last pass → the step fails naming the file; Argo retries it (limit 3), and the retry copies only what is missing
+- Semaphore wait → the cap of concurrent copies is reached; the pod waits until a slot opens
+
+**`verify-staged-input-template`** (in `ingress-verify`)
+(image: `cloudpipe/python`, node: `cpu-light-nodepool`; runs in every mode)
+
+Checks the staged tree against the ingress contract before inventory reads it, and refuses an `ingress-mode` other than `https` or `presynced`. What it fails and warns on is in [data-ingress.md](data-ingress.md#pre-staging-without-globus-ingress-modepresynced).
 
 ---
 
@@ -232,7 +222,7 @@ Outputs:
 Resources: 256Mi memory, 100m CPU, 500M ephemeral-storage (request and limit).
 
 Failure modes:
-- Subject not found in `mmps_mproc/` → transfer failed silently; check Globus task status
+- Subject not found in `mmps_mproc/` → nothing was staged; in `presynced` mode, check what was staged by hand
 - Subject/session missing from `nss_volumes.csv` → add the row and resubmit
 - S3 permission error → check that `argo-workflows-runner` Pod Identity role has access to the bucket
 
@@ -483,6 +473,8 @@ with no zero guard, no clamp, and — unlike the `-surface` branch, which calls 
 
 **The crash site is exact.** Pass 1's `MRInormFindControlPoints` → `find_tissue_intensities` calls `MRIhistogram(mri_src, 0)` at `mrinorm.cpp:3371`, between its two `printf("white matter peak found at %2.0f\n", …)` at `:3368` and `:3392` — which is why a victim log prints that line **once** and every healthy session prints it **twice**. The first peak search uses `MRIhistogramLabel` restricted to control-point voxels, and the outlier is not a control point, so it succeeds at 110; the whole-volume histogram immediately after hits it. `HISTOGRAM` holds two `float *`, so 8 bytes/bin → **15.9 GiB**, which the `ulimit -v 8G` cap converts into a legible `ErrorExit`. (`prune == 0` here — no `using csf threshold` lines appear anywhere in the log — which rules out the other `find_tissue_intensities` caller at `:3062`.)
 
+> **The control-point geometry has a cause (2026-11-13): [Deep-MI/FastSurfer#956](https://github.com/Deep-MI/FastSurfer/issues/956).** FastSurfer 2.5.0–2.6.0 builds `aseg.auto.mgz` from the unmasked network prediction, so white matter mislabelled outside the brain survives into `aseg.presurf.mgz` and becomes control points at intensity 0. On every one of 35 trees where the sentinel fired, such white matter was present (min 68 voxels; 26 of 87 controls, max 240). Clearing the labels outside `brainmask.mgz` took the non-finite count to **0** on all 5 victims probed, and removing as many white-matter voxels *inside* the mask did not. Present is necessary, not sufficient: one control has 240 such voxels and never fires. `images/fastsurfer/normalize_aseg_guard.sh` now fixes this in-pod — see "Two silent anatomy failures and their guards" under the long parcellation phase. The paragraph below is right that no *intensity* screen generalises; the screen that does is a label one.
+
 **This is why no data-side gate generalises.** The trigger is the *bias fit* — control-point geometry — not intensities. That is exactly the shape of the evidence in the note above: control-point counts, saturation fraction, WM-peak location and NaN/Inf screening each flagged a different victim and cleared the others. Stop looking for an intensity screen. A contributing condition, not a cause: ABCD minimally preprocessed input is already intensity-inhomogeneity corrected (Hagler et al. 2019), which is why `wm_snr_norm` sits essentially on top of `wm_snr_orig` in the metrics dictionary. With the multiplicative field already removed, the bias-field fit is unconstrained to begin with — plausibly why this path is reached on ABCD input at all and would be rarer on raw data.
 
 **FreeSurfer 8 does not fix it; a version bump is not a mitigation.** `utils/mrihisto.cpp`, `utils/histo.cpp` and `utils/mrinorm.cpp` are **byte-identical** across `v7.4.1`, `v8.0.0`, `v8.1.0`, `v8.2.0` and `dev` (md5 `6f471ccf…`, `402aac69…`, `27617d37…`). That was verified with a positive control — `CMakeLists.txt` differs across all four refs, and `mri_normalize.cpp` does differ between 7.4.1 and 8.2.0 (sole change: a `copyVolGeom` → struct-assignment refactor in LTA handling, on a path we do not take) — so the identical hashes are real and not a fetch artifact. `HISTOalloc` in `dev` still has no upper bound. **Filed upstream 2026-08-15 as [freesurfer/freesurfer#1452](https://github.com/freesurfer/freesurfer/issues/1452)** (text retained at `plans/histoalloc-upstream-issue-draft.md`) — the ask is a bound on an unguarded allocation. (The issue says "make the existing one-sided guard symmetric"; that is **wrong**, and the correction above explains why — the guard it names is in `MRIhistogramRegion`, not in the `MRIhistogram` that this path calls.) It was for a long time **not our fix path**: `images/fastsurfer/Dockerfile` is `FROM deepmi/fastsurfer:latest`, so a merged fix must traverse an FS release *plus* FastSurfer adoption. Do not plan around it landing.
@@ -612,7 +604,7 @@ Two operational notes from running it, both now fixed in the manifest. Run 1 (`h
 | `cloudpipe-72cq2` | subject B | `ses-06A` | 2001891713 |
 | `cloudpipe-tgmnx` | subject A | `ses-04A` | 2001892225 |
 
-At 1.0% that is roughly **116 sessions** across the 11,628-subject cohort — sessions, not subjects, and that distinction is now load-bearing. The per-session guard rejects the bad timepoint and publishes the rest, and since #273 drives the session fan-out from published derivatives rather than from the inventory's `t1w_available` list, an affected subject lands `partial` with its remaining sessions delivered instead of `Error` with the whole subject lost.
+At 1.0% that is roughly **116 sessions** across the 11,628-subject cohort — sessions, not subjects, and that distinction is now load-bearing. The per-session guard rejected the bad timepoint and published the rest, and since #273 drives the session fan-out from published derivatives rather than from the inventory's `t1w_available` list, an affected subject landed `partial` with its remaining sessions delivered instead of `Error` with the whole subject lost. (#1197 has since withdrawn the partial delivery: a rejection now publishes nothing, because the survivors' template was built with the rejected session. See the completion guard below. #422 fixed `HISTOalloc` itself.)
 
 > **`cloudpipe-72cq2` and `cloudpipe-tgmnx` were briefly recorded elsewhere as "a spot kill orphaned a FastSurfer tree." That is wrong.** The anatomical phase ran to completion and succeeded in both; `fastsurfer-long-parcellation` exited 0 having rejected one timepoint on `HISTOalloc`. The downstream `The specified key does not exist` failures on `fastsurfer-orig` and `fastsurfer-output` were the #270 fan-out, not a lost upload. Verified against S3: `_complete.json` is present for every session and the long-template of both subjects and absent for exactly the rejected session — a one-to-one match with `published_fastsurfer_sessions()`, so #273's gate excludes precisely those two sessions and over-rejects nothing.
 
@@ -620,9 +612,28 @@ At 1.0% that is roughly **116 sessions** across the 11,628-subject cohort — se
 
 So the container validates each session before publishing it, rejecting any that has an `IsRunning` marker or is missing a non-empty white/pial surface per hemisphere.
 
-Since ADR 017 the guard works **positively**: the publish loop iterates the sessions that passed, so a rejected session is never written and never gets a `_complete.json`. It no longer depends on deleting a directory so that an `optional: true` artifact is skipped. The directory is still removed — for ephemeral-storage reclaim, and so that a future edit iterating the directory listing rather than the guard's verdict cannot publish a rejected session — but removal is no longer what enforces the guard.
+**Since #1197, one rejected session publishes nothing for the subject.** The step exits **69** (`TEMPLATE_TIMEPOINT_FAILED_EXIT_CODE`, category `algorithm`, not retried) before `long_compat_segmentHA.py`, QC or any publish. The reason is the base template: `mri_robust_template` built it from *every* session in `T1w_sessions`, so it is partly shaped by the rejected one. The policy this replaces (#273) published the survivors and pruned the rejected names from `base-tps`. That left every kept session's anatomy in a template made partly from a session production does not keep, and left `base-tps` disagreeing with the template's own `mri/transforms/<ses>_to_<subject>_template.lta` set. The 2026-11-12 reprocess audit found 7 such subjects (8 sessions, all `HISTOalloc` before #422). On one, the upright transform moved 0.59° / 0.6 mm, the conformed headers up to 15 mm and BOLD→T1w up to 19 mm.
 
-> **The deletion order is load-bearing.** Removing the directory at detection time cost two whole workflows in the 300-subject batch of 2026-08-12 (subject A, subject C). `long_compat_segmentHA.py` tolerates an *incomplete* session directory — it had been running against these very sessions before the guard existed — but not a *missing* one. It exited 1, `base-tps` was never written, and the exit-75 guard then retried a **deterministic** failure until the 8-attempt budget was gone (`retryStrategy.expression evaluated to false`), taking each subject's three-plus good sessions with it. Detection therefore runs before the bridge and removal after it. The derivative of a rejected session is genuinely absent — the existence check correctly reports the session missing and the next submission re-runs the phase. Self-healing is restored by making the failure legible, not by adding a second source of truth. Rejected sessions are also pruned from `base-tps` (written from the template's timepoint list, not from what is on disk), so one bad session does not fail `segment-subregions` for the whole subject. If *no* session survives, the step exits **1** — not 75 — because a deterministic allocation failure re-run is an identical failure, the same reasoning that keeps 137 out of the retry expression (#115).
+**The workflow then rebuilds the subject without the rejected session (2026-11-14).** A failed session should end as missing data for that timepoint, not cost the subject its good sessions. So the master runs the anatomical phase through `anatomy-with-rebuild-dag-template`:
+
+1. **Record.** Before exiting 69, the guard writes which sessions it rejected, and from which set, to `scratch/<workflow>/anat/long-rejected.json`.
+2. **Decide.** `decide-anatomy-rebuild` runs only when the attempt failed. It reads that record from a pod that succeeds. (On Argo v4, a downstream reference to a failed pod's unreported output waits forever.) It then either outputs the surviving sessions or exits 1. It refuses when there is no matching record (the failure was something else), when every session was rejected, or after 3 rebuilds.
+3. **Rebuild.** The wrapper calls itself with the survivors and runs the whole phase again, template-build included, so no published session sits in a template the rejected one shaped. Each rebuild has strictly fewer sessions.
+
+These phase semantics were measured on the cluster (`rebuild-phase-probe-8kw79`), not assumed:
+- An attempt that succeeds leaves `decide` and `rebuild` Omitted, and the wrapper Succeeded.
+- A failed attempt followed by a successful rebuild leaves the wrapper Succeeded.
+- A failed attempt that `decide` refuses leaves the wrapper Failed, and everything downstream Omitted.
+
+The rejected session has no `_complete.json`, so `published-sessions` leaves it out of the fan-out. Its `record-outcome-rejected-sessions-dagtask` row then marks the subject `partial`, so a missing timepoint is never silent. Subregion segmentation also takes its session list from `published-sessions`, so it never sees the dropped session.
+
+The cost is a second anatomical run for that subject. If no rebuild is possible, the operator's remedies are unchanged: fix the cause and resubmit, or resubmit with `exclude-sessions=<ses>`.
+
+The CONSORT flow (`scripts/consort_flow.py`) reads the guard's `REJECTED <ses>:` lines and files the rejected session as "FastSurfer produced no anatomy". A sibling lands in the separate *withheld* box only if the rebuild did not succeed.
+
+Before publishing, the step also checks that the template's `<ses>_to_<BASE>.lta` set, `base-tps` and the sessions about to be published are identical. If they differ it exits 1 and writes nothing. That check is the audit's detection method (it agreed with the template logs on 72 of 72 subjects), and it holds at k=1 too.
+
+> **History: the deletion order.** Before #1197 the rejected directory was removed after `long_compat_segmentHA.py`, never before. Removing it at detection time cost two whole workflows in the 300-subject batch of 2026-08-12 (subject A, subject C). The bridge tolerates an *incomplete* session directory but not a *missing* one. It exited 1, `base-tps` was never written, and the exit-75 guard retried a **deterministic** failure until the 8-attempt budget was gone. The step now exits before the bridge and removes nothing, so the hazard is gone.
 
 This is the output-side counterpart to the input-side `find "$SD" -name '*IsRunning*' -delete` guard: the same marker, applied to what the pod produces rather than to what it inherits.
 
@@ -669,6 +680,98 @@ Failure modes:
 - Pod evicted with `ephemeral-storage` pressure → a subject with more sessions than the `12 + 4k` budget anticipated; check `kubectl describe pod` for the eviction reason before raising it
 - FastSurfer crash on a specific session T1w → inspect pod logs; T1w may be unusable
 - `long_compat_segmentHA.py` fails to produce `base-tps` → exits 75 (`EX_TEMPFAIL`) to force a retry of the anatomical phase (usually missing base-template white surfaces)
+- `REJECTED <ses>: surf/autodet.gw.stats.<hemi>.dat has gray_mean or white_border_low >= 100` → the collapsed-surface backstop below fired: the image lacked the autodet guard, or its fallback did not take. Exits 69 under #1197; look for `scripts/autodet-gm-collapsed.<hemi>`
+- `REJECTED <ses>: <hemi> gray-mode fallback produced implausible surfaces` → the guard corrected the hemisphere but the result failed the pial/white area check; the session is most likely misregistered to its template. The workflow rebuilds the subject without it, so it ends as missing data
+
+#### Two silent anatomy failures and their guards
+
+Both were found on 2026-11-13 by comparing our FastSurfer issues against the 2.6.1 release. Both
+ran to "success" in the 2.5.4 cohort. The image now wraps the two FreeSurfer binaries involved, in
+the same move-aside pattern as the topology bound (#958).
+
+- **Each guard is a passthrough until something goes wrong.** The real binary runs first, with
+  recon-all's arguments, untouched. Only when its own output shows the failure does the guard run it
+  a second time on corrected inputs. A healthy session runs the stock command once and is
+  voxel-identical to the cohort build (checked on the controls below), so the one-build census
+  holds for every tree neither failure touched.
+- **The decision logic is in one place:** `images/fastsurfer/fs_guards.py`, with the evidence in
+  its docstring.
+- **Each correction leaves a marker in `scripts/`,** which is published with the tree, so a census
+  can count them.
+
+**1. Labels outside the brain mask, the cause of HISTOalloc.** The wrapper is
+`normalize_aseg_guard.sh`, installed over `mri_normalize`.
+- **Trigger:** the `-aseg` call prints the #1452 sentinel's `cloudpipe: bounded` line, or a NaN/Inf
+  white-matter peak (upstream #956's silent-collapse signature).
+- **Correction:** every label outside the `-mask` volume is cleared from the `-aseg` volume, in
+  place. The corpus callosum is kept, as upstream #957 does. Then the binary runs again.
+- **Downstream effect:** later stages all read the cleared `aseg.presurf.mgz`: wm editing, surface
+  placement, and the hypointensity relabel that makes `aseg.mgz`. `aseg.auto.mgz` and the
+  deep-segmentation stats are untouched.
+- **Marker:** `scripts/aseg-outside-mask-cleaned`.
+- **Validated on 5 victims and 1 control:**
+  - Each victim's guarded `brain.mgz` is voxel-identical to the proven clean result, and its re-run
+    is sentinel-silent.
+  - The control (240 outside white-matter voxels, never fires) is voxel-identical to its unguarded
+    run.
+
+**2. Gray-matter mode = the white-matter clip spike.** The wrapper is `autodet_gm_guard.sh`,
+installed over `mris_autodet_gwstats`.
+- **The mechanism:**
+  - `AutoDetGWStats::AutoDetectStats` clips white matter to 110 in memory (`MRIclipBrightWM`). It
+    then replaces the gray-matter mean with the single highest histogram bin of samples 1 mm outside
+    `?h.orig`.
+  - In some long time points that bin is the 110 spike. Every gray-derived threshold then comes out
+    near 110.
+  - `mris_place_surface` pulls the white surface inward and the pial onto it. Cortex volume about
+    halves, thickness drops about 1 mm, and every step reports success.
+- **Scope in the 2.5.4 cohort:**
+  - 80 of 33,466 session trees in 76 subjects: 28 with one bad hemisphere and 52 with both.
+  - 0 of 11,813 long templates.
+  - Across all 90,558 hemispheres, `gray_mode` is 60–87 or exactly 110, with nothing in between.
+- **Not fixed upstream:** `AutoDetectStats` and `MRIScomputeClassModes` are byte-identical in
+  FreeSurfer 7.4.1 and 8.2.0, so FastSurfer 2.6.x does not fix this.
+- **Trigger:** the `.dat` the real binary wrote has `gray_mode` ≥ 100.
+- **Correction, step one:** re-run with the five gray-derived thresholds overridden. The fallback
+  gray value is FreeSurfer's own class mean, which it prints before the mode overwrite, plus a
+  −3.1 offset.
+  - That offset is the median mode − class-mean gap over 626 healthy hemispheres (IQR −4.2 to −2.0).
+  - The failing hemispheres' class means are normal (68.5–79.3), so only the mode is broken.
+- **Correction, step two:** rewrite `gray_mean` in the `.dat`. **The overrides alone fix only the
+  pial.** `mris_place_surface` places the white surface from `gray_mean`
+  (`border_low = f·gray_mean + (1−f)·white_mean`, f = 1; `mris_place_surface.cpp:639-642`), not
+  from `white_border_low`. That formula is also unchanged in 8.2.0.
+- **Markers:** `scripts/autodet-gm-fallback.<hemi>` for a correction. If the fallback cannot be
+  computed or does not take, the hemisphere fails with `scripts/autodet-gm-collapsed.<hemi>`.
+- **Validated on one session with one collapsed hemisphere,** replaying the long stream's autodet →
+  white.preaparc → white → pial with the guarded image:
+
+  | rh | mean thickness | white area | pial area |
+  |---|---|---|---|
+  | published (collapsed) | 1.59 mm | 790 cm² | 934 cm² |
+  | guarded | 2.63 mm | 927 cm² | 1,191 cm² |
+  | healthy lh (reference) | 2.63 mm | 928 cm² | 1,177 cm² |
+
+  The lh passed through the guard and reproduced its published surfaces exactly. The fallback gray
+  for rh was 68.5; the lh's own mode is 68.
+- **Backstop, part one:** the long-parcellation completion guard rejects any session whose `.dat`
+  still has `gray_mean` or `white_border_low` ≥ 100.
+- **Backstop, part two:** a corrected hemisphere must also have plausible surfaces. Its pial/white
+  area ratio has to sit in [1.15, 1.35] (`fs_guards.py surface-check`); healthy hemispheres are
+  1.176–1.309 (n = 800), and the validated correction was 1.285.
+  - **Why it's needed:** on a session misregistered to its template (one case is rotated 93.5°
+    against about 21° for its sibling sessions) the class statistics look normal, so the fallback
+    runs. But the white surface comes out *larger* than the pial (ratio 0.97–0.98). That no longer
+    reads 110, so without this check it would be published.
+  - **What happens then:** such a session is rejected, and the workflow rebuilds the subject's
+    anatomy without it, so it ends as missing data and the subject's other sessions are kept.
+
+**Already-published trees are not changed by the image.**
+- **The 80 collapsed sessions need their anatomy rerun** on the guarded image. After the rerun,
+  rebuild the anatomical-QC reject list (`scripts/build_anat_qc_rejects.py --write`, #1207), or the
+  fixed sessions stay excluded.
+- **Rerunning the 35 sentinel-rescued trees is optional.** Their `brain.mgz` differs from the clean
+  result mostly by 1 intensity unit (at most 2,541 voxels by more than 10).
 
 ---
 
@@ -725,6 +828,8 @@ A single `cpu-light` pod, `inventory` → `published-sessions-template`, sits be
 Sessions with no T1w source are excluded by the same filter and are **not** counted as rejections: they were never FastSurfer candidates, so reporting them as failures would mark most longitudinal subjects partial forever.
 
 Each rejected session gets a `fastsurfer-long-parc` StepOutcome with `status: Failed` at session grain, which is what makes the exit handler report `overall_status: partial`. Without it the subject would report `succeeded` — nothing fails any more — while silently missing a timepoint.
+
+This is again the main path. A guard rejection fails that attempt (exit 69, #1197), and the rebuild then publishes the survivors without the rejected session. This gate is what turns the rejected session into a `partial` subject.
 
 `session-level-pipeline-dag-template` receives per-session parameters from that fan-out: `session`, `runs`, `nss-frames`, `t1w-to-mni-exists`.
 
@@ -1273,7 +1378,7 @@ Runs on `cpu-light-nodepool`, 128M memory, 100m CPU. Invokes `exit_handler.py` w
 
 Query via Athena using the `workflow_runs` and `subject_manifests` tables.
 
-**Step 2 — `delete-globus-input-template`** (runs only when `workflow.status == Succeeded`)
+**Step 2 — `delete-globus-input-template`** (runs only when `workflow.status == Succeeded` and `ingress-mode` is not `presynced`)
 
 Runs on `cpu-light-nodepool`, 128M memory, 100m CPU. Paginates and deletes all objects under `s3://{bucket}/{globus-dest-base-path}/{subjID}/` using `delete_objects`. This avoids storing raw minimally-preprocessed input files long-term — derivatives are the durable output.
 
@@ -1453,7 +1558,7 @@ That is 8 label maps per hemisphere (16 total): the primary segmentation plus th
 - **After a checkpoint restore**, an incomplete tree counts as absent and the region recomputes. That only happens when the phase runs: `check_subregions_derivatives` reads markers, so a master resubmit skips a subject whose markers exist even if a tree is short a session; repair takes a direct `argo submit --from workflowtemplate/subregion-seg`.
 - **Before a publish**, a tree missing a session fails the phase with exit 1 (not the retryable 75: a tool that skipped a session will skip it again) instead of being published under a marker claiming completeness.
 
-The patterns were checked against 300 published subjects (859/859 sessions for all three regions) before gating on them. Sessions come from `base-tps`, which the #248 completion guard prunes of rejected timepoints, so a rejected session never trips the gate (verified across all 11,503 subjects on 2026-09-15).
+The patterns were checked against 300 published subjects (859/859 sessions for all three regions) before gating on them. Sessions come from `base-tps`. When this was verified (all 11,503 subjects, 2026-09-15), the #248 completion guard pruned rejected timepoints from it, so a rejected session never tripped the gate. Since #1197 a rejection publishes no long-template at all, so `base-tps` always lists exactly the template's sessions and every one of them is published.
 
 **T1-only:** `segment_subregions` exposes no T2 input, so the T2w scans this pipeline ingests are not used in this phase. (FastSurfer's HypVINN, in the anatomical phase, *does* accept `--t2` and currently runs T1-only.)
 
@@ -1484,8 +1589,20 @@ The OpenSpec spec `first-level-analysis` states cloudpipe's side of the contract
 
 **Workflow** (one per subject):
 
-1. `list-sessions` lists the subject's sessions that have a `derivatives/func/` `_complete.json`.
+1. `list-sessions` lists the subject's sessions that have a `derivatives/func/` `_complete.json`, less any session on the anatomical-QC reject list (below).
 2. `first-level` runs one pod per session. Sessions succeed, fail and retry independently.
+
+**The anatomical-QC reject list** (#1205) holds the sessions whose cortical surfaces collapsed. All are longitudinal time points. FreeSurfer's `mris_autodet_gwstats` estimates grey matter as the most common intensity just outside the white surface, after white matter has been clipped to 110. In these sessions the clip spike wins, so `gray_mean` in `surf/autodet.gw.stats.?h.dat` is 110. `mris_place_surface` places the white surface from that value and derives the pial thresholds from it, so both surfaces collapse inward, and every step still reports success. T1w → MNI QC rejects only the gross cases, so the others reach func.
+
+What tips a session over isn't established. Two things track it: a mismatch between the session and its template, and a change of scanner manufacturer between visits. In subjects scanned on more than one manufacturer, the odd-one-out session fails 32% of the time, against 0.12% otherwise.
+
+fsqc measures the collapse: its white/grey contrast, `con_snr_{lh,rh}`, falls to about 0, against a cohort median of 3.36. In November 2026 no session scored between 0.47 and 1.15. A session whose lower hemisphere scores below 1.0 is on the list; 81 of the 82 sessions it caught had `gray_mean` = 110.
+
+The list is an interim gate until the affected subjects are rebuilt, and it deletes nothing. It is keyed by subject ID, so it lives only in the data bucket, at `config/anat_qc_rejected.csv`. `scripts/build_anat_qc_rejects.py` rebuilds it from the fsqc_qc metrics: a dry run by default, and `--write` uploads it.
+- **Rebuild it after any anatomy rebuild**, because a rebuilt session gets a new fsqc record and is judged on that.
+- **Who reads it:** the first-level stager and the first-level queue manager skip listed sessions, and the CONSORT flow counts them as an exclusion after anatomy.
+- **Both first-level readers fail closed.** Without the list they refuse to run rather than fit every session.
+- **Older outputs stay in place.** A listed session's func and first-level outputs written before the list existed are not removed, so read the list before using a session's outputs directly.
 
 **Per session,** the runner downloads only the runs the func marker names, and calls the fork's `fmri-first-level-abcd` on the local copy. Staging and every analysis setting live in the fork; its `docs/abcd_staging.md` describes them, and its `docs/orchestrator_comparison.md` lists where they differ from Taylor's orchestrator. Since `4.0.0+cp.2`, rest denoising matches the orchestrator's: no global signal regression, and WM and CSF regressors from FastSurfer's 1 mm `label-WM_mask` and `label-CSF_mask`, nearest-neighbour to the BOLD grid within the run's brain mask. The probseg maps are no longer read. Since `4.0.0+cp.10` those regressors are the confounds TSV's own `white_matter` and `csf` columns (step 6b above, with the same definition), less the trimmed rows. The runner no longer downloads the masks, and a TSV without the columns skips rest as `no-tissue-confounds`. Trees written before cp.10 computed the same regressors with `3dmaskave`, to 6 significant digits, and were not rerun. On one subject's four sessions, cp.10 moved the regressors by at most 4.9e-6 relative, and the rest Fisher-z matrices by a mean |Δz| of 5e-5 to 1.4e-4 (at most 0.0012; r above 0.9999998), so the two versions are interchangeable. Since `4.0.0+cp.6` the fork also:
 - ships the Schaefer 400 + Tian S4 atlas with its licences, so the image carries no copy;
@@ -1503,7 +1620,19 @@ It also changes what a session keeps, per Taylor Keding: each run's series, not 
 
 **The staged-run backfill** brings those older trees to the same layout without rerunning them (operator, 2026-11-11). `{pre}_concat_scan` is the staged n-back runs end to end, so the `staged-backfill` WorkflowTemplate (`images/fmri-first-level-proc/staged_backfill.py`) cuts it back into them with `3dTcat`, checks each against it voxel for voxel, and publishes them under `staged/`. Then it deletes both n-back analyses' `{pre}_concat_scan` and `{pre}_psc`, and writes the marker last, with `staged_bold` per run, `removed` per analysis, and a `staged_backfill` record of what changed. Only n-back runs are added: rest runs were never concatenated, and `derivatives/func/` rebuilds them exactly. A session whose listing disagrees with its marker, or whose rebuilt runs differ by one voxel, is set aside untouched. Each session's original marker and plan are kept at `config/first-level/staged-backfill/{label}/state/`, and an interrupted session resumes from there. Run it only through `scripts/backfill_staged_runs.py plan | submit | verify`, and not while the first-level queue manager runs: each session's marker is briefly absent mid-backfill. One session takes about 150 s on one CPU.
 
-Since `4.0.0+cp.12`, `nback_conn/` no longer holds its own copy of what it shares with `nback_act/`: the PSC runs, their means, the run-intersection mask and the resampled atlas (about 0.6 GB a session). Read them from `nback_act/`. `nback_conn`'s own results, including its min-outlier EPIs and raw ptseries, are unchanged. Trees written before cp.12 hold both copies.
+Since `4.0.0+cp.12`, `nback_conn/` no longer holds its own copy of what it shares with `nback_act/`: the PSC runs, their means, the run-intersection mask and the resampled atlas (about 0.6 GB a session). Read them from `nback_act/`. `nback_conn`'s own results, including its min-outlier EPIs and raw ptseries, are unchanged. Trees written before cp.12 hold both copies until the conn-dedup job below removes nback_conn's.
+
+**The conn-dedup job** brings pre-cp.12 trees to that layout (operator, 2026-11-13). The `conn-dedup` WorkflowTemplate (`images/fmri-first-level-proc/conn_dedup.py`) deletes each of `nback_conn/`'s shared files only once it is shown to be `nback_act/`'s data: equal size and ETag (cp.11 uploaded both from one hard-linked file), or else both decompressed and their voxels, shape and grid compared. A copy that differs is kept and recorded. Candidates are only `nback_conn`'s ledger `intermediate` outputs with a shared name that `nback_act/` also holds. A tree whose listing disagrees with its marker, or that still holds a concatenation, is set aside untouched. The marker is rewritten last, with `deduplicated` as cp.12 writes it and a `conn_dedup` record; the original is kept at `config/first-level/conn-dedup/{label}/state/`. Run it only through `scripts/backfill_conn_dedup.py plan | submit | verify`, and not while the first-level queue manager runs. A pre-cp.11 session takes about 2 minutes on one CPU, a cp.11 one under a second.
+
+**Reading first-level trees across versions.** File names are the same in every version, so code that reads a session should never branch on `package_version`. Compared on 2026-11-13, one complete session (2 n-back, 4 rest runs) from each of cp.6 to cp.10, all backfilled, held exactly cp.11's files less its rest staged runs. These things do differ, and code reading every session should follow these rules:
+
+| What | Which sessions | Read it this way |
+|---|---|---|
+| `staged/{s}_task-rest_run-{NN}_bold.nii.gz` | cp.11+ only; older sessions never kept their staged rest runs | Rebuild from `derivatives/func/` exactly as staging does: `3dcalc -a '{run}_space-MNI152NLin2009cAsym_bold.nii.gz[{n_remove}..$]' -b {run}_space-MNI152NLin2009cAsym_brainmask.nii.gz -expr 'a*step(b)' -datum float`, with `n_remove` from the marker's `runs` entry. The n-back staged runs exist in every session. |
+| `{pre}_run{N}_psc`, `{pre}_run{N}_mean`, `{pre}_run_intersect_mask`, the resampled atlas | in `nback_conn/` only before cp.12, until conn-dedup removes them | Always read them from `nback_act/`, which has them in every version. |
+| Single-run names | a session that supplied one n-back run | Its files carry no run number: `{pre}_psc.nii.gz`, `{pre}_mean.nii.gz`, `{pre}_min_outlier_epi.nii.gz`, and no `{pre}_run_intersect_mask`. Wherever `{pre}_psc.nii.gz` still exists, it is that one run's PSC: the multi-run concatenation of that name was deleted from every tree. |
+| The marker's `analyses.{analysis}.removed` | cp.11+ lists `{pre}_psc.nii` and `{pre}_concat_scan.nii`; backfilled sessions list `.nii.gz`, with a `staged_backfill` record | Treat both suffixes as the same two files. Neither exists in the bucket. |
+| `rest_conn/…_concat_residual_dtseries.nii.gz` sub-brick labels | `residual.nii[i]` from cp.11, `residual.nii.gz[i]` before | Address sub-bricks by index. The data are identical. |
 
 Cloudpipe holds no analysis logic. The runner, `stage_first_level.py`, only lists sessions, downloads, calls the CLI, publishes and maps exit codes. Each analysis runs as `fmri-first-level-proc --config … --analyses <i>`:
 
@@ -1567,7 +1696,7 @@ aws s3api list-objects-v2 --bucket "$CLOUDPIPE_BUCKET" --prefix derivatives/func
 
 ### Concurrency accounting
 
-Both Prefect flows count all active Argo workflows via the same `lib/argo.py` `ConcurrencyGate` implementation. If both pipelines run simultaneously, coordinate the `cloudpipe-max-concurrent` and `first-level-max-concurrent` Prefect Variables (`prefect variable set <name> <N>`) so the combined load stays within cluster and Globus semaphore limits (semaphore cap: 8 concurrent Globus transfers) and at or below the controller's namespace-wide `namespaceParallelism` of `400`.
+Both Prefect flows count all active Argo workflows via the same `lib/argo.py` `ConcurrencyGate` implementation. If both pipelines run simultaneously, coordinate the `cloudpipe-max-concurrent` and `first-level-max-concurrent` Prefect Variables (`prefect variable set <name> <N>`) so the combined load stays within cluster limits and at or below the controller's namespace-wide `namespaceParallelism` of `400`.
 
 ### Forcing a step to re-run
 

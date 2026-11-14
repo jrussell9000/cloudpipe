@@ -2,13 +2,12 @@
 
 `schemas/answers.schema.json` is the contract; this module is the way the rest of
 the code reads it, so nothing restates a field name, a prompt, or the gate list in
-Python. `globus init` renders from it (task 8.10), `setup-status` names gates from
-it, and a future wizard can render a form from the schema alone.
+Python, and a wizard can render a form from the schema alone.
 
 Validation lives here too, and is driven by the schema rather than restating it:
 every rule a problem can report comes from reading the same file a form
-generator reads, so the two can never disagree about what is valid. `init`
-decides how to present the problems; it does not decide what they are.
+generator reads, so the two can never disagree about what is valid.
+`config.load` runs it before any command acts.
 
 `jsonschema` is deliberately not used. It is not a declared dependency, and its
 errors name JSON Pointers and failing subschemas — accurate, and the wrong thing
@@ -32,24 +31,6 @@ from typing import Any
 
 SCHEMA_PATH = Path(__file__).with_name("schemas") / "answers.schema.json"
 
-#: How a secret is referred to rather than written down. `secretsmanager:<name>`
-#: reads from AWS Secrets Manager; `ssm:<parameter-name>` reads a SecureString from
-#: SSM Parameter Store; `env:<VARIABLE>` reads from the environment.
-#:
-#: `ssm:` exists because production's GCS service-client secret is already an SSM
-#: SecureString at `/cloudpipe/globus/gcs-client-secret`, alongside its client id and
-#: deployment key. Without this scheme an answers document could not truthfully say
-#: where that secret lives, and the only alternative was moving a live secret between
-#: stores to satisfy the schema — a migration with real blast radius, to fix a
-#: description. Note the consequence: Globus secrets now live in two stores, so
-#: anything that enumerates them must consult both.
-#:
-#: Kept in step with the schema's `pattern` by
-#: `tests/globus/test_answers_schema.py::test_the_pattern_and_the_scheme_list_agree`.
-#: The two encodings are independent — the pattern gates the document, this tuple
-#: gates `is_secret_reference` — so a scheme added to one alone splits them silently.
-SECRET_SCHEMES = ("secretsmanager", "ssm", "env")
-
 
 @dataclass(frozen=True)
 class Field:
@@ -70,11 +51,6 @@ class Field:
     pattern: str | None = None
     gate: str | None = None
     derived: bool = False
-
-    @property
-    def secret_reference(self) -> bool:
-        """Whether this field holds a pointer to a secret rather than a value."""
-        return self.name.endswith("_secret_ref")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -275,14 +251,3 @@ def _group_problems(document: dict[str, Any], document_schema: dict[str, Any]) -
             f"{alternatives}: one of these is required, and none is set",
         )
     ]
-
-
-def is_secret_reference(value: str) -> bool:
-    """Whether `value` points at a secret instead of being one.
-
-    Used to keep a literal out of the answers document. The check is on the shape
-    of the reference, not on whether the target resolves: a wrong pointer is a
-    mistake someone can see and fix, while a pasted secret has to be rotated.
-    """
-    scheme, _, rest = value.partition(":")
-    return scheme in SECRET_SCHEMES and bool(rest)

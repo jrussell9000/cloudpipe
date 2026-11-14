@@ -105,8 +105,8 @@ class Form:
             ui.label("Set up your CloudPipe deployment").classes("text-2xl font-semibold")
             ui.markdown(
                 "Answering these questions creates nothing in AWS or Cloudflare, and no password "
-                "or key is asked for. The optional Globus data transfer is set up separately, "
-                "with `globus init`."
+                "or key is asked for. HTTPS ingress's Globus login is made separately, with "
+                "the `globus login` command."
             )
             with ui.row().classes("text-sm text-grey-8 gap-6"):
                 ui.label(f"Terraform root: {self.root}")

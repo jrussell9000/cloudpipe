@@ -2,22 +2,24 @@
 """Deregister superseded Packer AMIs and delete the snapshots behind them.
 
 Nothing used to prune AMIs, and an AMI's snapshot IS the AMI, so every bake left
-~60 GiB (GPU) or ~20 GiB (globus) of EBS snapshot billing behind forever. Two
-months of that reached 17 AMIs / 700 GiB, of which 2 AMIs were referenced (#734).
+~60 GiB (GPU) of EBS snapshot billing behind forever. Two months of that reached
+17 AMIs / 700 GiB, of which 2 AMIs were referenced (#734).
 
-The retention policy is **current + one generation back, per kind**. Both images
-are reproducible from pinned inputs, so strictly none of the old ones are needed;
-what the spare insures against is a 30-minute rebake that depends on upstream
-still serving those inputs (`deepmi/fastsurfer` at a digest, the GCS tarball).
+The retention policy is **current + one generation back, per kind**. The image is
+reproducible from pinned inputs, so strictly none of the old ones are needed; what
+the spare insures against is a 30-minute rebake that depends on upstream still
+serving those inputs (`deepmi/fastsurfer` at a digest).
 
 Keeping two also covers the window this repository actually operates in: a bake
 pins its AMI in Terraform but does not roll anything. The GPU AMI reaches nodes on
-the next `terraform apply`; the globus AMI reaches the host when a PR is merged and
-applied. Until then the LIVE image is the previous generation, and it is inside the
-keep set by construction rather than by luck.
+the next `terraform apply`. Until then the LIVE image is the previous generation,
+and it is inside the keep set by construction rather than by luck.
+
+(The `globus` kind went with the Globus host, 2026-11-12: openspec
+retire-globus-host 5.8 deregistered the whole family with it, then 7.1 deleted it.)
 
 The failure mode is deleting an AMI something still needs, which is unrecoverable
-and only surfaces the next time a node or the Globus host launches. So every query
+and only surfaces the next time a node launches. So every query
 here is a guard, and every guard fails CLOSED: anything unexpected — an unreadable
 pin, a pin that resolves to no AMI, a missing CreationDate, an API error — aborts
 the whole run instead of pruning on a partial picture. Deleting nothing is always
@@ -26,7 +28,6 @@ an acceptable outcome; this script's job is to be boring.
 Usage:
 
     scripts/prune_amis.py --kind gpu --dry-run
-    scripts/prune_amis.py --kind globus
 
 `--dry-run` prints exactly what a real run would delete and touches nothing.
 """
@@ -63,6 +64,8 @@ class PruneAborted(RuntimeError):
 
 
 class Kind:
+    """One family of baked AMIs."""
+
     def __init__(self, name: str, name_prefix: str, pin_file: str):
         self.name = name
         self.name_prefix = name_prefix
@@ -76,13 +79,6 @@ KINDS = {
         #   "cloudpipe-gpu-fastsurfer-<digest12>-fireants-<digest12>-<timestamp>"
         name_prefix="cloudpipe-gpu-fastsurfer-",
         pin_file="terraform/modules/stack/karpenter.tf",
-    ),
-    "globus": Kind(
-        "globus",
-        # packer/globus-gcs/globus-gcs.pkr.hcl:
-        #   "cloudpipe-globus-gcs-<gcs_version>-<timestamp>"
-        name_prefix="cloudpipe-globus-gcs-",
-        pin_file="terraform/modules/stack/globus.tf",
     ),
 }
 
@@ -106,17 +102,6 @@ def pinned_gpu_digests(karpenter_tf: str) -> tuple[str, str]:
             "which AMI Karpenter resolves to"
         )
     return fastsurfer.group(1), fireants.group(1)
-
-
-def pinned_globus_ami_id(globus_tf: str) -> str:
-    """The AMI id `aws_instance` boots the Globus Connect Server host from."""
-    match = re.search(r'globus_ami_id\s*=\s*"(ami-[0-9a-f]+)"', globus_tf)
-    if not match:
-        raise PruneAborted(
-            "could not read globus_ami_id from the globus pin — the pin format "
-            "changed and this script cannot tell which AMI the host boots"
-        )
-    return match.group(1)
 
 
 # ── Selection ────────────────────────────────────────────────────────────────
@@ -181,7 +166,10 @@ def select_for_deletion(
     posture of this script.
     """
     if keep < 1:
-        raise PruneAborted("--keep must be at least 1; keeping zero generations is not a policy")
+        raise PruneAborted(
+            "--keep must be at least 1; keeping zero generations is not a policy "
+            "for a kind something still boots"
+        )
 
     newest_first = sorted(candidates, key=_creation_date, reverse=True)
     keep_ids = {image["ImageId"] for image in newest_first[:keep]} | set(protected_ids)
@@ -274,9 +262,8 @@ def protected_image_ids(region: str, kind: Kind, aws: Callable[..., dict]) -> se
     each answers a different question: what Terraform SAYS is current, what is
     running right now, and what something is still able to launch.
     """
-    pin_text = (REPO_ROOT / kind.pin_file).read_text()
-
     if kind.name == "gpu":
+        pin_text = (REPO_ROOT / kind.pin_file).read_text()
         # Karpenter resolves the AMI by tag, not by id, so the pin has to be
         # resolved the same way. Matching nothing is an abort: either the pin was
         # hand-edited ahead of a bake or the tags changed shape, and in both cases
@@ -299,12 +286,7 @@ def protected_image_ids(region: str, kind: Kind, aws: Callable[..., dict]) -> se
                 "to prune while the live AMI cannot be identified"
             )
     else:
-        # Pinned by id, so the guard is that the id still exists. describe-images
-        # raises InvalidAMIID.NotFound for an absent one, which _aws turns into an
-        # abort — correct: a broken pin is not the moment to delete images.
-        ami_id = pinned_globus_ami_id(pin_text)
-        aws(region, "describe-images", "--image-ids", ami_id)
-        pinned = {ami_id}
+        raise PruneAborted(f"no pin reader for kind {kind.name!r}")
 
     in_use = image_ids_in_use(
         aws(

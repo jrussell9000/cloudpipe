@@ -108,7 +108,7 @@ spec:
       # The freesurfer image: it ships registration_qc.py (bold-to-t1w) and boto3
       # on the system python, and already runs on cpu-heavy-nodepool. Re-pinned
       # with every freesurfer build by build-images.yaml.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:67da323487e00fd741d6233fd27134034194731770967a751aa99586cae270ef"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:1db506dd96d008ef81a77f59dc604acacdf782d64f8e578eba067c688f1dcdec"
       imagePullPolicy: IfNotPresent
       # The system interpreter, not bare `python3`: FreeSurfer's bundled 3.8 is
       # first on PATH and has no boto3 (see bold-to-t1w-session-template).
@@ -134,7 +134,7 @@ spec:
         # Provenance on each outcome line; repeats the image ref above so
         # build-images.yaml's re-pin rewrites both together.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:67da323487e00fd741d6233fd27134034194731770967a751aa99586cae270ef"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/freesurfer@sha256:1db506dd96d008ef81a77f59dc604acacdf782d64f8e578eba067c688f1dcdec"
         - name: OMP_NUM_THREADS
           value: "1"
         - name: OPENBLAS_NUM_THREADS

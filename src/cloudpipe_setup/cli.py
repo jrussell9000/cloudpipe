@@ -135,10 +135,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Check the collected answers against the world. Read-only; creates nothing.",
         parents=[common],
         description="Verify the facts the collected inputs assert about the world: the resolved "
-        "AWS identity, the hosted zone (when there is a domain), the managed prefix list, the "
-        "Cloudflare token and its Zero Trust scope, a federated provider's metadata, MFA "
-        "evidence and client secret, and whether `globus init` has rendered its inputs. "
-        "Every call is a read.",
+        "AWS identity, the hosted zone (when there is a domain), the data bucket and its "
+        "reference files, the machine images, image scanning, the Cloudflare token and its "
+        "Zero Trust scope, and a federated provider's metadata, MFA evidence and client "
+        "secret. Every call is a read.",
     )
     preflight.add_argument(
         "--account",

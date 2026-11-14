@@ -702,22 +702,21 @@ data "aws_iam_policy_document" "github_actions_packer" {
   # Narrowing those actions does not fix it. PutRolePolicy alone is sufficient
   # for the escalation, and Packer requires PutRolePolicy to apply a temporary
   # policy document — so the only real fix is for Packer not to write IAM. The
-  # builder profiles are now pre-created in packer_builder_profiles.tf and both
-  # templates reference them by name.
+  # builder profile is now pre-created in packer_builder_profiles.tf and the
+  # template references it by name.
   #
-  # What remains is PassRole on exactly those two roles, which RunInstances
-  # needs to launch with a profile. It is not escalatable: both roles' policies
-  # are Terraform-managed and hold only SSM messaging plus, for the GPU builder,
-  # read-only pulls from this deployment's ECR repositories. A job with this
-  # role can launch an instance as the builder, which it could already do, and
-  # can no longer decide what the builder is allowed to do.
+  # What remains is PassRole on exactly that role, which RunInstances needs to
+  # launch with a profile. It is not escalatable: the role's policy is
+  # Terraform-managed and holds only SSM messaging and read-only pulls from this
+  # deployment's ECR repositories. A job with this role can launch an instance as
+  # the builder, which it could already do, and can no longer decide what the
+  # builder is allowed to do.
   statement {
     sid     = "PackerPassBuilderProfile"
     effect  = "Allow"
     actions = ["iam:PassRole"]
     resources = [
       aws_iam_role.packer_builder_gpu.arn,
-      aws_iam_role.packer_builder_globus.arn,
     ]
   }
 
@@ -730,7 +729,7 @@ data "aws_iam_policy_document" "github_actions_packer" {
   #   packer-builder-gpu
   #
   # Reads, not escalation: Get* cannot change what a role may do, which is the
-  # whole reason the writes were removed. Scoped to the two builder identities
+  # whole reason the writes were removed. Scoped to the builder's identities
   # anyway so this does not become a general IAM-enumeration grant.
   statement {
     sid    = "PackerReadBuilderProfile"
@@ -741,9 +740,7 @@ data "aws_iam_policy_document" "github_actions_packer" {
     ]
     resources = [
       aws_iam_role.packer_builder_gpu.arn,
-      aws_iam_role.packer_builder_globus.arn,
       aws_iam_instance_profile.packer_builder_gpu.arn,
-      aws_iam_instance_profile.packer_builder_globus.arn,
     ]
   }
 
@@ -762,27 +759,9 @@ data "aws_iam_policy_document" "github_actions_packer" {
     resources = ["*"]
   }
 
-  # ── SSM Parameter Store: Canonical's published "current stable" AMI id ──────
-  # `packer/globus-gcs/` selects its Ubuntu 24.04 base from Canonical's public
-  # parameter rather than an AMI-name filter, because the parameter is
-  # Canonical's own statement of which image is current while a name filter can
-  # match one they have since superseded. Without this the build fails before it
-  # starts, on the data source rather than on anything it builds.
-  #
-  # The path is confined to Canonical's. These parameters are public and owned by
-  # the `ssm` service account, which is why the ARN carries a region and no
-  # account id — an account id here would match nothing.
-  statement {
-    sid    = "PackerReadCanonicalAMIParameter"
-    effect = "Allow"
-    actions = [
-      "ssm:GetParameter",
-      "ssm:GetParameters",
-    ]
-    resources = [
-      "arn:aws:ssm:${var.region}::parameter/aws/service/canonical/*",
-    ]
-  }
+  # (`PackerReadCanonicalAMIParameter` went with the Globus GCS bake, the only
+  # template that read Canonical's AMI parameter; the GPU bake selects its base by
+  # owner. openspec retire-globus-host 5.3.)
 
   # ── ECR Public: check that the fastsurfer image exists before building ──────
   # Retained for rollback; the existence check moves to private ECR below.

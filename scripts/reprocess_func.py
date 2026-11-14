@@ -602,8 +602,54 @@ def _same_url(a: str, b: str) -> bool:
     return a.rstrip("/").lower() == b.rstrip("/").lower()
 
 
+STALE_CHECKOUT_ENV = "CLOUDPIPE_ALLOW_STALE_CHECKOUT"
+
+
+def _git(*args: str, repo: Path = REPO) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=120
+    )
+
+
+def require_current_checkout(repo: Path = REPO) -> None:
+    """Refuse unless this checkout holds origin/main's tip.
+
+    These tools decide what to delete from rules that change. On 2026-11-12 a
+    `reconcile --write` ran from a checkout made the night before, without #1173
+    (merged that morning: surface rows belong to the workflow that wrote the
+    dtseries), and deleted 14,842 current newMSM step rows that the fixed rule keeps.
+    They were restored from the versioned bucket. A branch ahead of main passes, so
+    a reviewed fix can be run before it merges; one that is behind does not.
+    `CLOUDPIPE_ALLOW_STALE_CHECKOUT=1` skips the check, loudly, for a run that must
+    not wait (no network, say).
+    """
+    if os.environ.get(STALE_CHECKOUT_ENV) == "1":
+        print(f"WARNING: {STALE_CHECKOUT_ENV}=1: not checking this checkout against origin/main")
+        return
+    fetch = _git("fetch", "-q", "origin", "main", repo=repo)
+    if fetch.returncode != 0:
+        raise SystemExit(
+            f"refusing: could not fetch origin/main to check this checkout is current "
+            f"({fetch.stderr.strip() or fetch.returncode}). Set {STALE_CHECKOUT_ENV}=1 to skip."
+        )
+    contains = _git("merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD", repo=repo)
+    if contains.returncode == 0:
+        return
+    if contains.returncode != 1:
+        raise SystemExit(
+            f"refusing: could not compare HEAD with origin/main ({contains.stderr.strip()})"
+        )
+    behind = _git("rev-list", "--count", "HEAD..FETCH_HEAD", repo=repo).stdout.strip()
+    raise SystemExit(
+        f"refusing: this checkout ({repo}) lacks {behind} commit(s) on origin/main, and the "
+        f"rules for what to delete may have changed since. Update it first:\n"
+        f"  git -C {repo} pull --ff-only"
+    )
+
+
 def require_same_account() -> str:
-    """Refuse unless kubectl and the AWS credentials name the same cluster.
+    """Refuse unless the checkout is current (require_current_checkout) and kubectl and
+    the AWS credentials name the same cluster.
 
     The flush runs in the account the AWS credentials name; Argo, and the Prefect
     URL that cloudpipe-env.sh derives, follow kubectl's current context. On
@@ -619,6 +665,7 @@ def require_same_account() -> str:
     cluster's server URL, and an ARN-only check passed it. So the server URL must
     also equal the endpoint that `eks describe-cluster` reports for that ARN.
     """
+    require_current_checkout()
     cluster = kubectl_cluster()
     match = _EKS_ARN.match(cluster)
     if not match:
@@ -1749,6 +1796,8 @@ def reconcile_attribution(s3, args, audit: Audit, surface_only: bool):
 
 
 def reconcile(s3, args) -> int:
+    # Dry runs too: their counts are what a --write is approved on.
+    require_current_checkout()
     audit = Audit(Path(args.audit_dir) / f"reconcile_{now_utc():%Y%m%dT%H%M%SZ}.jsonl")
     tag = "write" if args.write else "dry-run"
     surface_only = getattr(args, "surface_only", False)
