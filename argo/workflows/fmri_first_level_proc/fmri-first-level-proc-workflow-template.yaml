@@ -115,7 +115,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: first-level-nodepool
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:8434991e571b54615c7ba631b77e33e832144cbf9305d2a5e65f91af8cd9a5ee"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:257a40faaf45fe0402722efbd6c2fc38fab77a09d926feba6eb95646511d59e9"
       imagePullPolicy: IfNotPresent
       command: ["python3", "/app/stage_first_level.py"]
       args:
@@ -181,7 +181,7 @@ spec:
       karpenter.sh/nodepool: first-level-nodepool
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:8434991e571b54615c7ba631b77e33e832144cbf9305d2a5e65f91af8cd9a5ee"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:257a40faaf45fe0402722efbd6c2fc38fab77a09d926feba6eb95646511d59e9"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:

@@ -1,8 +1,9 @@
 """Prerequisite checks, run before every command.
 
 The contract with the operator (and with a future wizard) is narrow on purpose:
-they install AWS CLI v2 and log in with SSO, they install Terraform and pixi, and
-this tool does nothing else about credentials. It never accepts an access key,
+they install AWS CLI v2 and log in with SSO, they install pixi, and this tool
+does nothing else about credentials. Terraform is not a prerequisite since
+contract 2.0: neither `login` nor `doctor` reads or applies it. It never accepts an access key,
 never writes AWS config, and never runs a login itself — the AWS CLI owns that
 browser flow, and wrapping it would add a second place for it to break.
 
@@ -13,20 +14,16 @@ and an SSO profile resolves with method `sso`.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from packaging.specifiers import InvalidSpecifier, SpecifierSet
-from packaging.version import InvalidVersion, Version
-
 from . import errors
 from .config import DeploymentConfig
 from .exits import CliError, ExitCode, Remedy
-from .shell import Completed, Runner, subprocess_runner
+from .shell import Runner, subprocess_runner
 
 PASS = "pass"
 WARN = "warn"
@@ -38,7 +35,6 @@ SKIPPED = "skipped"
 CHECK_AWS_CLI = "prereq.aws_cli"
 CHECK_AWS_SSO = "prereq.aws_sso"
 CHECK_AWS_ACCOUNT = "prereq.aws_account"
-CHECK_TERRAFORM = "prereq.terraform"
 CHECK_PIXI = "prereq.pixi"
 
 
@@ -234,74 +230,23 @@ def check_aws_account(identity: AwsIdentity | None, config: DeploymentConfig) ->
                 "expected_account": config.aws_account_id,
             },
         )
+    if config.aws_region and identity.region and config.aws_region != identity.region:
+        return CheckResult(
+            CHECK_AWS_ACCOUNT,
+            "AWS account is the intended one",
+            FAIL,
+            f"These credentials resolve region {identity.region}, but this deployment's "
+            f"answers name {config.aws_region}. Every parameter and secret would be read in "
+            "the wrong region and look absent.",
+            Remedy("command", f"export AWS_REGION={config.aws_region}"),
+            detail={"region": identity.region, "expected_region": config.aws_region},
+        )
     return CheckResult(
         CHECK_AWS_ACCOUNT,
         "AWS account is the intended one",
         PASS,
         f"account {identity.account}",
         detail={"account": identity.account},
-    )
-
-
-def check_terraform(
-    runner: Runner = subprocess_runner, *, versions_file: Path | None = None
-) -> CheckResult:
-    """Terraform must satisfy the repository's own `required_version`.
-
-    The constraint is read from `terraform/versions.tf` rather than duplicated
-    here, so this check can never disagree with Terraform about what is
-    acceptable.
-    """
-    constraint = read_required_version(versions_file)
-    result = runner(["terraform", "version", "-json"])
-    if not result.found:
-        return CheckResult(
-            CHECK_TERRAFORM,
-            "Terraform installed",
-            FAIL,
-            f"The `terraform` command is not on PATH; this deployment needs {constraint or 'it'}.",
-            Remedy("human", "install Terraform: https://developer.hashicorp.com/terraform/install"),
-            detail={"required": constraint},
-        )
-
-    version = _terraform_version(result)
-    if version is None:
-        return CheckResult(
-            CHECK_TERRAFORM,
-            "Terraform installed",
-            WARN,
-            "Could not read the Terraform version.",
-            detail={"raw": result.output[:200], "required": constraint},
-        )
-
-    if constraint:
-        try:
-            satisfied = Version(version) in SpecifierSet(constraint)
-        except (InvalidVersion, InvalidSpecifier):
-            return CheckResult(
-                CHECK_TERRAFORM,
-                "Terraform installed",
-                WARN,
-                f"Terraform {version} is installed; could not interpret the required_version "
-                f"constraint {constraint!r}.",
-                detail={"version": version, "required": constraint},
-            )
-        if not satisfied:
-            return CheckResult(
-                CHECK_TERRAFORM,
-                "Terraform installed",
-                FAIL,
-                f"Terraform {version} does not satisfy {constraint} from terraform/versions.tf.",
-                Remedy("human", f"install a Terraform version matching {constraint}"),
-                detail={"version": version, "required": constraint},
-            )
-
-    return CheckResult(
-        CHECK_TERRAFORM,
-        "Terraform installed",
-        PASS,
-        f"terraform {version}" + (f" (satisfies {constraint})" if constraint else ""),
-        detail={"version": version, "required": constraint},
     )
 
 
@@ -326,20 +271,6 @@ def check_pixi(runner: Runner = subprocess_runner) -> CheckResult:
     )
 
 
-def read_required_version(versions_file: Path | None = None) -> str | None:
-    """Extract `required_version` from terraform/versions.tf, if it can be found."""
-    path = versions_file or _repo_root() / "terraform" / "versions.tf"
-    try:
-        text = path.read_text()
-    except OSError:
-        return None
-    match = re.search(r'required_version\s*=\s*"([^"]+)"', text)
-    if not match:
-        return None
-    # Terraform writes ">= 1.10"; packaging wants no space.
-    return match.group(1).replace(" ", "")
-
-
 def run_all(
     config: DeploymentConfig,
     *,
@@ -351,7 +282,6 @@ def run_all(
     sso_result, identity = check_aws_sso(session_factory)
     results.append(sso_result)
     results.append(check_aws_account(identity, config))
-    results.append(check_terraform(runner))
     results.append(check_pixi(runner))
     return results, identity
 
@@ -392,7 +322,7 @@ def to_cli_error(result: CheckResult) -> CliError:
     Prerequisites that need a human action are BLOCKED; a wrong account is the
     operator's answers being wrong, which is INVALID.
     """
-    blocked_gates = {CHECK_AWS_CLI, CHECK_AWS_SSO, CHECK_TERRAFORM, CHECK_PIXI}
+    blocked_gates = {CHECK_AWS_CLI, CHECK_AWS_SSO, CHECK_PIXI}
     exit_code = ExitCode.BLOCKED if result.id in blocked_gates else ExitCode.INVALID
     if result.id == CHECK_AWS_SSO and result.detail.get("credential_method") not in (
         None,
@@ -420,15 +350,6 @@ def _from_cli_error(check_id: str, title: str, err: CliError) -> CheckResult:
         err.remedy,
         detail={"code": err.code, "raw": err.raw} if err.raw else {"code": err.code},
     )
-
-
-def _terraform_version(result: Completed) -> str | None:
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return _first_match(r"Terraform v(\d+\.\d+\.\d+)", result.output)
-    version = payload.get("terraform_version")
-    return str(version) if version else None
 
 
 def _first_match(pattern: str, text: str) -> str | None:

@@ -4,7 +4,7 @@ The checks themselves live in `globus_admin.doctor`; this module is only their
 presentation and the command's exit code. Keeping them apart is what lets each
 check be unit-tested against fakes without going through argument parsing.
 
-Unlike every other command, `doctor` does not refuse to run when a prerequisite
+Unlike `login`, `doctor` does not refuse to run when a prerequisite
 fails: reporting that failure *is* its job. It calls the checks directly rather
 than through `Context.require_prereqs`.
 """
@@ -29,10 +29,6 @@ def doctor(ctx: Context) -> ExitCode:
         aws=ctx.aws,
         runner=ctx.runner,
         session_factory=ctx.session_factory,
-        start_instance=bool(getattr(ctx.args, "start_instance", False)),
-        # Progress goes through the emitter like everything else, so it lands on
-        # stderr in both modes and cannot corrupt the JSON envelope on stdout.
-        notify=ctx.emitter.note,
     )
 
     results = doctor_module.run(diag)

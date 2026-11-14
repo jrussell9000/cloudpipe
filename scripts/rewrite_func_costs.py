@@ -445,13 +445,14 @@ def price_reconstruction(s3, mb: str, region, days: list[str]) -> dict[str, dict
     from athena import CloudpipeMetrics
     from reconstruct_costs import (
         DEFAULT_CALIBRATION,
+        assign_instance_types,
         build_rows,
         calibrate_from_days,
         load_snapshot_pods,
     )
 
     m = CloudpipeMetrics(bucket=mb, region=region)
-    rates, node_type = calibrate_from_days(s3, m, mb, list(DEFAULT_CALIBRATION))
+    rates = calibrate_from_days(s3, m, mb, list(DEFAULT_CALIBRATION))
     runs_by_name: dict[str, list[dict]] = defaultdict(list)
     for r in m._run_sql("""
         SELECT workflow_name, subject, started_at, finished_at FROM cloudpipe_metrics.workflow_runs
@@ -463,15 +464,11 @@ def price_reconstruction(s3, mb: str, region, days: list[str]) -> dict[str, dict
     for day_s in days:
         day = date.fromisoformat(day_s)
         pods = load_snapshot_pods(s3, mb, day)
-        types = dict(node_type)
-        for r in m._run_sql(
-            "SELECT DISTINCT node, node_instance_type FROM cloudpipe_metrics.pod_costs "
-            f"WHERE date = '{day_s}'"
-        ).to_dict("records"):
-            if r.get("node") and r.get("node_instance_type"):
-                types[r["node"]] = r["node_instance_type"]
-        for pod in pods:
-            pod["instance_type"] = types.get(pod.get("host_node"))
+        # The same per-day, ambiguity-refusing type assignment reconstruct_costs uses
+        # (#1060). A row reconstructed under the old last-one-wins map may no longer
+        # reproduce; the RECON_TOLERANCE_USD check in plan_recon then stops the run,
+        # which is the intended outcome. Days already modelled are frozen in the ledger.
+        assign_instance_types(m, day_s, pods)
         model: dict[str, list] = defaultdict(lambda: [0.0, 0.0])
         for row in build_rows(pods, runs_by_name, rates, day, {}, "cloudpipe_minproc")[0]:
             model[row.workflow_name][0] += row.total_cost_usd

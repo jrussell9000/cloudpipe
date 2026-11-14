@@ -204,7 +204,7 @@ spec:
     # so 312 sequential S3 GETs were billed as slice time.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:ad0dbabe3f99d8532851119338d0a87d338f97625e95cf18a62bf99ad8ef87ff"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:076af61071a21840fb614f660c028fa4cc66bdff961194f8c2ae9facf69c79f0"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -420,7 +420,7 @@ spec:
       #
       # The #245 guard below therefore no longer works by deleting a directory so
       # that an `optional: true` artifact is skipped. It works by publishing only
-      # the sessions that passed — a positive act, not the absence of one.
+      # when every session passed (#1197) — a positive act, not the absence of one.
       #
       # The QC JSONs stay artifacts: single files, no symlinks, no ordering
       # requirement, and they go to the metrics bucket rather than derivatives/.
@@ -701,7 +701,7 @@ spec:
     # $FREESURFER_HOME/subjects/fsaverage — see the args block below.
 
     container:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:ad0dbabe3f99d8532851119338d0a87d338f97625e95cf18a62bf99ad8ef87ff"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fastsurfer@sha256:076af61071a21840fb614f660c028fa4cc66bdff961194f8c2ae9facf69c79f0"
       imagePullPolicy: IfNotPresent
 
       volumeMounts:
@@ -830,18 +830,17 @@ spec:
           # never self-heal, while registration and func-preproc run against a surf/
           # missing its principal outputs.
           #
-          # The fix is to not publish it. Under ADR 017 that is now literal: the
-          # publish loop at the end of this script iterates COMPLETE_SESSIONS, so a
-          # rejected session's tree is never written and — critically — never gets a
-          # _complete.json. The derivative is then genuinely absent, the existence
-          # check (a head_object on that marker) correctly reports the session
-          # missing, and the next submission re-runs the phase. Self-healing is
-          # restored by making the failure legible rather than by adding a second
-          # source of truth.
+          # The fix is to not publish it — and, since #1197, to publish nothing at
+          # all when any session is rejected (see the branch after the loop). A
+          # rejected session's tree is never written and never gets a _complete.json,
+          # so the existence check (a head_object on that marker) correctly reports
+          # the session missing, and the next submission re-runs the phase.
+          # Self-healing is restored by making the failure legible rather than by
+          # adding a second source of truth.
           #
           # This used to work indirectly, by deleting the session directory so that
-          # Argo skipped its `optional: true` artifact. Publishing explicitly is the
-          # same guarantee without depending on artifact optionality.
+          # Argo skipped its `optional: true` artifact, and later by publishing only
+          # the sessions that passed. Neither is how it works now.
           #
           # Rejection criteria, cheapest-first: an IsRunning marker is FastSurfer's own
           # crashed/interrupted flag (the same hazard the input-side
@@ -864,9 +863,43 @@ spec:
                   break
                 fi
               done
+              # Collapsed-surface backstop. mris_autodet_gwstats can take the 110
+              # white-matter clip spike as the gray-matter mode; every gray threshold
+              # is then ~110 and the surfaces are placed on it: cortex volume about
+              # halves, thickness drops ~1 mm, and every step reports success (80
+              # sessions in the 2.5.4 cohort). images/fastsurfer/autodet_gm_guard.sh
+              # corrects it in-pod; this catches an image without the guard, or a
+              # fallback that did not take. mris_place_surface places the white
+              # surface from gray_mean and the pial from the *_border_* values, so
+              # both are checked; healthy sessions sit at 60-87, collapsed at 110.
+              # A hit is a rejection like any other: this attempt publishes nothing,
+              # exits 69, and the workflow rebuilds the subject without the session
+              # (see below), so the session becomes missing data instead of a
+              # collapsed cortex that every downstream step would trust.
+              if [[ -z "$reason" ]]; then
+                for hemi in lh rh; do
+                  dat="${sesdir}/surf/autodet.gw.stats.${hemi}.dat"
+                  if [[ -s "$dat" ]] && awk '($1 == "gray_mean" || $1 == "white_border_low") && $2 + 0 >= 100 { bad = 1 } END { exit !bad }' "$dat"; then
+                    reason="surf/autodet.gw.stats.${hemi}.dat has gray_mean or white_border_low >= 100 (gray mode = white-matter clip spike; collapsed surfaces)"
+                    break
+                  fi
+                  # A hemisphere the guard corrected must also have sane surfaces. On a
+                  # session misregistered to its template the fallback runs (the class
+                  # statistics look normal) but the white surface comes out larger than
+                  # the pial, which no longer reads 110 above. fs_guards.py
+                  # surface-check holds pial/white area to the healthy band.
+                  if [[ -e "${sesdir}/scripts/autodet-gm-fallback.${hemi}" ]] \
+                     && ! python3 -I /app/fs_guards.py surface-check --surf-dir "${sesdir}/surf" --hemi "$hemi"; then
+                    reason="${hemi} gray-mode fallback produced implausible surfaces (pial/white area outside the healthy band; session likely misregistered to its template)"
+                    break
+                  fi
+                done
+              fi
             fi
             if [[ -n "$reason" ]]; then
-              echo "REJECTED ${ses}: ${reason} — not publishing its tarball (#245)." >&2
+              # `REJECTED <ses>:` is parsed by scripts/consort_flow.py, which names this
+              # session as the failure and the subject's other sessions as withheld.
+              echo "REJECTED ${ses}: ${reason} (#245)." >&2
               INCOMPLETE_SESSIONS="${INCOMPLETE_SESSIONS} ${ses}"
             else
               COMPLETE_SESSIONS="${COMPLETE_SESSIONS} ${ses}"
@@ -874,27 +907,68 @@ spec:
           done
           echo "[guard] complete:${COMPLETE_SESSIONS:- none} | rejected:${INCOMPLETE_SESSIONS:- none}" >&2
 
-          # DETECTION ONLY ABOVE — THE DIRECTORIES ARE REMOVED LATER, AND THE ORDER IS
-          # LOAD-BEARING. Removing them here cost two whole workflows in the 300-subject
-          # batch of 2026-08-12 (the #235 repro subject and one other):
-          # long_compat_segmentHA.py
-          # below tolerates an INCOMPLETE session directory — it ran fine against these
-          # very sessions before the guard existed — but not a MISSING one. It exited 1,
-          # base-tps was never written, and the exit-75 guard then retried a
-          # deterministic failure until the 8-attempt budget was gone
-          # ("retryStrategy.expression evaluated to false"), taking the subject's three
-          # or more GOOD sessions down with it. Deferring the removal to after that
-          # bridge keeps its input exactly as it was pre-guard, and the artifacts are
-          # collected at pod exit either way, so publication is still prevented.
+          # ANY REJECTION FAILS THE STEP, AND NOTHING IS PUBLISHED (#1197).
+          #
+          # The base template was built by mri_robust_template from EVERY session in
+          # T1w_sessions, so it is partly shaped by the rejected one. The policy this
+          # replaces (#273) published the survivors and pruned the rejected names from
+          # base-tps: every kept session's anatomy then sat in a template made partly
+          # from a session production does not keep, and base-tps disagreed with the
+          # template's own mri/transforms/<ses>_to_<subject>_template.lta set. The
+          # reprocess audit found 7 such subjects (8 sessions, every one HISTOalloc
+          # before #422 fixed it); on one, the upright transform moved 0.59 deg /
+          # 0.6 mm, conformed headers up to 15 mm and BOLD->T1w up to 19 mm. Any
+          # later long-stream failure, for any reason, would recreate it.
+          #
+          # So a rejection publishes nothing from THIS attempt — not the template, not
+          # the survivors — and exits 69, TEMPLATE_TIMEPOINT_FAILED_EXIT_CODE in
+          # images/shared/step_outcome.py, which no retry expression includes (the
+          # one observed cause replayed identically on every attempt).
+          #
+          # THE SUBJECT IS THEN REBUILT WITHOUT THE REJECTED SESSIONS, IN THIS SAME
+          # WORKFLOW (anatomy-with-rebuild-dag-template in the master). A failed
+          # session ends as missing data for that timepoint; the subject's other
+          # sessions are not lost with it (operator, 2026-11-14). To make that
+          # possible this step first writes which sessions it rejected, and from which
+          # set, to scratch/<workflow>/anat/long-rejected.json. The master's
+          # decide-anatomy-rebuild step reads it, from a pod that succeeds, because a
+          # downstream reference to a FAILED pod's output parameter waits forever on
+          # Argo v4 if the output was never reported. The rebuild runs the whole
+          # anatomical phase again, template-build included, from the survivors only,
+          # so no published session sits in a template the rejected one shaped.
+          #
+          # Exiting here, before long_compat_segmentHA.py, also retires the ordering
+          # hazard the old removal carried (2026-08-12: the bridge fails on a MISSING
+          # session directory and two whole workflows were lost): nothing is removed
+          # and the bridge never runs.
+          if [[ -n "$INCOMPLETE_SESSIONS" ]]; then
+            echo "ERROR:${INCOMPLETE_SESSIONS} failed the long stream, but the base template was built from" >&2
+            echo "       every session in T1w_sessions. Publishing nothing from this attempt (#1197); the" >&2
+            echo "       workflow rebuilds the subject's anatomy without them (anatomy-with-rebuild). If it" >&2
+            echo "       cannot (no survivors, or the record below did not land), resubmit with" >&2
+            echo "       exclude-sessions=<session>." >&2
+            REJECTED_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split()))' "$INCOMPLETE_SESSIONS")"
+            if ! python3 -I - "{{workflow.parameters.bucket}}" "scratch/{{workflow.name}}/anat/long-rejected.json" \
+                 '{{inputs.parameters.T1w_sessions}}' "$REJECTED_JSON" <<'PYEOF'
+          import json, sys
+          import boto3
+          bucket, key, attempted, rejected = sys.argv[1], sys.argv[2], json.loads(sys.argv[3]), json.loads(sys.argv[4])
+          body = json.dumps({"attempted": attempted, "rejected": rejected}).encode()
+          boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+          print(f"[rebuild] wrote s3://{bucket}/{key}: rejected {rejected} of {attempted}", file=sys.stderr)
+          PYEOF
+            then
+              echo "ERROR: could not record the rejected sessions; the workflow cannot rebuild without them." >&2
+            fi
+            exit 69
+          fi
           if [[ -z "$COMPLETE_SESSIONS" ]]; then
-            for ses in $INCOMPLETE_SESSIONS; do rm -rf "${SD}/${ses}"; done
-            echo "ERROR: no session passed the completion guard; nothing to publish." >&2
+            echo "ERROR: T1w_sessions is empty; nothing to publish." >&2
             exit 1
           fi
 
-          # QC only for sessions that will actually be published — a rejected session's
-          # directory is gone, and QC for a derivative nobody can read is noise in the
-          # anat-qc table.
+          # QC only once every session has passed — QC for a derivative that will not
+          # be published is noise in the anat-qc table.
           for ses in $COMPLETE_SESSIONS; do
             python3 /app/extract_qc.py \
               --subjects-dir "$SD" \
@@ -932,33 +1006,26 @@ spec:
             exit 75
           fi
 
-          # NOW remove the rejected sessions — after long_compat_segmentHA.py has had
-          # the directory layout it expects, and after the base-tps check above.
-          #
-          # Publication is already prevented by the publish loop below, which walks
-          # COMPLETE_SESSIONS only, so this removal is no longer what enforces #245.
-          # It is kept for two lesser reasons: it reclaims ephemeral-storage before
-          # the upload, and it means a rejected session cannot be published by a
-          # future edit that loops over the directory listing instead of the guard's
-          # verdict. The ordering constraint above still stands either way.
-          for ses in $INCOMPLETE_SESSIONS; do
-            echo "[guard] removing rejected ${ses} (publication already excluded)." >&2
-            rm -rf "${SD}/${ses}"
-          done
-
-          # base-tps is written from the template's timepoint list, not from what is on
-          # disk, so a session the guard above rejected is still named in it. Leaving it
-          # there turns one bad session into a segment-subregions failure for the whole
-          # subject — the step reads base-tps and looks for a directory that no longer
-          # exists. Prune the rejected names so the k-1 good sessions still get their
-          # subregion outputs.
-          if [[ -n "$INCOMPLETE_SESSIONS" ]]; then
-            # One line on purpose: a YAML literal block scalar ends at the first line
-            # indented less than the block, so a column-0 python body would terminate
-            # the script, and an indented one would be an IndentationError.
-            python3 -c "import pathlib, sys; p = pathlib.Path(sys.argv[1]); rej = set(sys.argv[2:]); kept = [ln for ln in p.read_text().splitlines() if ln.strip() not in rej]; p.write_text('\n'.join(kept) + '\n'); print('[guard] pruned', sorted(rej), 'from base-tps;', len(kept), 'timepoints remain')" \
-              "$SD/$BASE/base-tps" $INCOMPLETE_SESSIONS
+          # THE TEMPLATE'S TIMEPOINTS, base-tps AND THE PUBLISHED SESSIONS MUST AGREE
+          # (#1197). The rejection branch above makes this true; this check keeps it
+          # true against a future edit, and fails before anything is written.
+          # mri_robust_template leaves one `<ses>_to_<BASE>.lta` per session it built
+          # the template from, at every k including 1 (the reverse `<BASE>_to_<ses>.lta`
+          # does not match the pattern). That is how the reprocess audit read a
+          # template's sessions, and it agreed with the template logs on 72 of 72
+          # subjects. base-tps is what segment-subregions iterates. Exit 1, not 69: a
+          # disagreement here is a bug in this step, not a failed timepoint.
+          TEMPLATE_TPS=$(cd "${SD}/${BASE}/mri/transforms" 2>/dev/null && for f in *_to_"${BASE}".lta; do [[ -e "$f" ]] && echo "${f%_to_"${BASE}".lta}"; done | sort)
+          LISTED_TPS=$(awk 'NF {print $1}' "${SD}/${BASE}/base-tps" | sort)
+          PUBLISHING=$(printf '%s\n' $COMPLETE_SESSIONS | sort)
+          if [[ "$TEMPLATE_TPS" != "$PUBLISHING" || "$LISTED_TPS" != "$PUBLISHING" ]]; then
+            echo "ERROR: template timepoints disagree; publishing nothing (#1197)." >&2
+            echo "       template LTAs: $(echo $TEMPLATE_TPS)" >&2
+            echo "       base-tps:      $(echo $LISTED_TPS)" >&2
+            echo "       publishing:    $(echo $PUBLISHING)" >&2
+            exit 1
           fi
+          echo "[guard] template timepoints == base-tps == published: $(echo $PUBLISHING)" >&2
 
           # PUBLISH THE DURABLE DERIVATIVES (ADR 017).
           #

@@ -81,6 +81,25 @@ def apply_command(labels: Path, reference: Path, out: Path, transforms: list[Pat
     return cmd
 
 
+def ants_version() -> str | None:
+    """The ANTs version, from `antsRegistration --version`; None if it cannot be read.
+
+    antsApplyTransforms has no --version option. It prints "ERROR: Invalid flag
+    provided version" on stdout, and that string went into every labels marker
+    up to 2026-11-12. antsRegistration has the option, and it ships in the same
+    ANTs package. nipype reads the version the same way. A line other than
+    "ANTs Version: ..." gives None, never a recorded error.
+    """
+    try:
+        out = subprocess.run(["antsRegistration", "--version"], capture_output=True, text=True)
+    except OSError:
+        return None
+    for line in out.stdout.splitlines():
+        if line.startswith("ANTs Version:"):
+            return line.split(":", 1)[1].strip() or None
+    return None
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -134,8 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             "command": cmd,
             "inputs": {p.name: sha256(p) for p in (labels, *transforms)},
         }
-    version = subprocess.run(["antsApplyTransforms", "--version"], capture_output=True, text=True)
-    record["ants_version"] = version.stdout.strip()
+    record["ants_version"] = ants_version()
     (args.out / COMPLETE_MARKER).write_text(json.dumps(record, indent=2))
     return 0
 

@@ -28,9 +28,9 @@ Its lock file is a byte-for-byte copy of the root's, asserted by that test. Afte
 
 ### Variables that must be set
 
-**Eighteen** variables must be supplied, because a default is one deployment's value handed to everyone who does not set it — and nothing errors. A fork inheriting `domain` publishes services under a domain it does not own; one inheriting `github_oidc_allowed_subs` trusts this repository's workflows to assume its roles. Without a default, Terraform prompts, or fails under `-input=false` naming the variable.
+**Eleven** variables must be supplied, because a default is one deployment's value handed to everyone who does not set it — and nothing errors. A fork inheriting `domain` publishes services under a domain it does not own; one inheriting `github_oidc_allowed_subs` trusts this repository's workflows to assume its roles. Without a default, Terraform prompts, or fails under `-input=false` naming the variable.
 
-Eleven have no default at all. The other seven are the Globus ingress's, and they are required **only when `globus_enabled` is true**: each defaults to the empty string and each `validation` refuses the empty string once the flag is on. Terraform has no "conditionally required" keyword, so that cross-variable validation *is* the declaration — and both the wizard and the tests derive the eighteen from it rather than keeping a list, so a nineteenth is covered without anyone editing anything.
+None of the eleven has a default at all. The wizard reads them from the declarations rather than keeping a list (`src/cloudpipe_setup/schema.py`), and owns every one, so a twelfth is covered without anyone editing it. Until 2026-11-12 seven more were required only when `globus_enabled` was true; they went with the Globus host (ADR 024).
 
 | Group | Variables | Required |
 |---|---|---|
@@ -39,13 +39,12 @@ Eleven have no default at all. The other seven are the Globus ingress's, and the
 | Source control | `github_user_url`, `github_repo`, `gitops_repo_url`, `github_oidc_allowed_subs` | Always |
 | Data | `globus_s3_destination_bucket` — the imaging data bucket, under a historical name | Always |
 | Cloudflare Zero Trust | `cloudflare_team_domain`, `cloudflare_team_name` | Always |
-| Globus ingress | `globus_admin_prefix_list_id`, `globus_source_collection_id`, `globus_client_id`, `globus_org_name`, `globus_contact_email`, `globus_owner_email`, `globus_identity_domain` | Only with `globus_enabled = true`; `globus init` renders all seven |
 
 `operator_emails` is who runs the deployment: the administrators of every web UI, and — with the Amazon Cognito user pool the stack creates by default — who may enroll a WARP device and reach the cluster.
 
-All of them carry a `validation` block except `cloudflare_team_name`, which Cloudflare generates, so there is no shape to check. `tests/test_terraform_required_variables.py` keeps the facts aligned: no inherited value, a validation block, and a line in the example file for each one the root does not compute itself. An empty default passes that test only beside a validation that refuses the empty value when another variable says it is needed — which is the Globus shape, and nothing else.
+All of them carry a `validation` block except `cloudflare_team_name`, which Cloudflare generates, so there is no shape to check. `tests/test_terraform_required_variables.py` keeps the facts aligned: no inherited value, a validation block, and a line in the example file for each one the root does not compute itself.
 
-Two placeholders in the example root's `terraform.tfvars.example` are deliberately **not** well-formed. `globus_source_collection_id` and `globus_client_id` are UUIDs, that file is published, and the publish gate fails on any 8-4-4-4-12 hex string — a valid-looking placeholder is indistinguishable from a real collection identifier both to the gate and to a reader. Terraform's `validation` rejects them once `globus_enabled` is true, which is the intended failure; with the ingress off they are inert, so that file applies as shipped.
+The HTTPS ingress's source, `globus_source_collection_id` and `globus_source_base_path`, is optional: an empty collection id runs `ingress-mode=presynced`, and every reader refuses the placeholder it writes. The example root's `terraform.tfvars.example` ships it as `""` rather than a UUID-shaped placeholder, because that file is published and the publish gate fails on any 8-4-4-4-12 hex string — a valid-looking placeholder is indistinguishable from a real collection identifier both to the gate and to a reader.
 
 Everything else keeps its default on purpose. `prefect_namespace` and `vpc_cidr` are sane starting values, not claims about who is deploying.
 
@@ -65,7 +64,8 @@ Paths below are relative to `terraform/modules/stack/` unless stated otherwise.
 | `argowf.tf` | Argo Workflows SSO secrets, RBAC, Prefect→Argo cross-namespace bindings |
 | `argocd.tf` | ArgoCD Helm release, Dex OIDC config, bootstrap ApplicationSet |
 | `prefect.tf` | Prefect module call, oauth2-proxy secret |
-| `globus.tf` | Globus module call |
+| `ingress_network.tf` | The ingress node pool's dedicated public subnets, their network ACL, and its node security group (ADR 021) |
+| `ingress_session.tf` | The HTTPS ingress's SSM parameters: the login time and the source collection and paths |
 | `finops.tf` | Kubecost + Athena CUR module |
 | `metrics.tf` | Pipeline observability module (Glue database + hand-declared catalog tables, Athena workgroup, Grafana Pod Identity) |
 | `metrics_bucket.tf` | The `cloudpipe-metrics` bucket (versioned) that holds all QC/cost records |
@@ -102,7 +102,7 @@ This replaced a local-only backend (no remote state at all) after a 2026-07 inci
 |---|---|
 | Primary CIDR | `10.0.0.0/16` — the only CIDR in use. `var.secondary_cidr_blocks` is declared, but `vpc.tf` never associates it, so it is empty in practice. |
 | Private subnets | Three AZs (`a`/`b`/`c` in the deployment region), `/20` each — EKS nodes. Upper 3/4 of each is a `prefix` CIDR reservation for pod prefix delegation, see [pod IP address space](#pod-ip-address-space) |
-| Public subnets | Three AZs, `/24` each — ALBs, Globus EC2 |
+| Public subnets | Three AZs, `/24` each — ALBs. The ingress node pool has public subnets of its own (`ingress_network.tf`) |
 | NAT gateway | Single (cost optimisation) — private subnets route through it |
 | S3 VPC Gateway endpoint | All route tables — S3 traffic stays on AWS backbone |
 | VPC flow logs | → `cloudpipe-logging` S3 bucket under `vpc-flow-logs/`, 60s aggregation |
@@ -230,16 +230,18 @@ There is no untainted managed node. Anything that must stay off Karpenter's spot
 
 ### Karpenter node pools (on-demand provisioning for pipeline workloads)
 
-There are **five** node pools. All are **spot-only** — no pool allows on-demand, and there is no on-demand fallback anywhere in the cluster.
+There are **eight** node pools (`terraform/modules/karpenter/helm-values/*-nodepool.yaml`). Six are **spot-only**. The other two, `gpu-ondemand-nodepool` and `fmriprep-bench-nodepool`, are on-demand and tainted, so only a pod that tolerates the taint lands there; no pipeline step does, so there is no on-demand fallback for the pipeline itself.
 
 | Node pool | Instance selection | Capacity type | Pool limits | Used by |
 |---|---|---|---|---|
-| `cpu-light-nodepool` | category `t` | spot | 160 CPU / 640 Gi | Globus control, inventory, S3 sync |
-| `cpu-heavy-nodepool` | category `c`,`m`; sizes 2xlarge, 4xlarge; nitro | spot | 2560 CPU / 10240 Gi | BOLD→T1w registration, functional preprocessing |
+| `cpu-light-nodepool` | category `t`; nitro | spot | 256 CPU / 1024 Gi | inventory, the staged-input check, outcome recorders, surface resample, fsqc metrics, metrics |
+| `cpu-heavy-nodepool` | category `c`,`m`; sizes 2xlarge, 4xlarge; nitro | spot | 4096 CPU / 10240 Gi | BOLD→T1w registration, functional preprocessing, subregion segmentation |
+| `ingress-nodepool` | category `c`,`m`; size 2xlarge; nitro; `ingress-nodeclass` (dedicated public subnets, public IPv4 for egress only); tainted `cloudpipe.io/ingress` | spot | 64 CPU | The `https-transfer` step only — the one network ingress. See [HTTPS ingress](#https-ingress) |
 | `first-level-nodepool` | families `m6gd`/`m7gd`/`r6gd`/`r7gd`/`c6gd`/`c7gd` (**Graviton/ARM64**, local NVMe); sizes xlarge–4xlarge | spot | 1536 CPU / 12288 Gi | First-level (task-based) analysis; about 1,200 session pods at 1 CPU / 10 Gi |
 | `gpu-nodepool` | families `g4dn`/`g5`/`g6`/`g6e`; sizes xlarge, 2xlarge, **except** `g5`/`g6`/`g6e.2xlarge`; nitro; zones `a`/`b`/`c`; weight 10 (preferred) | spot | 512 CPU / 2048 Gi | T1w→MNI registration (FireANTs), FastSurfer template-build + long-segmentation |
 | `gpu-dense-nodepool` | types `g5.2xlarge`/`g6.2xlarge`/`g6e.2xlarge`; nitro; zones `a`/`b`/`c`; no weight (fallback) | spot | 512 CPU / 2048 Gi | The same three GPU steps, when every `gpu-nodepool` offering is out of capacity |
 | `gpu-ondemand-nodepool` | `gpu-nodepool`'s five reachable types; nitro; zones `a`/`b`/`c`; tainted `cloudpipe.io/gpu-on-demand` (opt-in) | on-demand | 64 CPU / 256 Gi | Only templates that tolerate the taint, for runs that cannot wait out a GPU spot drought. The pipeline's own GPU steps never land here |
+| `fmriprep-bench-nodepool` | category `c`,`m`; size 4xlarge; nitro; tainted `cloudpipe.io/fmriprep-bench` | on-demand | 256 CPU / 1024 Gi | The fMRIPrep reference arm of the equivalence benchmark (`argo/workflows/fmriprep_bench`), on-demand so its runtime and cost carry no spot reclaims |
 
 The `Pool limits` column is the Karpenter `spec.limits` ceiling on aggregate provisioned capacity — a safety stop, not a reservation and not a statement of what a pool typically runs.
 
@@ -247,7 +249,7 @@ The `Pool limits` column is the Karpenter `spec.limits` ceiling on aggregate pro
 
 **GPU time-slicing.** Slice counts are set per GPU pool. `gpu-nodepool` nodes carry **3** schedulable GPU slices per physical GPU: its smallest card, the g4dn's T4, has 15 GiB, and an xlarge has only ~3920m of CPU for `cpu: 1` pods. `gpu-dense-nodepool` nodes carry **4**. Those are 2xlarge nodes with a 22–45 GiB card, and 4 is the most that fits the largest per-pod VRAM: t1w-to-mni, measured at 4903 MiB per process. The pool shipped at 5, sized from an estimate of ~4.4 GiB, and was cut to 4 once the measurement showed four t1w-to-mni pods on one card would overflow. The count reaches Karpenter through a `NodeOverlay` per pool's types (`gpu-timeslice-3x`, and `gpu-dense-timeslice-4x` at weight 10). It reaches each node through the device-plugin profile selected by the `nvidia.com/device-plugin.config` label, which only the dense pool sets. Because overlays match instance types in every pool, two pools may share a type only if both load the same slice count. `gpu-ondemand-nodepool` shares `gpu-nodepool`'s types at the default 3 slices, and `gpu-nodepool` and `gpu-dense-nodepool` share none. `tests/argo/test_gpu_step_resources.py` enforces that and the other invariants, including that the device plugin tolerates the on-demand pool's taint. The GPU templates accept both spot pools through a `karpenter.sh/nodepool In` node affinity. A separate `g6f-fractional-gpu` overlay covers the fractional-GPU g6f family, which no pool currently admits.
 
-All Karpenter nodes consolidate to zero when empty (`consolidateAfter: 10m`). Disruption budgets allow removing up to 20% of nodes at a time.
+Every pool consolidates to zero when empty: after `10m`, except `ingress-nodepool` (`5m`). `cpu-light-nodepool` alone also consolidates underutilized nodes (`WhenEmptyOrUnderutilized`); the rest are `WhenEmpty`, because almost every workflow pod carries `karpenter.sh/do-not-disrupt` and cannot be repacked anyway. Disruption budgets allow removing 20% of nodes at a time on `cpu-light`, `cpu-heavy`, `gpu` and `gpu-dense`, and 10 nodes on `first-level`. The ingress and both on-demand pools set no budget, so Karpenter's default (10%) applies.
 
 ---
 
@@ -337,7 +339,7 @@ All pod-level AWS permissions use EKS Pod Identity (not IRSA). Each service acco
 | Service account | Namespace | Key permissions |
 |---|---|---|
 | `argo-workflows-controller` | `argo-workflows` | S3 read/write on the data bucket (artifact storage) |
-| `argo-workflows-runner` | `argo-workflows` | S3 read/write on the data bucket, SSM read on `/cloudpipe/globus/*`, EC2 start/stop (via globus module), `workflowtaskresults` create/patch |
+| `argo-workflows-runner` | `argo-workflows` | S3 read/write on the data bucket, SSM read on `/cloudpipe/globus/*`, `workflowtaskresults` create/patch |
 | `argo-workflows-server` | `argo-workflows` | S3 read on the data bucket (serve archived logs) |
 | `prefect-worker` | `prefect` | S3 read/write on the data bucket, SSM read on Globus params; K8s RBAC to create/manage Jobs in `prefect` ns and list/create Workflows in `argo-workflows` ns |
 | `ebs-csi-controller-sa` | `aws-ebs-csi-driver` | EBS CSI managed policy |
@@ -421,42 +423,22 @@ Container Insights was removed entirely on 2026-09-08, for the same reason fluen
 
 ---
 
-## Globus Connect Server (EC2)
+## HTTPS ingress
 
-**Optional, and off by default.** Everything in this section exists only when `globus_enabled = true`. The module is 52 resources behind one `count`, and enabling it needs a Globus subscription, a registered service client, a managed prefix list and a GCS AMI built from `packer/globus-gcs/` in the deploying account — the `globus_ami_id` committed in `terraform/modules/stack/globus.tf` is this deployment's image and is shared with nobody. With the flag false the pipeline runs in `ingress-mode=presynced` and reads whatever is already in the data bucket. See [deployer-first-hour.md](deployer-first-hour.md#step-5--decide-whether-you-are-running-the-globus-ingress).
+Network ingress has no host of its own. The `https-transfer` step runs as a pod on `ingress-nodepool`, a Karpenter pool of spot nodes with public addresses, in dedicated public subnets, so the download from the source pays no NAT charge. Inbound traffic from the internet is denied twice, by the nodes' security group and by their subnets' network ACL, and nothing but that step tolerates the pool's taint (ADR 021, `terraform/modules/stack/ingress_network.tf`). The pod writes to the data bucket as the Argo runner's Pod Identity.
 
-The Globus Connect Server runs on a standalone EC2 instance in a public subnet, separate from EKS.
-
-| Attribute | Value |
-|---|---|
-| AMI | Ubuntu 22.04 LTS x86_64 (Canonical) |
-| Subnet | Public (`a` zone) |
-| Public IP | Elastic IP (fixed — used for endpoint registration) |
-| Storage | S3 storage gateway — GridFTP writes directly to the data bucket, with no staging volume |
-
-Security group inbound rules (mandated by Globus Connect Server v5 architecture):
-
-| Port | Source | Reason |
-|---|---|---|
-| 443 | `0.0.0.0/0` | HTTPS collections + GCS Manager API (must be world-open) |
-| 50000–51000 | `0.0.0.0/0` | GridFTP data channels (peer-to-peer; must be world-open) |
-| 22 | `var.globus_admin_prefix_list_id` | SSH admin access (managed prefix list) |
-
-Access control is enforced by Globus OAuth2/OIDC, not network-layer filtering.
-
-SSM parameters the workflows read:
+The SSM parameters it depends on are created unconditionally in `terraform/modules/stack/ingress_session.tf`:
 
 | Parameter | Content |
 |---|---|
-| `/cloudpipe/globus/instance-id` | EC2 instance ID (Terraform) |
-| `/cloudpipe/globus/collection-id` | Destination collection UUID (recorded by `globus configure`; unchanged by instance replacement) |
-| `/cloudpipe/globus/source-collection-id` | Source collection UUID (NBDC Data Hub collection) |
-| `/cloudpipe/globus/source-base-path` | Root path on source collection |
+| `/cloudpipe/globus/session-established-at` | When the stored Globus login was made. Written by `pixi run globus login`, never by Terraform (`ignore_changes`) |
+| `/cloudpipe/globus/source-collection-id` | Source collection UUID (NBDC Data Hub collection), from `globus_source_collection_id` |
+| `/cloudpipe/globus/source-base-path` | Root path on the source collection, from `globus_source_base_path` |
+| `/cloudpipe/globus/fasttrack-source-base-path` | The FastTrack DICOMs' root on the same collection, from `fasttrack_source_base_path`; nothing reads it yet |
 
-The full list, with what sets each one, is in
-[globus.md → SSM parameters](globus.md#ssm-parameters).
+Who reads each one, and how the session is renewed, is in [globus.md → The SSM parameters](globus.md#the-ssm-parameters).
 
-The Globus instance is stopped when not actively transferring; `start-globus-instance-template` starts it at the beginning of each workflow and waits for status checks to pass.
+Until 2026-11-12 this section described a Globus Connect Server endpoint on EC2 (`module.globus`, about 50 resources behind `globus_enabled`). It was destroyed by `terraform apply`, and its module, variables, Packer template and AMIs are deleted (ADR 024). A `tfvars` file that still sets `globus_enabled` or another of the host's variables draws an undeclared-variable warning, not an error; delete the line.
 
 ---
 
@@ -467,7 +449,6 @@ The Globus instance is stopped when not actively transferring; `start-globus-ins
 | `addons` | `modules/addons` | Pod Identity associations for cert-manager, External Secrets, AWS LBC |
 | `argo-workflows` | `modules/argo-workflows` | RDS instance, IAM/Pod Identity, RBAC, network policies, metrics; PgBouncer Deployment + Service in `gitops/apps/argo-workflows/templates/` |
 | `finops` | `modules/finops` | Kubecost Helm release, Athena CUR table, IAM for cost data |
-| `globus` | `modules/globus` | EC2 instance, EIP, security group, IAM role, SSM parameters. Only with `globus_enabled = true` |
 | `karpenter` | `modules/karpenter` | Karpenter Helm release, NodePool/NodeClass manifests |
 | `metrics` | `modules/metrics` | Glue catalog database + 9 raw and 9 compacted hand-declared catalog tables (**no crawlers**), Athena `cloudpipe_metrics_workgroup`, Grafana Pod Identity |
 | `prefect` | `modules/prefect` | RDS instance, IAM/Pod Identity, RBAC, network policies |
@@ -504,7 +485,7 @@ The table is the same one `--list-phases` prints; a test holds the two equal, so
 | Phase | What happens | Public endpoint |
 |---|---|---|
 | 1 | **Create the network and the Kubernetes cluster.** `-target` the VPC, then EKS, with `endpoint_public_access=true` (bootstrapping needs a reachable API). Then `aws eks update-kubeconfig`, log Helm in to ECR Public, and pre-create the `argo-workflows` namespace — Phase 2's resources need it before ArgoCD has synced anything | open |
-| 2 | **Install the cluster add-ons.** One apply with seven `-target`s: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, Globus, FinOps. Terraform orders them by the graph: FinOps after add-ons, Globus after Argo Workflows. The Globus target is a no-op when `globus_enabled` is false — Terraform reports "No changes" for a module call with no instances, rather than an error | open |
+| 2 | **Install the cluster add-ons.** One apply with six `-target`s: the EBS CSI and external-dns Pod Identity modules, Karpenter, add-ons, Argo Workflows, FinOps. Terraform orders them by the graph: FinOps after add-ons | open |
 | 3 | **Add the network rules for the cluster's system services.** The twelve kube-system NetworkPolicies, in one apply. Strict mode blocks every pod with no policy, CoreDNS included, and the cluster deadlocks | open |
 | 4 | **Create the remaining resources, including the Cloudflare tunnel, and store its token.** First a targeted apply of ArgoCD and its root app, then a wait of up to ten minutes for each namespace ArgoCD's first sync creates that the next apply writes into (`argo-workflows`, `prefect`, `grafana`), then the full apply: the Cloudflare tunnel, its Access applications and everything else. The token sync is part of this phase; the commands are below for an operator doing it by hand against a half-built cluster | open |
 | 5 | **Wait for ArgoCD to install the resource types later phases need.** `clustersecretstores.external-secrets.io` and `prometheusrules.monitoring.coreos.com`, each polled for existence and then for `Established` | open |
@@ -579,8 +560,7 @@ its teardown order by reversing the same list rather than keeping a second copy.
 | `vpc_cni_network_policy_enabled` | `false` | Set `true` from Phase 6. Turns the VPC CNI network-policy **agent** on; `false` makes every NetworkPolicy in the cluster inert. Persisted in `install-state.auto.tfvars` |
 | `vpc_cni_strict_mode` | `false` | **Opt-in; the installer never sets it.** Chooses strict over standard enforcement, and only has effect while the agent above is on. Strict mode denies any pod that no NetworkPolicy selects, and this repo ships policies for four namespaces out of roughly twenty in a running cluster — see [Enabling NetworkPolicy enforcement](operations.md#enabling-networkpolicy-enforcement) and #746 |
 | `operator_emails` | — | The operators: administrators of every web UI and, with Cognito, who may reach the cluster |
-| `globus_enabled` | `false` | Set `true` to stand up the Globus Connect Server ingress — 52 resources, and four prerequisites no fork inherits. False is a complete deployment reading pre-staged data |
-| `globus_client_id` | `""` | Globus service account app client ID. Required, and refused empty, once `globus_enabled` is true — as are the other six ingress inputs |
+| `globus_source_collection_id` | `""` | The HTTPS ingress's source collection. Empty runs `ingress-mode=presynced` only |
 | `globus_s3_destination_bucket` | — | The data bucket (no default — must be provided) |
 | `kubernetes_version` | `1.35` | Bump for EKS version upgrades |
 | `domain` | — | Base domain for every service hostname, or `null` for port-forward mode (no default — must be provided) |

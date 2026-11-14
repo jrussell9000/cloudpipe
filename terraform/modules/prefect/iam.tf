@@ -83,70 +83,29 @@ data "aws_iam_policy_document" "worker" {
     resources = ["*"]
   }
 
-  # cloudpipe_queue_manager reads the Globus dest collection UUID at runtime
-  # so instance replacements take effect without redeploying the flow.
+  # The queue manager reads the HTTPS source (collection and base path) at
+  # runtime, so a change takes effect without redeploying the flow.
   #
   # session-established-at is read by the batch gate: before submitting, the
   # queue manager checks how much life the Globus session has left, because a
   # batch submitted against a lapsed session fails one workflow at a time until
   # all of them have failed (2026-08-17: 300 subjects).
+  #
+  # The grants for the retired Globus host (`collection-id`, `config`,
+  # `gateway-name`, `instance-id`, and starting the instance) went with it
+  # (openspec retire-globus-host 5.2).
   statement {
     sid     = "SSMReadGlobusParams"
     actions = ["ssm:GetParameter"]
     resources = [
-      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/collection-id",
       "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/source-collection-id",
       "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/source-base-path",
       "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/session-established-at",
-      # The gate measures the session against the gateway's DECLARED timeout, so
-      # it needs the document that declares it and the name of the gateway to
-      # read out of it. Both were missing, and the failure was invisible:
-      # `_read_ssm_optional` swallows every exception, so an AccessDenied read
-      # back as "not configured" and the gate fell through to
-      # DEFAULT_SESSION_TIMEOUT_MINUTES. It logged `from the default (nothing
-      # declares a timeout)` on every run since the gate shipped, and nobody read
-      # that line. Found by the 4.9 canary; #506 fixed the same symptom from the
-      # other end and was verified from a workstation, where the operator's own
-      # credentials could read both.
-      #
-      # These two belong together. Granting `config` alone makes the gate see two
-      # declared gateways with no name and raise AmbiguousGatewayError, refusing
-      # every batch.
-      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/config",
-      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/gateway-name",
-      # The gate starts the Globus host before its live listing (#652); this is
-      # how it finds the instance. See StartGlobusHost below.
-      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.cluster_name}/globus/instance-id",
     ]
   }
 
-  # The live listing cannot succeed against a stopped host, and the host is
-  # stopped every night at 00:00 UTC. Until #652 the gate refused every batch
-  # submitted after an idle midnight, because the only thing that started the
-  # host was a workflow, and no workflow exists until the gate lets one through.
-  # The same two grants the Argo runner holds for its start-globus-instance step
-  # (runner_globus_ec2 in terraform/modules/globus/main.tf): start this one
-  # instance, describe any (EC2 describe actions take no resource ARN).
-  dynamic "statement" {
-    for_each = var.globus_instance_arn == "" ? [] : [var.globus_instance_arn]
-    content {
-      sid       = "StartGlobusHost"
-      actions   = ["ec2:StartInstances"]
-      resources = [statement.value]
-    }
-  }
-
-  dynamic "statement" {
-    for_each = var.globus_instance_arn == "" ? [] : [var.globus_instance_arn]
-    content {
-      sid       = "DescribeGlobusHost"
-      actions   = ["ec2:DescribeInstanceStatus", "ec2:DescribeInstances"]
-      resources = ["*"]
-    }
-  }
-
-  # The gate's second half is a live listing through the destination collection,
-  # which needs the transfer credential.
+  # The gate's second half is a live listing of the source through the Transfer
+  # API, which needs the operator's refresh token.
   #
   # The six `?` are Secrets Manager's own suffix: it appends a hyphen and exactly
   # six random characters to every secret name, and the authorization request

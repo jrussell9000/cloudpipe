@@ -108,7 +108,7 @@ spec:
     container:
       # The first-level image: the same AFNI that wrote the concatenations, and
       # staged_backfill.py. build-fmri-first-level-proc.yaml re-pins both templates.
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:8434991e571b54615c7ba631b77e33e832144cbf9305d2a5e65f91af8cd9a5ee"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:257a40faaf45fe0402722efbd6c2fc38fab77a09d926feba6eb95646511d59e9"
       imagePullPolicy: IfNotPresent
       command: ["python3", "/app/staged_backfill.py"]
       args:

@@ -22,13 +22,12 @@
 # Pre-creating the profile removes the need for Packer to write IAM at all,
 # which is why it is the fix rather than a narrowing.
 #
-# TWO profiles, not one shared superset: the fastsurfer builder pulls container
-# images from the private registry and the globus builder does not, so a single
-# role would hand the globus builder ECR access it never uses. That is the same
-# over-grant this issue is about, one level down.
+# One profile per builder, never a shared superset, so no builder holds access it
+# never uses. There is one builder now: the Globus GCS AMI bake and its SSM-only
+# profile were retired with the Globus host (openspec retire-globus-host 5.2).
 #
-# Both policies are copied verbatim from what the templates previously requested
-# in `temporary_iam_instance_profile_policy_document`, so the builders' runtime
+# The policy is copied verbatim from what the template previously requested in
+# `temporary_iam_instance_profile_policy_document`, so the builder's runtime
 # permissions are unchanged — only who creates them is.
 ################################################################################
 
@@ -42,9 +41,8 @@ data "aws_iam_policy_document" "packer_builder_assume" {
   }
 }
 
-# Session Manager, needed by every builder: both templates reach the instance
-# over SSM rather than SSH on a public IP, so without this the build cannot
-# connect at all.
+# Session Manager: the template reaches the instance over SSM rather than SSH on
+# a public IP, so without this the build cannot connect at all.
 data "aws_iam_policy_document" "packer_builder_ssm" {
   statement {
     sid    = "SessionManagerMessaging"
@@ -113,23 +111,4 @@ resource "aws_iam_role_policy" "packer_builder_gpu" {
 resource "aws_iam_instance_profile" "packer_builder_gpu" {
   name = "packer-builder-gpu"
   role = aws_iam_role.packer_builder_gpu.name
-}
-
-# ── globus builder: SSM only ──────────────────────────────────────────────────
-
-resource "aws_iam_role" "packer_builder_globus" {
-  name               = "packer-builder-globus"
-  description        = "Instance profile for the Globus GCS AMI bake (SSM only)"
-  assume_role_policy = data.aws_iam_policy_document.packer_builder_assume.json
-}
-
-resource "aws_iam_role_policy" "packer_builder_globus" {
-  name   = "packer-builder-globus"
-  role   = aws_iam_role.packer_builder_globus.name
-  policy = data.aws_iam_policy_document.packer_builder_ssm.json
-}
-
-resource "aws_iam_instance_profile" "packer_builder_globus" {
-  name = "packer-builder-globus"
-  role = aws_iam_role.packer_builder_globus.name
 }

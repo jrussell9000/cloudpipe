@@ -5,7 +5,7 @@
 # made HTTPS ingress depend on the Globus host's module for no reason of its own:
 # a deployment with the ingress off had no session clock and no source to read,
 # and destroying the host would have destroyed the login timestamp with it
-# (openspec/changes/retire-globus-host, design D5). Readers:
+# (openspec/changes/archive/2026-11-13-retire-globus-host, design D5). Readers:
 #
 #   session-established-at  the ingress pod (images/globus/https_ingress.py), the
 #                           queue manager's batch gate, `globus doctor`

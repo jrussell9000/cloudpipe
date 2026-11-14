@@ -12,7 +12,7 @@ and each subject's long-template alike:
 The device is read from the tree itself, not inferred: the workflow label that
 also records it is gone with the workflow, and the pod-cost instance type is a
 hostname join that #1060 showed can name the wrong node. `_complete.json` is the
-only existence test for a tree (CLAUDE.md, ADR 017), so an incomplete tree's
+only existence test for a tree (docs/pipelines.md, ADR 017), so an incomplete tree's
 logs are not read at all.
 
 Read-only. The 2026-10-26 census of 45,246 trees survives only as a summary;

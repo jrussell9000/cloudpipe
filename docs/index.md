@@ -8,7 +8,7 @@ It takes ABCD's minimally preprocessed sMRI/fMRI ([Hagler et al. 2019](https://d
 
 Most neuroimaging pipelines assume a persistent filesystem and a fixed pool of compute. CloudPipe assumes neither, and most of its design follows from that:
 
-- **No shared POSIX filesystem.** Steps exchange data as compressed S3 artifacts, and pods read the source data through a Globus S3 gateway rather than a staged copy (ADR 001, ADR 004). Nothing survives a pod, so every step is restartable and the storage bill is not a function of how long a batch takes.
+- **No shared POSIX filesystem.** Steps exchange data as compressed S3 artifacts, and ingress copies the source data from the provider's HTTPS server straight into S3, with no staging volume (ADR 004, ADR 024). Nothing survives a pod, so every step is restartable and the storage bill is not a function of how long a batch takes.
 - **Nodes exist only while work does.** Karpenter provisions each pipeline pod's node on demand and reclaims it after (ADR 007), including spot GPU nodes for registration. GPUs are time-sliced three pods to a card.
 - **Every run is measured, not just logged.** Each step emits structured QC and cost records to a queryable metrics corpus (S3 → Glue → Athena → Grafana), so per-run alignment quality and per-run dollar cost are both first-class queryable facts rather than something reconstructed later from logs. See [observability.md](observability.md).
 - **Design choices are written down as they are made.** Architecture Decision Records (ADRs) record what was chosen, what was rejected, and — where it matters — the measurement that decided it. They are not published yet; references to "ADR NNN" in these pages point to them.
@@ -49,7 +49,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 | **Stand up my own deployment, starting from a fresh clone** | [deployer-first-hour.md](deployer-first-hour.md) |
 | Understand how the system fits together | [architecture.md](architecture.md) |
 | Get ABCD data into the bucket, with or without Globus | [data-ingress.md](data-ingress.md) |
-| Find out whether I *can* reproduce the Globus ingress | [globus-prerequisites.md](globus-prerequisites.md) |
+| Find out whether I *can* reproduce the HTTPS ingress | [globus-prerequisites.md](globus-prerequisites.md) |
 | Run the pipeline or check on a subject | [operations.md](operations.md) |
 | Understand what each pipeline step does | [pipelines.md](pipelines.md) |
 | Investigate a failed workflow | [operations.md → Handling failures](operations.md#handling-failures) |
@@ -58,11 +58,11 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 | Look up what a metrics field means | [metrics_data_dictionary.md](metrics_data_dictionary.md) |
 | Understand what a QC metric measures and how it is computed | [qc-metrics-explained.md](qc-metrics-explained.md) |
 | Get FastSurfer and subregion stats for the whole cohort as tables | [anatomical-stats.md](anatomical-stats.md) |
+| See how cloudpipe was compared against fMRIPrep, or run the comparison | [fmriprep-benchmark.md](fmriprep-benchmark.md) |
 | Understand why `bold_to_t1w` NMI is ~1.02 and not ~2.0 | [nmi-interpretation.md](nmi-interpretation.md) |
 | Update `preproc.py` | [operations.md → Updating code](operations.md#updating-code) |
 | Run tests or check what CI validates on a PR | [operations.md → Running tests and CI checks](operations.md#running-tests-and-ci-checks) |
-| Rotate a Globus credential | [globus.md → Credential rotation](globus.md#credential-rotation) |
-| Replace the GCS EC2 instance | [globus.md → Instance replacement](globus.md#instance-replacement) |
+| Renew the Globus login, or check it before a batch | [globus.md → Session renewal](globus.md#session-renewal) |
 | Add a new WorkflowTemplate | [argo-workflows.md → Adding a new WorkflowTemplate](argo-workflows.md#adding-a-new-workflowtemplate) |
 | Add a new Docker image | [images.md → Adding a new image](images.md#adding-a-new-image) |
 | Rebuild or deploy a pre-baked GPU AMI | [pre-baked-amis.md](pre-baked-amis.md) |
@@ -75,7 +75,7 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 
 ### Deploying this yourself
 
-- [**deployer-first-hour.md**](deployer-first-hour.md) — The path from a fresh clone to a Terraform root ready for its first apply: the prerequisite bootstrapper, `cloudpipe setup` (which collects the fifteen deployment inputs and renders `terraform.tfvars` and `backend.tf`), the state bucket, `globus init`, and the read-only `cloudpipe preflight` that checks your answers against AWS, Cloudflare and your OIDC issuer before anything is applied. None of those commands create a cloud resource.
+- [**deployer-first-hour.md**](deployer-first-hour.md) — The path from a fresh clone to a Terraform root ready for its first apply: the prerequisite bootstrapper, `cloudpipe setup` (which collects the eighteen deployment inputs and renders `terraform.tfvars` and `backend.tf`), the state bucket, and the read-only `cloudpipe preflight` that checks your answers against AWS, Cloudflare and your OIDC issuer before anything is applied. None of those commands create a cloud resource.
 
 ### System
 
@@ -112,15 +112,15 @@ Note that CloudPipe is intentionally *not* compatible with the DCAN/ABCD-BIDS to
 
 ### Data ingress
 
-- [**data-ingress.md**](data-ingress.md) — **Start here for anything ingress-related.** The S3 key contract every processing step actually depends on (exact keys, including the literally-matched T1w filename), where the seam sits in the DAG, and how to choose between Globus, POSIX staging, and pre-staged S3. Globus is one implementation of this contract, not a requirement.
+- [**data-ingress.md**](data-ingress.md) — **Start here for anything ingress-related.** The S3 key contract every processing step actually depends on (exact keys, including the literally-matched T1w filename), where the seam sits in the DAG, and how to choose between the HTTPS ingress and pre-staged S3. The HTTPS ingress is one implementation of this contract, not a requirement.
 
-- [**globus-prerequisites.md**](globus-prerequisites.md) — What you must obtain *before* `globus-setup.md` can work: an NBDC Data Hub Data Use Certification, an institutional Globus High Assurance subscription, and a human Globus admin to attach your endpoint to it. Three of the four gates are granted by other organisations and cannot be automated. Includes the recurring manual credential burden and a four-question decision tree for whether to reproduce this at all.
+- [**globus-prerequisites.md**](globus-prerequisites.md) — What you must obtain *before* the first Globus login: an NBDC Data Hub Data Use Certification on a Globus identity, a native app registration, and a person to log in every 30 days. No Globus subscription or endpoint of your own. Includes a three-question decision tree for whether to reproduce this at all.
 
 ### Globus
 
-- [**globus.md**](globus.md) — Reference and operations for the running system: architecture, current deployment values, EC2/SSM/IAM components, two-credential model (IAM user key for S3 gateway vs. OAuth2 refresh token), transfer.py walkthrough, High Assurance requirements, credential rotation, instance replacement, operational checks, troubleshooting, and endpoint recovery.
+- [**globus.md**](globus.md) — The runbook for the Globus session behind the HTTPS ingress: machine prerequisites and the answers document, `pixi run globus login`, `pixi run globus doctor`, the 30-day renewal, the SSM parameters, and troubleshooting.
 
-- [**globus-setup.md**](globus-setup.md) — One-time build-from-scratch walkthrough: prerequisites, network requirements, endpoint creation, S3 storage gateway, collection, IAM credentials, SSM parameters, HA subscription, native app registration, and refresh token. Includes a historical appendix on the disabled POSIX+EBS staging alternative.
+- [**globus-contract.md**](globus-contract.md) — The operator CLI's integration contract (2.0): its two commands, exit codes, JSON envelope, the six `doctor` checks and the answers schema.
 
 ---
 
@@ -141,7 +141,6 @@ terraform/            — AWS infrastructure; the root holds only backend, provi
       example/        — a minimal root for outside deployments to copy
     addons/           — EKS add-ons + their Pod Identity associations
     argo-workflows/   — Argo IAM, RDS, RBAC
-    globus/           — GCS EC2, SSM, EventBridge
     karpenter/        — NodePools and NodeClass
     metrics/          — Glue catalog tables (hand-declared), Athena workgroup, Grafana IAM
     finops/           — CUR/Athena cost-and-usage reporting
@@ -155,7 +154,7 @@ prefect/flows/        — Prefect queue manager flows
 src/                  — importable library code (on pytest pythonpath)
   metrics/            — schemas, Athena/DuckDB query helpers, exit handler, cost scraper,
                         nightly compactor, per-step outcome recorder
-  globus_admin/       — Globus operator tooling (`pixi run globus <command>`)
+  globus_admin/       — the Globus session CLI (`pixi run globus login`, `... doctor`)
   cloudpipe_setup/    — the setup wizard (`scripts/cloudpipe-setup`)
   anat_stats/         — cohort aggregation of FastSurfer and subregion stats into Parquet
   inventory.py, validate_test_batch.py, workflow_steps.py, pullsamplestats.py,
@@ -193,7 +192,6 @@ docs-internal/        — Architecture Decision Records, dated investigations an
 | ECR private registry (primary, `ecr-registry` param) | `{account-id}.dkr.ecr.{region}.amazonaws.com/cloudpipe/`; `CLOUDPIPE_ECR_REGISTRY` under `pixi run -e ops` |
 | ECR Public prefix (secondary — dual-push, rollback target; being retired per image) | `public.ecr.aws/l9e7l1h1/cloudpipe/` |
 | Globus source collection (NBDC Data Hub) | SSM `/cloudpipe/globus/source-collection-id` |
-| Globus destination collection | SSM `/cloudpipe/globus/collection-id` |
 | Prefect server | `https://prefect.<domain>`, where `<domain>` is the Terraform `domain` variable |
 | Argo server | `https://argo.<domain>` |
 | ArgoCD | `https://argocd.<domain>` |

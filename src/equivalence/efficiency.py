@@ -138,6 +138,7 @@ CLOUDPIPE_EXCLUDED_STEPS: Mapping[str, str] = {
     "workflow-start-marker": "bookkeeping",
     "workflow-verdict": "bookkeeping",
     "published-sessions": "bookkeeping",
+    "decide-anatomy-rebuild": "bookkeeping",
 }
 
 # Each step's prerequisites in the master workflow's DAG

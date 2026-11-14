@@ -194,52 +194,9 @@ globus_s3_destination_bucket = "example-neuroimaging-data"
 globus_source_collection_id = ""
 
 
-# --- Globus ingress (optional) -----------------------------------------------
-# Leave `globus_enabled = false` unless you are standing up a Globus Connect
-# Server to pull imaging in. Enabling it needs four things this repository
-# cannot give you:
-#
-#   * a Globus subscription — the S3 connector is a paid feature;
-#   * a confidential service client registered in the Globus Developers Portal;
-#   * a managed prefix list in this region for the SSH rule;
-#   * a GCS AMI built from `packer/globus-gcs/` in your own AWS account, and
-#     `globus_ami_id` in `terraform/modules/stack/globus.tf` pointed at it. The
-#     id committed there is the reference deployment's, shared with nobody.
-#
-# With it false, the pipeline runs in `ingress-mode=presynced`: it reads
-# whatever is already in the data bucket above and never starts a transfer.
-#
-# The six values below are required once the flag is true, and the module
-# refuses an empty one — so turning the ingress on is one edit of seven lines,
-# not an apply that half-works. They do not have to be filled in by hand: write
-# the answers document (../../../../docs/globus-setup.md, step 3.1) and run
-# `pixi run globus init`, which renders them into a globus.auto.tfvars that
-# Terraform loads AFTER this file, so a value there wins over the same value
-# here.
-globus_enabled = false
-
-# The confidential service client that owns the endpoint. A UUID, and the
-# placeholder is deliberately not UUID-shaped, for the reason given for the
-# source collection above. Terraform rejects it once `globus_enabled` is true,
-# which is the intended failure; with it false it is inert.
-globus_client_id = "<service-client-uuid>"
-
-# Prefix list of IP ranges allowed SSH to the Globus EC2 instance, typically a
-# narrow sysadmin-only one.
-globus_admin_prefix_list_id = "pl-0123456789abcdef0"
-
-# Shown on the endpoint's public listing page.
-globus_org_name      = "Example University"
-globus_contact_email = "globus-admin@example.edu"
-
-# The person the institution contacts about the endpoint — typically an
-# institutional Globus administrator. Named in the subscription request
-# `globus bootstrap-endpoint` prints. NOT the endpoint owner, which is the
-# service client above.
-globus_owner_email = "globus-admins@example.edu"
-
-# Identity domain permitted to authenticate to the Globus storage gateway.
-globus_identity_domain = "example.edu"
+# The address HTTPS ingress names in its User-Agent, so the source's operators
+# can reach you about your traffic. Optional: empty leaves the address off.
+globus_contact_email = ""
 
 # Optional, and only optional if you follow the convention. The metrics bucket is
 # created by the bootstrap root — which requires its name — and the stack

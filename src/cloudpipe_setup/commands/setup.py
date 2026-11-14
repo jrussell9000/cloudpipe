@@ -158,7 +158,6 @@ def _report(
 #: index it.
 STEP_ORDER = {
     "state.bucket": 0,
-    "globus.inputs": 1,
     "config.objects": 2,
     "install.cloudflare_token": 3,
     "preflight": 4,
@@ -321,39 +320,9 @@ def _outstanding(root: Path, answers: dict, *, with_backend: bool) -> list[dict]
     """
     steps = []
 
-    # Set anywhere Terraform loads — rendered by `globus init` or written by hand
-    # into terraform.tfvars — counts as done. Narrowed by `globus_enabled` exactly
-    # as preflight's `globus.inputs` is, through the same function: this list used
-    # to demand all eight from a deployment with no ingress after preflight had
-    # stopped doing so.
-    expected = roots.wanted_globus_inputs(root, schema.STACK_VARIABLES) or ()
-    globus = roots.globus_inputs(root, expected)
-    done = bool(expected) and not globus.missing
-    kind, text = roots.missing_globus_remedy(root, globus.missing)
-    if kind == "command":
-        text += (
-            "  (read docs/globus-prerequisites.md first — several of its inputs come from "
-            "gates that take days)"
-        )
-    one = len(expected) == 1
-    steps.append(
-        {
-            "identifier": "globus.inputs",
-            # With the ingress off, the one input wanted is the data bucket's name,
-            # and a title naming Globus sent deployers who are not running it to
-            # skip the step (acceptance install, 2026-10-23).
-            "title": "The data bucket's name" if one else "Globus Terraform inputs",
-            "state": "pass" if done else "blocked",
-            "message": (
-                f"{'the one' if one else f'all {len(expected)}'} set, in "
-                f"{', '.join(p.name for p in globus.sources)}"
-                if done
-                else f"not set: {', '.join(globus.missing) or 'unknown'}; this tool does not own "
-                f"{'it' if len(globus.missing) == 1 else 'them'}"
-            ),
-            "remedy": None if done else {"kind": kind, "text": text},
-        }
-    )
+    # There is no `globus.inputs` step since contract 3.0: the data bucket, the one
+    # input it still covered, is one of this wizard's own fields, and the
+    # Globus host whose inputs `globus init` rendered is retired.
 
     if with_backend:
         steps.append(

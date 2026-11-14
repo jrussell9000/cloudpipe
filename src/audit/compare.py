@@ -3,7 +3,7 @@
 Spec `audit-comparison`. Reads only; writes only --out. A root is a data bucket
 (optionally with a key prefix before `derivatives/`), so the same code compares
 production with the audit (fresh vs stored) and the audit with its repeat pair
-(the noise floor). Layout is the production layout (CLAUDE.md, "S3 layout").
+(the noise floor). Layout is the production layout (docs/architecture.md).
 
 Every measure is recorded as a DISTANCE: 0 means identical, larger means
 further apart. Correlations and Dice become 1 - value; differences are
@@ -605,26 +605,76 @@ def compare_tissue(ctx: Ctx, subject: str, session: str) -> Iterator[dict]:
                        voxel_difference(pa, pb, within)["mean_abs_diff"])  # fmt: skip
 
 
+#: fsLR 32k cortical grayordinates, first in every cloudpipe CIFTI (CORTEX_LEFT then
+#: CORTEX_RIGHT); the subcortical block after them follows the subject's T1w->MNI
+#: registration, so its per-structure counts can differ between two runs.
+CORTICAL_GRAYORDINATES = 59412
+
+
+def _structure_counts(img) -> dict[str, int]:
+    # len(bm), not the slice: nibabel leaves the last structure's slice open (stop=None).
+    return {str(name).replace("CIFTI_STRUCTURE_", ""): len(bm)
+            for name, _, bm in img.header.get_axis(1).iter_structures()}  # fmt: skip
+
+
+def cortical_tail_distance(a: np.ndarray, b: np.ndarray, n_nss_frames: int) -> tuple[float, int]:
+    """(1 - 5th-percentile temporal r over the cortex, grayordinates left out).
+
+    `a`, `b` are CIFTI arrays, time x grayordinates. Not
+    equivalence.endpoints.cortical_grayordinates: its Pearson is 0 where either
+    series is constant, so a grayordinate constant in BOTH runs (agreement) counts
+    as r = 0. A run with more than 5% of its cortex constant (2026-11-12: 4,471 of
+    59,412 in one session, in production and fresh alike) then has a 5th
+    percentile of 0, distance 1, though its cortex differed by at most 0.045 and its
+    median r was 0.99999999999. Here a grayordinate constant in both is left out and
+    counted; one constant in only one run stays at r = 0, a real disagreement.
+    """
+    x = np.asarray(a[n_nss_frames:, :CORTICAL_GRAYORDINATES], dtype=np.float64)
+    y = np.asarray(b[n_nss_frames:, :CORTICAL_GRAYORDINATES], dtype=np.float64)
+    x = x - x.mean(axis=0)
+    y = y - y.mean(axis=0)
+    sx, sy = np.sqrt((x * x).sum(axis=0)), np.sqrt((y * y).sum(axis=0))
+    both_constant = (sx == 0) & (sy == 0)
+    r = np.zeros(x.shape[1])
+    ok = (sx > 0) & (sy > 0)
+    r[ok] = (x[:, ok] * y[:, ok]).sum(axis=0) / (sx[ok] * sy[ok])
+    kept = r[~both_constant]
+    tail = float(np.percentile(kept, 5)) if kept.size else 1.0
+    return 1.0 - tail, int(both_constant.sum())
+
+
 def compare_grayordinates(
     ctx: Ctx, subject: str, session: str, run: str, nss: int
 ) -> Iterator[dict]:
-    from equivalence.endpoints import cortical_grayordinates
-
+    unit = f"grayordinates/{run}"
     rel = f"derivatives/func_surf/{subject}/{session}/fsLR32k/{subject}_{session}_{run}_space-fsLR32k_bold.dtseries.nii"
     pa, pb = ctx.pair(rel)
-    miss = _presence(subject, session, f"grayordinates/{run}", "dtseries", pa, pb)
+    miss = _presence(subject, session, unit, "dtseries", pa, pb)
     if miss:
         yield miss
         return
-    a = np.asarray(_load(pa).dataobj)
-    b = np.asarray(_load(pb).dataobj)
-    if np.array_equal(a, b):
-        yield _row(subject, session, f"grayordinates/{run}", "dtseries_p5_temporal_r", 0.0)
+    ia, ib = _load(pa), _load(pb)
+    ca, cb = _structure_counts(ia), _structure_counts(ib)
+    if ca != cb:
+        # The subcortical block's voxel counts follow T1w->MNI, so a different
+        # registration changes the layout; no grayordinate past the cortex is
+        # comparable by position. Reported, not scored.
+        differ = {
+            k: [ca.get(k), cb.get(k)] for k in sorted(set(ca) | set(cb)) if ca.get(k) != cb.get(k)
+        }
+        yield _row(subject, session, unit, "dtseries_layout", status="layout_differs",
+                   structures_differ=differ)  # fmt: skip
+    a, b = np.asarray(ia.dataobj), np.asarray(ib.dataobj)
+    if a.shape == b.shape and np.array_equal(a, b):
+        yield _row(subject, session, unit, "dtseries_p5_temporal_r", 0.0)
         return
-    # CIFTI stores time x grayordinates; the endpoint takes grayordinates as rows.
-    g = cortical_grayordinates(a.T, b.T, n_nss_frames=nss)
-    yield _row(subject, session, f"grayordinates/{run}", "dtseries_p5_temporal_r",
-               1.0 - g.tail_temporal_correlation)  # fmt: skip
+    if a.shape[0] != b.shape[0] or min(a.shape[1], b.shape[1]) < CORTICAL_GRAYORDINATES:
+        yield _row(subject, session, unit, "dtseries_p5_temporal_r", status="shape_differs",
+                   shapes=[list(a.shape), list(b.shape)])  # fmt: skip
+        return
+    distance, constant = cortical_tail_distance(a, b, nss)
+    yield _row(subject, session, unit, "dtseries_p5_temporal_r", distance,
+               constant_in_both=constant)  # fmt: skip
 
 
 def _runs(ctx: Ctx, subject: str, session: str) -> list[str]:
@@ -719,6 +769,31 @@ def _guarded(fn, ctx: Ctx, subject: str, session: str, *args) -> list[dict]:
 
 WITHIN_NOISE, HARDWARE, DEFECT, UNEXPLAINED = "within_noise", "hardware", "defect", "unexplained"
 
+#: The smallest distance treated as a difference, for measures whose noise floor
+#: can be exactly 0. Two identical fresh runs give 0, but a run compared with a
+#: production tree written by other pods differs at rounding level. In the main
+#: run's anatomy-identical subjects (2026-11-12): BOLD->T1w up to 0.008 mm,
+#: CompCor subspaces up to 2.3e-3, DVARS/FD up to 2.3e-4, confound signals up to
+#: 2.5e-3, and the grayordinate tail at 1e-11..1e-5. A floor above the tolerance
+#: wins. Anatomy has none on purpose: same-card anatomy is bit-identical, and any
+#: difference there is a finding.
+ZERO_FLOOR_TOLERANCE: dict[str, float] = {
+    "displacement_mm": 0.01,  # a hundredth of a millimetre
+    "dtseries_p5_temporal_r": 1e-4,
+    "confounds_signals_max_rel_diff": 5e-3,
+    "confounds_dvars_fd_max_rel_diff": 1e-3,
+    "confounds_motion_max_rel_diff": 1e-6,
+    "confounds_design_max_rel_diff": 0.0,
+}
+_SUBSPACE_TOLERANCE = 5e-3  # every confounds_*_subspace_distance
+
+
+def tolerance(measure: str) -> float:
+    """The rounding-level distance below which `measure` counts as no difference."""
+    if measure.endswith("_subspace_distance"):
+        return _SUBSPACE_TOLERANCE
+    return ZERO_FLOOR_TOLERANCE.get(measure, 0.0)
+
 
 def classify(
     measure: str,
@@ -734,9 +809,10 @@ def classify(
     runs, "cpu|cuda" (sorted) across. Same hardware: within_noise or defect.
     Different hardware: within_noise if inside the same-hardware floor, hardware
     if inside that pair's floor, defect if outside it, unexplained if that pair
-    was never measured.
+    was never measured. Every floor is at least `tolerance(measure)`.
     """
-    by_pair = floor.get(measure, {})
+    tol = tolerance(measure)
+    by_pair = {k: max(v, tol) for k, v in floor.get(measure, {}).items()}
     same = by_pair.get(f"{hardware_a}|{hardware_a}") if hardware_a == hardware_b else None
     if hardware_a == hardware_b:
         if same is None:

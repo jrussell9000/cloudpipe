@@ -162,9 +162,14 @@ RUN --mount=type=cache,target=/opt/conda/pkgs \
 # exploded publish (ADR 017; fs_derivatives needs restore_links' sidecar names).
 # Staging and the analysis template live in fmri-first-level-proc.
 COPY images/shared/fs_derivatives.py images/shared/restore_links.py ./
+# The anatomical-QC reject list's reader (#1205). Standard library only, so the file
+# alone; the Prefect flows read the same module from src/metrics/.
+COPY src/metrics/anat_qc_rejects.py ./
 COPY images/fmri-first-level-proc/stage_first_level.py ./
 # The one-off staged-run backfill of pre-cp.11 trees (staged-backfill WorkflowTemplate).
 COPY images/fmri-first-level-proc/staged_backfill.py ./
+# The one-off removal of nback_conn's shared copies from pre-cp.12 trees (conn-dedup).
+COPY images/fmri-first-level-proc/conn_dedup.py ./
 # The atlas ships inside the fmri-first-level-proc package, with its licences (4.0.0+cp.4).
 
 # Point directly to the python in the env

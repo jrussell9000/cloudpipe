@@ -89,14 +89,24 @@ deployments:
       bucket: "{{ $CLOUDPIPE_METRICS_BUCKET }}"
       pipeline: cloudpipe_minproc
 
-  # The same flow, re-reading YESTERDAY at 12:00 UTC, so each pod's instance is
-  # proven from complete data (#1060). At 02:00 Kubecost has not finished
-  # building the day's node assets and labels: on 2026-11-07 the 02:00 read
-  # proved the instance of 7,849 of 10,358 pods and a later read 10,032. Every
-  # one the 02:00 read proved, the later read proved to be the same instance,
-  # and the later read carries them forward, so this pass only adds. 12:00 is
-  # 36 h after the window opens, inside Kubecost's 49 h of hourly data
-  # (retention1h); past that, reused hostnames merge and cannot be told apart.
+  # The same flow, re-reading YESTERDAY at 12:00 and again at 22:00 UTC, so each
+  # pod's instance is proven from complete data (#1060). At 02:00 Kubecost has
+  # not finished building the day's node assets and labels: on 2026-11-07 the
+  # 02:00 read proved the instance of 7,849 of 10,358 pods and a later read
+  # 10,032. Every one an earlier read proved, the later read proved to be the
+  # same instance, and each read carries the stored record's instances forward,
+  # so every pass only adds.
+  #
+  # 12:00 alone was not late enough on a busy day: on 2026-11-13 the 12:00 read
+  # of 11-12 proved the instance of 66% of its 7,881 production pods; the same
+  # pods read at 16:45 proved 94%. The pod set did not change between reads.
+  # (A raw read of the window also returns the reprocess audit's pods, 1,672 that
+  # day, which route_workflows writes to the audit buckets.) 22:00 is 46 h after
+  # the window opens, the latest that leaves margin inside Kubecost's 49 h of
+  # hourly data (retention1h): the window's first hour expires at 01:00 the next
+  # day, and past that reused hostnames merge and cannot be told apart (11-11
+  # read at 64 h: 2,261 of its 5,816 production pods left). 12:00 stays as the
+  # fallback if the 22:00 run fails.
   # The day stays scrape_age_days = 1. The settled re-scrape, the drift probe
   # and the gap detector are left to the 02:00 run.
   - name: kubecost-day1-refresh
@@ -111,6 +121,9 @@ deployments:
         finished_job_ttl: 60
     schedules:
       - cron: "0 12 * * *"
+        timezone: UTC
+        active: true
+      - cron: "0 22 * * *"
         timezone: UTC
         active: true
     parameters:
@@ -136,9 +149,12 @@ deployments:
       - cron: "30 2 * * *"
         timezone: UTC
         active: true
-      # And 30 min after kubecost-day1-refresh's 0 12 * * * run, so the Parquet
-      # copy of yesterday does not keep the 02:00 read for a day.
+      # And 30 min after each kubecost-day1-refresh run (0 12 and 0 22), so the
+      # Parquet copy of yesterday does not keep an earlier read for a day.
       - cron: "30 12 * * *"
+        timezone: UTC
+        active: true
+      - cron: "30 22 * * *"
         timezone: UTC
         active: true
     parameters:

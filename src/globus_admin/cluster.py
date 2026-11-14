@@ -17,7 +17,7 @@ import json
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -84,25 +84,41 @@ def eso_refresh_interval(manifest: Path | None = None) -> str:
     return str(interval) if interval else "its refresh interval"
 
 
+#: Every key the ExternalSecret syncs into the Kubernetes Secret, which is every
+#: key `login` writes. `doctor` compares each, and `login` waits for each: the
+#: HTTPS ingress pods read `https-refresh-token`, and a check of `refresh-token`
+#: alone passed while that key was missing (#523).
+SYNCED_KEYS = ("native-app-client-id", REFRESH_TOKEN_KEY, "https-refresh-token")
+
+
 @dataclass(frozen=True)
 class SecretRead:
-    """What the cluster holds for the token, or why it could not be read."""
+    """What the cluster Secret holds, or why it could not be read.
 
-    token: str | None = None
+    `exists=False` with no error means the Secret is not there at all, which a
+    check reports as "this deployment has none" rather than as a read failure.
+    """
+
+    values: dict[str, str] = field(default_factory=dict)
     error: str | None = None
+    exists: bool = True
 
     @property
     def ok(self) -> bool:
         return self.error is None
 
+    @property
+    def token(self) -> str | None:
+        return self.values.get(REFRESH_TOKEN_KEY)
 
-def read_secret_token(
+
+def read_secret(
     runner: Runner = subprocess_runner,
     *,
     name: str,
     namespace: str = ARGO_NAMESPACE,
 ) -> SecretRead:
-    """The `refresh-token` value inside a Kubernetes Secret.
+    """Every key inside a Kubernetes Secret, decoded.
 
     Shared by `doctor`'s Secret check and `login`'s wait: both need the same
     answer, and two readers of one Secret would eventually disagree about what
@@ -112,18 +128,29 @@ def read_secret_token(
         ["kubectl", "get", "secret", name, "-n", namespace, "-o", "json", "--request-timeout=15s"]
     )
     if not result.ok:
+        if _MISSING_OBJECT.search(result.output or ""):
+            return SecretRead(exists=False)
         return SecretRead(error=result.output[:300] or f"kubectl exited {result.returncode}")
     try:
         payload = json.loads(result.stdout or "{}")
     except json.JSONDecodeError:
         return SecretRead(error="kubectl returned output that is not JSON")
-    encoded = (payload.get("data") or {}).get(REFRESH_TOKEN_KEY)
-    if not encoded:
-        return SecretRead(token=None)
-    try:
-        return SecretRead(token=base64.b64decode(encoded).decode().strip())
-    except (binascii.Error, UnicodeDecodeError, ValueError):
-        return SecretRead(error=f"the Secret's {REFRESH_TOKEN_KEY} is not readable base64 text")
+    values: dict[str, str] = {}
+    for key, encoded in (payload.get("data") or {}).items():
+        try:
+            values[key] = base64.b64decode(encoded).decode().strip()
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return SecretRead(error=f"the Secret's {key} is not readable base64 text")
+    return SecretRead(values=values)
+
+
+def current_server(runner: Runner = subprocess_runner) -> str | None:
+    """The API server kubectl's current context talks to, or None if it has none."""
+    result = runner(
+        ["kubectl", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"]
+    )
+    server = (result.stdout or "").strip() if result.ok else ""
+    return server or None
 
 
 def force_external_secret_sync(
@@ -160,10 +187,8 @@ def force_external_secret_sync(
     # "Could not trigger a re-sync" plus "the cluster will pick it up on its own
     # schedule" is true of a transient failure and FALSE when there is no
     # ExternalSecret at all: nothing is watching Secrets Manager, so there is no
-    # schedule to wait for. Staging is in exactly that state — only production has
-    # a manifest (DEFAULT_ESO_MANIFEST) — so the environment that gets this message
-    # most often is the one it misleads. Separated rather than softened: a reader
-    # who has to act now should not be told to wait.
+    # schedule to wait for. Separated rather than softened: a reader who has to
+    # act now should not be told to wait.
     if _MISSING_OBJECT.search(result.output or ""):
         return CliError(
             "cluster.no_external_secret",
@@ -171,12 +196,12 @@ def force_external_secret_sync(
             "is watching Secrets Manager for this credential and the new token will NOT be "
             "picked up on any schedule. The token itself is stored safely, but the "
             f"Kubernetes Secret `{name}` has to be created or refreshed by hand until this "
-            "environment has an ExternalSecret of its own.",
+            "deployment has an ExternalSecret of its own.",
             exit_code=ExitCode.CHECK_FAILED,
             remedy=Remedy(
                 "human",
                 f"Create or refresh `{name}` in {namespace} by hand from the token in "
-                "Secrets Manager, or give this environment its own ExternalSecret, "
+                "Secrets Manager, or give this deployment its own ExternalSecret, "
                 f"modelled on {DEFAULT_ESO_MANIFEST}.",
             ),
             raw=result.output[:300],
@@ -196,28 +221,28 @@ def force_external_secret_sync(
     )
 
 
-def wait_for_secret_token(
+def wait_for_secret(
     runner: Runner = subprocess_runner,
     *,
     name: str,
-    expected: str,
+    expected: dict[str, str],
     namespace: str = ARGO_NAMESPACE,
     timeout: float = 120.0,
     interval: float = 5.0,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> bool:
-    """Poll until the cluster Secret carries `expected`, or give up.
+    """Poll until the cluster Secret carries every value in `expected`, or give up.
 
-    Giving up is not an error: the value is already in Secrets Manager and
+    Giving up is not an error: the values are already in Secrets Manager and
     External Secrets will converge on its own interval. The caller reports the
     wait as unfinished rather than the login as failed — telling someone their
     login did not work, when it did, sends them round the loop again.
     """
     deadline = clock() + timeout
     while True:
-        read = read_secret_token(runner, name=name, namespace=namespace)
-        if read.ok and read.token == expected:
+        read = read_secret(runner, name=name, namespace=namespace)
+        if read.ok and all(read.values.get(key) == value for key, value in expected.items()):
             return True
         if clock() >= deadline:
             return False

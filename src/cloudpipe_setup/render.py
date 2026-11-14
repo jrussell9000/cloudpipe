@@ -33,21 +33,16 @@ BACKEND_NAME = "backend.tf"
 TFVARS_HEADER = """\
 # Rendered by `cloudpipe setup` from the answers document.
 #
-# Safe to edit, unlike globus.auto.tfvars beside it: this tool refuses to
-# overwrite the file once it exists, so an edit here survives a re-run. Prefer
-# editing the answers document and re-rendering with --force, so that the two do
-# not drift and the next machine you resume on has the same values.
+# Safe to edit: this tool refuses to overwrite the file once it exists, so an
+# edit here survives a re-run. Prefer editing the answers document and
+# re-rendering with --force, so that the two do not drift and the next machine
+# you resume on has the same values.
 #
-# Two kinds of value are NOT here, because this tool does not own them:
-#
-#   * globus_s3_destination_bucket — the imaging data bucket, despite the name,
-#     and required either way. Put it in data-bucket.auto.tfvars beside this
-#     file, not here: a re-render with --force drops lines added to this file.
-#     The value is the data_bucket name you gave the bootstrap root
-#     (`terraform -chdir=bootstrap output data_bucket`).
-#   * The Globus ingress's seven inputs, needed only with globus_enabled = true.
-#     `globus init`, run from this directory, renders them into
-#     globus.auto.tfvars, which Terraform loads after this file.
+# globus_s3_destination_bucket is the imaging data bucket, despite the name: the
+# answers document's own field of that name. HTTPS ingress's source collection
+# (globus_source_collection_id, globus_source_base_path) is not asked for; set it
+# in an *.auto.tfvars beside this file if you copy from one. Terraform loads
+# those after this file.
 #
 # Next step is not `terraform apply`. A fresh deployment's first apply is phased,
 # because the root's providers look up a cluster that does not exist yet. Run
@@ -137,8 +132,9 @@ def cli_command(subcommand: str, *, task: str = "cloudpipe") -> str:
 
     A bare `pixi run cloudpipe ...` only works from inside the clone, and the
     deployer runs these from their root, so every printed command carries
-    `--manifest-path`. `task="globus"` gives the same for `globus init`, which
-    also resolves its paths against the directory it is run from.
+    `--manifest-path`. `task="globus"` gives the same for `globus login` and
+    `globus doctor`, which also resolve their paths against the directory they
+    are run from.
     """
     return f"pixi run --manifest-path {shlex.quote(str(CLONE / 'pixi.toml'))} {task} {subcommand}"
 
@@ -165,10 +161,8 @@ def bootstrap_command(answers: dict[str, Any], root: Path, *, clone: Path = CLON
     Every bucket name carries the deployment's random `bucket_suffix`, because
     S3 names are global: with the default name, `cloudpipe-metrics` is a bucket
     the reference deployment already owns (second-account rerun, 2026-10-13). The
-    data bucket's name is a suggestion, because the wizard does not own
-    `globus_s3_destination_bucket`; the deployer sets that to the same name, and
-    preflight's `aws.data_bucket` and `globus.inputs` point back at
-    `terraform output` here if they do not.
+    data bucket's name is the wizard's `globus_s3_destination_bucket` answer (contract 3.0); before
+    that the wizard did not own it and only suggested `<prefix>-data`.
     """
     source = clone / BOOTSTRAP_ROOT
     target = root / BOOTSTRAP_DIR
@@ -184,15 +178,17 @@ def bootstrap_command(answers: dict[str, Any], root: Path, *, clone: Path = CLON
         f" -var freesurfer_license_path={shlex.quote(str(license_path))}" if license_path else ""
     )
     # The metrics name is the stack's own default, so the two agree with nothing
-    # set in the stack root. The data bucket's is only a suggestion the deployer
-    # may change, then repeats in data-bucket.auto.tfvars.
+    # set in the stack root. The data bucket's is the wizard's own
+    # `globus_s3_destination_bucket` answer, which terraform.tfvars renders, so the bucket this
+    # creates is the one the stack configures.
     prefix = bucket_prefix(answers)
+    data_bucket = answers.get("globus_s3_destination_bucket") or f"{prefix}-data"
     return (
         f"mkdir -p {quoted} && cp {files} {quoted}/ && "
         f"terraform -chdir={quoted} init && "
         f"terraform -chdir={quoted} apply "
         f"-var region={answers['region']} -var state_bucket={answers['state_bucket']} "
-        f"-var data_bucket={prefix}-data "
+        f"-var data_bucket={data_bucket} "
         f"-var metrics_bucket={prefix}-metrics" + license_var
     )
 

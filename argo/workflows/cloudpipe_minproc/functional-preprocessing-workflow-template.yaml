@@ -486,7 +486,7 @@ spec:
       karpenter.sh/nodepool: cpu-heavy-nodepool
 
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:7e57fc87a24774898613f7126afdc02f3683d0fd2aae3b11d827b465a2641705"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:c08d44cb3f769984b91a5b7a30b5b95a0d31e48f719bbf20d8c7cf3cc42463fa"
       imagePullPolicy: IfNotPresent
 
       resources:
@@ -545,7 +545,7 @@ spec:
         # resolves against the *caller* — an undefined parameter there would
         # break the image ref itself rather than just its provenance.
         - name: CLOUDPIPE_IMAGE
-          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:7e57fc87a24774898613f7126afdc02f3683d0fd2aae3b11d827b465a2641705"
+          value: "{{workflow.parameters.ecr-registry}}/cloudpipe/afni@sha256:c08d44cb3f769984b91a5b7a30b5b95a0d31e48f719bbf20d8c7cf3cc42463fa"
 
         # Single source of truth for the CPU request: the driver derives
         # --threads / ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS from this rather

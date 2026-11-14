@@ -41,7 +41,6 @@ from .output import Record
 CHECK_IDENTITY = "aws.identity"
 CHECK_ACCOUNT = "aws.account"
 CHECK_HOSTED_ZONE = "aws.hosted_zone"
-CHECK_PREFIX_LISTS = "aws.prefix_lists"
 CHECK_DATA_BUCKET = "aws.data_bucket"
 CHECK_CONFIG_OBJECTS = "aws.config_objects"
 CHECK_AMIS = "aws.amis"
@@ -51,7 +50,6 @@ CHECK_CLOUDFLARE_ORGANIZATION = "cloudflare.organization"
 CHECK_FEDERATION_METADATA = "federation.metadata"
 CHECK_FEDERATION_EVIDENCE = "federation.mfa_evidence"
 CHECK_FEDERATION_SECRET = "federation.client_secret"
-CHECK_GLOBUS_INPUTS = "globus.inputs"
 
 # Contract 2.0 removed two checks whose subjects the answers no longer held
 # (design D7 of openspec/changes/optional-domain-and-cognito-auth):
@@ -63,12 +61,17 @@ CHECK_GLOBUS_INPUTS = "globus.inputs"
 # discovery document or a SAML provider's metadata, and `federation.secret`
 # looks for the OIDC client secret the deployer creates by hand. Each reports
 # `skipped` for a deployment that federates nothing, which is most of them.
+#
+# Contract 3.0 removed two more, and a third's Globus half, with the Globus host
+# (openspec retire-globus-host): `aws.prefix_lists`, whose one subject was the
+# host's SSH rule; `globus.inputs`, the variables `globus init` rendered, which
+# no longer exist; and the Globus AMI half of `aws.amis`. The data bucket became
+# an input of this wizard's (`globus_s3_destination_bucket`), so nothing is owned elsewhere.
 
 ORDER = (
     CHECK_IDENTITY,
     CHECK_ACCOUNT,
     CHECK_HOSTED_ZONE,
-    CHECK_PREFIX_LISTS,
     CHECK_DATA_BUCKET,
     CHECK_CONFIG_OBJECTS,
     CHECK_AMIS,
@@ -78,7 +81,6 @@ ORDER = (
     CHECK_FEDERATION_METADATA,
     CHECK_FEDERATION_EVIDENCE,
     CHECK_FEDERATION_SECRET,
-    CHECK_GLOBUS_INPUTS,
 )
 """The order checks run and are reported in: identity first, because every AWS
 check after it is `skipped` without one."""
@@ -205,12 +207,6 @@ class World:
         wanted = domain.rstrip(".") + "."
         return [zone for zone in response.get("HostedZones", ()) if zone.get("Name") == wanted]
 
-    def managed_prefix_list(self, identifier: str) -> dict[str, Any] | None:
-        client = self._client("ec2")
-        response = client.describe_managed_prefix_lists(PrefixListIds=[identifier])
-        found = response.get("PrefixLists", ())
-        return dict(found[0]) if found else None
-
     def bucket_region(self, name: str) -> str:
         """The bucket's region, which doubles as the existence test.
 
@@ -313,7 +309,6 @@ def run(
         identity_record,
         _check_account(identity, expected_account),
         _check_hosted_zone(world, answers, identity),
-        _check_prefix_lists(world, answers, root, identity),
         _check_data_bucket(world, root, identity),
         _check_config_objects(world, root, repo, identity),
         _check_amis(world, root, repo, identity),
@@ -323,7 +318,6 @@ def run(
         _check_federation_metadata(world, answers),
         _check_federation_evidence(answers),
         _check_federation_secret(world, answers, identity),
-        _check_globus_inputs(root, repo),
     ]
     assert [record.identifier for record in records] == list(ORDER)
     return records
@@ -520,88 +514,6 @@ def _check_hosted_zone(
     )
 
 
-def _check_prefix_lists(
-    world: World, answers: dict[str, Any], root: Path, identity: dict[str, Any] | None
-) -> Record:
-    """The managed prefix list the deployment references: `globus init`'s.
-
-    Read out of the rendered tfvars rather than the answers document — it is not
-    the wizard's field to own (design D4). The wizard's own prefix-list field left
-    with contract 2.0, because nothing read it; the check keeps its identifier,
-    and a dict, so a second id is one more entry rather than a new check.
-    """
-    from . import roots
-
-    if not roots.globus_ingress_enabled(root):
-        # The only prefix list the stack references is the Globus host's SSH
-        # rule, inside `module.globus`. With the ingress off that module has no
-        # instances, so there is no rule to resolve an id for — and reporting
-        # this as outstanding would send a deployer to look up an id nothing
-        # reads. See the spec: a check whose subject is not configured is not run.
-        return _not_applicable(
-            CHECK_PREFIX_LISTS,
-            "Managed prefix lists",
-            "globus_enabled is not true in this root, so the stack creates no security-group "
-            "rule that references a managed prefix list.",
-            Remedy("human", "Nothing to do unless you enable the Globus ingress."),
-        )
-
-    wanted = {}
-    globus_id = _globus_prefix_list_id(root)
-    if globus_id:
-        wanted["globus_admin_prefix_list_id"] = globus_id
-
-    if not wanted:
-        return _skipped(
-            CHECK_PREFIX_LISTS,
-            "Managed prefix lists",
-            "globus_admin_prefix_list_id is not set in any tfvars file in this root.",
-            Remedy("command", _cli("init", task="globus")),
-        )
-    if identity is None:
-        return _no_credentials(CHECK_PREFIX_LISTS, "Managed prefix lists")
-
-    missing, resolved = [], []
-    for variable, identifier in sorted(wanted.items()):
-        try:
-            found = world.managed_prefix_list(identifier)
-        except Exception as err:  # noqa: BLE001
-            if _error_code(err) in _DENIED_CODES:
-                return _translate(
-                    err,
-                    CHECK_PREFIX_LISTS,
-                    "Managed prefix lists",
-                    "ec2:DescribeManagedPrefixLists",
-                )
-            found = None
-        if found is None:
-            missing.append(f"{variable}={identifier}")
-        else:
-            resolved.append(f"{variable}={identifier} ({found.get('PrefixListName', 'unnamed')})")
-
-    if missing:
-        return Record(
-            identifier=CHECK_PREFIX_LISTS,
-            title="Managed prefix lists",
-            state="fail",
-            message=f"{', '.join(missing)} does not resolve in account "
-            f"{identity.get('Account', 'unknown')}, region {world.region}. The ingress and SSH "
-            "security-group rules reference it directly, so the apply fails on the rule rather "
-            "than on the id.",
-            remedy=Remedy(
-                "human",
-                "Check the id in the AWS console under VPC > Managed prefix lists, in the same "
-                "region as the deployment. A prefix list is regional.",
-            ),
-        )
-    return Record(
-        identifier=CHECK_PREFIX_LISTS,
-        title="Managed prefix lists",
-        state="pass",
-        message="; ".join(resolved),
-    )
-
-
 def _check_data_bucket(world: World, root: Path, identity: dict[str, Any] | None) -> Record:
     """The data bucket the stack configures but never creates.
 
@@ -612,21 +524,24 @@ def _check_data_bucket(world: World, root: Path, identity: dict[str, Any] | None
     `NoSuchBucket`, in the untargeted apply, after the cluster exists. That is the
     most expensive moment in the install to discover a bucket name.
 
-    Read from the rendered tfvars, not the answers document: like the prefix list,
-    `globus_s3_destination_bucket` is `globus init`'s field and not the wizard's
-    (design D4).
+    Read as Terraform will see it, from whichever tfvars file wins: the wizard
+    renders `globus_s3_destination_bucket` as one of its own fields since
+    contract 3.0, and a root made earlier may still set it in a
+    `data-bucket.auto.tfvars` of its own.
     """
     from . import roots
 
     value, _ = roots.tfvars_assignments(root).get(roots.DATA_BUCKET_VARIABLE, (None, None))
     name = value if isinstance(value, str) and value else None
     if not name:
-        kind, text = roots.missing_globus_remedy(root, (roots.DATA_BUCKET_VARIABLE,))
         return _skipped(
             CHECK_DATA_BUCKET,
             "Data bucket",
             f"{roots.DATA_BUCKET_VARIABLE} is not set in any tfvars file in this root.",
-            Remedy(kind, text),
+            Remedy(
+                "command",
+                f"Set globus_s3_destination_bucket in the answers document and run `{_cli('setup')} --force`.",
+            ),
         )
     if identity is None:
         return _no_credentials(CHECK_DATA_BUCKET, "Data bucket")
@@ -778,18 +693,6 @@ def _check_config_objects(
         "The install would succeed and every workflow would then fail at artifact staging.",
         remedy=Remedy("human", " ".join(remedies)),
     )
-
-
-def _globus_prefix_list_id(root: Path) -> str | None:
-    """`globus_admin_prefix_list_id` as Terraform will see it, from whichever file wins.
-
-    Rendered by `globus init` or written by hand into `terraform.tfvars`: reading
-    only the rendered file skipped this id for every root that sets it by hand.
-    """
-    from . import roots
-
-    value, _ = roots.tfvars_assignments(root).get("globus_admin_prefix_list_id", (None, None))
-    return value if isinstance(value, str) and value else None
 
 
 def _verify_cloudflare_token(
@@ -1129,98 +1032,56 @@ def _check_cloudflare_organization(
 #: Where the stack names the machine images it launches. Read, never restated:
 #: a check that kept its own copy of an AMI id would pass against an id the stack
 #: no longer uses.
-_GLOBUS_CALL = "terraform/modules/stack/globus.tf"
 _KARPENTER_CALL = "terraform/modules/stack/karpenter.tf"
 _STACK_VARIABLES = "terraform/modules/stack/variables.tf"
 _GPU_AMI_DOC = "docs/pre-baked-amis.md"
 
 
 def _check_amis(world: World, root: Path, repo: Path, identity: dict[str, Any] | None) -> Record:
-    """Whether the machine images the stack launches exist in this account.
+    """Whether the machine image the stack launches for GPU nodes exists in this account.
 
-    Two images, with different consequences, so they are judged differently:
+    The GPU node AMI is chosen by Terraform (`terraform/modules/gpu-ami-choice`):
+    this account's bake, else the publisher's pinned public AMI, else the stock
+    AL2023 AMI. All three launch GPU nodes, so all three pass, with a note saying
+    which. It used to be `blocked` when no bake matched, because the node class
+    then selected nothing; the stock fallback ended that. The one `fail` is a
+    pinned public AMI this account cannot see (`_gpu_ami_choice`).
 
-    * **The Globus host's AMI**, a literal id in `globus.tf`, launched only with
-      `globus_enabled`. Not visible means the phase 4 apply fails with
-      `InvalidAMIID.NotFound` after the cluster exists — which is how the second
-      deployment found that the id was this project's own image, shared with
-      nobody. `fail`.
-    * **The GPU node AMI**, chosen by Terraform (`terraform/modules/gpu-ami-choice`):
-      this account's bake, else the publisher's pinned public AMI, else the stock
-      AL2023 AMI. All three launch GPU nodes, so all three pass, with a note
-      saying which. It used to be `blocked` when no bake matched, because the node
-      class then selected nothing; the stock fallback ended that. The one `fail`
-      is a pinned public AMI this account cannot see (`_gpu_ami_choice`).
+    The check also judged the Globus host's AMI until contract 3.0, which removed
+    the host (openspec retire-globus-host).
 
-    `terraform plan` would catch neither. An AMI is only resolved at apply, and a
-    tag selector only by Karpenter at runtime.
+    `terraform plan` would not catch it. A tag selector is only resolved by
+    Karpenter at runtime.
     """
-    from . import roots
-
     title = "Machine images"
     if identity is None:
         return _no_credentials(CHECK_AMIS, title)
 
-    sources = _ami_sources(root, repo)
-    if sources is None:
+    gpu_tags = _ami_sources(root, repo)
+    if gpu_tags is None:
         return _skipped(
             CHECK_AMIS,
             title,
-            f"the image references could not be read from {repo / _GLOBUS_CALL} and "
-            f"{repo / _KARPENTER_CALL}. Run this from a clone of the repository.",
+            f"the image references could not be read from {repo / _KARPENTER_CALL}. Run this "
+            "from a clone of the repository.",
             Remedy("human", "Check that the clone's terraform/modules/stack/ is intact."),
         )
-    globus_ami, gpu_tags = sources
     account = identity.get("Account", "unknown")
 
     try:
-        globus_missing = False
-        if roots.globus_ingress_enabled(root):
-            try:
-                globus_missing = not world.images(ImageIds=[globus_ami])
-            except Exception as err:  # noqa: BLE001
-                if _error_code(err) not in ("InvalidAMIID.NotFound", "InvalidAMIID.Unavailable"):
-                    raise
-                globus_missing = True
         gpu_found = world.images(
             Owners=["self"],
             Filters=[{"Name": f"tag:{key}", "Values": [value]} for key, value in gpu_tags.items()],
         )
-    except Exception as err:  # noqa: BLE001
-        if _error_code(err) in _DENIED_CODES:
-            return _translate(err, CHECK_AMIS, title, "ec2:DescribeImages")
-        raise
-
-    try:
         gpu_failure, gpu_note = _gpu_ami_choice(world, root, repo, gpu_tags, gpu_found, account)
     except Exception as err:  # noqa: BLE001
         if _error_code(err) in _DENIED_CODES:
             return _translate(err, CHECK_AMIS, title, "ec2:DescribeImages")
         raise
 
-    if globus_missing:
-        return Record(
-            identifier=CHECK_AMIS,
-            title=title,
-            state="fail",
-            message=f"globus_enabled is true, and the Globus host's AMI {globus_ami} is not "
-            f"visible from account {account} — neither owned by it nor shared with it. The phase "
-            f"4 apply would fail with InvalidAMIID.NotFound, after the cluster exists. {gpu_note}",
-            remedy=Remedy(
-                "human",
-                "Build the Globus Connect Server image in this account from packer/globus-gcs/, "
-                f"and set globus_ami_id in {_GLOBUS_CALL} to its id — or leave globus_enabled "
-                "unset; the pipeline runs without the ingress.",
-            ),
-        )
     if gpu_failure is not None:
         return gpu_failure
-    globus = (
-        f"Globus host AMI {globus_ami}: visible. "
-        if roots.globus_ingress_enabled(root)
-        else "Globus host AMI: not needed, globus_enabled is not true. "
-    )
-    return Record(identifier=CHECK_AMIS, title=title, state="pass", message=f"{globus}{gpu_note}")
+    return Record(identifier=CHECK_AMIS, title=title, state="pass", message=gpu_note)
 
 
 _PUBLISHED_GPU_AMIS = "terraform/modules/karpenter/published-gpu-amis.json"
@@ -1358,110 +1219,37 @@ def _check_image_scanning(world: World, identity: dict[str, Any] | None) -> Reco
     )
 
 
-def _ami_sources(root: Path, repo: Path) -> tuple[str, dict[str, str]] | None:
-    """(Globus AMI id, GPU selector tags) as the stack will use them, or None.
+def _ami_sources(root: Path, repo: Path) -> dict[str, str] | None:
+    """The GPU selector tags as the stack will use them, or None.
 
-    The GPU selector is the three tags in
-    `terraform/modules/karpenter/helm-values/gpu-nodeclass.yaml`: two image
-    digests from the stack's `module "karpenter"` call, and the EKS version —
-    `kubernetes_version` from this root's tfvars if it sets one, else the
-    stack's default.
+    The three tags in `terraform/modules/karpenter/helm-values/gpu-nodeclass.yaml`:
+    two image digests from the stack's `module "karpenter"` call, and the EKS
+    version — `kubernetes_version` from this root's tfvars if it sets one, else
+    the stack's default.
     """
     from . import roots
 
     try:
-        globus_text = (repo / _GLOBUS_CALL).read_text()
         karpenter_text = (repo / _KARPENTER_CALL).read_text()
         variables_text = (repo / _STACK_VARIABLES).read_text()
     except OSError:
         return None
 
-    globus = re.search(r'^\s*globus_ami_id\s*=\s*"(ami-[0-9a-f]+)"', globus_text, re.M)
     fastsurfer = re.search(r'^\s*fastsurfer_ami_digest\s*=\s*"([^"]+)"', karpenter_text, re.M)
     fireants = re.search(r'^\s*fireants_ami_digest\s*=\s*"([^"]+)"', karpenter_text, re.M)
     default = re.search(
         r'variable "kubernetes_version"\s*\{[^}]*?default\s*=\s*"([^"]+)"', variables_text, re.S
     )
-    if not (globus and fastsurfer and fireants and default):
+    if not (fastsurfer and fireants and default):
         return None
 
     override, _ = roots.tfvars_assignments(root).get("kubernetes_version", (None, None))
     version = override if isinstance(override, str) and override else default.group(1)
-    return globus.group(1), {
+    return {
         "fastsurfer-image-digest": fastsurfer.group(1),
         "fireants-image-digest": fireants.group(1),
         "eks-version": version,
     }
-
-
-def _check_globus_inputs(root: Path, repo: Path) -> Record:
-    """Whether every one of `globus init`'s variables is set in a file Terraform loads.
-
-    A report, not a requirement this command can satisfy: those variables are the
-    Globus tool's to own (design D4). Unset, `terraform plan` prompts for them, or
-    fails outright under `-input=false`.
-
-    Set, not *rendered*. This used to pass only when a Globus `*.auto.tfvars`
-    existed, and so told a root that sets the variables by hand in
-    `terraform.tfvars` — the reference deployment's own, and one the example's
-    `terraform.tfvars.example` explicitly allows — that eight variables were unset
-    when none was. Terraform does not care which file a value came from, so this
-    does not either.
-
-    How many of the eight are checked depends on `globus_enabled`. Seven of them
-    are required only when the ingress is on, and demanding them from a
-    deployment that creates no Globus resource would be this command reporting a
-    prerequisite that does not exist. `globus_s3_destination_bucket` is checked
-    either way: despite the name it is the imaging data bucket, which the
-    pipeline reads whether or not anything Globus wrote it.
-    """
-    from . import roots
-
-    title = "Globus inputs"
-    variables_tf = repo / "terraform/modules/stack/variables.tf"
-    expected = roots.wanted_globus_inputs(root, variables_tf)
-    if expected is None:
-        return _skipped(
-            CHECK_GLOBUS_INPUTS,
-            title,
-            f"the list of Globus variables could not be derived: {variables_tf} is not readable. "
-            "Run this from a clone of the repository.",
-            Remedy("human", f"Check that {variables_tf} is present and readable."),
-        )
-
-    enabled = roots.globus_ingress_enabled(root)
-    found = roots.globus_inputs(root, expected)
-    if found.missing:
-        missing = len(found.missing)
-        where = "in any file Terraform loads from" if missing == len(expected) else "in"
-        kind, text = roots.missing_globus_remedy(root, found.missing)
-        how = (
-            "Render them with `globus init`, or set them by hand in terraform.tfvars as the "
-            "example terraform.tfvars.example shows; either satisfies Terraform."
-            if kind == "command"
-            else "It is set by hand; nothing renders it."
-        )
-        return Record(
-            identifier=CHECK_GLOBUS_INPUTS,
-            title=title,
-            state="fail",
-            message=f"{_count(missing, len(expected))} {_noun(len(expected))} "
-            f"{'is' if missing == 1 else 'are'} not set {where} {root}: "
-            f"{', '.join(found.missing)}. Terraform would prompt for "
-            f"{'it' if missing == 1 else 'them'} — or fail, under -input=false. {how}",
-            remedy=Remedy(kind, text),
-        )
-    ingress = (
-        "" if enabled else " (globus_enabled is not true, so the ingress inputs are not needed)"
-    )
-    every = "the one" if len(expected) == 1 else f"all {len(expected)}"
-    return Record(
-        identifier=CHECK_GLOBUS_INPUTS,
-        title=title,
-        state="pass",
-        message=f"{every} {_noun(len(expected))} {'is' if len(expected) == 1 else 'are'} "
-        f"set{ingress}, in {', '.join(path.name for path in found.sources)}.",
-    )
 
 
 def _noun(count: int) -> str:

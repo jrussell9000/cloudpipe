@@ -1,0 +1,135 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: conn-dedup
+  namespace: argo-workflows
+
+###########################################################################
+# One-off: remove nback_conn's copies of what it shares with nback_act (the
+# PSC runs, their means, the run-intersection mask, the resampled atlas) from
+# first-level trees written before fmri-first-level-proc 4.0.0+cp.12, which
+# keeps them once, in nback_act/ (operator, 2026-11-13). Each copy is deleted
+# only once it is shown to be nback_act's data: same bytes by ETag, or same
+# voxels. images/fmri-first-level-proc/conn_dedup.py does one session at a
+# time; its docstring has the order and the resume rules.
+#
+# Planned, submitted and verified by scripts/backfill_conn_dedup.py, never by
+# hand: the session list it writes is the contract, and its `verify` is the proof.
+#
+#   label   names the plan: config/first-level/conn-dedup/{label}/
+#   shards  how many pods share the list (each takes every shards-th)
+#
+# The shard count IS the concurrency, as in staged-backfill (see there).
+###########################################################################
+
+spec:
+  # Runaway backstop, not the working cap. Equals MAX_SHARDS in
+  # scripts/backfill_conn_dedup.py; tests/argo hold the two together.
+  parallelism: 400
+
+  serviceAccountName: argo-workflows-runner
+
+  workflowMetadata:
+    labels:
+      pipeline: conn-dedup
+
+  podGC:
+    strategy: OnWorkflowCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+
+  arguments:
+    parameters:
+      - name: label
+      - name: shards
+      - name: bucket
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: bucket
+      - name: region
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: region
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef:
+            name: cloudpipe-config
+            key: ecr_registry
+
+  volumes:
+    - name: scratch
+      emptyDir:
+        sizeLimit: 20Gi
+
+  entrypoint: backfill
+
+  templates:
+  - name: backfill
+    steps:
+    - - name: shard
+        template: backfill-shard
+        withSequence:
+          count: "{{workflow.parameters.shards}}"
+        arguments:
+          parameters:
+            - name: shard
+              value: "{{item}}"
+
+  - name: backfill-shard
+    metadata:
+      labels:
+        cloudpipe.io/phase: first-level
+        cloudpipe.io/step: conn-dedup
+    inputs:
+      parameters:
+        - name: shard
+    # Spot reclaims and S3 errors only, as in fmri-first-level-proc: 64/143
+    # executor or SIGTERM, 75 the module's own S3-error exit. A session that
+    # cannot be backfilled is set aside and recorded, never a pod failure, so a
+    # deterministic error cannot loop; anything else is a bug and stops the shard.
+    retryStrategy:
+      limit: "8"
+      retryPolicy: Always
+      expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+      backoff:
+        duration: "1m"
+        factor: "2"
+        cap: "5m"
+    nodeSelector:
+      karpenter.sh/nodepool: first-level-nodepool
+    container:
+      # The first-level image, which carries conn_dedup.py; no AFNI program runs.
+      # build-fmri-first-level-proc.yaml re-pins every template on it.
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:257a40faaf45fe0402722efbd6c2fc38fab77a09d926feba6eb95646511d59e9"
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "/app/conn_dedup.py"]
+      args:
+        - --label
+        - "{{workflow.parameters.label}}"
+        - --shard
+        - "{{inputs.parameters.shard}}"
+        - --shards
+        - "{{workflow.parameters.shards}}"
+        - --bucket
+        - "{{workflow.parameters.bucket}}"
+        - --region
+        - "{{workflow.parameters.region}}"
+        - --scratch
+        - /scratch
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+      resources:
+        # One file pair at a time: both copies decompressed to disk (~3.2 GB for a
+        # PSC run) and compared as memory maps, a slab of frames at a time. Pairs
+        # whose ETags match are never downloaded.
+        requests:
+          cpu: "1"
+          memory: 4Gi
+          ephemeral-storage: 8Gi
+        limits:
+          cpu: "1"
+          memory: 6Gi

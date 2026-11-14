@@ -147,18 +147,29 @@ def tree_counts(objs: dict[str, int]) -> tuple[int, int, int]:
 # ---------------------------------------------------------------------------
 
 
+def require_listing_matches(marker: dict, objs: dict[str, int]) -> None:
+    """Raise SetAside unless the tree in the bucket is the one its marker describes.
+
+    Files and bytes must agree exactly. A marker may count MORE directories than the
+    listing shows: publish counts directories on disk, and an empty one (left by a
+    failed analysis, seen on 8 cp.7 trees) has no object in S3. Fewer would mean a
+    file the marker does not know, so that is still refused. conn_dedup.py uses it too.
+    """
+    if marker.get("link_count"):
+        raise SetAside("tree-has-links")
+    counts = tree_counts(objs)
+    recorded = (marker.get("file_count"), marker.get("total_bytes"), marker.get("dir_count"))
+    if counts[:2] != recorded[:2] or not isinstance(recorded[2], int) or recorded[2] < counts[2]:
+        raise SetAside(f"listing-disagrees-with-marker: {counts} != {recorded}")
+
+
 def make_plan(marker: dict, objs: dict[str, int], subj: str, ses: str) -> dict | None:
     """What this session's backfill does, or None when it has no concatenation."""
     pre = f"{subj}_{ses}_nback"
     source = next((a for a in NBACK if f"{a}/{pre}_concat_scan.nii.gz" in objs), None)
     if source is None:
         return None
-    if marker.get("link_count"):
-        raise SetAside("tree-has-links")
-    counts = tree_counts(objs)
-    recorded = (marker.get("file_count"), marker.get("total_bytes"), marker.get("dir_count"))
-    if counts != recorded:
-        raise SetAside(f"listing-disagrees-with-marker: {counts} != {recorded}")
+    require_listing_matches(marker, objs)
     if any(r.startswith(f"{STAGED_DIR}/") for r in objs):
         raise SetAside("already-has-staged")
 
@@ -268,6 +279,7 @@ def new_marker(
         "original_written_at": old.get("written_at"),
         "original_file_count": old.get("file_count"),
         "original_total_bytes": old.get("total_bytes"),
+        "original_dir_count": old.get("dir_count"),
     }
     marker.update(file_count=files, total_bytes=total, dir_count=dirs, written_at=now())
     return marker

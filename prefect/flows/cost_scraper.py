@@ -4,9 +4,9 @@ Prefect flow: kubecost-cost-scraper
 Runs nightly at 02:00 UTC to fetch yesterday's per-subject cost allocations
 from the in-cluster Kubecost API and write CostAllocation JSON records to S3.
 A second deployment of this flow, kubecost-day1-refresh, re-reads yesterday at
-12:00 UTC with the settled re-scrape, drift probe and gap detector off: by then
-Kubecost has finished building the day's node assets, so far more pods can be
-matched to their EC2 instance (#1060; see prefect/prefect.yaml).
+12:00 and 22:00 UTC with the settled re-scrape, drift probe and gap detector
+off: by then Kubecost has finished building the day's node assets, so far more
+pods can be matched to their EC2 instance (#1060; see prefect/prefect.yaml).
 
 Scrapes the same window at two grains: CostAllocation per workflow into
 metrics/costs/, and PodCost per pod into metrics/pod-costs/ — the latter

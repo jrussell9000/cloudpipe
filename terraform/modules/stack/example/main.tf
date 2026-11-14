@@ -342,44 +342,9 @@ variable "globus_source_collection_id" {
   default = ""
 }
 
-# The Globus ingress and the six inputs it needs.
-#
-# These do have defaults in the module — `globus_enabled` is false and the six
-# are empty — so by the rule above they would not be declared here at all. They
-# are, because turning the ingress on means setting seven values at once, and
-# the module refuses an empty one once the flag is true. Leaving them out would
-# mean editing this file before editing tfvars.
-variable "globus_enabled" {
-  type    = bool
-  default = false
-}
-
-variable "globus_client_id" {
-  type    = string
-  default = ""
-}
-
-variable "globus_admin_prefix_list_id" {
-  type    = string
-  default = ""
-}
-
-variable "globus_org_name" {
-  type    = string
-  default = ""
-}
-
+# The address HTTPS ingress names in its User-Agent, so the source's operators
+# can reach you about your traffic. Declared for the same reason as the source.
 variable "globus_contact_email" {
-  type    = string
-  default = ""
-}
-
-variable "globus_owner_email" {
-  type    = string
-  default = ""
-}
-
-variable "globus_identity_domain" {
   type    = string
   default = ""
 }
@@ -416,15 +381,9 @@ module "stack" {
   cloudflare_account_id          = var.cloudflare_account_id
   cloudflare_team_domain         = var.cloudflare_team_domain
   cloudflare_team_name           = var.cloudflare_team_name
-  globus_enabled                 = var.globus_enabled
   globus_s3_destination_bucket   = var.globus_s3_destination_bucket
   globus_source_collection_id    = var.globus_source_collection_id
-  globus_client_id               = var.globus_client_id
-  globus_admin_prefix_list_id    = var.globus_admin_prefix_list_id
-  globus_org_name                = var.globus_org_name
   globus_contact_email           = var.globus_contact_email
-  globus_owner_email             = var.globus_owner_email
-  globus_identity_domain         = var.globus_identity_domain
 }
 
 ################################################################################
@@ -501,18 +460,6 @@ output "github_actions_packer_role_arn" {
 
 output "github_actions_pr_pull_role_arn" {
   value = module.stack.github_actions_pr_pull_role_arn
-}
-
-output "globus_collection_id_ssm_parameter" {
-  value = module.stack.globus_collection_id_ssm_parameter
-}
-
-output "globus_public_ip" {
-  value = module.stack.globus_public_ip
-}
-
-output "globus_staging" {
-  value = module.stack.globus_staging
 }
 
 output "security_findings_topic_arn" {

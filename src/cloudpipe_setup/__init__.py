@@ -30,7 +30,7 @@ institution name, a personal identity — may appear in this package or its sche
 The publish gate scans `src/`, and it fails closed.
 """
 
-CONTRACT_VERSION = "2.0"
+CONTRACT_VERSION = "3.0"
 """Version of the integration contract (the input schema, JSON outputs, exit codes).
 
 Additive changes within a major version only: fields are never removed or

@@ -73,6 +73,7 @@ from step_outcome import (  # noqa: F401 — re-exports
     _EXIT_CODE_REASON,
     _TAXONOMY,
     QC_REJECTED_EXIT_CODE,
+    TEMPLATE_TIMEPOINT_FAILED_EXIT_CODE,
     TOPOLOGY_UNFIXABLE_EXIT_CODE,
     classify_failure,
 )

@@ -5,17 +5,17 @@ This page is the path from a fresh clone to a Terraform root that is ready for i
 Two things to know before you start, because they set expectations for everything below:
 
 - **None of these commands create anything.** They read your environment, write three files into a directory you choose, and tell you what is still missing. No AWS, Cloudflare, Kubernetes or Globus resource is created, modified or deleted by any of them. The first thing that changes your cloud account is the Terraform apply in the last step, which you run yourself.
-- **The slow parts are not the commands.** Several inputs come from gates other organisations control — a data use certification, a Globus subscription. Those take days to weeks. Read [globus-prerequisites.md](globus-prerequisites.md) before you budget time for this; the tooling here takes an hour, and it cannot shorten the rest.
+- **The slow parts are not the commands.** Access to the imaging data comes from a gate another organisation controls — a data use certification for the source collection. That takes weeks. Read [globus-prerequisites.md](globus-prerequisites.md) before you budget time for this; the tooling here takes an hour, and it cannot shorten the rest.
 
 ## What you need to have in hand
 
-The wizard will ask you for twelve values, and fills in three of them from earlier answers. Most you can read off a dashboard in a few minutes; two things you have to own first, and a third only if you want hostnames. Every bucket this deployment needs is created for you in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack).
+The wizard asks for each value in turn, and fills in a few of them from earlier answers. Most you can read off a dashboard in a few minutes; two things you have to own first, and a third only if you want hostnames. Every bucket this deployment needs is created for you in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack).
 
 | You must already own | Why | Where it is checked |
 |---|---|---|
 | An **AWS account** you can reach with an AWS CLI v2 SSO profile | Static access keys are not supported anywhere in this tooling | `cloudpipe preflight`, check `aws.identity` |
 | A **Cloudflare account with Zero Trust enabled**, and an API token for it with four permission groups — see [below](#the-cloudflare-account-and-its-token) | The deployment creates a tunnel, Access applications and policies, and the WARP device settings | `cloudflare.token`, `cloudflare.organization` |
-| A **name for the imaging data bucket**, which you supply as `globus_s3_destination_bucket` | The bucket itself is created in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack), by Terraform, along with the other two that outlive a cluster. You only have to decide what it is called — or name one you already have, and tell that root not to create it | `aws.data_bucket` |
+| A **name for the imaging data bucket**, which the wizard asks for as `globus_s3_destination_bucket` and suggests as `<name>-<suffix>-data` | The bucket itself is created in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack), by Terraform, along with the other two that outlive a cluster. You only have to decide what it is called — or name one you already have, and tell that root not to create it | `aws.data_bucket` |
 | *Optional:* a **Route53 hosted zone** in that account for the domain you will publish services under | Certificate validation is DNS-based, and it runs against the zone this account owns. Without a domain, answer `none`: nothing is published, and you reach each UI through a port-forward (see [below](#reaching-the-web-uis-without-a-domain)) | `aws.hosted_zone` |
 
 ### The Cloudflare account and its token
@@ -58,7 +58,7 @@ Two answers change what gets built. Both are decided by what you put in the answ
 | You must own | a Route53 hosted zone for the domain | nothing |
 | To open one | a bookmark | `cloudpipe ui <name>` ([below](#reaching-the-web-uis-without-a-domain)) |
 
-Everything else — the cluster, the pipeline, Globus ingress, the metrics store — is identical. Port-forward mode is not a reduced deployment; it is the same deployment without public hostnames for its private UIs.
+Everything else — the cluster, the pipeline, the HTTPS ingress, the metrics store — is identical. Port-forward mode is not a reduced deployment; it is the same deployment without public hostnames for its private UIs.
 
 **Who may sign in** follows from `external_identity`, which the wizard does not ask about:
 
@@ -156,12 +156,11 @@ Three details that matter in practice:
   - The GitHub OIDC subject claim is derived from the repository you gave. A wrong one fails nothing; it just quietly denies your CI the credentials it asked for.
   - `bucket_suffix` is six random lowercase letters and digits, generated once and kept. S3 bucket names are global across every AWS account, so every bucket name carries it: `<name>-<suffix>-metrics`, `<name>-<suffix>-logging` and so on. Without it, two deployments that kept the default name would collide, and anyone could claim a predictable name first. Change it only before step 4: once the buckets exist, a new suffix names buckets that do not.
   - The state bucket is `<name>-<suffix>-terraform-state`.
-- **It will not overwrite an existing `terraform.tfvars` or `backend.tf`**, even one an earlier run wrote. Pass `--force` to render them again from your answers. That drops any line you added by hand, which is why the one value you add yourself goes in a file of its own (step 4).
+- **It will not overwrite an existing `terraform.tfvars` or `backend.tf`**, even one an earlier run wrote. Pass `--force` to render them again from your answers. That drops any line you added by hand, which is why the values you add yourself go in a file of their own (step 5).
 
-Two kinds of value are deliberately **not** asked for here:
+One field's name needs explaining: **`globus_s3_destination_bucket`** is the imaging data bucket. Despite the prefix it is required whether or not you use Globus, and nothing Globus writes to it any more; the name is historical. The wizard suggests `<name>-<suffix>-data`, and step 4 creates the bucket it names.
 
-- **`globus_s3_destination_bucket`**, the imaging data bucket. Despite the prefix it is required whether or not you run Globus. You choose its name in [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) and then write it into `data-bucket.auto.tfvars` by hand; the header of the rendered file says so, and preflight reports it if you forget.
-- **The Globus ingress's seven inputs**, needed only if you enable the ingress. They belong to a separate tool, covered in step 5.
+One pair of values is deliberately **not** asked for here: the HTTPS ingress's source collection and path, which only a deployer with NBDC access has. Step 5 covers them.
 
 ### Driving it from a script
 
@@ -202,14 +201,9 @@ terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap apply \
   -var metrics_bucket=<name>-<suffix>-metrics
 ```
 
-`cloudpipe setup` prints that command with your own paths, name and suffix filled in, so nothing in it needs replacing. The metrics name has to stay as it is: the stack configures `<name>-<suffix>-metrics` unless you set `metrics_bucket` in the stack root too. The data bucket's name is only a suggestion. Why the copy matters: this root keeps its state in a local file, and applied in place that file would sit inside a git checkout, where `git clean -fdx` or deleting the clone to start again would take the only record of the three buckets. Terraform reads only the top level of a directory, so the stack root ignores the `bootstrap/` subdirectory.
+`cloudpipe setup` prints that command with your own paths, name, suffix and data bucket filled in, so nothing in it needs replacing. The metrics name has to stay as it is: the stack configures `<name>-<suffix>-metrics` unless you set `metrics_bucket` in the stack root too. The data bucket is whatever you answered for `globus_s3_destination_bucket`, which `terraform.tfvars` already carries, so the bucket this creates is the one the stack configures. Why the copy matters: this root keeps its state in a local file, and applied in place that file would sit inside a git checkout, where `git clean -fdx` or deleting the clone to start again would take the only record of the three buckets. Terraform reads only the top level of a directory, so the stack root ignores the `bootstrap/` subdirectory.
 
-Then write the data bucket's name into a file of its own in the stack root, `data-bucket.auto.tfvars`. It is the one stack input the wizard does not write. Use that file, not `terraform.tfvars`: re-running `cloudpipe setup --force` renders `terraform.tfvars` again from your answers and drops any line you added to it. Terraform loads every `*.auto.tfvars` file in the root, and the wizard never writes this one:
-
-```hcl
-# data-bucket.auto.tfvars
-globus_s3_destination_bucket = "<name>-<suffix>-data"
-```
+A root made before the wizard asked for the data bucket may still set it in a `data-bucket.auto.tfvars` of its own. Terraform loads that file after `terraform.tfvars`, so its value wins; keep the two equal, or delete the file.
 
 `terraform -chdir=$HOME/my-cloudpipe-deployment/bootstrap output` prints all three names if you need them again.
 
@@ -268,36 +262,32 @@ pixi run --manifest-path <your clone>/pixi.toml python <your clone>/scripts/make
 aws s3 cp nss_volumes.csv s3://<data bucket>/config/nss_volumes.csv
 ```
 
-## Step 5 — decide whether you are running the Globus ingress
+## Step 5 — decide whether you are running the HTTPS ingress
 
-**Skip this step unless you are standing up a Globus Connect Server.** `globus_enabled` defaults to `false`, and with it false the stack creates no Globus resource at all — 52 of them, including an EC2 host and an Elastic IP. The pipeline then runs in `ingress-mode=presynced`: it reads whatever is already under `mmps_mproc/` in the data bucket and never starts a transfer. That is a complete deployment, and it is the one most people want first, because getting imaging into the bucket by any means is a smaller problem than reproducing this ingress.
+**Skip this step unless you have NBDC access to the ABCD source collection.** With no source configured the pipeline runs in `ingress-mode=presynced`: it reads whatever is already under `mmps_mproc/` in the data bucket and never copies anything. That is a complete deployment, and it is the one most people want first, because getting imaging into the bucket by any means is a smaller problem than getting access to the source.
 
-Globus is one implementation of the data-ingress contract, not a requirement. If you are staging data another way, read [data-ingress.md](data-ingress.md) — it documents the S3 key contract the pipeline actually depends on, which is the only thing that has to be true.
+The HTTPS ingress is one implementation of the data-ingress contract, not a requirement. If you are staging data another way, read [data-ingress.md](data-ingress.md) — it documents the S3 key contract the pipeline actually depends on, which is the only thing that has to be true.
 
 ### If you are running it
 
-Enabling it needs four things this repository cannot give you:
+The ingress needs no infrastructure of its own beyond the stack: no Globus endpoint, subscription, machine image or AWS key. It needs a Data Use Certification on a Globus identity and a native app registration, both covered in [globus-prerequisites.md](globus-prerequisites.md), and then two values in a file of their own in your root, so that `cloudpipe setup --force` never drops them:
 
-| What | Why it is not ours to give |
-|---|---|
-| A **Globus subscription** | The S3 connector is a paid feature. [globus-prerequisites.md](globus-prerequisites.md) covers the gates, which run days to weeks |
-| A **confidential service client**, registered in the Globus Developers Portal | The endpoint is created under it rather than under a person, so it survives someone leaving |
-| A **managed prefix list** in this region | The host's SSH rule references it by id, and a prefix list is regional |
-| A **GCS AMI** in your own account, built from `packer/globus-gcs/` | The `globus_ami_id` committed in `terraform/modules/stack/globus.tf` is the reference deployment's image, shared with nobody. Point it at yours |
-
-Then set `globus_enabled = true` and the seven inputs it makes mandatory. The module refuses an empty one once the flag is true, so this is one edit of eight lines rather than an apply that half-works. Those seven are owned by a separate tool, which renders them into a `globus.auto.tfvars` in the same root:
-
-```
-pixi run --manifest-path <your clone>/pixi.toml globus init
+```hcl
+# ingress.auto.tfvars
+globus_source_collection_id = "<the source collection's UUID>"
+globus_contact_email        = "<an address the source's operators can reach you at>"
 ```
 
-Run it from your root, like `cloudpipe setup`: it reads `globus-answers.yaml` from there and writes into it.
+The source base path defaults to the NBDC collection's `/abcd/derivatives/mmps_mproc`. Terraform writes the collection id and the base path into SSM (`terraform/modules/stack/ingress_session.tf`), where the queue manager and `globus doctor` read them, and the contact address into the `cloudpipe-config` ConfigMap as `ingress_contact`, which the copy names in its User-Agent. An empty collection id is a working configuration: it writes the placeholder, and every reader refuses it.
 
-Terraform loads `.auto.tfvars` files after `terraform.tfvars`, so those values win over anything you put in the latter. Setting them by hand in `terraform.tfvars` instead, as `terraform.tfvars.example` shows, works just as well — both `cloudpipe setup` and `cloudpipe preflight` check that each variable is set, not which file set it.
+After the stack is applied, one person logs in, from your root:
 
-Read [globus-setup.md](globus-setup.md) for what that tool needs. Two tools writing one variable is two tools disagreeing about it, which is why the wizard reports on these variables and never writes them.
+```
+pixi run --manifest-path <your clone>/pixi.toml globus login
+pixi run --manifest-path <your clone>/pixi.toml globus doctor
+```
 
-`globus_s3_destination_bucket` is the exception, and it is required either way: despite the name it is the imaging data bucket from [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack), which the Prefect worker, the Argo runner's IAM policy, the access logs and the lifecycle rules all name whether or not anything Globus wrote it.
+Both read a short `globus-answers.yaml` from the directory you run them in. What goes in it, and what the login does, are in [globus.md](globus.md#before-the-first-login). The login lasts 30 days.
 
 ## If your GitOps repository is private
 
@@ -343,24 +333,22 @@ pixi run --manifest-path <your clone>/pixi.toml cloudpipe preflight --account <y
 
 Preflight checks what your answers assert about the world, which is a different question from whether the answers are well-formed. It is read-only: every call it makes is a read, and it creates, modifies and deletes nothing. You can re-run it, paste its output into a ticket, and run it against a deployment somebody else built.
 
-Thirteen checks, in order:
+Twelve checks, in order:
 
 | Check | What it confirms |
 |---|---|
 | `aws.identity` | Credentials resolve, are not expired, and came from an SSO profile |
 | `aws.account` | The resolved account is the one you intended |
 | `aws.hosted_zone` | A hosted zone with exactly your domain's name exists in that account. Skipped, not failed, with `domain: null` |
-| `aws.prefix_lists` | The Globus managed prefix list ID resolves in this account and region. Skipped when `globus_enabled` is not true, because no rule references one |
 | `aws.data_bucket` | `globus_s3_destination_bucket` exists in this account. The stack configures that bucket — access logging, lifecycle rules, the Argo and Prefect policies scoped to its ARN — and never creates it; [step 4](#step-4--create-the-three-buckets-that-come-before-the-stack) is what does. Says so if it is in another region, which costs transfer on every ingest. Skipped when the variable is not set yet |
 | `aws.config_objects` | Every `config/` object the workflows stage is in the data bucket: your FreeSurfer license, the MNI templates, the fsLR meshes and `nss_volumes.csv` ([the reference files](#put-the-reference-files-in-the-data-bucket)). **Fails** naming each missing object and where to get it. The set is read from the workflow templates, so a template that starts staging something new is checked too. It only lists keys; no object is read |
-| `aws.amis` | The machine images the stack launches are visible from this account. **Fails** if `globus_enabled` is true and the Globus host's AMI is not visible, because the phase 4 apply would fail on it after the cluster exists. For GPU nodes, says which AMI they will launch from: your own pre-baked AMI ([pre-baked-amis.md](pre-baked-amis.md)), else the stock EKS-optimized AL2023 AMI. On the stock AMI, the first GPU pod on each new node pulls about 11 GB of images through your cache, which adds minutes. No pre-baked AMI is published for you to use. Either way GPU nodes launch, so this does not fail. It fails only if `terraform/modules/karpenter/published-gpu-amis.json` pins an AMI your account cannot see; set `gpu_ami_selection = "alias"` to bypass it |
+| `aws.amis` | The machine images the stack launches are visible from this account. For GPU nodes, says which AMI they will launch from: your own pre-baked AMI ([pre-baked-amis.md](pre-baked-amis.md)), else the stock EKS-optimized AL2023 AMI. On the stock AMI, the first GPU pod on each new node pulls about 11 GB of images through your cache, which adds minutes. No pre-baked AMI is published for you to use. Either way GPU nodes launch, so this does not fail. It fails only if `terraform/modules/karpenter/published-gpu-amis.json` pins an AMI your account cannot see; set `gpu_ami_selection = "alias"` to bypass it |
 | `aws.image_scanning` | Amazon Inspector's ECR scanning is enabled in this account and region. The stack configures ENHANCED registry scanning, which applies without Inspector and then scans nothing. Reports **WAIT** if it is off: the install does not need it, but a deployment handling CUI needs the findings (NIST 800-171 3.11.2). If your organization manages Inspector, its delegated administrator enables it. See [How the images are trusted](images.md#how-the-images-are-trusted) |
 | `cloudflare.token` | The token is valid and active, and each of the [four permission groups](#the-cloudflare-account-and-its-token) can read its part of your account. Says whether a refusal looks like a token for a different account or one missing particular groups. Read is what a read-only check can prove; a token made from the printed link has Write. Skipped, not failed, while Zero Trust is off: Cloudflare then answers the two Access groups with "Access is not enabled", which says nothing about the token |
 | `cloudflare.organization` | Zero Trust is on in the account, and its team domain is your `cloudflare_team_domain`. **Fails** if Zero Trust is off or there is no organization, because Terraform cannot create one ([enable it in the dashboard](#the-cloudflare-account-and-its-token)), or if the domains differ, because the apply would try to rename the team domain. Skipped when `cloudflare.token` fails |
 | `federation.metadata` | A federated provider's discovery document or SAML metadata is reachable. Skipped when nothing is federated |
 | `federation.mfa_evidence` | Exactly one form of multifactor evidence is declared |
 | `federation.client_secret` | A federated OIDC provider's hand-created client secret exists |
-| `globus.inputs` | Every Globus variable this deployment needs is set in a file Terraform loads — rendered by `globus init`, or by hand in `terraform.tfvars`. With the ingress off that is only the data bucket |
 
 Exit `3` if any check failed, `0` if every check passed, was skipped, or is marked WAIT.
 
@@ -600,5 +588,5 @@ aws s3 rb s3://<bucket> --force   # for each bucket the teardown named
 | Understand what I am about to deploy | [architecture.md](architecture.md) |
 | Read the Terraform resource map and the install phases | [infrastructure.md](infrastructure.md) |
 | Decide how to get data into the bucket | [data-ingress.md](data-ingress.md) |
-| Find out whether I can reproduce the Globus ingress at all | [globus-prerequisites.md](globus-prerequisites.md) |
+| Find out whether I can reproduce the HTTPS ingress at all | [globus-prerequisites.md](globus-prerequisites.md) |
 | Run the pipeline once the cluster is up | [operations.md](operations.md) |

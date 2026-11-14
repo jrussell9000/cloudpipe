@@ -67,6 +67,8 @@ from lib.gpu_drought import (
     parse_device_mode,
 )
 from lib.subjects import load_with_params
+from lib.submission_ledger import SubmissionLedger, read_submitted
+from prefect.runtime import flow_run as runtime_flow_run
 from prefect.variables import Variable
 
 from prefect import flow, get_run_logger, task
@@ -343,6 +345,21 @@ def own_prefixes(workflow_template: str, name_prefix: str) -> tuple[str, tuple[s
     return prefix, tuple(p for p in audit_pairs.PREFIXES if p != prefix and p.startswith(prefix))
 
 
+def restart_skip(
+    subj_id: str, done_before: set[str], running: set[str], prefix: str
+) -> tuple[str, str] | None:
+    """(summary kind, log reason) when a restarted flow must not submit the subject, else None.
+
+    Submitted before the restart (the submission ledger), or a workflow of this run's
+    prefix is still running for it (#1130).
+    """
+    if subj_id in done_before:
+        return "submitted before a restart", "this flow run submitted it before a restart"
+    if subj_id.removeprefix("sub-") in running:
+        return "already running", f"its {prefix}* workflow is still running"
+    return None
+
+
 def bucket_params(bucket: str, metrics_bucket: str) -> dict[str, str]:
     """The bucket overrides to pass, if any. Empty means the ConfigMap's defaults.
 
@@ -602,9 +619,13 @@ def cloudpipe_queue_manager(
     # with the first, both writing the same session (2026-11-10: 46 subjects of a
     # 568-subject reprocess slice, caught before either wrote; #1105). A subject with
     # an active workflow of THIS run's name prefix is skipped. A subject whose first
-    # workflow already finished is resubmitted, which the pipeline's exists-gates turn
-    # into a no-op; only concurrency is the hazard.
+    # workflow already FINISHED is skipped too, by the run's submission ledger
+    # (lib/submission_ledger.py): its resubmission would be a no-op that still
+    # transfers the whole input and holds a slot (2026-11-12: ~300 such no-ops stalled
+    # the newmsm-cohort-02 slice for hours).
     prefix, foreign = own_prefixes(workflow_template, name_prefix)
+    ledger = SubmissionLedger.for_run(subjects_file, runtime_flow_run.id)
+    done_before = read_submitted(ledger, logger.warning)
     running = list_active_subjects_by_prefix(
         prefix,
         exclude=foreign,
@@ -619,13 +640,11 @@ def cloudpipe_queue_manager(
         )
 
     last_submitted_at: float | None = None
-    skipped = 0
+    skipped: dict[str, int] = {}
     for i, (subj_id, subj_params) in enumerate(batch):
-        if subj_id.removeprefix("sub-") in running:
-            logger.info(
-                f"[{i + 1}/{total}] skipping {subj_id} — its {prefix}* workflow is still running"
-            )
-            skipped += 1
+        if why := restart_skip(subj_id, done_before, running, prefix):
+            logger.info(f"[{i + 1}/{total}] skipping {subj_id} — {why[1]}")
+            skipped[why[0]] = skipped.get(why[0], 0) + 1
             continue
         # Pace before the slot check, not after: the active count must be the last
         # thing read before a submission, or a pacing sleep could let it go stale.
@@ -658,6 +677,14 @@ def cloudpipe_queue_manager(
         )
         last_submitted_at = time.monotonic()
         gate.record(name)
+        ledger.record(
+            subj_id,
+            name,
+            on_error=lambda exc, s=subj_id: logger.warning(
+                f"Could not record {s} in the submission ledger ({type(exc).__name__}: "
+                f"{exc}) — a restart would submit it again"
+            ),
+        )
         logger.info(
             f"[{i + 1}/{total}] submitted {subj_id} → {name} "
             f"({active + 1} active, fastsurfer-device={device}"
@@ -665,5 +692,5 @@ def cloudpipe_queue_manager(
             + "".join(f", {k}={v}" for k, v in subj_params.items() if k != "fastsurfer-device")
             + ")"
         )
-    if skipped:
-        logger.warning(f"Done: {skipped} of {total} subject(s) skipped as already running")
+    for kind, n in skipped.items():
+        logger.warning(f"Done: {n} of {total} subject(s) skipped as {kind}")

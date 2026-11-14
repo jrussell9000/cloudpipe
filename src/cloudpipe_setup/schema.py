@@ -313,34 +313,18 @@ def backend_fields() -> tuple[Field, ...]:
 STACK_VARIABLES = Path(__file__).resolve().parents[2] / "terraform/modules/stack/variables.tf"
 
 
-def globus_variables(variables_tf: Path = STACK_VARIABLES) -> tuple[str, ...] | None:
-    """The stack variables a deployer must supply that this wizard does not own.
-
-    Derived as every variable the stack requires, minus the ones this schema
-    binds. That is the ownership split itself (design D4), which
-    `tests/test_setup_wizard_schema.py` holds exact: every required variable has
-    exactly one owner. So the result is the Globus set without listing it here,
-    and without importing `globus_admin`, whose package pulls in `globus-sdk`.
-
-    `None` when the declarations cannot be read, so a caller reports that rather
-    than guessing at a list.
-    """
-    try:
-        text = variables_tf.read_text()
-    except OSError:
-        return None
-    owned = {field.terraform_variable for field in terraform_fields()}
-    return tuple(sorted(required_variables(text) - owned))
-
-
 def required_variables(text: str) -> set[str]:
     """Every variable a deployer may have to supply: unconditional and conditional.
 
-    "No default" alone stopped being the whole answer when the Globus ingress
-    became opt-in. Its seven inputs now default to the empty string and are
-    rejected as empty only when `globus_enabled` is true, so by the old reading
-    they are optional — and a deployer who turned the ingress on would be told
-    nothing about them until `terraform plan` refused the empty values.
+    "No default" alone is not the whole answer: a variable can default to the
+    empty string and be refused as empty only when another variable says so (the
+    retired Globus ingress's inputs were, under `globus_enabled`). By the old
+    reading such a variable is optional, and a deployer would be told nothing
+    about it until `terraform plan` refused the empty value.
+
+    Every variable this returns is this wizard's to own since contract 3.0
+    (`tests/test_setup_wizard_schema.py` holds it exact); the `globus init` half
+    of the split is gone with the Globus host.
 
     Terraform has no "conditionally required" keyword, so the cross-variable
     validation IS the declaration, and reading it is reading the source of truth

@@ -240,8 +240,8 @@ def _preamble(emitter: Emitter, style: _Style, *, total: int) -> None:
         "  Answering creates nothing in AWS or Cloudflare, and no password or key is asked for."
     )
     emitter.note(
-        "  Settings for the optional Globus data transfer are not asked here; a separate tool, "
-        "`globus init`, covers them."
+        "  HTTPS ingress's source collection is not asked here (set it in an *.auto.tfvars), "
+        "and its Globus login is a separate tool's `globus login` command."
     )
 
 

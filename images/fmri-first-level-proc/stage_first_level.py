@@ -26,6 +26,7 @@ import sys
 import threading
 from pathlib import Path
 
+import anat_qc_rejects
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from fs_derivatives import publish
@@ -233,7 +234,15 @@ def _has_marker(s3, bucket: str, key: str) -> bool:
 
 def list_sessions(s3, bucket: str, subj: str, missing_only: bool = False) -> list[dict]:
     """The subject's complete func sessions; with `missing_only`, only the ones that
-    have no first-level `_complete.json` (a half-published tree counts as missing)."""
+    have no first-level `_complete.json` (a half-published tree counts as missing).
+
+    A session on the anatomical-QC reject list (#1205) is left out: its cortical
+    surfaces collapsed, so its func output is not fitted. A missing list fails the subject
+    rather than fitting every session."""
+    try:
+        rejected = anat_qc_rejects.load(s3, bucket)
+    except anat_qc_rejects.MissingList as exc:
+        raise SessionError(str(exc)) from exc
     sessions = []
     prefix = f"{FUNC_PREFIX}/{subj}/"
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter="/")
@@ -245,6 +254,9 @@ def list_sessions(s3, bucket: str, subj: str, missing_only: bool = False) -> lis
             if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
                 continue  # half-published: skipped, never inferred from a listing
             raise
+        if (subj, ses) in rejected:
+            log("anat-qc-rejected", subj=subj, ses=ses, list=anat_qc_rejects.KEY)
+            continue
         if missing_only and _has_marker(s3, bucket, f"{OUT_PREFIX}/{subj}/{ses}/{MARKER}"):
             continue
         sessions.append({"ses": ses})

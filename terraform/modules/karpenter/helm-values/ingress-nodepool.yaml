@@ -6,9 +6,11 @@ metadata:
 # every other pipeline pod off these public-IP nodes; only the ingress step
 # tolerates it, apart from DaemonSets that tolerate everything.
 #
-# Sized for the https-transfer semaphore (8 concurrent steps at 2 CPU / 4 Gi):
-# one 2xlarge carries them all. The cpu limit of 64 allows headroom to raise the
-# semaphore later without a pool change.
+# Sized for the https-transfer semaphore, which is 2 since MSI asked us to cut
+# load on the NBDC source (2026-11-09; cloudpipe-semaphores-configmap.yaml):
+# 2 concurrent steps at 2 CPU / 2 Gi requested, so one 2xlarge carries both. The
+# cpu limit of 64 is a runaway backstop, not a target; raising the semaphore
+# needs MSI's agreement, not a pool change.
 spec:
   limits:
     cpu: 64

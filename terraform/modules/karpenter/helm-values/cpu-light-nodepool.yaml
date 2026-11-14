@@ -19,7 +19,7 @@ spec:
   # Derivation: assume up to ~50 sessions across the batch complete within
   # the same clustering window (anatomical-phase duration is far less
   # variable than func-preproc's, so early-phase completions can cluster more
-  # than the CLAUDE.md-documented BOLD-driven runtime variance suggests for
+  # than the BOLD-driven runtime variance in docs/index.md suggests for
   # later phases) plus ~50 more concurrent workflows in the lighter
   # globus/inventory/exit-handler phase:
   #   50 * (2 cpu surface-resample + ~0.5 cpu recorder burst) ~= 125 cpu

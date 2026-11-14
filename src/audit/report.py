@@ -57,7 +57,7 @@ INGRESS_STEPS = frozenset(
 # (the default). A pod on another family is not the pod's node (#1060), so it is
 # unpriced. tests/audit/test_audit_report.py holds this against the templates.
 CPU_LIGHT_STEPS = (
-    "delete-globus-input", "dvars-backfill", "fsqc-metrics", "newmsm-image-guard",
+    "decide-anatomy-rebuild", "delete-globus-input", "dvars-backfill", "fsqc-metrics", "newmsm-image-guard",
     "published-sessions", "record-step-outcome", "subject-data-inventory", "surface-resample",
     "verify-staged-input", "workflow-run-metrics", "workflow-start-marker", "workflow-verdict",
 )  # fmt: skip

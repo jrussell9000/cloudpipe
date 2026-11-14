@@ -50,7 +50,7 @@ signal here** and nothing gates on it.
 ## How it works
 
 ```
-Globus transfer ──► S3 ──► inventory ──► anatomical (FastSurfer, GPU)
+HTTPS copy ───────► S3 ──► inventory ──► anatomical (FastSurfer, GPU)
                                      │        │
                                      │        ├─► subregion segmentation
                                      │        └─► fsqc anatomical QC
@@ -65,8 +65,8 @@ Globus transfer ──► S3 ──► inventory ──► anatomical (FastSurfe
 Each box is an Argo Workflows step running a purpose-built container image. Nodes are
 provisioned on demand by Karpenter and released when the step finishes, so a batch's cost
 scales with work done rather than with cluster uptime. A Prefect flow drip-feeds subject
-submissions to keep concurrency under both the Argo controller's limits and the transfer
-service's.
+submissions to keep concurrency under both the Argo controller's limits and the data
+source's.
 
 Every step emits a structured JSON QC record to S3, which is compacted nightly to Parquet and
 queried through Athena and Grafana. That record — not the pod logs — is the system of record

@@ -485,13 +485,65 @@ spec:
           # `depends` is ever edited away.
           depends: "(https-transfer-dagtask.Succeeded || https-transfer-dagtask.Skipped) && (verify-staged-input-dagtask.Succeeded || verify-staged-input-dagtask.Skipped)"
 
-        # Anatomical processing pipeline
+        # Ingress failures as StepOutcome rows, so workflow-verdict fails the
+        # workflow. Inventory's `depends` names both tasks, and Argo counts a
+        # failure that a downstream `depends` names as handled: a failed copy or a
+        # refused subject left the workflow Succeeded with nothing processed and
+        # no failure anywhere (reprocess audit, 2026-11-12: an anatomy-only
+        # subject, refused at verify-staged-input, ended "Succeeded, 0 failures").
+        # Each runs only when its task failed, so a healthy subject gets no extra
+        # pod and no extra row; workflow-verdict waits on both.
+        - name: record-outcome-https-transfer-dagtask
+          depends: "https-transfer-dagtask.Failed || https-transfer-dagtask.Errored"
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: https-transfer
+              - name: status
+                value: '{{tasks.https-transfer-dagtask.status}}'
+              - name: exit-code
+                value: "{{= tasks['https-transfer-dagtask'].exitCode ?? '' }}"
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        - name: record-outcome-verify-staged-input-dagtask
+          depends: "verify-staged-input-dagtask.Failed || verify-staged-input-dagtask.Errored"
+          templateRef:
+            name: outcome-recorder
+            template: record-step-outcome
+          arguments:
+            parameters:
+              - name: step
+                value: verify-staged-input
+              - name: status
+                value: '{{tasks.verify-staged-input-dagtask.status}}'
+              - name: exit-code
+                value: "{{= tasks['verify-staged-input-dagtask'].exitCode ?? '' }}"
+              - name: subject
+                value: '{{workflow.parameters.subjID}}'
+              - name: bucket
+                value: '{{workflow.parameters.bucket}}'
+              - name: metrics-bucket
+                value: '{{workflow.parameters.metrics-bucket}}'
+
+        # Anatomical processing pipeline. The task keeps its name (everything below
+        # gates on it), but runs the rebuild wrapper: if the long stream rejects a
+        # session, the whole phase is run again without it, so that session ends as
+        # missing data and the subject's other sessions are still published.
         - name: anatomical-processing-pipeline-dagtask
-          # Reference to an in-line DAG template (provided below)
-          template: anatomical-processing-pipeline-dag-template
+          template: anatomy-with-rebuild-dag-template
           depends: subject-data-inventory-dagtask.Succeeded
           arguments:
             parameters:
+              - name: rebuild-depth
+                value: "0"
               # Extract session strings from the enriched inventory array for anatomical templates,
               # which expect a flat ["ses-00A", "ses-02A", ...] list. Filtered to sessions with a
               # T1w source in S3 — not every longitudinal session has an anatomical scan, and
@@ -597,16 +649,24 @@ spec:
         # HypVINN.) The gate reads per-region markers only, so it cannot see a
         # tree missing sessions; repairing those takes a direct subregion-seg
         # submission, where the phase's own coverage check recomputes them.
+        #
+        # Its session list is what the anatomical phase PUBLISHED, not every session
+        # with a T1w: when the phase rebuilt the subject without a rejected session,
+        # that session has no FastSurfer tree to segment. published-sessions runs on
+        # the same anatomical gate and is a few head_objects, so waiting on it costs
+        # seconds. `.Succeeded` only: this task reads its outputs (ADR 016).
         - name: subregion-segmentation-dagtask
           templateRef:
             name: subregion-seg
             template: subregion-seg-dag-template
-          depends: "anatomical-processing-pipeline-dagtask.Succeeded || anatomical-processing-pipeline-dagtask.Skipped"
+          depends: >-
+            (anatomical-processing-pipeline-dagtask.Succeeded || anatomical-processing-pipeline-dagtask.Skipped) &&
+            published-sessions-dagtask.Succeeded
           when: '{{tasks.subject-data-inventory-dagtask.outputs.parameters.subregions-exist}} == "False"'
           arguments:
             parameters:
               - name: T1w_sessions
-                value: '{{= toJson(map(filter(jsonpath(tasks[''subject-data-inventory-dagtask''].outputs.result, "$[*]"), {#.t1w_available == true}), {#.session})) }}'
+                value: '{{= toJson(map(jsonpath(tasks[''published-sessions-dagtask''].outputs.parameters[''session-items''], "$[*]"), {#.session})) }}'
 
         # fsqc anatomical QC — one pod per subject, covering all sessions.
         # A third sibling of session-level-pipeline-dagtask and
@@ -792,6 +852,11 @@ spec:
 
         # One StepOutcome per session the anatomical phase declined to publish.
         #
+        # Since #1197 the long-parcellation guard never publishes a subset: one
+        # rejected session fails that step (exit 69) and this task is Omitted. It
+        # stays as the backstop for a tree an older release published partially,
+        # or one that lost a marker.
+        #
         # Without this, #270's fix would be worse than the bug it replaces. The
         # rejected session no longer fans out, so nothing fails, so the workflow
         # succeeds — and exit_handler computes `overall_status: succeeded` for a
@@ -858,7 +923,9 @@ spec:
             (record-outcome-anatomical-dagtask.Succeeded || record-outcome-anatomical-dagtask.Skipped || record-outcome-anatomical-dagtask.Omitted) &&
             (record-outcome-session-dagtask.Succeeded || record-outcome-session-dagtask.Skipped || record-outcome-session-dagtask.Omitted) &&
             (record-outcome-rejected-sessions-dagtask.Succeeded || record-outcome-rejected-sessions-dagtask.Skipped || record-outcome-rejected-sessions-dagtask.Omitted) &&
-            (record-outcome-newmsm-dagtask.Succeeded || record-outcome-newmsm-dagtask.Skipped || record-outcome-newmsm-dagtask.Omitted)
+            (record-outcome-newmsm-dagtask.Succeeded || record-outcome-newmsm-dagtask.Skipped || record-outcome-newmsm-dagtask.Omitted) &&
+            (record-outcome-https-transfer-dagtask.Succeeded || record-outcome-https-transfer-dagtask.Skipped || record-outcome-https-transfer-dagtask.Omitted) &&
+            (record-outcome-verify-staged-input-dagtask.Succeeded || record-outcome-verify-staged-input-dagtask.Skipped || record-outcome-verify-staged-input-dagtask.Omitted)
           templateRef:
             name: metrics-exit-handler
             template: workflow-verdict-template
@@ -878,6 +945,185 @@ spec:
 #######################################
 #----- Anatomical Processing DAG -----#
 #######################################
+
+  ##################################################
+  # Anatomy with rebuild: a failed session becomes missing data.
+  #
+  # The long-parcellation guard rejects a session it cannot publish (surfaces
+  # missing, a collapsed gray-mode fallback, ...) and, because the base template
+  # was built from every session (#1197), publishes nothing from that attempt and
+  # exits 69 after writing scratch/<workflow>/anat/long-rejected.json. This
+  # wrapper then runs the WHOLE anatomical phase again from the surviving
+  # sessions, template-build included, so the subject keeps its good sessions and
+  # none of them sits in a template the rejected one shaped (operator,
+  # 2026-11-14). It recurses: a rebuild that rejects again rebuilds again, each
+  # time with strictly fewer sessions, up to MAX_REBUILDS.
+  #
+  # Phase semantics, measured on this cluster (rebuild-phase-probe-8kw79,
+  # 2026-11-14), not assumed:
+  #   attempt Succeeded                        -> decide and rebuild Omitted, wrapper Succeeded
+  #   attempt Failed, decide ok, rebuild ok    -> wrapper Succeeded (the failure is handled)
+  #   attempt Failed, decide refuses           -> wrapper Failed, downstream Omitted
+  # So a failure that is NOT a session rejection (an OOM, a template-build crash,
+  # a write that did not land) still fails the phase: decide finds no matching
+  # record and exits 1.
+  #
+  # What reports the dropped session: published-sessions sees it has no
+  # _complete.json, and record-outcome-rejected-sessions-dagtask writes a Failed
+  # StepOutcome for it, so the subject ends `partial` — never silently complete.
+  ##################################################
+  - name: anatomy-with-rebuild-dag-template
+    inputs:
+      parameters:
+        - name: T1w_sessions
+        - name: rebuild-depth
+    dag:
+      failFast: false
+      tasks:
+        - name: anatomy-attempt-dagtask
+          template: anatomical-processing-pipeline-dag-template
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+
+        - name: decide-anatomy-rebuild-dagtask
+          template: decide-anatomy-rebuild-template
+          depends: anatomy-attempt-dagtask.Failed || anatomy-attempt-dagtask.Errored
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: "{{inputs.parameters.T1w_sessions}}"
+              - name: rebuild-depth
+                value: "{{inputs.parameters.rebuild-depth}}"
+
+        - name: anatomy-rebuild-dagtask
+          template: anatomy-with-rebuild-dag-template
+          depends: decide-anatomy-rebuild-dagtask.Succeeded
+          arguments:
+            parameters:
+              - name: T1w_sessions
+                value: "{{tasks.decide-anatomy-rebuild-dagtask.outputs.parameters.survivors}}"
+              - name: rebuild-depth
+                value: "{{tasks.decide-anatomy-rebuild-dagtask.outputs.parameters.next-depth}}"
+
+  # Reads the rejection record the long-parcellation guard wrote, and either hands
+  # the surviving sessions to a rebuild or refuses (exit 1), which fails the phase.
+  # tests/argo/test_anatomy_rebuild.py runs this source.
+  - name: decide-anatomy-rebuild-template
+    metadata:
+      labels:
+        cloudpipe.io/phase: anatomical
+        cloudpipe.io/step: decide-anatomy-rebuild
+    inputs:
+      parameters:
+        - name: T1w_sessions
+        - name: rebuild-depth
+    outputs:
+      parameters:
+        - name: survivors
+          valueFrom:
+            path: /tmp/survivors.json
+        - name: next-depth
+          valueFrom:
+            path: /tmp/next-depth.txt
+    retryStrategy:
+      limit: "3"
+      # `Always`: a throttled control plane is phase Error (#269). A refusal is a
+      # deterministic exit 1 that every retry reproduces, which costs seconds.
+      retryPolicy: Always
+      backoff:
+        duration: "30s"
+        factor: "2"
+    nodeSelector:
+      karpenter.sh/nodepool: cpu-light-nodepool
+    script:
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:803b7296c5ad533c2d98f2eabdc0b4b342157dd9061c477f95f1415404a6c9cc"
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: 128M
+          cpu: 100m
+      env:
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: cloudpipe-config
+              key: region
+      command: [python]
+      source: |
+        import json
+        import sys
+
+        # Each rebuild drops at least one session, so recursion ends on its own;
+        # this only bounds the cost of a subject whose sessions fail one by one.
+        MAX_REBUILDS = 3
+        RECORD = "scratch/{workflow}/anat/long-rejected.json"
+        SEG_TARBALL = "scratch/{workflow}/anat/sessions-seg/{ses}.tar.gz"
+
+
+        def decide(record, attempted, depth):
+            """(survivors, reason). survivors is None when there is nothing to rebuild."""
+            if record is None:
+                return None, (
+                    "the anatomical attempt failed, but the long stream recorded no rejected "
+                    "session: the failure is not a session rejection, so there is nothing to "
+                    "rebuild without"
+                )
+            if sorted(record.get("attempted", [])) != sorted(attempted):
+                return None, (
+                    f"the rejection record is for sessions {record.get('attempted')}, not this "
+                    f"attempt's {attempted}; refusing to act on a stale record"
+                )
+            rejected = [s for s in record.get("rejected", []) if s in attempted]
+            if not rejected:
+                return None, "the rejection record names no session of this attempt"
+            survivors = [s for s in attempted if s not in rejected]
+            if not survivors:
+                return None, f"every session was rejected ({rejected}); no anatomy for this subject"
+            if depth >= MAX_REBUILDS:
+                return None, f"already rebuilt {depth} time(s); not rebuilding again"
+            return survivors, f"dropping {rejected}; rebuilding from {survivors}"
+
+
+        def main():
+            import boto3
+            from botocore.exceptions import ClientError
+
+            bucket = "{{workflow.parameters.bucket}}"
+            workflow = "{{workflow.name}}"
+            attempted = json.loads('{{inputs.parameters.T1w_sessions}}')
+            depth = int("{{inputs.parameters.rebuild-depth}}")
+            s3 = boto3.client("s3")
+            key = RECORD.format(workflow=workflow)
+            try:
+                record = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+            except ClientError as e:
+                if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+                    raise
+                record = None
+
+            survivors, reason = decide(record, attempted, depth)
+            if survivors is None:
+                print(f"NO REBUILD: {reason}", file=sys.stderr)
+                sys.exit(1)
+
+            with open("/tmp/survivors.json", "w") as fh:
+                json.dump(survivors, fh)
+            with open("/tmp/next-depth.txt", "w") as fh:
+                fh.write(str(depth + 1))
+            # The rebuild must not find the rejected sessions' segmentation tarballs
+            # from the old template, nor this record (a later failure that is not a
+            # rejection would otherwise look like one). The record goes LAST, so a
+            # retry after a crash anywhere above still finds it.
+            for ses in record["rejected"]:
+                s3.delete_object(Bucket=bucket, Key=SEG_TARBALL.format(workflow=workflow, ses=ses))
+            s3.delete_object(Bucket=bucket, Key=key)
+            print(f"REBUILD (depth {depth + 1}): {reason}", file=sys.stderr)
+
+
+        if __name__ == "__main__":
+            main()
 
   - name: anatomical-processing-pipeline-dag-template
     inputs:
@@ -1462,7 +1708,7 @@ spec:
     nodeSelector:
       karpenter.sh/nodepool: cpu-light-nodepool
     script:
-      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:302613557e5fbad1e0d4ec0ede67503f2cb5012e2be000ee92fb28ba70b52739"
+      image: "{{workflow.parameters.ecr-registry}}/cloudpipe/python@sha256:803b7296c5ad533c2d98f2eabdc0b4b342157dd9061c477f95f1415404a6c9cc"
       imagePullPolicy: IfNotPresent
       resources:
         requests:

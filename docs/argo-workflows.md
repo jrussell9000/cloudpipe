@@ -116,7 +116,7 @@ There is no longer a workflow-scoped EFS PVC anywhere in this pipeline. `subregi
 
 These three live in `terraform/modules/argo-workflows/main.tf`, **not** in the Helm values. The chart renders them only via `templates/controller/workflow-controller-config-map.yaml`, and `controller.configMap.create` is `false` because Terraform owns that ConfigMap — so setting them under `controller:` in `values.yaml` is silently inert. That is exactly how this repo shipped a documented pod-creation rate limit that was never in effect, and no namespace cap at all, until #206.
 
-Semaphores are defined in `cloudpipe-semaphores-configmap.yaml` and referenced by name in the `globus-transfer-template`. Adding a new semaphore requires adding a key to that ConfigMap and a `synchronization.semaphore.configMapKeyRef` block in the relevant template.
+Semaphores are defined in `cloudpipe-semaphores-configmap.yaml` and referenced by name in the template that takes one (today only `https-transfer-template`). Adding a new semaphore requires adding a key to that ConfigMap and a `synchronization.semaphore.configMapKeyRef` block in the relevant template.
 
 `namespaceParallelism` and `resourceRateLimit` live in the **Terraform-owned** controller ConfigMap (`terraform/modules/argo-workflows/main.tf`), not in `gitops/apps/argo-workflows/values.yaml`. The Argo Helm chart accepts these keys under `controller:`, but its only consumer of them is the controller ConfigMap template — and this deployment sets `controller.configMap.create: false` so Terraform can own that ConfigMap's dynamic DB credentials. Anything set for them in `values.yaml` therefore renders nowhere and is **silently inert**; that is exactly how the repo shipped a documented pod-creation rate limit that was never in effect (#206). `tests/argo/test_controller_config.py` guards both directions.
 
@@ -156,7 +156,7 @@ Every pipeline pod is labelled for Kubecost cost attribution:
 | Label | Values | Set by |
 |---|---|---|
 | `cloudpipe.io/phase` | `transfer`, `inventory`, `anatomical`, `registration`, `functional`, `subregion-segmentation`, `observability`, `cleanup`, `first-level` | Template `metadata.labels` |
-| `cloudpipe.io/step` | `start-globus-instance`, `globus-transfer`, `delete-globus-input`, `subject-data-inventory`, `published-sessions`, `template-build`, `template-parcellation`, `long-segmentation`, `long-parcellation`, `fsqc-metrics`, `t1w-to-mni`, `bold-to-t1w`, `bold-preprocessing`, `surface-resample`, `segment-gems`, `segment-dl`, `orchestrate`, `workflow-start-marker`, `workflow-run-metrics`, `record-step-outcome` | Template `metadata.labels` |
+| `cloudpipe.io/step` | `https-transfer`, `verify-staged-input`, `delete-globus-input`, `subject-data-inventory`, `published-sessions`, `template-build`, `template-parcellation`, `long-segmentation`, `long-parcellation`, `fsqc-metrics`, `t1w-to-mni`, `bold-to-t1w`, `bold-preprocessing`, `surface-resample`, `segment-gems`, `segment-dl`, `orchestrate`, `workflow-start-marker`, `workflow-run-metrics`, `record-step-outcome` | Template `metadata.labels` |
 | `subjectid` | `{subjID}` | `podMetadata.labels` in master WorkflowTemplate |
 | `app` | `cloudpipe` | `podMetadata.labels` in master WorkflowTemplate |
 
@@ -182,16 +182,17 @@ Parameters (all read from `cloudpipe-config` ConfigMap by default):
 | `metrics-bucket` | from ConfigMap | Separate versioned QC-metrics bucket (`cloudpipe-metrics`). Distinct from `bucket` so metrics survive a derivative flush — see [observability.md](observability.md). |
 | `ecr-registry` | from ConfigMap | Container registry prefix. Now the **private** ECR registry (`{account-id}.dkr.ecr.{region}.amazonaws.com`) — set from `local.ecr_registry` in `terraform/modules/stack/argowf.tf`. ECR Public remains a dual-push secondary kept for rollback for most images; it is no longer what workflows pull from, and its repos are being retired image by image (`fmri-first-level-proc` already is). |
 | `region` | from ConfigMap | Deployment region. Read by every `s3:` artifact block in the templates this master invokes, which need both the regional endpoint (`s3.{region}.amazonaws.com`) and the region itself. Declared on the master even though the master has no artifact of its own: a `templateRef` inherits `templates` only, so the sub-templates' own defaults are ignored under it and every artifact resolves against the master's parameter set (issue #212). |
-| `globus-source-collection-id` | — | Source Globus collection UUID |
+| `ingress-mode` | `https` | `https` copies the subject from the source collection; `presynced` verifies what is already staged. See [data-ingress.md](data-ingress.md) |
+| `globus-source-collection-id` | — | Source Globus collection UUID (the HTTPS copy's source) |
 | `globus-source-base-path` | — | Root path on source collection |
-| `globus-dest-collection-id` | — | Destination GCS collection UUID |
-| `globus-dest-base-path` | — | Root path on destination collection |
+| `globus-dest-base-path` | — | Prefix in the data bucket the copy writes to, e.g. `/mmps_mproc` |
 | `globus-scan-types` | — | JSON array of BIDS scan types |
-| `globus-use-s3-gateway` | `"true"` | **Deprecated and unread.** Declared so older submitters are not rejected; the POSIX sync step it selected is gone |
+| `globus-dest-collection-id` | `""` | **Deprecated and unread.** It named the destination collection on the retired Globus host; declared so older submitters are not rejected |
+| `globus-use-s3-gateway` | `"true"` | **Deprecated and unread.** Declared so older submitters are not rejected; the gateway it selected is gone |
 
 DAG structure (see architecture.md for the full phase breakdown):
 ```
-start-globus-instance → globus-transfer
+https-transfer (https only) → verify-staged-input
                                         ↓
                               subject-data-inventory
                                         ↓
@@ -209,11 +210,9 @@ start-globus-instance → globus-transfer
 
 ### globus-transfer (`globus-transfer-workflow-template.yaml`)
 
-Three templates, called in sequence by the master DAG:
+One template. The WorkflowTemplate and its file keep the name `globus-transfer` because the master, `confounds-rerun` and both `fmriprep_bench` templates call it by that name; the Globus Transfer task and host it once ran are retired (ADR 024).
 
-**`start-globus-instance-template`** — Reads instance ID from SSM (`/cloudpipe/globus/instance-id`), starts the EC2 instance if not running, waits for status checks. Idempotent. Node pool: `cpu-light`. Image: `python`.
-
-**`globus-transfer-template`** — Submits the Globus transfer and polls until completion. It takes no semaphore of its own; the `https-transfer` semaphore (2) bounds the HTTPS copy step. Credentials come from the `globus-credentials` K8s Secret (synced from Secrets Manager via ExternalSecret every hour). Node pool: `cpu-light`. Image: `globus`.
+**`https-transfer-template`** — Lists the subject through the Globus Transfer API, copies it from the source collection's HTTPS server straight into the data bucket, and checks every object's size (`images/globus/https_ingress.py`). Refuses a Globus login older than 30 days with exit 78, which its retry expression excludes. Takes the `https-transfer` semaphore. Credentials come from the `globus-credentials` K8s Secret (synced from Secrets Manager via ExternalSecret every hour). Node pool: `ingress-nodepool`. Image: `globus`. See [data-ingress.md](data-ingress.md#reading-the-source-over-https-ingress-modehttps).
 
 ### inventory (`inventory-workflow-template.yaml`)
 
@@ -329,14 +328,15 @@ Separate pipeline for first-level GLM analysis. Submitted by `first-level-queue-
 
 ## Globus credentials secret
 
-The `globus-credentials` ExternalSecret (in `argo/workflows/cloudpipe_minproc/`) syncs two fields from the Secrets Manager secret `globus/refresh-token`:
+The `globus-credentials` ExternalSecret (in `argo/workflows/cloudpipe_minproc/`) syncs every property of the Secrets Manager secret `globus/refresh-token` (`dataFrom.extract`), which `pixi run globus login` writes:
 
-| K8s key | Secrets Manager property |
+| K8s key | What it is |
 |---|---|
-| `native-app-client-id` | `native-app-client-id` |
-| `refresh-token` | `refresh-token` |
+| `native-app-client-id` | The Globus native app the login was made through |
+| `refresh-token` | The transfer token, which lists the source |
+| `https-refresh-token` | The HTTPS token, which reads the source's files |
 
-These are injected as environment variables into the `globus-transfer-template` container. The ExternalSecret refreshes every hour, so token rotation takes effect within 1 hour without redeploying.
+These are injected as environment variables into the `https-transfer-template` container. The ExternalSecret refreshes every hour, and `login` forces an immediate sync, so a new login reaches new pods without redeploying. See [globus.md](globus.md#how-the-session-reaches-the-copy).
 
 ---
 

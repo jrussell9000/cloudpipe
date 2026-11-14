@@ -469,6 +469,64 @@ RUN set -eu; \
       *) echo "ERROR: the real mris_fix_topology did not run behind the wrapper: $out"; exit 1 ;; \
     esac
 
+# Two input guards, same move-aside pattern as the topology bound above:
+#
+#   mri_normalize         -> normalize_aseg_guard.sh  (Deep-MI/FastSurfer#956, the
+#                            cause of HISTOalloc: segmentation labels outside the
+#                            brain mask become zero-intensity control points)
+#   mris_autodet_gwstats  -> autodet_gm_guard.sh      (gray mode = the 110 white-
+#                            matter clip spike, which collapses the surfaces)
+#
+# Both run the real binary first with the caller's arguments and act ONLY when its
+# own output shows the failure, then run it again with corrected inputs. A healthy
+# session runs the identical command once, so the one-build census above still
+# holds for every tree that never hit either failure. fs_guards.py holds the
+# decision logic and the evidence; it needs only the base image's /venv (nibabel).
+#
+# mri_normalize here is already the patched build from stage 1; the sentinel stays
+# as the backstop behind the guard, and the guard keys on the sentinel's output.
+#
+# The checks below run each name through its wrapper with no guarded arguments,
+# which must pass straight through to the real binary: mri_normalize's --version
+# has to carry the patched build stamp, and mris_autodet_gwstats's the 7.4.1 one.
+COPY --chown=1000:1000 images/fastsurfer/fs_guards.py /app/fs_guards.py
+COPY --chown=1000:1000 images/fastsurfer/normalize_aseg_guard.sh /app/normalize_aseg_guard.sh
+COPY --chown=1000:1000 images/fastsurfer/autodet_gm_guard.sh /app/autodet_gm_guard.sh
+RUN set -eu; \
+    chmod 770 /app/normalize_aseg_guard.sh /app/autodet_gm_guard.sh; \
+    /venv/bin/python3 -I -c "import nibabel, numpy" || { echo "ERROR: /venv lacks nibabel/numpy; fs_guards.py cannot run"; exit 1; }; \
+    for pair in mri_normalize:normalize_aseg_guard.sh mris_autodet_gwstats:autodet_gm_guard.sh; do \
+        prog="${pair%%:*}"; shim="/app/${pair##*:}"; bin="/opt/freesurfer/bin/${prog}"; \
+        if [ ! -x "$bin" ]; then \
+            echo "ERROR: ${bin} is missing from the image; the guard has nothing to wrap."; \
+            exit 1; \
+        fi; \
+        if [ -e "${bin}.unguarded" ]; then \
+            echo "ERROR: ${bin}.unguarded already exists; the image changed shape."; \
+            exit 1; \
+        fi; \
+        mv "$bin" "${bin}.unguarded"; \
+        cp "$shim" "$bin"; \
+        chown 1000:1000 "$bin" "${bin}.unguarded"; \
+        chmod 770 "$bin" "${bin}.unguarded"; \
+    done; \
+    grep -aq 'cloudpipe: bounded' /opt/freesurfer/bin/mri_normalize.unguarded \
+        || { echo "ERROR: the binary behind the mri_normalize guard is not the patched build"; exit 1; }; \
+    grep -q 'Deep-MI/FastSurfer#956' /opt/freesurfer/bin/mri_normalize \
+        || { echo "ERROR: /opt/freesurfer/bin/mri_normalize is not the guard"; exit 1; }; \
+    grep -q 'gray-mode clip spike' /opt/freesurfer/bin/mris_autodet_gwstats \
+        || { echo "ERROR: /opt/freesurfer/bin/mris_autodet_gwstats is not the guard"; exit 1; }; \
+    out="$(/opt/freesurfer/bin/mri_normalize --version 2>&1)" || true; \
+    case "$out" in \
+      *cloudpipe-histoalloc1452*) echo "mri_normalize guard passes through: $out" ;; \
+      *) echo "ERROR: mri_normalize --version through the guard did not reach the patched build: $out"; exit 1 ;; \
+    esac; \
+    out="$(/opt/freesurfer/bin/mris_autodet_gwstats --version 2>&1)" || true; \
+    case "$out" in \
+      *7.4.1*) echo "mris_autodet_gwstats guard passes through: $out" ;; \
+      *) echo "ERROR: mris_autodet_gwstats --version through the guard did not reach the 7.4.1 binary: $out"; exit 1 ;; \
+    esac
+
 COPY images/fastsurfer/extract_qc.py /app/extract_qc.py
 
 # Exploded-derivative publish (ADR 017). This is the ONE dependency the whole

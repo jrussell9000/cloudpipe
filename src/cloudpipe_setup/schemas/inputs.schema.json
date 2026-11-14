@@ -2,12 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cloudpipe.invalid/schemas/inputs.schema.json",
   "title": "CloudPipe deployment inputs",
-  "x-schema-version": "2.0",
-  "description": "Every cluster-wide value a human supplies to stand up a CloudPipe deployment, and nothing else. `pixi run cloudpipe setup` reads this file rather than hard-coding its questions, and renders `terraform.tfvars` and `backend.tf` into a target Terraform root from the answers.\n\nThis is the integration contract for any front end. A caller reads it and renders a complete input form without opening another file: `title` is the prompt, `description` is the help text, `pattern` is the rule, `x-section` is the grouping, and `x-source` says where a human obtains the value. Fields marked `x-derived` are computed and overridable — a form generator must display the computed value and accept a change, but must NOT present them as questions. A derivation is `x-derived-template` filled from the answers named in `x-derived-from`; with `x-derived-pattern`, a regex with named groups is matched against the one source first, and the template may use its groups. Fields carrying `x-suggested-from` and `x-suggested-template` (and optionally `x-suggested-pattern`, read the same way) ARE questions: a form generator offers the computed value as the answer's default, and keeps offering the recomputed one while the answer has not been changed from it.\n\nThe eight Globus variables are deliberately absent. `pixi run globus init` owns them and renders them into a separate `globus.auto.tfvars`; see `src/globus_admin/schemas/answers.schema.json`. The two sets are disjoint and a test holds them so, because two tools writing one variable is two tools disagreeing about it.\n\nThere is deliberately NO AWS credential, key, or profile field, and no Cloudflare API token field. AWS credentials come from the deployer's environment through an AWS CLI v2 SSO profile; the Cloudflare token comes from CLOUDFLARE_API_TOKEN. Neither is ever prompted for, stored, or printed.\n\nEvery `pattern` here is the mechanical equivalent of a `validation` block in `terraform/modules/stack/variables.tf`, and `tests/test_setup_wizard_schema.py` derives both sides from that file and asserts they agree. A field whose variable Terraform does not constrain carries no pattern: one invented here would reject values Terraform accepts, which is the single failure a deployer cannot work around. `x-error-message` is Terraform's own `error_message`, verbatim, so the two can never word the same rule differently.\n\nNo value in this file identifies any deployment. Where a shape needs illustrating, the description uses a placeholder or a reserved example name.",
+  "x-schema-version": "3.0",
+  "description": "Every cluster-wide value a human supplies to stand up a CloudPipe deployment, and nothing else. `pixi run cloudpipe setup` reads this file rather than hard-coding its questions, and renders `terraform.tfvars` and `backend.tf` into a target Terraform root from the answers.\n\nThis is the integration contract for any front end. A caller reads it and renders a complete input form without opening another file: `title` is the prompt, `description` is the help text, `pattern` is the rule, `x-section` is the grouping, and `x-source` says where a human obtains the value. Fields marked `x-derived` are computed and overridable — a form generator must display the computed value and accept a change, but must NOT present them as questions. A derivation is `x-derived-template` filled from the answers named in `x-derived-from`; with `x-derived-pattern`, a regex with named groups is matched against the one source first, and the template may use its groups. Fields carrying `x-suggested-from` and `x-suggested-template` (and optionally `x-suggested-pattern`, read the same way) ARE questions: a form generator offers the computed value as the answer's default, and keeps offering the recomputed one while the answer has not been changed from it.\n\nSince contract 3.0 every required stack variable is asked here, the data bucket (`globus_s3_destination_bucket`) included: `globus init`, which rendered the retired Globus host's inputs, is gone. The Globus answers schema (`src/globus_admin/schemas/answers.schema.json`) renders no Terraform variable, and a test holds it so, because two tools writing one variable is two tools disagreeing about it.\n\nThere is deliberately NO AWS credential, key, or profile field, and no Cloudflare API token field. AWS credentials come from the deployer's environment through an AWS CLI v2 SSO profile; the Cloudflare token comes from CLOUDFLARE_API_TOKEN. Neither is ever prompted for, stored, or printed.\n\nEvery `pattern` here is the mechanical equivalent of a `validation` block in `terraform/modules/stack/variables.tf`, and `tests/test_setup_wizard_schema.py` derives both sides from that file and asserts they agree. A field whose variable Terraform does not constrain carries no pattern: one invented here would reject values Terraform accepts, which is the single failure a deployer cannot work around. `x-error-message` is Terraform's own `error_message`, verbatim, so the two can never word the same rule differently.\n\nNo value in this file identifies any deployment. Where a shape needs illustrating, the description uses a placeholder or a reserved example name.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "region",
+    "globus_s3_destination_bucket",
     "domain",
     "operator_emails",
     "github_repo",
@@ -54,6 +55,21 @@
       "x-terraform-variable": "bucket_suffix",
       "x-derived": true,
       "x-derived-random": 6
+    },
+    "globus_s3_destination_bucket": {
+      "type": "string",
+      "pattern": "^[a-z0-9.-]{3,63}$",
+      "x-error-message": "globus_s3_destination_bucket must be a valid S3 bucket name.",
+      "title": "Storage bucket for the imaging data",
+      "description": "The storage bucket that holds the imaging data and every result the pipeline computes from it. <name>-<code>-data is offered; keep it unless the data is already in a bucket of its own, and then name that one. The bucket is created, or an existing one adopted, in Step 4 of the deployer guide; the stack configures it but never creates it.\n\nTerraform calls it globus_s3_destination_bucket, for historical reasons: Globus no longer writes to it, and HTTPS ingress, or whoever staged the data, does.",
+      "x-section": "aws",
+      "x-source": "deployer-choice",
+      "x-terraform-variable": "globus_s3_destination_bucket",
+      "x-suggested-from": [
+        "name",
+        "bucket_suffix"
+      ],
+      "x-suggested-template": "{name}-{bucket_suffix}-data"
     },
     "domain": {
       "type": [

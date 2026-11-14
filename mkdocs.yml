@@ -114,6 +114,7 @@ nav:
       - metrics_data_dictionary.md
       - how-to-timeframe-metrics-dataframe.md
       - anatomical-stats.md
+      - fmriprep-benchmark.md
 
   - Infrastructure:
       - architecture.md
@@ -123,7 +124,6 @@ nav:
       - data-ingress.md
       - globus-prerequisites.md
       - globus.md
-      - globus-setup.md
       - globus-contract.md
 
   - Operations:
